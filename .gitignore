@@ -20,3 +20,6 @@ __pycache__/
 
 # Transient sandbox/staging dirs (created at runtime by the create pipelines)
 **/.staging/
+
+# Node dev tooling (release automation only; the plugin ships no JS)
+node_modules/
