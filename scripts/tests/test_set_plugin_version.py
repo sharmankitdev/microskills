@@ -58,3 +58,32 @@ def test_rejects_non_semver(tmp_path, bad):
     target = _sample(tmp_path)
     with pytest.raises(ValueError):
         mod.set_version(bad, path=target)
+
+
+def test_rejects_without_writing(tmp_path):
+    mod = _load()
+    target = _sample(tmp_path)
+    before = target.read_text()
+    with pytest.raises(ValueError):
+        mod.set_version("nope", path=target)
+    assert target.read_text() == before  # validate-before-write contract
+
+
+def test_main_success(tmp_path, monkeypatch):
+    mod = _load()
+    target = _sample(tmp_path)
+    monkeypatch.setattr(mod.set_version, "__defaults__", (target,))
+    assert mod.main(["set_plugin_version.py", "0.3.0"]) == 0
+    assert json.loads(target.read_text())["version"] == "0.3.0"
+
+
+def test_main_bad_version_returns_1(tmp_path, monkeypatch):
+    mod = _load()
+    target = _sample(tmp_path)
+    monkeypatch.setattr(mod.set_version, "__defaults__", (target,))
+    assert mod.main(["set_plugin_version.py", "nope"]) == 1
+
+
+def test_main_wrong_arg_count_returns_2():
+    mod = _load()
+    assert mod.main(["set_plugin_version.py"]) == 2

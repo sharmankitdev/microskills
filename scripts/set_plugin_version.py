@@ -12,7 +12,7 @@ from pathlib import Path
 
 PLUGIN_JSON = Path(__file__).resolve().parent.parent / ".claude-plugin" / "plugin.json"
 SEMVER = re.compile(
-    r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$"
+    r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?\Z"
 )
 
 
@@ -30,7 +30,7 @@ def main(argv: list) -> int:
         return 2
     try:
         set_version(argv[1])
-    except (ValueError, FileNotFoundError, json.JSONDecodeError) as exc:
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     return 0
