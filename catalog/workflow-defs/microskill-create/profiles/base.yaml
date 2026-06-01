@@ -1,0 +1,4 @@
+# Profile overlay for microskill-create. Deep-merged onto WORKFLOW.yaml by
+# compile-workflow. Customize the flow here without editing the definition —
+# e.g. a `lightweight.yaml` overlay could set `loop: { max_iters: 1 }`.
+version: 1

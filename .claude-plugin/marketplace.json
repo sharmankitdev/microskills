@@ -1,0 +1,13 @@
+{
+  "name": "microskills",
+  "owner": {
+    "name": "Ankit Sharma"
+  },
+  "plugins": [
+    {
+      "name": "microskills",
+      "source": "./",
+      "description": "Composable microskills + workflows engine. Run /microskills:initialize-harness once per project to bootstrap the runtime from the catalog, then /sync-harness for your own source:custom components."
+    }
+  ]
+}

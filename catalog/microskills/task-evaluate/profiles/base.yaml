@@ -1,0 +1,33 @@
+version: 1
+
+# Default domain = microskill creation. The `workflow` overlay swaps the executor
+# agent + contract doc. The verdict output_schema is identical across domains.
+vars:
+  contract_doc: .claude/workflow-defs/microskill-create/references/evaluator.md
+
+inputs:
+  staging_paths:
+    required: true
+  requirement:
+    required: true
+  plan_path:
+    required: true
+
+runtime:
+  agent: microskill-evaluator
+  model: opus
+
+output_schema:
+  type: object
+  required: [pass, issues]
+  properties:
+    pass: { type: boolean }
+    issues:
+      type: array
+      items:
+        type: object
+        required: [severity, location, message]
+        properties:
+          severity: { type: string, enum: [block, warn] }
+          location: { type: string }
+          message: { type: string }

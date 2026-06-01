@@ -1,0 +1,294 @@
+version: 1
+name: decompose-monolith-orchestrator
+description: >
+  Decompose a monolith orchestrator SKILL.md into the microskills design pattern —
+  analyze the monolith orchestrator into a decomposition brief, plan the
+  WORKFLOW.yaml that realizes it (human-approval gate), provision the microskills it
+  needs, then implement/evaluate/finalize the resulting workflow.
+
+# Caller-supplied inputs. skill_path is the primary input (the monolith orchestrator
+# SKILL.md to decompose); the rest mirror workflow-create's finalize plumbing since
+# the build half is inline-expanded from that workflow.
+inputs:
+  skill_path:
+    type: string
+    required: true
+    description: Filesystem path to the monolith orchestrator SKILL.md to decompose.
+  name:
+    type: string
+    required: false
+    description: Optional name override for the planner's proposed workflow name.
+  output_dir:
+    type: string
+    required: false
+    default: .claude/workflow-defs
+    description: Parent dir for the new (decomposed) workflow folder.
+  commands_dir:
+    type: string
+    required: false
+    default: .claude/commands
+    description: Parent dir for the slash-command shim.
+  staging_dir:
+    type: string
+    required: false
+    default: .claude/.workflow-staging/decompose
+    description: Sandbox dir; the implementer writes <staging_dir>/<name>/ before finalize moves it.
+
+imports:
+  - microskills/analyze-monolith-orchestrator
+  - microskills/task-plan
+  - microskills/task-implement
+  - microskills/task-evaluate
+
+# Node definition order is load-bearing: the orchestrator nodes (provision, advise)
+# are defined BEFORE the loop body so they don't split the implement/evaluate segment.
+nodes:
+  # Seg 1 (background): analyze the monolith orchestrator SKILL.md into a structured
+  # decomposition brief. Pure read+analysis, no interaction — an autonomous use: node
+  # that sits ahead of the approval gate. Its decomposition_requirement becomes the
+  # planner's requirement (and the evaluator's semantic ground truth).
+  - id: analyze
+    use: analyze-monolith-orchestrator
+    depends_on: []
+    inputs:
+      skill_path: ${workflow.inputs.skill_path}
+    output_schema:
+      type: object
+      required: [decomposition_requirement, responsibilities]
+      properties:
+        decomposition_requirement:
+          type: string
+          description: Self-contained requirement describing the target workflow to build from the monolith orchestrator.
+        responsibilities:
+          type: array
+          description: Responsibilities extracted from the monolith, each classified and routed. Only target=microskill entries are meant to become microskills.
+          items:
+            type: object
+            properties:
+              name: { type: string }
+              purpose: { type: string }
+              shape: { type: string, description: "atomic | conditional | iterative | fan_out | interactive." }
+              target: { type: string, description: "microskill | orchestrator_node | gate | loop | nested_workflow." }
+              atomic_core: { type: string, description: For target=microskill, the pure single-action core stripped of cross-cutting concerns. }
+              hoisted_concerns: { type: array, items: { type: object }, description: Cross-cutting orchestration pushed to the workflow layer (concern + owning node/loop/gate). }
+        step_order: { type: array, items: { type: string } }
+        control_flow:
+          type: object
+          description: Branch/loop/fan-out structure implied by the monolith orchestrator's logic.
+        data_flow:
+          type: array
+          description: What each step consumes and produces, for human review at the gate.
+          items:
+            type: object
+            properties:
+              step: { type: string }
+              consumes: { type: array, items: { type: string } }
+              produces: { type: array, items: { type: string } }
+        agent_dependencies:
+          type: array
+          description: Sub-agents the rebuilt workflow depends on; each with name, used_by, and exists (whether present under .claude/agents/). Missing agents are surfaced at provision before any build.
+          items:
+            type: object
+            properties:
+              name: { type: string }
+              used_by: { type: string }
+              exists: { type: boolean }
+        nested_workflows:
+          type: array
+          description: >
+            Sub-pipelines (target=nested_workflow) the rebuilt workflow invokes from an
+            orchestrator node at runtime. exists=false ones are built via workflow-create
+            at provision before their node; exists=true ones are invoked as-is.
+          items:
+            type: object
+            properties:
+              name: { type: string }
+              requirement: { type: string }
+              exists: { type: boolean }
+              invoke_target: { type: string }
+
+  # Seg 1 (background): plan the WORKFLOW.yaml from the decomposition brief. The
+  # workflow planner designs the node graph + profile reuse and lists any microskills
+  # the decomposition needs that don't yet exist. Human approves the decomposition at
+  # the gate below.
+  - id: plan
+    use: task-plan
+    customize: { profile: workflow }
+    depends_on: [analyze]
+    inputs:
+      requirement: ${analyze.output.decomposition_requirement}
+      name_override: ${workflow.inputs.name}
+      staging_dir: ${workflow.inputs.staging_dir}
+    output_schema:
+      type: object
+      required: [plan_path, name, scope_advisory, missing_microskills]
+      properties:
+        plan_path: { type: ["string", "null"], description: Path to the written WORKFLOW.yaml-design plan file under staging_dir, or null when a scope advisory applies. }
+        name: { type: ["string", "null"] }
+        scope_advisory: { type: ["object", "null"], description: "{kind: split|promote|adapt, reason, recommendation} or null." }
+        missing_microskills:
+          type: array
+          description: Microskills the decomposition needs that do not yet exist; each is created via microskill-create before implement.
+          items:
+            type: object
+            properties:
+              name: { type: string }
+              requirement: { type: string }
+
+  # Checkpoint (orchestrator): provision the microskills AND missing nested workflows
+  # the decomposition needs, in two cheap-first phases, surfacing unbuildable work
+  # BEFORE spending build tokens. Runs in the main loop — the only place a node may
+  # invoke a nested workflow. Guarded so the advisory path skips it. Defined before the
+  # loop body so it doesn't split the implement/evaluate segment. (With analyze routing
+  # non-atomic responsibilities to workflow constructs, missing_microskills should be
+  # atomic-only; phase 1 + the gate are the safety net that keeps a stray non-atomic
+  # candidate or missing agent from burning a full build loop — the failure mode that
+  # wasted ~1M tokens before.) Recursion is bounded at ONE level: a nested workflow is
+  # built via workflow-create, which provisions only microskills — it never builds
+  # further nested workflows, so decompose -> workflow-create -> microskills and stops.
+  - id: provision
+    delegation: orchestrator
+    when: ${plan.output.scope_advisory == null}
+    depends_on: [plan, analyze]
+    prompt: >
+      Provision the microskills in ${plan.output.missing_microskills} and the missing
+      nested workflows in ${analyze.output.nested_workflows}, cheap phase first, and
+      surface unbuildable work before spending build tokens.
+
+      PHASE 1 — plan only (cheap). For every missing microskill, run ONLY the plan
+      stage of microskill-create (its compiled seg-1) with the `autonomous` profile,
+      each in its own staging dir, to obtain a scope_advisory. For every nested workflow
+      in ${analyze.output.nested_workflows} with exists=false, likewise run ONLY the
+      plan stage of workflow-create (its compiled seg-1) with the `autonomous` profile,
+      each in its own staging dir, to obtain a scope_advisory. Record, per candidate,
+      whether it is buildable (scope_advisory == null) or carries an advisory.
+
+      AGENT CHECK. Inspect ${analyze.output.agent_dependencies}: collect every entry
+      with exists=false — agents the assembled workflow imports but that are absent
+      under .claude/agents/. These cannot be fabricated.
+
+      GATE. If any microskill candidate is non-atomic, OR any missing nested workflow
+      returned an advisory, OR any agent dependency is missing, STOP and AskUserQuestion
+      before building: present the non-atomic microskills and advisory nested workflows
+      (with each advisory's split/promote recommendation) and the missing agents, then
+      offer revise-plan (re-plan so the non-atomic work becomes the right construct —
+      the preferred fix) / build-buildable-only (build only the clean candidates and
+      flag the rest) / abandon. Never build a unit the planner flagged with an advisory,
+      and never fabricate a missing agent.
+
+      PHASE 2 — build (buildable candidates only).
+      Microskills: for each atomic candidate, run microskill-create's build stage
+      (seg-2) then finalize it to .claude/microskills/<name>/ with its slash shim.
+      Nested workflows: for each exists=false candidate with no advisory, run
+      workflow-create's build stage (seg-2) then finalize it to
+      .claude/workflow-defs/<name>/ with its slash shim. An exists=true nested workflow
+      is NOT built — the parent's orchestrator node invokes its invoke_target as-is.
+      EARLY-ABORT: if a build round returns empty staging output or repeats an identical
+      block verdict, stop that unit, report it, and move on — do not burn the full retry
+      cap. A failed or skipped unit is reported but does not block its siblings; the
+      unresolved set is surfaced so the downstream implement/evaluate fails loud rather
+      than shipping a workflow with missing microskills or dangling nested-workflow
+      invokes.
+
+      Emit a provisioning summary: built_microskills[], built_workflows[],
+      invoked_existing_workflows[], advised[], failed[], missing_agents[].
+
+  # Checkpoint (orchestrator): when the planner returns a scope_advisory instead of
+  # a plan (e.g. the monolith orchestrator is really two independent workflows →
+  # split, or a single atomic task → promote), surface it and stop. Defined before
+  # the loop body.
+  - id: advise
+    delegation: orchestrator
+    when: ${plan.output.scope_advisory != null}
+    depends_on: [plan]
+    prompt: >
+      The planner returned a scope advisory instead of a plan:
+      ${plan.output.scope_advisory}. Present it to the user. For kind=split, list
+      the candidate workflows the monolith orchestrator should be decomposed into
+      separately. For kind=promote, explain the monolith orchestrator's logic is
+      really a single atomic task — recommend microskill-create instead. For
+      kind=adapt, name the existing workflow that already covers this. Do not
+      implement anything — stop here.
+
+  # Seg 2 (background): the implement <-> evaluate loop assembling and validating the
+  # decomposed WORKFLOW.yaml. Both body nodes are guarded so the advisory path skips
+  # the loop entirely (the compiled loop breaks on a fully-skipped iteration).
+  - id: implement
+    use: task-implement
+    customize: { profile: workflow }
+    when: ${plan.output.scope_advisory == null}
+    depends_on: [plan, provision]
+    inputs:
+      plan_path: ${plan.output.plan_path}
+      staging_dir: ${workflow.inputs.staging_dir}
+      last_findings: ${loop.carry.last_findings}
+    output_schema:
+      type: object
+      required: [staging_paths]
+      properties:
+        staging_paths: { type: array, items: { type: string } }
+
+  - id: evaluate
+    use: task-evaluate
+    customize: { profile: workflow }
+    when: ${plan.output.scope_advisory == null}
+    depends_on: [implement, plan, analyze]
+    inputs:
+      staging_paths: ${implement.output.staging_paths}
+      requirement: ${analyze.output.decomposition_requirement}
+      plan_path: ${plan.output.plan_path}
+      name: ${plan.output.name}
+      staging_base: ${workflow.inputs.staging_dir}
+    output_schema:
+      type: object
+      required: [pass, issues]
+      properties:
+        pass: { type: boolean }
+        issues: { type: array, items: { type: object } }
+
+  # Checkpoint (orchestrator): move staging -> final, write the slash shim, populate
+  # .compiled/, handle name collisions interactively.
+  - id: finalize
+    delegation: orchestrator
+    when: ${plan.output.scope_advisory == null}
+    depends_on: [plan, implement, evaluate]
+    prompt: >
+      Finalize the decomposed workflow. The approved plan is at
+      ${plan.output.plan_path}; staged files are ${implement.output.staging_paths};
+      evaluator verdict ${evaluate.output.pass} with issues ${evaluate.output.issues}.
+      FIRST, if issues is non-empty (e.g. warn-severity findings that passed but were
+      never fixed), present each as severity + message and AskUserQuestion
+      (fix-and-finalize / accept-as-is / abandon): for fix-and-finalize, apply the
+      fixes to the staged files before moving them; for abandon, stop and clean
+      staging. THEN compute final_dir = ${workflow.inputs.output_dir}/${plan.output.name}
+      and shim_path = ${workflow.inputs.commands_dir}/${plan.output.name}.md. On
+      collision, AskUserQuestion (overwrite / pick-new-name / abandon). Move the staged
+      files to final_dir, write the workflow slash shim (delegates to the `workflow`
+      skill), run compile-workflow ${plan.output.name} to populate .compiled/, and
+      print a summary of the decomposition (monolith orchestrator microskills created
+      + the workflow graph).
+
+# Human-approval gate after `plan`: the segment boundary, and the requirement's
+# "pause for human approval of the proposed decomposition before building". Approving
+# also authorizes creation of the microskills listed under missing_microskills.
+gates:
+  - id: approve_decomposition
+    after: plan
+    type: human_approval
+    severity: hard
+    prompt: >
+      Review the proposed decomposition of the monolith orchestrator: the node graph,
+      the atomic microskills it maps to, the gates/loops/fan-out, and the microskills
+      to be created. Approve to build, revise to re-plan, or abandon.
+    options: [approve, revise, abandon]
+
+# Guarded loop: repeat implement->evaluate until the evaluator passes or the cap.
+loop:
+  while: ${!evaluate.output.pass}
+  max_iters: 3
+  body: [implement, evaluate]
+  carry:
+    last_findings: ${evaluate.output}
+
+output:
+  from: finalize

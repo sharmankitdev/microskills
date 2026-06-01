@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+"""
+initialize-harness — bootstrap a project's runtime from the plugin catalog.
+
+This is the ONE globally-registered plugin command. Everything else (the
+microskill/workflow/sync-harness dispatchers, per-component shims) is materialized
+into the project's .claude/ here, which is what keeps them hidden until a project
+is initialized. It:
+
+  1. Seeds harness/harness.yaml from the catalog's base-tagged components (only if
+     absent — an existing manifest is used as-is, never overwritten).
+  2. Materializes the ENGINE (scripts, dispatcher skills, agents, engine command
+     shims) from the plugin catalog into .claude/.
+  3. Materializes every `source: plugin` component listed in harness.yaml into
+     .claude/ (+ generated shim), honoring the profiles selection.
+  4. Records everything in .claude/.harness-state.json: plugin components tagged
+     source:plugin, plus an `engine` block. `source: custom` components are owned by
+     harness-sync and are preserved here untouched.
+
+Plugin provenance is owned HERE. harness-sync NEVER touches source:plugin entries;
+this command NEVER touches source:custom entries. Re-running is an explicit re-pull
+from the (possibly updated) catalog.
+
+Catalog root resolves to ${CLAUDE_PLUGIN_ROOT}/catalog (installed plugin) or
+<repo>/catalog (in-repo dogfood). Project root is the cwd (or --project-root).
+
+Usage:
+  initialize-harness [--plan | --apply]
+                     [--project-root <dir>] [--catalog <dir>]
+                     [--harness-root <dir>] [--harness-yaml <file>]
+                     [--state <file>] [--deploy-root <dir>]
+
+Stdout: JSON result. Exit codes: 0 clean · 1 block (conflict/error/bad input) · 2 env/script error.
+"""
+
+import argparse
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import sys
+from pathlib import Path
+
+try:
+    import yaml
+except ImportError:
+    print(json.dumps({"error": "PyYAML not installed. pip3 install pyyaml"}))
+    sys.exit(2)
+
+try:
+    from jsonschema import Draft202012Validator
+except ImportError:
+    print(json.dumps({"error": "jsonschema not installed. pip3 install jsonschema"}))
+    sys.exit(2)
+
+SCRIPT = Path(__file__).resolve()
+PROJECT_ROOT_DEFAULT = SCRIPT.parents[2]
+# Plugin root for catalog discovery: ${CLAUDE_PLUGIN_ROOT}/catalog (installed) or <repo>/catalog.
+PLUGIN_ROOT = Path(os.environ.get("CLAUDE_PLUGIN_ROOT", PROJECT_ROOT_DEFAULT))
+
+
+def _templates_root(script):
+    """Locate the templates/ tree (schemas + component templates). Prefer the materialized
+    runtime copy, then an explicit ${CLAUDE_PLUGIN_ROOT}, then the in-repo dogfood source."""
+    proj = script.parents[2]
+    cands = [proj / ".claude" / "templates"]
+    env = os.environ.get("CLAUDE_PLUGIN_ROOT")
+    if env:
+        cands.append(Path(env) / "templates")
+    cands.append(proj / "templates")
+    return next((c for c in cands if c.is_dir()), cands[0])
+
+
+SCHEMA_PATH = _templates_root(SCRIPT) / "references" / "harness-schema.json"
+HARNESS_SYNC = SCRIPT.parent / "harness-sync"
+
+# Reuse the harness-sync engine (extension-less file → SourceFileLoader). harness-sync
+# in turn loads resolve-microskill; importing it only defines functions (its argparse is
+# guarded by __main__), so this is side-effect-free.
+_loader = importlib.machinery.SourceFileLoader("harness_sync", str(HARNESS_SYNC))
+_spec = importlib.util.spec_from_loader("harness_sync", _loader)
+_hs = importlib.util.module_from_spec(_spec)
+_loader.exec_module(_hs)
+
+# Engine subtrees materialized verbatim into .claude/, and paths to skip. initialize-harness
+# itself + the dev tests stay plugin-resident; the initialize-harness dispatcher is never
+# materialized (it remains the plugin's sole global entry point).
+ENGINE_SUBDIRS = ["scripts", "skills", "agents", "commands"]
+ENGINE_SKIP_PARTS = {"initialize-harness", "tests", "__pycache__"}
+
+
+def die(msg, code=2, **extra):
+    payload = {"error": msg}
+    payload.update(extra)
+    print(json.dumps(payload, indent=2))
+    sys.exit(code)
+
+
+def read_base(src_dir, kind):
+    """True if the component is tagged base (MICROSKILL.md frontmatter base:true for
+    microskills, top-level base:true for workflows)."""
+    if kind == "microskill":
+        try:
+            meta_raw = _hs.split_frontmatter((src_dir / "MICROSKILL.md").read_text())[0]
+        except OSError:
+            return False
+        if not meta_raw:
+            return False
+        try:
+            meta = yaml.safe_load(meta_raw) or {}
+        except yaml.YAMLError:
+            return False
+    else:
+        try:
+            meta = yaml.safe_load((src_dir / "WORKFLOW.yaml").read_text()) or {}
+        except (OSError, yaml.YAMLError):
+            return False
+    return bool(isinstance(meta, dict) and meta.get("base"))
+
+
+def catalog_names(catalog, kind):
+    d = catalog / _hs.KIND_DIR[kind]
+    if not d.is_dir():
+        return []
+    return sorted(p.name for p in d.iterdir() if p.is_dir() and not p.name.startswith("."))
+
+
+def seed_manifest(catalog):
+    """A v2 harness.yaml dict listing every base-tagged catalog component as source:plugin."""
+    m = {"version": 2, "microskills": [], "workflows": []}
+    for list_key, kind in _hs.LIST_KIND.items():
+        for name in catalog_names(catalog, kind):
+            if read_base(catalog / _hs.KIND_DIR[kind] / name, kind):
+                m[list_key].append({"name": name, "source": "plugin"})
+    return m
+
+
+def render_manifest_yaml(m):
+    lines = [
+        "# Harness manifest (v2) — generated by initialize-harness from the catalog base set.",
+        "# source: plugin → materialized from the plugin catalog by initialize-harness.",
+        "# source: custom → authored under harness/ and reconciled by harness-sync.",
+        "# Schema: templates/references/harness-schema.json",
+        f"version: {m['version']}",
+    ]
+    for list_key in ("microskills", "workflows"):
+        items = m.get(list_key) or []
+        lines.append(f"{list_key}:" + ("" if items else " []"))
+        for c in items:
+            lines.append(f"  - name: {c['name']}")
+            lines.append(f"    source: {c['source']}")
+            prof = c.get("profiles")
+            if prof and prof != "*":
+                lines.append(f"    profiles: [{', '.join(prof)}]")
+    return "\n".join(lines) + "\n"
+
+
+def engine_outputs(catalog, deploy_root):
+    """(src_file, dest_abs) for every engine file materialized into .claude/."""
+    out = []
+    for sub in ENGINE_SUBDIRS:
+        sdir = catalog / sub
+        if not sdir.is_dir():
+            continue
+        for f in sorted(p for p in sdir.rglob("*") if p.is_file()):
+            rel = f.relative_to(sdir)
+            if set(rel.parts) & ENGINE_SKIP_PARTS or f.suffix == ".pyc":
+                continue
+            out.append((f, deploy_root / sub / rel))
+    # templates/ (schemas + component templates) live at the plugin root, a sibling of
+    # catalog/, not under it. The runtime scripts + agents resolve them from .claude/templates,
+    # so materialize the whole tree there as part of the engine (tracked/pruned in the ledger).
+    tdir = catalog.parent / "templates"
+    if tdir.is_dir():
+        for f in sorted(p for p in tdir.rglob("*") if p.is_file()):
+            if f.suffix == ".pyc":
+                continue
+            out.append((f, deploy_root / "templates" / f.relative_to(tdir)))
+    return out
+
+
+def engine_hash(outputs):
+    h = hashlib.sha256()
+    for src, dst in sorted(outputs, key=lambda t: str(t[1])):
+        h.update(str(dst).encode())
+        h.update(b"\0")
+        h.update(src.read_bytes())
+        h.update(b"\0")
+    return "sha256:" + h.hexdigest()
+
+
+def materialize_engine(outputs, eng_installed, anchor, deploy_root):
+    """Copy engine files, preserving exec bits; prune previously-installed engine paths
+    no longer produced."""
+    new_dests = {dst for _, dst in outputs}
+    for rel in (eng_installed or {}).get("installed_paths") or []:
+        old = anchor / rel
+        if old not in new_dests and old.exists():
+            old.unlink()
+            _hs.prune_empty(old.parent, deploy_root)
+    for src, dst in outputs:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(src.read_bytes())
+        if os.access(src, os.X_OK):
+            dst.chmod(dst.stat().st_mode | 0o111)
+
+
+def build_plugin_desired(manifest, catalog, anchor):
+    """Desired source:plugin components, read from the catalog. (custom entries are
+    owned by harness-sync and ignored here.)"""
+    desired, errors = {}, []
+    for list_key, kind in _hs.LIST_KIND.items():
+        for c in manifest.get(list_key) or []:
+            if c.get("source") != "plugin":
+                continue
+            name = c["name"]
+            src_dir = catalog / _hs.KIND_DIR[kind] / name
+            if not src_dir.is_dir():
+                errors.append({"name": name, "reason": f"catalog component not found: {src_dir}"})
+                continue
+            profiles = _hs.norm_profiles(c.get("profiles"))
+            if profiles != "*":
+                missing = sorted(set(profiles) - _hs.source_profiles(src_dir))
+                if missing:
+                    errors.append({"name": name,
+                                   "reason": f"selected profiles not in catalog source: {', '.join(missing)}"})
+                    continue
+            desired[name] = {
+                "name": name, "kind": kind, "source": "plugin",
+                "profiles": profiles, "src_dir": src_dir,
+                "tree_hash": _hs.tree_hash(src_dir),
+            }
+    return desired, errors
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Bootstrap a project's .claude/ runtime from the plugin catalog.")
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--plan", action="store_true", help="Dry-run (default): write nothing.")
+    mode.add_argument("--apply", action="store_true", help="Execute the bootstrap.")
+    ap.add_argument("--project-root", default=None, help="Project root (default: cwd).")
+    ap.add_argument("--catalog", default=None,
+                    help="Catalog dir (default: ${CLAUDE_PLUGIN_ROOT}/catalog or <repo>/catalog).")
+    ap.add_argument("--harness-root", default=None)
+    ap.add_argument("--harness-yaml", default=None)
+    ap.add_argument("--state", default=None)
+    ap.add_argument("--deploy-root", default=None)
+    args = ap.parse_args()
+
+    apply = args.apply  # neither flag → plan
+    project_root = Path(args.project_root or os.getcwd()).resolve()
+    catalog = Path(args.catalog or (PLUGIN_ROOT / "catalog")).resolve()
+    harness_root = Path(args.harness_root or (project_root / "harness"))
+    harness_yaml = Path(args.harness_yaml or (harness_root / "harness.yaml"))
+    deploy_root = Path(args.deploy_root or (project_root / ".claude")).resolve()
+    state_path = Path(args.state or (deploy_root / ".harness-state.json"))
+    anchor = deploy_root.parent
+
+    if not catalog.is_dir():
+        die(f"catalog not found: {catalog} (set CLAUDE_PLUGIN_ROOT or --catalog)", 2)
+
+    # 1. Seed harness.yaml from the base set if absent; otherwise use it as-is.
+    seeded = False
+    if harness_yaml.exists():
+        try:
+            manifest = yaml.safe_load(harness_yaml.read_text()) or {}
+        except yaml.YAMLError as e:
+            die(f"harness.yaml parse error: {e}", 1)
+    else:
+        manifest = seed_manifest(catalog)
+        seeded = True
+        if apply:
+            harness_yaml.parent.mkdir(parents=True, exist_ok=True)
+            harness_yaml.write_text(render_manifest_yaml(manifest))
+
+    if SCHEMA_PATH.exists():
+        schema = json.loads(SCHEMA_PATH.read_text())
+        errs = sorted(Draft202012Validator(schema).iter_errors(manifest), key=lambda e: list(e.path))
+        if errs:
+            msgs = ["schema " + ("/".join(str(x) for x in e.path) or "<root>") + ": " + e.message
+                    for e in errs]
+            die("harness.yaml fails schema validation", 1, schema_errors=msgs)
+
+    # 2. Plugin components + engine plan.
+    desired, errors = build_plugin_desired(manifest, catalog, anchor)
+    state = _hs.load_state(state_path)
+    installed_all = state.get("components") or {}
+    installed_plugin = {n: e for n, e in installed_all.items() if e.get("source") == "plugin"}
+
+    actions, conflicts = _hs.reconcile(desired, installed_plugin, anchor, deploy_root, {})
+
+    eng_out = engine_outputs(catalog, deploy_root)
+    eng_hash = engine_hash(eng_out)
+    eng_installed = state.get("engine") or {}
+    if not eng_installed:
+        eng_action = "add"
+    elif eng_installed.get("source_hash") != eng_hash:
+        eng_action = "update"
+    else:
+        eng_action = "noop"
+
+    summary = _hs.summarize(actions, conflicts, errors)
+    result = {
+        "mode": "apply" if apply else "plan",
+        "catalog": str(catalog),
+        "deploy_root": _hs.relto(deploy_root, anchor),
+        "seeded_harness_yaml": seeded,
+        "engine": {"action": eng_action, "files": len(eng_out)},
+        "actions": actions,
+        "conflicts": conflicts,
+        "errors": errors,
+        "summary": summary,
+    }
+
+    if not apply:
+        print(json.dumps(result, indent=2))
+        sys.exit(1 if (conflicts or errors) else 0)
+
+    # 3. Apply: engine first (the runtime that everything else depends on), then components.
+    materialize_engine(eng_out, eng_installed, anchor, deploy_root)
+    new_engine = {
+        "installed_paths": sorted(_hs.relto(dst, anchor) for _, dst in eng_out),
+        "source_hash": eng_hash,
+    }
+
+    new_components = dict(installed_all)
+    for a in actions:
+        name, act = a["name"], a["action"]
+        if act in ("add", "update"):
+            new_components[name] = _hs.execute_install(desired[name], installed_plugin.get(name),
+                                                       anchor, deploy_root)
+        elif act == "remove":
+            _hs.execute_remove(installed_plugin[name], anchor, deploy_root)
+            new_components.pop(name, None)
+        a["applied"] = True
+
+    new_state = dict(state)
+    new_state["version"] = _hs.STATE_VERSION
+    new_state["components"] = new_components
+    new_state["engine"] = new_engine
+    _hs.write_state_atomic(state_path, new_state)
+
+    result["state_path"] = _hs.relto(state_path, anchor)
+    result["state_written"] = True
+    result["engine"]["applied"] = True
+    print(json.dumps(result, indent=2))
+    sys.exit(1 if (conflicts or errors) else 0)
+
+
+if __name__ == "__main__":
+    main()

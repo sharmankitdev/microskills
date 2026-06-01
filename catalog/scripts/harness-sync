@@ -1,0 +1,453 @@
+#!/usr/bin/env python3
+"""
+harness-sync — reconcile the vendored harness/ source-of-truth into the runtime
+.claude/, scoped to the components this tool owns.
+
+harness.yaml (manifest) + harness/ (committed source) describe the desired set.
+.claude/.harness-state.json (ledger) records exactly which .claude/ paths this
+tool installed. Reconcile = diff desired vs ledger → add/update/remove acting ONLY
+on ledger-tracked paths; an unmanaged same-name path on disk is a conflict
+(skip + warn, overridable via --resolve). This is what makes sync non-destructive:
+anything sync did not install has no ledger entry and is never touched.
+
+Scope: this tool reconciles ONLY `source: custom` components (authored under harness/).
+`source: plugin` components are owned by `initialize-harness` (materialized from the plugin
+catalog) — they are skipped here and their ledger entries are never read, diffed, or removed.
+
+Usage:
+  harness-sync [--plan | --apply]
+               [--harness-root <dir>] [--harness-yaml <file>]
+               [--state <file>] [--deploy-root <dir>]
+               [--resolve <name=skip|overwrite>]...
+
+Stdout: JSON reconcile result.
+Exit codes: 0 clean · 1 block (conflict / error / bad input) · 2 environment/script error.
+"""
+
+import argparse
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import sys
+from pathlib import Path
+
+try:
+    import yaml
+except ImportError:
+    print(json.dumps({"error": "PyYAML not installed. pip3 install pyyaml"}))
+    sys.exit(2)
+
+try:
+    from jsonschema import Draft202012Validator
+except ImportError:
+    print(json.dumps({"error": "jsonschema not installed. pip3 install jsonschema"}))
+    sys.exit(2)
+
+SCRIPT = Path(__file__).resolve()
+PROJECT_ROOT = SCRIPT.parents[2]
+
+
+def _templates_root(script):
+    """Locate templates/ (schemas + component templates): prefer the materialized runtime
+    copy under .claude/, then ${CLAUDE_PLUGIN_ROOT}, then the in-repo dogfood source."""
+    proj = script.parents[2]
+    cands = [proj / ".claude" / "templates"]
+    env = os.environ.get("CLAUDE_PLUGIN_ROOT")
+    if env:
+        cands.append(Path(env) / "templates")
+    cands.append(proj / "templates")
+    return next((c for c in cands if c.is_dir()), cands[0])
+
+
+SCHEMA_PATH = _templates_root(SCRIPT) / "references" / "harness-schema.json"
+RESOLVE_SCRIPT = SCRIPT.parent / "resolve-microskill"
+
+# Reuse resolver helpers (extension-less file → SourceFileLoader, as compile-workflow does).
+_loader = importlib.machinery.SourceFileLoader("resolve_microskill", str(RESOLVE_SCRIPT))
+_spec = importlib.util.spec_from_loader("resolve_microskill", _loader)
+_rm = importlib.util.module_from_spec(_spec)
+_loader.exec_module(_rm)
+split_frontmatter = _rm.split_frontmatter
+
+# v2 harness.yaml lists components under `microskills:` / `workflows:` (kind implied by the list).
+LIST_KIND = {"microskills": "microskill", "workflows": "workflow"}
+KIND_DIR = {"microskill": "microskills", "workflow": "workflow-defs"}
+STATE_VERSION = 2
+
+# Never vendor or hash generated/transient artifacts: compiled workflow output and
+# Python caches. These appear in catalog/ runtime copies but must not be materialized.
+VENDOR_IGNORE_PARTS = {".compiled", "__pycache__"}
+
+
+def vendor_skip(rel):
+    """True if this component-relative path is a generated/transient artifact to skip."""
+    return bool(set(rel.parts) & VENDOR_IGNORE_PARTS) or rel.suffix == ".pyc"
+
+
+def die(msg, code=2, **extra):
+    payload = {"error": msg}
+    payload.update(extra)
+    print(json.dumps(payload, indent=2))
+    sys.exit(code)
+
+
+def relto(p, root):
+    """Path p displayed relative to root when possible, else absolute."""
+    try:
+        return str(Path(p).relative_to(root))
+    except ValueError:
+        return str(p)
+
+
+def tree_hash(d):
+    """Order-independent, location-independent content hash of a directory.
+    Feeds each file's POSIX-relative path + bytes (so a rename changes the hash,
+    but copying the tree elsewhere does not)."""
+    h = hashlib.sha256()
+    for f in sorted(p for p in d.rglob("*") if p.is_file()):
+        rel = f.relative_to(d)
+        if vendor_skip(rel):
+            continue
+        h.update(rel.as_posix().encode())
+        h.update(b"\0")
+        h.update(f.read_bytes())
+        h.update(b"\0")
+    return "sha256:" + h.hexdigest()
+
+
+def read_description(src_dir, kind):
+    fname = "MICROSKILL.md" if kind == "microskill" else "WORKFLOW.yaml"
+    try:
+        text = (src_dir / fname).read_text()
+    except OSError:
+        return None
+    raw = split_frontmatter(text)[0] if kind == "microskill" else text
+    if not raw:
+        return None
+    try:
+        meta = yaml.safe_load(raw) or {}
+    except yaml.YAMLError:
+        return None
+    desc = meta.get("description") if isinstance(meta, dict) else None
+    return " ".join(desc.split()) if isinstance(desc, str) and desc.strip() else None
+
+
+def render_shim(name, kind, src_dir):
+    """The ONE generated (non-vendored) artifact. Tracked in the ledger so sync owns it."""
+    desc = read_description(src_dir, kind) or name
+    if kind == "microskill":
+        return (
+            f"---\ndescription: >\n  {desc}\n---\n\n"
+            f"Invoke the `microskill` Skill with the microskill name `{name}` "
+            f"followed by these caller arguments: $ARGUMENTS.\n\n"
+            f"The dispatcher will load `.claude/microskills/{name}/MICROSKILL.md`, "
+            f"resolve the profile via `.claude/scripts/resolve-microskill`, and "
+            f"execute the resolved body.\n"
+        )
+    return (
+        f"---\ndescription: >\n  {desc}\n---\n\n"
+        f"Invoke the `workflow` Skill with the workflow name `{name}` "
+        f"followed by these caller arguments: $ARGUMENTS.\n\n"
+        f"The dispatcher will load `.claude/workflow-defs/{name}/WORKFLOW.yaml`, "
+        f"compile it via `.claude/scripts/compile-workflow`, then orchestrate the run.\n"
+    )
+
+
+def norm_profiles(p):
+    """Normalize a manifest `profiles` value for storage + comparison.
+    None (omitted) and "*" both mean 'all profiles in source'; a list is sorted
+    (order/duplicates are not significant — the schema already enforces uniqueness)."""
+    if p is None or p == "*":
+        return "*"
+    return sorted(p)
+
+
+def is_profile_overlay(rel):
+    """True for a direct profiles/<name>.yaml overlay file (the selectable unit)."""
+    parts = rel.parts
+    return len(parts) == 2 and parts[0] == "profiles" and parts[1].endswith(".yaml")
+
+
+def profile_selected(rel, profiles):
+    """Whether this overlay is in the selection. profiles "*" selects everything."""
+    if profiles == "*":
+        return True
+    return Path(rel.parts[1]).stem in profiles
+
+
+def source_profiles(src_dir):
+    """Profile stems present in the source tree (profiles/<stem>.yaml)."""
+    pdir = src_dir / "profiles"
+    if not pdir.is_dir():
+        return set()
+    return {p.stem for p in pdir.glob("*.yaml") if p.is_file()}
+
+
+def planned_outputs(name, kind, src_dir, deploy_root, profiles="*"):
+    """(src_file | None, dest_abs) for every file the component would write, shim last.
+    src None means the file is generated (the shim). Profile overlays under profiles/
+    are filtered to the selection; all other files always vend."""
+    dest_dir = deploy_root / KIND_DIR[kind] / name
+    out = []
+    for f in sorted(p for p in src_dir.rglob("*") if p.is_file()):
+        rel = f.relative_to(src_dir)
+        if vendor_skip(rel):
+            continue
+        if is_profile_overlay(rel) and not profile_selected(rel, profiles):
+            continue
+        out.append((f, dest_dir / rel))
+    out.append((None, deploy_root / "commands" / f"{name}.md"))
+    return out
+
+
+def build_desired(manifest, harness_root):
+    """Desired set = the source:custom components from harness.yaml (microskills + workflows).
+
+    source:plugin entries are owned by initialize-harness and are skipped here (no action,
+    no error) so harness-sync never touches plugin-materialized files or their ledger
+    entries. Custom components are read from harness/<kind-dir>/<name>/."""
+    desired, errors = {}, []
+    for list_key, kind in LIST_KIND.items():
+        for c in manifest.get(list_key) or []:
+            name, source = c["name"], c["source"]
+            if source == "plugin":
+                continue  # owned by initialize-harness — never reconciled here
+            if source != "custom":
+                errors.append({"name": name, "reason": f"unknown source '{source}'"})
+                continue
+            src_dir = harness_root / KIND_DIR[kind] / name
+            if not src_dir.is_dir():
+                errors.append({"name": name, "reason": f"source dir not found: {src_dir}"})
+                continue
+            profiles = norm_profiles(c.get("profiles"))
+            if profiles != "*":
+                missing = sorted(set(profiles) - source_profiles(src_dir))
+                if missing:
+                    errors.append({"name": name,
+                                   "reason": f"selected profiles not found in source: {', '.join(missing)}"})
+                    continue
+            desired[name] = {
+                "name": name, "kind": kind, "source": source,
+                "profiles": profiles, "src_dir": src_dir,
+                "tree_hash": tree_hash(src_dir),
+            }
+    return desired, errors
+
+
+def collisions(name, outputs, owned, resolves, anchor):
+    """Unmanaged same-name dest paths on disk → conflicts (unless --resolve overwrite)."""
+    if resolves.get(name) == "overwrite":
+        return []
+    cf = []
+    for _, dest in outputs:
+        rel = relto(dest, anchor)
+        if rel in owned:
+            continue
+        if dest.exists():
+            cf.append({
+                "name": name, "path": rel,
+                "reason": (f"unmanaged path already exists; pass --resolve {name}=overwrite "
+                           f"to take ownership or --resolve {name}=skip to ignore"),
+            })
+    return cf
+
+
+def reconcile(desired, installed, anchor, deploy_root, resolves):
+    actions, conflicts = [], []
+    for name in sorted(set(desired) | set(installed)):
+        if name in desired and name not in installed:
+            d = desired[name]
+            outputs = planned_outputs(name, d["kind"], d["src_dir"], deploy_root, d["profiles"])
+            cf = collisions(name, outputs, set(), resolves, anchor)
+            if cf:
+                conflicts.extend(cf)
+                continue
+            actions.append({"action": "add", "name": name, "kind": d["kind"],
+                            "paths": sorted(relto(dst, anchor) for _, dst in outputs)})
+        elif name in desired and name in installed:
+            d, ins = desired[name], installed[name]
+            if d["tree_hash"] != ins.get("source_hash") or d["profiles"] != ins.get("profiles"):
+                outputs = planned_outputs(name, d["kind"], d["src_dir"], deploy_root, d["profiles"])
+                owned = set(ins.get("installed_paths") or [])
+                cf = collisions(name, outputs, owned, resolves, anchor)
+                if cf:
+                    conflicts.extend(cf)
+                    continue
+                actions.append({"action": "update", "name": name, "kind": d["kind"],
+                                "old_hash": ins.get("source_hash"), "new_hash": d["tree_hash"],
+                                "paths": sorted(relto(dst, anchor) for _, dst in outputs)})
+            else:
+                actions.append({"action": "noop", "name": name, "kind": d["kind"]})
+        else:  # installed, no longer desired
+            ins = installed[name]
+            actions.append({"action": "remove", "name": name, "kind": ins.get("kind"),
+                            "paths": sorted(ins.get("installed_paths") or [])})
+    return actions, conflicts
+
+
+def prune_empty(d, deploy_root):
+    """Remove emptied dirs upward, but never deploy_root nor its direct children
+    (.claude/microskills, .claude/commands, … are shared engine dirs)."""
+    d = Path(d)
+    while d != deploy_root and d.parent != deploy_root and deploy_root in d.parents:
+        try:
+            d.rmdir()
+        except OSError:
+            break
+        d = d.parent
+
+
+def execute_install(desired_entry, installed_entry, anchor, deploy_root):
+    name, kind, src_dir = desired_entry["name"], desired_entry["kind"], desired_entry["src_dir"]
+    outputs = planned_outputs(name, kind, src_dir, deploy_root, desired_entry["profiles"])
+    new_dests = {dst for _, dst in outputs}
+    # Stale prune (update): drop previously-owned paths no longer produced. Owned only.
+    for rel in (installed_entry or {}).get("installed_paths") or []:
+        old = anchor / rel
+        if old not in new_dests and old.exists():
+            old.unlink()
+            prune_empty(old.parent, deploy_root)
+    installed_paths = []
+    for src, dest in outputs:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if src is None:
+            dest.write_text(render_shim(name, kind, src_dir))
+        else:
+            dest.write_bytes(src.read_bytes())
+        installed_paths.append(relto(dest, anchor))
+    return {
+        "kind": kind, "source": desired_entry["source"], "profiles": desired_entry["profiles"],
+        "deploy_path": relto(deploy_root / KIND_DIR[kind] / name, anchor),
+        "installed_paths": sorted(installed_paths),
+        "source_hash": desired_entry["tree_hash"],
+    }
+
+
+def execute_remove(installed_entry, anchor, deploy_root):
+    for rel in installed_entry.get("installed_paths") or []:
+        p = anchor / rel
+        if p.exists():
+            p.unlink()
+            prune_empty(p.parent, deploy_root)
+
+
+def write_state_atomic(path, state):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.parent / (path.name + ".tmp")
+    tmp.write_text(json.dumps(state, indent=2) + "\n")
+    os.replace(tmp, path)
+
+
+def load_state(path):
+    if not path.exists():
+        return {"version": STATE_VERSION, "components": {}}
+    try:
+        return json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        die(f"state file unreadable: {path}: {e}", 2)
+
+
+def summarize(actions, conflicts, errors):
+    s = {"add": 0, "update": 0, "remove": 0, "noop": 0,
+         "conflict": len(conflicts), "error": len(errors)}
+    for a in actions:
+        s[a["action"]] += 1
+    return s
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Reconcile vendored harness/ into runtime .claude/ (scoped, non-destructive).")
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--plan", action="store_true", help="Dry-run (default): write nothing.")
+    mode.add_argument("--apply", action="store_true", help="Execute the reconcile.")
+    ap.add_argument("--harness-root", default=str(PROJECT_ROOT / "harness"))
+    ap.add_argument("--harness-yaml", default=str(PROJECT_ROOT / "harness" / "harness.yaml"))
+    ap.add_argument("--state", default=str(PROJECT_ROOT / ".claude" / ".harness-state.json"))
+    ap.add_argument("--deploy-root", default=str(PROJECT_ROOT / ".claude"))
+    ap.add_argument("--resolve", action="append", default=[],
+                    help="Collision decision 'name=skip|overwrite'. Repeatable.")
+    args = ap.parse_args()
+
+    apply = args.apply  # neither flag → plan
+    harness_root = Path(args.harness_root).resolve()
+    harness_yaml = Path(args.harness_yaml)
+    state_path = Path(args.state)
+    deploy_root = Path(args.deploy_root).resolve()
+    anchor = deploy_root.parent
+
+    resolves = {}
+    for r in args.resolve:
+        if "=" not in r:
+            die(f"malformed --resolve (no '='): {r}", 1)
+        k, _, v = r.partition("=")
+        k, v = k.strip(), v.strip()
+        if v not in ("skip", "overwrite"):
+            die(f"invalid --resolve answer for {k!r}: {v!r} (want skip|overwrite)", 1)
+        resolves[k] = v
+
+    if not harness_yaml.exists():
+        die(f"harness.yaml not found: {harness_yaml}", 2)
+    try:
+        manifest = yaml.safe_load(harness_yaml.read_text()) or {}
+    except yaml.YAMLError as e:
+        die(f"harness.yaml parse error: {e}", 1)
+
+    if SCHEMA_PATH.exists():
+        schema = json.loads(SCHEMA_PATH.read_text())
+        errs = sorted(Draft202012Validator(schema).iter_errors(manifest), key=lambda e: list(e.path))
+        if errs:
+            msgs = ["schema " + ("/".join(str(x) for x in e.path) or "<root>") + ": " + e.message
+                    for e in errs]
+            die("harness.yaml fails schema validation", 1, schema_errors=msgs)
+
+    desired, errors = build_desired(manifest, harness_root)
+    state = load_state(state_path)
+    installed_all = state.get("components") or {}
+    # Reconcile ONLY within the custom-sourced scope: plugin/engine ledger entries are
+    # invisible here, so they can never be diffed as "no longer desired" and removed.
+    installed = {n: e for n, e in installed_all.items() if e.get("source") == "custom"}
+
+    actions, conflicts = reconcile(desired, installed, anchor, deploy_root, resolves)
+
+    result = {
+        "mode": "apply" if apply else "plan",
+        "harness_root": relto(harness_root, anchor),
+        "deploy_root": relto(deploy_root, anchor),
+        "actions": actions,
+        "conflicts": conflicts,
+        "errors": errors,
+        "summary": summarize(actions, conflicts, errors),
+    }
+
+    if not apply:
+        print(json.dumps(result, indent=2))
+        sys.exit(1 if (conflicts or errors) else 0)
+
+    # Base the new ledger on the FULL prior state (plugin + engine + custom), then apply
+    # only the custom-scope actions — plugin/engine entries pass through untouched.
+    new_components = dict(installed_all)
+    for a in actions:
+        name, act = a["name"], a["action"]
+        if act in ("add", "update"):
+            new_components[name] = execute_install(desired[name], installed.get(name),
+                                                   anchor, deploy_root)
+        elif act == "remove":
+            execute_remove(installed[name], anchor, deploy_root)
+            new_components.pop(name, None)
+        a["applied"] = True
+    new_state = dict(state)  # preserve other top-level keys (e.g. the engine block)
+    new_state["version"] = STATE_VERSION
+    new_state["components"] = new_components
+    write_state_atomic(state_path, new_state)
+
+    result["state_path"] = relto(state_path, anchor)
+    result["state_written"] = True
+    print(json.dumps(result, indent=2))
+    sys.exit(1 if (conflicts or errors) else 0)
+
+
+if __name__ == "__main__":
+    main()

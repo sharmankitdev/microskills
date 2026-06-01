@@ -1,0 +1,24 @@
+# Harness manifest (v2) — the components this project uses.
+# Two lists, each entry tagged by source:
+#   source: plugin  → materialized from the plugin catalog by `initialize-harness`
+#                     (referenced, never copied into harness/). `harness-sync` never touches these.
+#   source: custom  → authored here under harness/<kind-dir>/<name>/ and reconciled by `harness-sync`.
+# Schema: templates/references/harness-schema.json
+version: 2
+microskills:
+  - name: task-plan
+    source: plugin
+  - name: task-implement
+    source: plugin
+  - name: task-evaluate
+    source: plugin
+  - name: validate-microskill
+    source: plugin
+  - name: greet-user
+    source: custom
+    profiles: [base]
+workflows:
+  - name: microskill-create
+    source: plugin
+  - name: workflow-create
+    source: plugin

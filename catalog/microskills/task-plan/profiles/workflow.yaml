@@ -1,0 +1,25 @@
+version: 1
+
+# Workflow-creation domain: run as the workflow planner against its contract.
+vars:
+  contract_doc: .claude/workflow-defs/workflow-create/references/planner.md
+
+runtime:
+  agent: workflow-planner
+  # model inherited from base (opus) via deep-merge.
+
+# Workflow plan shape — overrides the base output_schema wholesale (replace, not merge).
+output_schema:
+  type: object
+  required: [plan_path, name, scope_advisory, missing_microskills]
+  properties:
+    plan_path: { type: ["string", "null"] }
+    name: { type: ["string", "null"] }
+    scope_advisory: { type: ["object", "null"] }
+    missing_microskills:
+      type: array
+      items:
+        type: object
+        properties:
+          name: { type: string }
+          requirement: { type: string }

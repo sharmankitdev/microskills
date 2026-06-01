@@ -1,0 +1,10 @@
+version: 1
+
+# Workflow-creation domain: run as the workflow implementer against its contract.
+# output_schema (staging_paths) is shared with the microskill domain → inherited from base.
+vars:
+  contract_doc: .claude/workflow-defs/workflow-create/references/implementer.md
+
+runtime:
+  agent: workflow-implementer
+  # model inherited from base (opus) via deep-merge.

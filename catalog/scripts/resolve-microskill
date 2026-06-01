@@ -1,0 +1,762 @@
+#!/usr/bin/env python3
+"""
+resolve-microskill — deterministic profile resolver + runtime config preflight.
+
+Loads a microskill's default + named-profile config, applies dotted-path
+overrides, validates against the JSON Schema, substitutes {{key}} placeholders
+in SKILL.md from `vars`, resolves `inputs.inject_from` sources, applies
+`steps.<n>.optional` / `mandate_tool`, gathers `context.refs/snippets/extend`,
+and emits a single JSON document on stdout describing the resolved state
+plus a rendered SKILL.md body ready for the LLM to execute.
+
+Usage:
+  resolve-microskill <skill-name> [--profile <name>]
+                                  [--override <dotted.path=value>]...
+                                  [--skip-step <n>]...
+                                  [--skill-root <dir>]
+
+Stdout: JSON (see README / config-schema doc for the shape).
+Exit codes: 0 OK · 1 block · 2 environment / script error.
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+try:
+    import yaml
+except ImportError:
+    print(json.dumps({"error": "PyYAML not installed. pip3 install pyyaml"}))
+    sys.exit(2)
+
+try:
+    from jsonschema import Draft202012Validator
+except ImportError:
+    print(json.dumps({"error": "jsonschema not installed. pip3 install jsonschema"}))
+    sys.exit(2)
+
+SCRIPT = Path(__file__).resolve()
+PROJECT_ROOT = SCRIPT.parents[2]
+DEFAULT_SKILL_ROOT = PROJECT_ROOT / ".claude" / "microskills"
+
+
+def _templates_root(script):
+    """Locate templates/ (schemas + component templates): prefer the materialized runtime
+    copy under .claude/, then ${CLAUDE_PLUGIN_ROOT}, then the in-repo dogfood source."""
+    proj = script.parents[2]
+    cands = [proj / ".claude" / "templates"]
+    env = os.environ.get("CLAUDE_PLUGIN_ROOT")
+    if env:
+        cands.append(Path(env) / "templates")
+    cands.append(proj / "templates")
+    return next((c for c in cands if c.is_dir()), cands[0])
+
+
+SCHEMA_PATH = _templates_root(SCRIPT) / "references" / "config-schema.json"
+
+PLACEHOLDER_RE = re.compile(r"\{\{([\w-]+)\}\}")
+STEP_LINE_RE = re.compile(r"^(\d+)\.\s", re.MULTILINE)
+INPUTS_HEADER_RE = re.compile(r"^\s*\|\s*Name\s*\|", re.IGNORECASE)
+INPUTS_SEP_RE = re.compile(r"^\s*\|[-| :]+\|\s*$")
+GATE_AFTER_STEP_RE = re.compile(r"^(?:step_)?(\d+)$")
+GATE_ID_COMMENT_RE = re.compile(r"<!--\s*gate-id:\s*([a-z][a-z0-9_-]*)\s*-->")
+
+
+def deep_merge(base, overlay, path=""):
+    if not isinstance(base, dict) or not isinstance(overlay, dict):
+        return overlay
+    result = dict(base)
+    for k, v in overlay.items():
+        cur_path = f"{path}.{k}" if path else k
+        if v is None:
+            result.pop(k, None)
+            continue
+        if k in result:
+            if cur_path == "output_schema":
+                # output_schema is a contract, not a knob: an overlay replaces it
+                # wholesale (never a recursive properties-merge that would let base
+                # fields leak into a profile's intended shape). Absence in the
+                # overlay leaves base's output_schema untouched (the fallback).
+                result[k] = v
+            elif isinstance(result[k], dict) and isinstance(v, dict):
+                result[k] = deep_merge(result[k], v, cur_path)
+            elif isinstance(result[k], list) and isinstance(v, list):
+                if cur_path == "gates.add":
+                    result[k] = result[k] + v
+                else:
+                    result[k] = v
+            else:
+                result[k] = v
+        else:
+            result[k] = v
+    return result
+
+
+def apply_override(cfg, dotted, raw_value):
+    parsed = yaml.safe_load(raw_value) if raw_value != "" else None
+    keys = [k for k in dotted.split(".") if k]
+    if not keys:
+        raise ValueError(f"empty override path: {dotted!r}")
+    cur = cfg
+    for k in keys[:-1]:
+        if k not in cur or not isinstance(cur[k], dict):
+            cur[k] = {}
+        cur = cur[k]
+    if parsed is None:
+        cur.pop(keys[-1], None)
+    else:
+        cur[keys[-1]] = parsed
+
+
+def strip_nulls(obj):
+    if isinstance(obj, dict):
+        return {k: strip_nulls(v) for k, v in obj.items() if v is not None}
+    if isinstance(obj, list):
+        return [strip_nulls(x) for x in obj]
+    return obj
+
+
+def split_frontmatter(text):
+    if not text.startswith("---\n"):
+        return None, text
+    end = text.find("\n---\n", 4)
+    if end == -1:
+        return None, text
+    return text[4:end], text[end + 5:]
+
+
+def substitute_vars(text, vars_map, unresolved):
+    def repl(m):
+        k = m.group(1)
+        if k in vars_map:
+            return str(vars_map[k])
+        if k not in unresolved:
+            unresolved.append(k)
+        return m.group(0)
+    return PLACEHOLDER_RE.sub(repl, text)
+
+
+def resolve_inject_from(input_name, spec, config_dir, warnings):
+    if "env" in spec:
+        var = spec["env"]
+        val = os.environ.get(var, "")
+        if not val:
+            warnings.append(f"input '{input_name}': env var '{var}' is unset or empty")
+            return None
+        return val
+    if "git_config" in spec:
+        key = spec["git_config"]
+        try:
+            proc = subprocess.run(
+                ["git", "config", key], cwd=str(config_dir),
+                capture_output=True, text=True,
+            )
+        except FileNotFoundError:
+            warnings.append(f"input '{input_name}': git not available on PATH")
+            return None
+        if proc.returncode != 0 or not proc.stdout.strip():
+            warnings.append(f"input '{input_name}': git config '{key}' returned no value")
+            return None
+        return proc.stdout.strip()
+    if "file" in spec:
+        path = config_dir / spec["file"]
+        try:
+            return path.read_text().strip()
+        except (FileNotFoundError, PermissionError) as e:
+            warnings.append(f"input '{input_name}': file '{spec['file']}' not readable ({e})")
+            return None
+    if "command" in spec:
+        cmd = spec["command"]
+        try:
+            proc = subprocess.run(
+                cmd, shell=True, cwd=str(config_dir),
+                capture_output=True, text=True,
+            )
+        except Exception as e:
+            warnings.append(f"input '{input_name}': command '{cmd}' failed: {e}")
+            return None
+        if proc.returncode != 0:
+            warnings.append(
+                f"input '{input_name}': command '{cmd}' exited with code "
+                f"{proc.returncode}: {proc.stderr.strip()}"
+            )
+            return None
+        out = proc.stdout.strip()
+        if not out:
+            warnings.append(f"input '{input_name}': command '{cmd}' produced no output")
+            return None
+        return out
+    warnings.append(f"input '{input_name}': inject_from has no recognized source key")
+    return None
+
+
+def parse_inputs_table(body):
+    m = re.search(r"(?m)^## Inputs\s*$", body)
+    if not m:
+        return {}
+    start = m.end()
+    after = re.search(r"(?m)^## ", body[start:])
+    section = body[start: start + after.start()] if after else body[start:]
+    out = {}
+    for line in section.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            continue
+        if INPUTS_HEADER_RE.match(line):
+            continue
+        if INPUTS_SEP_RE.match(line):
+            continue
+        parts = line.split("|")
+        if len(parts) < 7:
+            continue
+        name = parts[1].strip()
+        if not name:
+            continue
+        out[name] = {
+            "required_col": parts[2].strip(),
+            "default_col": parts[5].strip(),
+        }
+    return out
+
+
+def rewrite_inputs_table(body, profile_overrides_inputs, base_defaults=None):
+    base_defaults = base_defaults or {}
+    if not profile_overrides_inputs and not base_defaults:
+        return body
+    m = re.search(r"(?m)^## Inputs\s*$", body)
+    if not m:
+        return body
+    start = m.end()
+    after = re.search(r"(?m)^## ", body[start:])
+    section_end = start + after.start() if after else len(body)
+    section = body[start:section_end]
+    out_chunks = []
+    for line in section.splitlines(keepends=True):
+        stripped = line.rstrip("\n")
+        if (not stripped.strip().startswith("|")
+                or INPUTS_HEADER_RE.match(stripped)
+                or INPUTS_SEP_RE.match(stripped)):
+            out_chunks.append(line)
+            continue
+        parts = stripped.split("|")
+        if len(parts) < 7:
+            out_chunks.append(line)
+            continue
+        name = parts[1].strip()
+        if name in profile_overrides_inputs:
+            parts[2] = " yes "
+            parts[5] = " — "
+            new_line = "|".join(parts)
+        elif name in base_defaults:
+            parts[5] = f" {base_defaults[name]} "
+            new_line = "|".join(parts)
+        else:
+            out_chunks.append(line)
+            continue
+        if line.endswith("\n"):
+            new_line += "\n"
+        out_chunks.append(new_line)
+    return body[:start] + "".join(out_chunks) + body[section_end:]
+
+
+def parse_steps_section(body):
+    m = re.search(r"(?m)^## Steps\s*$", body)
+    if not m:
+        return body, None, ""
+    start = m.end()
+    after_match = re.search(r"(?m)^## ", body[start:])
+    if after_match:
+        block_end = start + after_match.start()
+        return body[: m.start()], body[m.start():block_end], body[block_end:]
+    return body[: m.start()], body[m.start():], ""
+
+
+def enumerate_steps(steps_block):
+    if not steps_block:
+        return []
+    starts = [(m.start(), int(m.group(1))) for m in STEP_LINE_RE.finditer(steps_block)]
+    out = []
+    for i, (s, n) in enumerate(starts):
+        e = starts[i + 1][0] if i + 1 < len(starts) else len(steps_block)
+        out.append((s, e, n))
+    return out
+
+
+def parse_gate_after_step(after_val):
+    """Return original step number for step-anchored `after`, else None."""
+    if after_val is None:
+        return None
+    m = GATE_AFTER_STEP_RE.match(str(after_val).strip())
+    return int(m.group(1)) if m else None
+
+
+def apply_step_directives(body, cfg, skip_steps, warnings):
+    """Renumber, skip, and annotate the Steps section.
+
+    Returns (rendered_body, inline_gate_ids: set[str]) so the trailing
+    `## Gates (resolved)` block can skip gates already emitted inline.
+    """
+    before, steps_block, after = parse_steps_section(body)
+    if steps_block is None:
+        return body, set()
+    steps = enumerate_steps(steps_block)
+    if not steps:
+        return body, set()
+
+    steps_cfg = cfg.get("steps") or {}
+    runtime_cfg = cfg.get("runtime") or {}
+    allowed_tools = runtime_cfg.get("allowed_tools") or []
+    allowed_mcps = runtime_cfg.get("allowed_mcps") or []
+    inputs_cfg = cfg.get("inputs") or {}
+    snippets = (cfg.get("context") or {}).get("snippets") or []
+    gates_cfg = cfg.get("gates") or {}
+    gates_add = gates_cfg.get("add") or []
+
+    step_anchored_gates = {}
+    for g in gates_add:
+        n_orig = parse_gate_after_step(g.get("after"))
+        if n_orig is not None:
+            step_anchored_gates.setdefault(n_orig, []).append({
+                "id": g["id"],
+                "severity": g.get("severity", "hard"),
+            })
+
+    valid_skips = set()
+    for n in skip_steps:
+        scfg = (steps_cfg.get(str(n)) or {}) if steps_cfg else {}
+        if scfg.get("optional"):
+            valid_skips.add(n)
+        else:
+            warnings.append(
+                f"--skip-step {n} ignored: step {n} is not marked optional in config"
+            )
+
+    inline_gate_ids = set()
+    existing_step_numbers = {n for (_, _, n) in steps}
+    for n_orig in list(step_anchored_gates.keys()):
+        if n_orig in valid_skips:
+            for g in step_anchored_gates[n_orig]:
+                warnings.append(
+                    f"gate '{g['id']}' anchored after skipped step {n_orig}; "
+                    f"falling back to trailing 'Gates (resolved)' block"
+                )
+            del step_anchored_gates[n_orig]
+        elif n_orig not in existing_step_numbers:
+            for g in step_anchored_gates[n_orig]:
+                warnings.append(
+                    f"gate '{g['id']}' anchored after step {n_orig} which does not exist in MICROSKILL.md; "
+                    f"falling back to trailing 'Gates (resolved)' block"
+                )
+            del step_anchored_gates[n_orig]
+
+    head = steps_block[: steps[0][0]]
+    counter = 0
+    out_chunks = []
+    for (s, e, n) in steps:
+        if n in valid_skips:
+            continue
+        counter += 1
+        chunk = steps_block[s:e]
+        chunk = re.sub(r"^\d+\.\s", f"{counter}. ", chunk, count=1)
+        scfg = (steps_cfg.get(str(n)) or {}) if steps_cfg else {}
+
+        tags = []
+        tool = scfg.get("mandate_tool")
+        if tool:
+            tags.append(f"[REQUIRED TOOL: {tool}]")
+        if allowed_tools:
+            tags.append(f"[ALLOWED TOOLS: {', '.join(allowed_tools)}]")
+        if allowed_mcps:
+            tags.append(f"[ALLOWED MCPs: {', '.join(allowed_mcps)}]")
+        for in_name, in_spec in inputs_cfg.items():
+            allowed = (in_spec or {}).get("allowed_values") or []
+            if not allowed:
+                continue
+            if re.search(rf"\b{re.escape(in_name)}\b", chunk):
+                tags.append(f"[INPUT {in_name} ∈ {'|'.join(allowed)}]")
+                warnings.append(
+                    f"heuristic match: input '{in_name}' allowed_values echoed on step {counter}"
+                )
+        for snip in snippets:
+            name = (snip or {}).get("name") or ""
+            if not name:
+                continue
+            if re.search(rf"\b{re.escape(name)}\b", chunk):
+                tags.append(f"[CITE SNIPPET: {name}]")
+                warnings.append(
+                    f"heuristic match: snippet '{name}' citation hint added on step {counter}"
+                )
+        if tags:
+            tag_str = " ".join(tags)
+            chunk = re.sub(
+                rf"^{counter}\.\s",
+                f"{counter}. {tag_str} ",
+                chunk, count=1,
+            )
+
+        if n in step_anchored_gates:
+            gate_lines = [
+                f"   [GATE AFTER STEP {counter}: {g['id']} (severity: {g['severity']})]"
+                for g in step_anchored_gates[n]
+            ]
+            for g in step_anchored_gates[n]:
+                inline_gate_ids.add(g["id"])
+            first_nl = chunk.find("\n")
+            insertion = "\n" + "\n".join(gate_lines) + "\n"
+            if first_nl == -1:
+                chunk = chunk + insertion
+            else:
+                chunk = chunk[: first_nl + 1] + insertion + chunk[first_nl + 1:]
+
+        out_chunks.append(chunk)
+
+    return before + head + "".join(out_chunks) + after, inline_gate_ids
+
+
+def build_context_block(context_cfg, config_dir, vars_map, unresolved, warnings):
+    parts = []
+    refs = context_cfg.get("refs") or []
+    if refs:
+        missing = [r for r in refs if not (config_dir / r).exists()]
+        for m in missing:
+            warnings.append(f"context.refs path not found: {m}")
+        if missing:
+            return None
+        parts.append("### References (read before starting)")
+        for r in refs:
+            parts.append(f"- {r}")
+        parts.append("")
+    snippets = context_cfg.get("snippets") or []
+    if snippets:
+        parts.append("### Snippets")
+        for s in snippets:
+            txt = substitute_vars(s["text"], vars_map, unresolved)
+            parts.append(f"- **{s['name']}**: {txt}")
+        parts.append("")
+    extend = context_cfg.get("extend")
+    if extend:
+        epath = config_dir / extend
+        if not epath.exists():
+            warnings.append(f"context.extend path not found: {extend}")
+            return None
+        parts.append("### Extended context (revise in place)")
+        parts.append(f"Source path: `{extend}`")
+        parts.append("")
+        parts.append(epath.read_text())
+        parts.append("")
+    return "\n".join(parts)
+
+
+def build_gates_directive(gates_cfg):
+    out = []
+    for key, val in gates_cfg.items():
+        if key == "add":
+            continue
+        entry = {"id": key}
+        if val and "severity" in val:
+            entry["severity"] = val["severity"]
+        out.append(entry)
+    for added in gates_cfg.get("add", []) or []:
+        out.append({
+            "id": added["id"],
+            "after": added.get("after"),
+            "type": added.get("type"),
+            "prompt": added.get("prompt"),
+            "severity": added.get("severity", "hard"),
+        })
+    return out
+
+
+def render_gates_block(gates_list, inline_gate_ids=None):
+    inline_gate_ids = inline_gate_ids or set()
+    visible = [g for g in gates_list if g["id"] not in inline_gate_ids]
+    if not visible:
+        return ""
+    lines = ["", "## Gates (resolved)", ""]
+    for g in visible:
+        line = f"- **{g['id']}** (severity: {g.get('severity', 'hard')})"
+        if g.get("after"):
+            line += f" — fires after `{g['after']}`"
+        if g.get("type"):
+            line += f", type: `{g['type']}`"
+        if g.get("prompt"):
+            line += f". Prompt: {g['prompt']!r}"
+        lines.append(line)
+    lines.append("")
+    return "\n".join(lines)
+
+
+def emit_and_exit(payload, code):
+    print(json.dumps(payload, indent=2))
+    sys.exit(code)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Resolve a microskill's profile config and render its SKILL.md.",
+    )
+    ap.add_argument("skill", help="Skill name (subdir under --skill-root).")
+    ap.add_argument("--profile", default=None,
+                    help="Profile name. Resolved from base.profile.default if omitted; falls back to base alone.")
+    ap.add_argument("--override", action="append", default=[],
+                    help="Dotted-path override 'a.b.c=value'. Repeatable.")
+    ap.add_argument("--skip-step", action="append", default=[], type=int,
+                    help="Skip an optional step by number. Repeatable.")
+    ap.add_argument("--skill-root", default=str(DEFAULT_SKILL_ROOT),
+                    help="Override skill-root directory.")
+    args = ap.parse_args()
+
+    skill_root = Path(args.skill_root).resolve()
+    skill_dir = skill_root / args.skill
+
+    if not skill_dir.is_dir():
+        sys.stderr.write(f"skill directory not found: {skill_dir}\n")
+        emit_and_exit({"error": f"skill directory not found: {skill_dir}"}, 2)
+
+    warnings = []
+
+    profiles_dir = skill_dir / "profiles"
+    base_path = profiles_dir / "base.yaml"
+    if not base_path.exists():
+        sys.stderr.write(f"profiles/base.yaml not found: {base_path}\n")
+        emit_and_exit({"error": f"profiles/base.yaml not found: {base_path}"}, 2)
+    try:
+        cfg = yaml.safe_load(base_path.read_text()) or {}
+    except yaml.YAMLError as e:
+        sys.stderr.write(f"base.yaml parse error: {e}\n")
+        emit_and_exit({"error": f"base.yaml parse error: {e}"}, 1)
+
+    base_default_profile = (cfg.get("profile") or {}).get("default")
+    if args.profile is not None:
+        effective_profile = args.profile
+    elif base_default_profile:
+        effective_profile = base_default_profile
+    else:
+        effective_profile = "base"
+
+    profile_used = effective_profile
+    if effective_profile != "base":
+        overlay_path = profiles_dir / f"{effective_profile}.yaml"
+        if overlay_path.exists():
+            try:
+                overlay_cfg = yaml.safe_load(overlay_path.read_text()) or {}
+            except yaml.YAMLError as e:
+                sys.stderr.write(f"profile '{effective_profile}' parse error: {e}\n")
+                emit_and_exit({"error": f"profile '{effective_profile}' parse error: {e}"}, 1)
+            if "profile" in overlay_cfg:
+                sys.stderr.write(
+                    f"profile '{effective_profile}': 'profile' block is only allowed in base.yaml\n"
+                )
+                emit_and_exit({
+                    "error": f"profile '{effective_profile}': 'profile' block is only allowed in base.yaml"
+                }, 1)
+            overlay_default_inputs = [
+                name for name, spec in (overlay_cfg.get("inputs") or {}).items()
+                if isinstance(spec, dict) and "default" in spec
+            ]
+            if overlay_default_inputs:
+                sys.stderr.write(
+                    f"profile '{effective_profile}': inputs.<name>.default is base-only "
+                    f"(overlays must not redeclare); found in: {overlay_default_inputs}\n"
+                )
+                emit_and_exit({
+                    "error": f"profile '{effective_profile}': inputs.<name>.default is base-only; found in: {overlay_default_inputs}"
+                }, 1)
+            cfg = deep_merge(cfg, overlay_cfg)
+        else:
+            warnings.append(
+                f"profile '{effective_profile}' not found at profiles/{effective_profile}.yaml; using base"
+            )
+            profile_used = "base"
+
+    for ov in args.override:
+        if "=" not in ov:
+            sys.stderr.write(f"malformed --override (no '='): {ov}\n")
+            emit_and_exit({
+                "warnings": warnings + [f"malformed --override: {ov}"],
+                "error": "override must be in form 'dotted.path=value'",
+            }, 1)
+        path, _, val = ov.partition("=")
+        try:
+            apply_override(cfg, path.strip(), val.strip())
+        except Exception as e:
+            sys.stderr.write(f"override apply failed: {e}\n")
+            emit_and_exit({"error": f"override apply failed: {e}"}, 1)
+
+    cfg = strip_nulls(cfg)
+
+    if cfg and not SCHEMA_PATH.exists():
+        emit_and_exit({"error": f"config-schema.json not found: {SCHEMA_PATH}"}, 1)
+
+    if cfg:
+        schema = json.loads(SCHEMA_PATH.read_text())
+        v = Draft202012Validator(schema)
+        errs = sorted(v.iter_errors(cfg), key=lambda e: list(e.path))
+        if errs:
+            for e in errs:
+                p = "/".join(str(x) for x in e.path) or "<root>"
+                msg = f"schema {p}: {e.message}"
+                warnings.append(msg)
+                sys.stderr.write(msg + "\n")
+            emit_and_exit({
+                "skill_name": args.skill,
+                "profile_used": profile_used,
+                "profile_requested": args.profile,
+                "warnings": warnings,
+                "config": cfg,
+            }, 1)
+
+    vars_map = cfg.get("vars") or {}
+
+    injected_inputs = {}
+    inject_failed = False
+    for name, spec in (cfg.get("inputs") or {}).items():
+        inj = (spec or {}).get("inject_from")
+        if not inj:
+            continue
+        val = resolve_inject_from(name, inj, skill_dir, warnings)
+        if val is None:
+            inject_failed = True
+        else:
+            injected_inputs[name] = val
+
+    skill_md = skill_dir / "MICROSKILL.md"
+    if not skill_md.exists():
+        sys.stderr.write(f"MICROSKILL.md not found: {skill_md}\n")
+        emit_and_exit({"error": f"MICROSKILL.md not found: {skill_md}"}, 2)
+    full = skill_md.read_text()
+    _, body = split_frontmatter(full)
+
+    unresolved = []
+    rendered = substitute_vars(body, vars_map, unresolved)
+
+    skill_md_inputs = parse_inputs_table(body)
+    required_inputs = []
+    profile_overrides_inputs = {}
+    for name, spec in (cfg.get("inputs") or {}).items():
+        if not (spec or {}).get("required"):
+            continue
+        if name not in skill_md_inputs:
+            warnings.append(
+                f"input '{name}': declared required in config but not found in MICROSKILL.md Inputs table"
+            )
+            continue
+        if name in injected_inputs:
+            continue
+        required_inputs.append(name)
+        if skill_md_inputs[name]["required_col"].lower() != "yes":
+            profile_overrides_inputs[name] = {
+                "required": True,
+                "default_nullified": True,
+            }
+    base_defaults = {
+        name: spec["default"]
+        for name, spec in (cfg.get("inputs") or {}).items()
+        if isinstance((spec or {}).get("default"), str)
+    }
+    rendered = rewrite_inputs_table(rendered, profile_overrides_inputs, base_defaults)
+
+    rendered, inline_gate_ids = apply_step_directives(
+        rendered,
+        cfg,
+        args.skip_step,
+        warnings,
+    )
+
+    gates_cfg = cfg.get("gates") or {}
+    declared_gate_ids = set(GATE_ID_COMMENT_RE.findall(body))
+    add_ids = [(g or {}).get("id") for g in (gates_cfg.get("add") or [])]
+    collisions = [gid for gid in add_ids if gid in declared_gate_ids]
+    if collisions:
+        sys.stderr.write(
+            f"gates.add[].id collision with skill-declared gate id(s): {collisions}\n"
+        )
+        emit_and_exit({
+            "error": f"gates.add[].id collision with skill-declared gate id(s): {collisions}"
+        }, 1)
+    seen_add_ids = set()
+    duplicate_add_ids = []
+    for gid in add_ids:
+        if gid in seen_add_ids and gid not in duplicate_add_ids:
+            duplicate_add_ids.append(gid)
+        seen_add_ids.add(gid)
+    if duplicate_add_ids:
+        sys.stderr.write(
+            f"gates.add[].id duplicated across merged layers: {duplicate_add_ids}\n"
+        )
+        emit_and_exit({
+            "error": f"gates.add[].id duplicated across merged layers: {duplicate_add_ids}"
+        }, 1)
+    gates_directive = build_gates_directive(gates_cfg)
+    gates_block_text = render_gates_block(gates_directive, inline_gate_ids)
+    if gates_block_text:
+        rendered = rendered.rstrip() + "\n" + gates_block_text
+
+    # output_schema: declared structured-output contract. Inject a directive so
+    # the skill returns exactly this JSON shape (standalone or composed in a
+    # workflow use: node). It is a skill-level contract — keep it in base.yaml.
+    output_schema = cfg.get("output_schema")
+    if output_schema:
+        rendered = rendered.rstrip() + (
+            "\n\n## Output (required structured result)\n\n"
+            "Return your final result as a single JSON object that validates against "
+            "the schema below. Emit only that JSON object as your result — no prose, "
+            "no commentary, no markdown fences around it:\n\n"
+            "```json\n" + json.dumps(output_schema, indent=2) + "\n```\n"
+        )
+
+    context_block = ""
+    context_cfg = cfg.get("context") or {}
+    if context_cfg:
+        result = build_context_block(context_cfg, skill_dir, vars_map, unresolved, warnings)
+        if result is None:
+            emit_and_exit({
+                "skill_name": args.skill,
+                "profile_used": profile_used,
+                "profile_requested": args.profile,
+                "warnings": warnings,
+                "config": cfg,
+            }, 1)
+        context_block = result
+
+    runtime_cfg = cfg.get("runtime") or {}
+    directives = {
+        "allowed_tools": runtime_cfg.get("allowed_tools") or [],
+        "allowed_mcps": runtime_cfg.get("allowed_mcps") or [],
+        "skip_steps": list(args.skip_step),
+        "mandated_tools": {
+            sk: sv["mandate_tool"]
+            for sk, sv in (cfg.get("steps") or {}).items()
+            if sv and "mandate_tool" in sv
+        },
+        "gates": gates_directive,
+        # Workflow-composition executor identity: when set, a use: node runs this
+        # microskill AS this agent on this model (compiler bakes them into agent()).
+        "agent": runtime_cfg.get("agent"),
+        "model": runtime_cfg.get("model"),
+    }
+
+    payload = {
+        "skill_name": args.skill,
+        "profile_used": profile_used,
+        "profile_requested": args.profile,
+        "warnings": warnings,
+        "config": cfg,
+        "rendered_skill_body": rendered,
+        "unresolved_vars": unresolved,
+        "injected_inputs": injected_inputs,
+        "required_inputs": required_inputs,
+        "profile_overrides_inputs": profile_overrides_inputs,
+        "context_block": context_block,
+        "directives": directives,
+        "output_schema": output_schema,
+    }
+    emit_and_exit(payload, 1 if inject_failed else 0)
+
+
+if __name__ == "__main__":
+    main()

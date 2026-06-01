@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://anthropic.com/microskills/workflow-schema.json",
+  "title": "Workflow",
+  "description": "Declarative composition of microskills and agents into a deterministic DAG. Compiled to Claude Code Workflow-JS segments + a run manifest; segments run on the native Workflow engine, the dispatcher orchestrates segments and human checkpoints.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "name", "nodes"],
+  "properties": {
+    "version": { "const": 1 },
+    "name": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$", "description": "Bare workflow identifier (kebab-case)." },
+    "description": { "type": "string", "description": "One-line description of the workflow." },
+    "base": { "type": "boolean", "description": "Catalog curation hint: true marks this as a base component that initialize-harness seeds into a new project's harness.yaml. Ignored by the compiler." },
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": { "default": { "type": "string", "minLength": 1 } },
+      "description": "base.yaml only; names the default profile overlay applied when --profile is omitted."
+    },
+    "imports": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Optional, advisory: paths to the microskills/agents this composes. The compiler resolves names directly, so this documents dependencies."
+    },
+    "inputs": {
+      "type": "object",
+      "description": "Top-level workflow inputs. Referenced via ${workflow.inputs.<name>}.",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "type": { "type": "string" },
+          "required": { "type": "boolean" },
+          "description": { "type": "string" },
+          "default": {}
+        }
+      }
+    },
+    "nodes": {
+      "type": "array",
+      "minItems": 1,
+      "description": "DAG nodes. Each is a leaf microskill (use:) or an agent invocation (agent:).",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z][a-z0-9_-]*$", "description": "Unique node id within the workflow." },
+          "use": { "type": "string", "description": "Bare microskill name (resolved via resolve-microskill)." },
+          "agent": { "type": "string", "description": "Agent type to invoke for this node (e.g. microskill-planner)." },
+          "depends_on": { "type": "array", "items": { "type": "string" }, "description": "Upstream node ids. Every ${<id>.output...} reference MUST be declared here." },
+          "when": { "type": "string", "description": "Deterministic JS condition (inner of ${...}); false → node skipped." },
+          "for_each": { "type": "string", "description": "Expression resolving to a collection → fan-out one instance per item." },
+          "as": { "type": "string", "description": "Loop-variable name bound to each for_each item; referenced as ${<as>}." },
+          "inputs": {
+            "type": "object",
+            "additionalProperties": { "type": "string" },
+            "description": "Wiring: input field → ${...} expression (workflow inputs, upstream outputs, loop carry, for_each item)."
+          },
+          "prompt": { "type": "string", "description": "For agent nodes: the task prompt template (may contain ${...} references)." },
+          "output_schema": { "type": "object", "description": "JSON Schema fragment forcing structured node output (passed to agent() schema)." },
+          "customize": { "type": "object", "additionalProperties": true, "description": "Per-node knobs for a use: microskill — profile and/or dotted overrides." },
+          "grant_tools": { "type": "array", "items": { "type": "string" }, "description": "Extra tools granted to this node's subagent." },
+          "delegation": { "enum": ["auto", "orchestrator"], "description": "Override the auto-derived delegation classification." }
+        }
+      }
+    },
+    "gates": {
+      "type": "array",
+      "description": "Checkpoints anchored after a node. human_approval / hard-severity gates run in the orchestrator (segment boundaries).",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "after", "type"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z][a-z0-9_-]*$" },
+          "after": { "type": "string", "description": "Node id this gate fires after." },
+          "type": { "enum": ["human_approval", "verification", "tool_check"] },
+          "severity": { "enum": ["warn", "hard"], "default": "hard" },
+          "prompt": { "type": "string" },
+          "options": { "type": "array", "items": { "type": "string" }, "description": "Choices for a human_approval gate (e.g. approve/revise/abandon)." }
+        },
+        "allOf": [
+          {
+            "if": { "properties": { "type": { "const": "human_approval" } }, "required": ["type"] },
+            "then": { "required": ["prompt"] }
+          }
+        ]
+      }
+    },
+    "loop": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["while", "max_iters", "body"],
+      "description": "Guarded while loop over a subset of nodes. Compiled to a JS while inside a single autonomous segment.",
+      "properties": {
+        "while": { "type": "string", "description": "Continue-condition (inner of ${...}) over the latest iteration's output." },
+        "max_iters": { "type": "integer", "minimum": 1, "description": "Mandatory iteration cap." },
+        "body": { "type": "array", "items": { "type": "string" }, "description": "Node ids that repeat each iteration." },
+        "carry": { "type": "object", "additionalProperties": { "type": "string" }, "description": "State passed to the next iteration: var → ${...} expression." }
+      }
+    },
+    "output": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["from"],
+      "properties": { "from": { "type": "string", "description": "Node id whose output is the workflow's aggregate output." } }
+    }
+  }
+}

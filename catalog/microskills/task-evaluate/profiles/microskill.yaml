@@ -1,0 +1,3 @@
+version: 1
+# Microskill-creation domain. Inherits the base defaults verbatim; declared
+# explicitly so callers select `profile: microskill`.

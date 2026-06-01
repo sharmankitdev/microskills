@@ -1,0 +1,106 @@
+# WORKFLOW.yaml — annotated skeleton for workflow-create. Fill in the real
+# values and DELETE the comment blocks you don't use. The grammar is closed
+# (additionalProperties: false everywhere) — unknown keys fail validation.
+#
+# A node is exactly one of:
+#   use: <microskill-name>      — reuse a registered microskill (optionally customize.profile)
+#   agent: <agent-type>         — invoke an agent with a prompt + output_schema
+#   delegation: orchestrator    — neither use nor agent; runs in the main loop (AskUserQuestion ok)
+#
+# References:  ${workflow.inputs.<x>} · ${<node-id>.output.<field>} · ${loop.carry.<v>} · ${<as>}
+# Every ${<id>.output...} a node uses MUST appear in that node's depends_on.
+#
+# ORDERING RULE: an orchestrator node defined BETWEEN two loop-body nodes splits
+# the loop segment and breaks the loop. Keep loop.body nodes contiguous; place
+# orchestrator nodes before or after the loop body.
+
+version: 1
+name: <kebab-case-name>          # ^[a-z][a-z0-9-]*$
+description: <one-line description>
+
+# Caller-supplied inputs (optional).
+inputs:
+  <required_input>:
+    type: string
+    required: true
+    description: <what it represents>
+  <optional_input>:
+    type: string
+    required: false
+    default: <value>
+    description: <what it represents>
+
+# Advisory only (documents dependencies; no runtime effect).
+imports:
+  - agents/<agent-name>
+  # - microskills/<microskill-name>
+
+nodes:
+  # agent node
+  - id: <first_node>
+    agent: <agent-type>
+    inputs:
+      <field>: ${workflow.inputs.<required_input>}
+    prompt: >
+      <Task prompt. May contain ${...} references.>
+    output_schema:
+      type: object
+      required: [<field>]
+      properties:
+        <field>: { type: string }
+
+  # use: (microskill) node — customize.profile selects base / an overlay / a minted profile
+  # - id: <ms_node>
+  #   use: <microskill-name>
+  #   depends_on: [<first_node>]
+  #   customize:
+  #     profile: <profile-name>
+  #   inputs:
+  #     <ms_input>: ${<first_node>.output.<field>}
+  #   output_schema:
+  #     type: object
+  #     properties:
+  #       <out>: { type: string }
+
+  # conditional node — runs only when the condition is true (else yields null)
+  # - id: <guarded_node>
+  #   agent: <agent-type>
+  #   when: ${<first_node>.output.flag}
+  #   depends_on: [<first_node>]
+  #   prompt: > ...
+
+  # fan-out node — runs once per item in the collection; ${<as>} is the item
+  # - id: <fanout_node>
+  #   agent: <agent-type>
+  #   for_each: ${<first_node>.output.items}
+  #   as: item
+  #   depends_on: [<first_node>]
+  #   prompt: > process ${item} ...
+
+  # orchestrator-native node — filesystem side effects, AskUserQuestion, nested workflows
+  # - id: <finalize_node>
+  #   delegation: orchestrator
+  #   depends_on: [<first_node>]
+  #   prompt: > ...
+
+# Human-approval gate (segment boundary). human_approval gates always flush the
+# current segment; severity: warn continues without pausing.
+gates:
+  - id: <gate_id>
+    after: <first_node>
+    type: human_approval
+    severity: hard
+    prompt: <what to ask the user>
+    options: [approve, revise, abandon]
+
+# Guarded loop over a contiguous subset of nodes (optional, at most one).
+# loop:
+#   while: ${!<eval_node>.output.pass}
+#   max_iters: 3
+#   body: [<impl_node>, <eval_node>]
+#   carry:
+#     last_findings: ${<eval_node>.output}
+
+# The node whose output is the workflow's aggregate result (optional).
+output:
+  from: <finalize_node>

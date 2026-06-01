@@ -1,0 +1,537 @@
+#!/usr/bin/env python3
+"""
+compile-workflow — deterministic compiler: WORKFLOW.yaml → Claude Code Workflow-JS
+segments + a run manifest.
+
+Pipeline:
+  1. Load WORKFLOW.yaml + profiles/base.yaml (+ overlay), deep-merge, apply
+     overrides, strip nulls (helpers reused from resolve-microskill).
+  2. Validate the merged doc against workflow-schema.json.
+  3. Classify each node background|orchestrator per the delegation governance:
+     - explicit `delegation` wins;
+     - a node with neither use nor agent is an orchestrator-native step;
+     - a `use:` microskill whose resolved allowed_tools contains AskUserQuestion,
+       or that carries a hard gate, is orchestrator (fail-safe: resolution
+       failure → orchestrator);
+     - agent nodes are background (autonomous) unless a gate/override says otherwise;
+     - a hard / human_approval gate anchored `after: X` is an orchestrator checkpoint.
+  4. Partition the topologically-sorted DAG into maximal background segments
+     separated by orchestrator nodes/gates. loop.body stays inside one segment.
+  5. Emit one Workflow-JS per background segment + manifest.json to
+     <def-dir>/.compiled/. Deterministic: same inputs → byte-identical output.
+
+Usage:
+  compile-workflow <name> [--profile <p>] [--override a.b=c]... [--defs-root <dir>]
+
+Stdout: JSON summary { name, profile_used, compiled_dir, manifest_path, segments, checkpoints }.
+Exit codes: 0 OK · 1 block (schema/DAG error) · 2 environment/script error.
+"""
+
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+try:
+    import yaml
+except ImportError:
+    print(json.dumps({"error": "PyYAML not installed. pip3 install pyyaml"}))
+    sys.exit(2)
+
+try:
+    from jsonschema import Draft202012Validator
+except ImportError:
+    print(json.dumps({"error": "jsonschema not installed. pip3 install jsonschema"}))
+    sys.exit(2)
+
+SCRIPT = Path(__file__).resolve()
+PROJECT_ROOT = SCRIPT.parents[2]
+DEFAULT_DEFS_ROOT = PROJECT_ROOT / ".claude" / "workflow-defs"
+
+
+def _templates_root(script):
+    """Locate templates/ (schemas + component templates): prefer the materialized runtime
+    copy under .claude/, then ${CLAUDE_PLUGIN_ROOT}, then the in-repo dogfood source."""
+    proj = script.parents[2]
+    cands = [proj / ".claude" / "templates"]
+    env = os.environ.get("CLAUDE_PLUGIN_ROOT")
+    if env:
+        cands.append(Path(env) / "templates")
+    cands.append(proj / "templates")
+    return next((c for c in cands if c.is_dir()), cands[0])
+
+
+SCHEMA_PATH = _templates_root(SCRIPT) / "references" / "workflow-schema.json"
+RESOLVE_SCRIPT = SCRIPT.parent / "resolve-microskill"
+
+# Reuse resolver helpers (extension-less file → SourceFileLoader).
+_loader = importlib.machinery.SourceFileLoader("resolve_microskill", str(RESOLVE_SCRIPT))
+_spec = importlib.util.spec_from_loader("resolve_microskill", _loader)
+_rm = importlib.util.module_from_spec(_spec)
+_loader.exec_module(_rm)
+deep_merge = _rm.deep_merge
+apply_override = _rm.apply_override
+strip_nulls = _rm.strip_nulls
+
+REF_RE = re.compile(r"\$\{([^}]*)\}")
+
+
+def rel(p):
+    """Display path relative to project root when possible, else absolute."""
+    try:
+        return str(Path(p).relative_to(PROJECT_ROOT))
+    except ValueError:
+        return str(p)
+
+
+def die(msg, code=1, **extra):
+    payload = {"error": msg}
+    payload.update(extra)
+    print(json.dumps(payload, indent=2))
+    sys.exit(code)
+
+
+def jsvar(node_id):
+    return "n_" + re.sub(r"[^a-zA-Z0-9_]", "_", node_id)
+
+
+def topo_sort(nodes):
+    """Kahn's algorithm; ties broken by definition order (deterministic)."""
+    ids = [n["id"] for n in nodes]
+    deps = {n["id"]: [d for d in (n.get("depends_on") or []) if d in ids] for n in nodes}
+    indeg = {i: 0 for i in ids}
+    for i in ids:
+        for d in deps[i]:
+            indeg[i] += 1
+    order = []
+    ready = [i for i in ids if indeg[i] == 0]  # preserves definition order
+    while ready:
+        cur = ready.pop(0)
+        order.append(cur)
+        for i in ids:
+            if cur in deps[i]:
+                indeg[i] -= 1
+                if indeg[i] == 0:
+                    ready.append(i)
+    if len(order) != len(ids):
+        die("dependency cycle detected in nodes", 1)
+    return order
+
+
+def resolve_microskill_directives(use_name, customize, defs_root):
+    """Run resolve-microskill to read a use: node's allowed_tools + gates.
+    Fail-safe: on any failure return None (caller treats as orchestrator)."""
+    profile = (customize or {}).get("profile")
+    cmd = [str(RESOLVE_SCRIPT), use_name]
+    if profile:
+        cmd += ["--profile", str(profile)]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, cwd=str(PROJECT_ROOT))
+    except Exception:
+        return None
+    if proc.returncode not in (0, 1):
+        return None
+    try:
+        data = json.loads(proc.stdout)
+    except Exception:
+        return None
+    return data.get("directives")
+
+
+def classify(node, gates_after, defs_root):
+    """Return 'orchestrator' or 'background'."""
+    deleg = node.get("delegation")
+    if deleg == "orchestrator":
+        return "orchestrator"
+    if deleg == "auto":
+        return "background"
+    has_use = bool(node.get("use"))
+    has_agent = bool(node.get("agent"))
+    if not has_use and not has_agent:
+        return "orchestrator"  # orchestrator-native step
+    if has_agent:
+        return "background"  # agents are autonomous unless a gate forces otherwise
+    # use: microskill — inspect resolved directives (fail-safe → orchestrator)
+    directives = resolve_microskill_directives(node["use"], node.get("customize"), defs_root)
+    # Stash the executor identity so node_call_js can bake it into the runMicroskill
+    # call (background segments can't nest-dispatch, so the executor must BE this agent).
+    node["_exec_agent"] = (directives or {}).get("agent")
+    node["_exec_model"] = (directives or {}).get("model")
+    if directives is None:
+        return "orchestrator"
+    if "AskUserQuestion" in (directives.get("allowed_tools") or []):
+        return "orchestrator"
+    for g in directives.get("gates") or []:
+        if g.get("severity", "hard") == "hard":
+            return "orchestrator"
+    return "background"
+
+
+def translate_ref(inner, seg_var_ids):
+    """Translate a ${...} inner expression to a JS expression.
+    seg_var_ids: node ids materialized as JS vars in the current segment."""
+    s = inner.strip()
+    s = re.sub(r"\bworkflow\.inputs\.([a-zA-Z0-9_]+)", r"_args.wf_\1", s)
+    s = re.sub(r"\bloop\.carry\.([a-zA-Z0-9_]+)", r"carry_\1", s)
+
+    def repl_out(m):
+        nid, rest = m.group(1), m.group(2) or ""
+        if nid in seg_var_ids:
+            return jsvar(nid) + rest
+        return f'_args[{json.dumps(nid)}]' + rest
+
+    s = re.sub(r"\b([a-z][a-z0-9_-]*)\.output((?:\.[a-zA-Z0-9_]+)*)", repl_out, s)
+    return s
+
+
+class Needs:
+    def __init__(self):
+        self.wf_inputs = set()
+        self.nodes = set()
+        self.carry = set()
+
+    def scan(self, text, seg_var_ids):
+        if not isinstance(text, str):
+            return
+        for inner in REF_RE.findall(text):
+            for m in re.finditer(r"\bworkflow\.inputs\.([a-zA-Z0-9_]+)", inner):
+                self.wf_inputs.add(m.group(1))
+            for m in re.finditer(r"\bloop\.carry\.([a-zA-Z0-9_]+)", inner):
+                self.carry.add(m.group(1))
+            for m in re.finditer(r"\b([a-z][a-z0-9_-]*)\.output\b", inner):
+                if m.group(1) not in seg_var_ids:
+                    self.nodes.add(m.group(1))
+
+
+def tmpl_literal(text, seg_var_ids):
+    """Turn a string with ${...} refs into a JS template literal using __ref()."""
+    def repl(m):
+        return "${__ref(" + translate_ref(m.group(1), seg_var_ids) + ")}"
+    body = REF_RE.sub(repl, text or "")
+    body = body.replace("`", "\\`")
+    return "`" + body + "`"
+
+
+def strip_ref_wrapper(expr):
+    """Drop a surrounding ${...} from a condition/collection expression."""
+    return (expr or "").strip().lstrip("$").strip("{}")
+
+
+def node_call_js(node, seg_var_ids, indent="  ", declare=True, track_ran=False):
+    """Emit the assignment JS for one background node.
+
+    declare=False assigns to a pre-declared var (used inside loop bodies).
+    track_ran=True (a guarded loop body) sets `__ran` and uses an if/else form
+    for `when`, so a fully-skipped iteration can break out of the loop.
+    `when` → conditional skip (node yields null). `for_each` → parallel fan-out
+    over a collection, with `as` naming the per-item var."""
+    nid = node["id"]
+    var = jsvar(nid)
+    kw = "const " if declare else ""
+    phase = nid
+    schema = node.get("output_schema")
+    schema_js = json.dumps(schema, indent=2) if schema else "null"
+    prompt = tmpl_literal(node.get("prompt") or f"Execute node {nid}.", seg_var_ids)
+    if node.get("agent"):
+        raw = (f'runAgent({json.dumps(node["agent"])}, {prompt}, '
+               f'{schema_js}, {json.dumps(phase)}, {json.dumps("node:" + nid)})')
+    else:  # use: microskill
+        profile = (node.get("customize") or {}).get("profile", "base")
+        inputs_pairs = []
+        for k, expr in (node.get("inputs") or {}).items():
+            m = REF_RE.fullmatch(expr.strip()) if isinstance(expr, str) else None
+            val = translate_ref(m.group(1), seg_var_ids) if m else json.dumps(expr)
+            inputs_pairs.append(f"{json.dumps(k)}: {val}")
+        inputs_js = "{ " + ", ".join(inputs_pairs) + " }"
+        # Bake the executor identity (runtime.agent / runtime.model from the resolved
+        # microskill) so the use: node runs AS that agent on that model.
+        exec_extra = ""
+        if node.get("_exec_agent"):
+            exec_extra += f', agentType: {json.dumps(node["_exec_agent"])}'
+        if node.get("_exec_model"):
+            exec_extra += f', model: {json.dumps(node["_exec_model"])}'
+        raw = (f'runMicroskill({json.dumps(node["use"])}, {{ '
+               f'profile: {json.dumps(profile)}, inputs: {inputs_js}, '
+               f'schema: {schema_js}, phase: {json.dumps(phase)}{exec_extra} }})')
+
+    # for_each → fan out over a collection; `as` names the per-item var, which
+    # ${<as>} refs resolve to (translate_ref leaves bare identifiers untouched).
+    fe = node.get("for_each")
+    if fe:
+        coll = translate_ref(strip_ref_wrapper(fe), seg_var_ids)
+        as_var = node.get("as") or "item"
+        expr = f"await parallel((({coll}) || []).map(({as_var}) => () => {raw}))"
+    else:
+        expr = f"await {raw}"
+
+    when = node.get("when")
+    cond = translate_ref(strip_ref_wrapper(when), seg_var_ids) if when else None
+
+    if track_ran:
+        if cond is not None:
+            return (f"{indent}if ({cond}) {{ {var} = {expr}; __ran = true }} "
+                    f"else {{ {var} = null }}\n")
+        return f"{indent}{var} = {expr}; __ran = true\n"
+    if cond is not None:
+        return f"{indent}{kw}{var} = ({cond}) ? {expr} : null\n"
+    return f"{indent}{kw}{var} = {expr}\n"
+
+
+HELPERS_JS = r"""
+// --- node runtimes (identical to the proven spike templates) ---
+async function runMicroskill(name, { profile = 'base', inputs = {}, schema, phase, agentType, model } = {}) {
+  const lines = Object.entries(inputs).map(([k, v]) => `- ${k}: ${JSON.stringify(v)}`).join('\n')
+  return agent(
+    `Execute the microskill "${name}".
+1. Run via Bash from the project root: .claude/scripts/resolve-microskill ${name} --profile ${profile}
+2. Parse stdout JSON. Execute rendered_skill_body, honoring directives.allowed_tools and gates.
+3. Caller inputs:\n${lines}
+4. If a required input or decision is missing, FAIL with an error — do NOT invent an answer.
+5. Return ONLY the structured object matching the required schema. No prose.`,
+    { label: `ms:${name}`, phase, schema, agentType, model }
+  )
+}
+async function runAgent(agentType, prompt, schema, phase, label) {
+  return agent(prompt, { agentType, schema, phase, label })
+}
+function __ref(v) { return typeof v === 'string' ? v : JSON.stringify(v) }
+""".strip("\n")
+
+
+def emit_segment_js(seg_nodes, wf, loop, seg_index):
+    """Emit a Workflow-JS file for one background segment. Returns (js, needs, produces)."""
+    seg_ids = [n["id"] for n in seg_nodes]
+    seg_var_ids = set(seg_ids)
+    needs = Needs()
+    loop_body = set((loop or {}).get("body") or [])
+    is_loop_seg = bool(loop) and set(seg_ids) == loop_body and loop_body
+
+    # Scan refs for needs (carry only relevant on the loop segment).
+    for n in seg_nodes:
+        needs.scan(n.get("prompt"), seg_var_ids)
+        needs.scan(n.get("when"), seg_var_ids)
+        needs.scan(n.get("for_each"), seg_var_ids)
+        for expr in (n.get("inputs") or {}).values():
+            needs.scan(expr, seg_var_ids)
+    if is_loop_seg:
+        needs.scan((loop or {}).get("while"), seg_var_ids)
+        for expr in ((loop or {}).get("carry") or {}).values():
+            needs.scan(expr, seg_var_ids)
+
+    phases = ", ".join(f'{{ title: {json.dumps(i)} }}' for i in seg_ids)
+    name = f'{wf["name"]}__seg{seg_index}'
+    head = (f"export const meta = {{\n"
+            f"  name: {json.dumps(name)},\n"
+            f"  description: {json.dumps('Compiled segment ' + str(seg_index) + ' of ' + wf['name'])},\n"
+            f"  phases: [{phases}],\n}}\n\n")
+
+    guard = ("// Workflow args arrives as a JSON string — parse it.\n"
+             "let _args = args\n"
+             "if (typeof _args === 'string') { try { _args = JSON.parse(_args) } catch (e) { _args = {} } }\n\n")
+
+    body = ""
+    produces = list(seg_ids)
+    if is_loop_seg:
+        max_iters = int(loop["max_iters"])
+        while_js = translate_ref((loop.get("while") or "true").strip().lstrip("$").strip("{}"), seg_var_ids)
+        # carry vars: init from _args.carry_<v> (null first round), reassign each round
+        carry = loop.get("carry") or {}
+        carry_init = "".join(
+            f"let carry_{v} = (_args && _args.carry_{v}) || null\n" for v in carry)
+        # When a body node is `when`-guarded, track whether any node actually ran
+        # this iteration; an all-skipped iteration breaks out (avoids spinning to
+        # the cap and reading a skipped node's null output in the while condition).
+        has_guarded_body = any(n.get("when") for n in seg_nodes)
+        loop_calls = "".join(
+            node_call_js(n, seg_var_ids, indent="    ", declare=False, track_ran=has_guarded_body)
+            for n in seg_nodes)
+        ran_init = "    let __ran = false\n" if has_guarded_body else ""
+        break_line = "    if (!__ran) break\n" if has_guarded_body else ""
+        carry_assign = "".join(
+            f"    carry_{v} = {translate_ref(REF_RE.fullmatch(expr.strip()).group(1), seg_var_ids)}\n"
+            for v, expr in carry.items() if isinstance(expr, str) and REF_RE.fullmatch(expr.strip()))
+        # Loop segments also return __rounds (the iteration count) so the orchestrator
+        # recap can state how many rounds ran. Not in `produces` → never stored as a node result.
+        ret = "{ " + ", ".join(f"{json.dumps(i)}: {jsvar(i)}" for i in seg_ids) + ', "__rounds": __iter }'
+        body = (carry_init +
+                f"let __iter = 0\nconst __max = {max_iters}\n"
+                f"let {', '.join(jsvar(i) for i in seg_ids)}\n"
+                f"do {{\n{ran_init}{loop_calls}{break_line}{carry_assign}"
+                f"  __iter++\n"
+                f"}} while (({while_js}) && __iter < __max)\n\n"
+                f"log(`{name}: ran ${{__iter}} iteration(s)`)\n"
+                f"return {ret}\n")
+    else:
+        calls = ""
+        for n in seg_nodes:
+            calls += f"phase({json.dumps(n['id'])})\n"
+            calls += node_call_js(n, seg_var_ids, indent="").lstrip()
+        ret = "{ " + ", ".join(f"{json.dumps(i)}: {jsvar(i)}" for i in seg_ids) + " }"
+        body = calls + f"\nreturn {ret}\n"
+
+    js = head + HELPERS_JS + "\n\n" + guard + body
+    needs_dict = {
+        "wf_inputs": sorted(needs.wf_inputs),
+        "nodes": sorted(needs.nodes),
+        "carry": sorted(needs.carry),
+    }
+    return js, needs_dict, produces
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Compile a WORKFLOW.yaml into Workflow-JS segments + manifest.")
+    ap.add_argument("name", help="Workflow name (subdir under --defs-root).")
+    ap.add_argument("--profile", default=None)
+    ap.add_argument("--override", action="append", default=[])
+    ap.add_argument("--defs-root", default=str(DEFAULT_DEFS_ROOT))
+    args = ap.parse_args()
+
+    defs_root = Path(args.defs_root).resolve()
+    def_dir = defs_root / args.name
+    wf_path = def_dir / "WORKFLOW.yaml"
+    if not wf_path.exists():
+        die(f"WORKFLOW.yaml not found: {wf_path}", 2)
+
+    wf = yaml.safe_load(wf_path.read_text()) or {}
+
+    profiles_dir = def_dir / "profiles"
+    base_path = profiles_dir / "base.yaml"
+    profile_used = "base"
+    if base_path.exists():
+        base_cfg = yaml.safe_load(base_path.read_text()) or {}
+        # base.yaml carries only overlay fields (version etc.); merge onto def.
+        wf = deep_merge(wf, {k: v for k, v in base_cfg.items() if k != "version"})
+    default_profile = (wf.get("profile") or {}).get("default")
+    effective = args.profile or default_profile
+    if effective and effective != "base":
+        overlay_path = profiles_dir / f"{effective}.yaml"
+        if overlay_path.exists():
+            overlay = yaml.safe_load(overlay_path.read_text()) or {}
+            wf = deep_merge(wf, {k: v for k, v in overlay.items() if k != "version"})
+            profile_used = effective
+        else:
+            die(f"profile '{effective}' not found at {overlay_path}", 1)
+
+    for ov in args.override:
+        if "=" not in ov:
+            die(f"malformed --override (no '='): {ov}", 1)
+        path, _, val = ov.partition("=")
+        apply_override(wf, path.strip(), val.strip())
+
+    wf = strip_nulls(wf)
+
+    if not SCHEMA_PATH.exists():
+        die(f"workflow schema not found: {SCHEMA_PATH}", 1)
+    schema = json.loads(SCHEMA_PATH.read_text())
+    errs = sorted(Draft202012Validator(schema).iter_errors(wf), key=lambda e: list(e.path))
+    if errs:
+        msgs = ["schema " + ("/".join(str(x) for x in e.path) or "<root>") + ": " + e.message for e in errs]
+        die("merged workflow fails schema validation", 1, schema_errors=msgs)
+
+    nodes = wf.get("nodes") or []
+    node_by_id = {n["id"]: n for n in nodes}
+    loop = wf.get("loop")
+
+    gates_after = {}
+    for g in wf.get("gates") or []:
+        gates_after.setdefault(g["after"], []).append(g)
+
+    order = topo_sort(nodes)
+
+    # --- partition into manifest steps ---
+    steps = []
+    seg = []
+
+    def flush_segment():
+        nonlocal seg
+        if seg:
+            steps.append({"kind": "segment", "nodes": list(seg)})
+            seg = []
+
+    for nid in order:
+        node = node_by_id[nid]
+        klass = classify(node, gates_after, defs_root)
+        if klass == "orchestrator":
+            flush_segment()
+            chk = {"kind": "checkpoint", "checkpoint_type": "orchestrator_node", "node": nid,
+                   "prompt": node.get("prompt", ""), "depends_on": node.get("depends_on") or []}
+            # when/for_each/as are handled by the dispatcher for orchestrator nodes.
+            for k in ("when", "for_each", "as"):
+                if node.get(k) is not None:
+                    chk[k] = node[k]
+            steps.append(chk)
+        else:
+            seg.append(nid)
+        for g in gates_after.get(nid, []):
+            if g.get("type") == "human_approval" or g.get("severity", "hard") == "hard":
+                flush_segment()
+                steps.append({"kind": "checkpoint", "checkpoint_type": "gate", "gate": g})
+    flush_segment()
+
+    # --- emit segments ---
+    compiled_dir = def_dir / ".compiled"
+    compiled_dir.mkdir(parents=True, exist_ok=True)
+    # clean stale segment files for determinism
+    for old in compiled_dir.glob("seg-*.js"):
+        old.unlink()
+
+    seg_index = 0
+    manifest_steps = []
+    for step in steps:
+        if step["kind"] == "segment":
+            seg_index += 1
+            seg_nodes = [node_by_id[i] for i in step["nodes"]]
+            js, needs, produces = emit_segment_js(seg_nodes, wf, loop, seg_index)
+            fname = f"seg-{seg_index}.js"
+            (compiled_dir / fname).write_text(js)
+            manifest_steps.append({
+                "kind": "segment",
+                "index": seg_index,
+                "script": str(compiled_dir / fname),
+                "nodes": step["nodes"],
+                "is_loop": bool(loop) and set(step["nodes"]) == set((loop or {}).get("body") or []),
+                "needs": needs,
+                "produces": produces,
+            })
+        else:
+            manifest_steps.append(step)
+
+    required_inputs = sorted(
+        name for name, spec in (wf.get("inputs") or {}).items()
+        if isinstance(spec, dict) and spec.get("required"))
+    input_defaults = {
+        name: spec["default"] for name, spec in (wf.get("inputs") or {}).items()
+        if isinstance(spec, dict) and "default" in spec}
+
+    manifest = {
+        "name": wf["name"],
+        "profile_used": profile_used,
+        "description": wf.get("description", ""),
+        "required_inputs": required_inputs,
+        "input_defaults": input_defaults,
+        "output": wf.get("output"),
+        "steps": manifest_steps,
+    }
+    manifest_path = compiled_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+
+    summary = {
+        "name": wf["name"],
+        "profile_used": profile_used,
+        "compiled_dir": rel(compiled_dir),
+        "manifest_path": rel(manifest_path),
+        "segments": sum(1 for s in manifest_steps if s["kind"] == "segment"),
+        "checkpoints": sum(1 for s in manifest_steps if s["kind"] == "checkpoint"),
+        "sequence": [s.get("checkpoint_type", "segment") if s["kind"] == "checkpoint" else f"segment[{','.join(s['nodes'])}]" for s in manifest_steps],
+    }
+    print(json.dumps(summary, indent=2))
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

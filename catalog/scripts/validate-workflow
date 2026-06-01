@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+"""
+validate-workflow — structural + schema + DAG validation for a WORKFLOW.yaml.
+
+Mirrors validate-microskill. Validates the deep-merge of WORKFLOW.yaml + any
+profile overlays against workflow-schema.json, then runs DAG checks (node
+shape, unique ids, depends_on completeness, ${ref} declaration, cycles, gate
+and loop anchoring).
+
+Usage:
+  validate-workflow <WORKFLOW.yaml> [<profile.yaml> ...]
+
+Stdout: {"pass": bool, "issues": [{"severity","location","message"}]}
+Exit codes: 0 pass (no block) · 1 at least one block · 2 script/env error.
+"""
+
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+try:
+    import yaml
+except ImportError:
+    print(json.dumps({"error": "PyYAML not installed. pip3 install pyyaml"}))
+    sys.exit(2)
+
+try:
+    from jsonschema import Draft202012Validator
+except ImportError:
+    print(json.dumps({"error": "jsonschema not installed. pip3 install jsonschema"}))
+    sys.exit(2)
+
+SCRIPT = Path(__file__).resolve()
+
+
+def _templates_root(script):
+    """Locate templates/ (schemas + component templates): prefer the materialized runtime
+    copy under .claude/, then ${CLAUDE_PLUGIN_ROOT}, then the in-repo dogfood source."""
+    proj = script.parents[2]
+    cands = [proj / ".claude" / "templates"]
+    env = os.environ.get("CLAUDE_PLUGIN_ROOT")
+    if env:
+        cands.append(Path(env) / "templates")
+    cands.append(proj / "templates")
+    return next((c for c in cands if c.is_dir()), cands[0])
+
+
+SCHEMA_PATH = _templates_root(SCRIPT) / "references" / "workflow-schema.json"
+
+# Reuse the resolver's merge/strip helpers — single source of truth.
+# resolve-microskill has no .py extension, so load it via SourceFileLoader.
+_loader = importlib.machinery.SourceFileLoader(
+    "resolve_microskill", str(SCRIPT.parent / "resolve-microskill"))
+_spec = importlib.util.spec_from_loader("resolve_microskill", _loader)
+_rm = importlib.util.module_from_spec(_spec)
+_loader.exec_module(_rm)
+deep_merge = _rm.deep_merge
+strip_nulls = _rm.strip_nulls
+
+REF_RE = re.compile(r"\$\{([^}]*)\}")
+NODE_OUTPUT_RE = re.compile(r"\b([a-z][a-z0-9_-]*)\.output\b")
+AS_RE = re.compile(r"^[a-z][a-z0-9_]*$")  # safe JS identifier for for_each `as`
+
+
+def add(issues, severity, location, message):
+    issues.append({"severity": severity, "location": location, "message": message})
+
+
+def collect_strings(obj):
+    """Yield every string value anywhere in a nested structure."""
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            yield from collect_strings(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from collect_strings(v)
+
+
+def refs_in(obj):
+    """All ${...} inner expressions found in any string under obj."""
+    out = []
+    for s in collect_strings(obj):
+        out.extend(REF_RE.findall(s))
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Validate a WORKFLOW.yaml (+ optional profile overlays).")
+    ap.add_argument("workflow", help="Path to WORKFLOW.yaml")
+    ap.add_argument("configs", nargs="*", help="Optional profile YAML overlays to merge before validation")
+    args = ap.parse_args()
+
+    issues = []
+
+    wf_path = Path(args.workflow)
+    if not wf_path.exists():
+        add(issues, "block", "file", f"WORKFLOW.yaml not found: {wf_path}")
+        print(json.dumps({"pass": False, "issues": issues}, indent=2))
+        sys.exit(1)
+
+    try:
+        merged = yaml.safe_load(wf_path.read_text()) or {}
+    except yaml.YAMLError as e:
+        add(issues, "block", "file", f"WORKFLOW.yaml YAML parse error: {e}")
+        print(json.dumps({"pass": False, "issues": issues}, indent=2))
+        sys.exit(1)
+
+    for cfg_path in args.configs:
+        p = Path(cfg_path)
+        if not p.exists():
+            add(issues, "block", "config", f"profile not found: {p}")
+            continue
+        try:
+            overlay = yaml.safe_load(p.read_text()) or {}
+        except yaml.YAMLError as e:
+            add(issues, "block", "config", f"{p.name} YAML parse error: {e}")
+            continue
+        if p.name != "base.yaml" and "profile" in overlay:
+            add(issues, "block", "config", f"{p.name}: 'profile' block is base.yaml-only")
+        merged = deep_merge(merged, overlay)
+
+    merged = strip_nulls(merged)
+
+    # --- Schema validation (on the merged document) ---
+    if SCHEMA_PATH.exists():
+        schema = json.loads(SCHEMA_PATH.read_text())
+        v = Draft202012Validator(schema)
+        for e in sorted(v.iter_errors(merged), key=lambda e: list(e.path)):
+            loc = "/".join(str(x) for x in e.path) or "<root>"
+            add(issues, "block", f"schema:{loc}", e.message)
+    else:
+        add(issues, "block", "environment", f"workflow-schema.json not found: {SCHEMA_PATH}")
+
+    # If schema already failed hard, structural assumptions below may not hold;
+    # still attempt DAG checks defensively.
+    nodes = merged.get("nodes") or []
+    node_ids = []
+    node_by_id = {}
+    for i, n in enumerate(nodes):
+        if not isinstance(n, dict):
+            add(issues, "block", f"nodes[{i}]", "node is not a mapping")
+            continue
+        nid = n.get("id")
+        if not nid:
+            add(issues, "block", f"nodes[{i}]", "node missing id")
+            continue
+        if nid in node_by_id:
+            add(issues, "block", f"nodes/{nid}", f"duplicate node id '{nid}'")
+        node_ids.append(nid)
+        node_by_id[nid] = n
+
+    id_set = set(node_ids)
+
+    # --- Per-node shape + ref-completeness ---
+    for nid, n in node_by_id.items():
+        has_use = bool(n.get("use"))
+        has_agent = bool(n.get("agent"))
+        is_orch = n.get("delegation") == "orchestrator"
+        if has_use and has_agent:
+            add(issues, "block", f"nodes/{nid}", "node has both 'use' and 'agent'; choose one")
+        if not has_use and not has_agent and not is_orch:
+            add(issues, "block", f"nodes/{nid}",
+                "node has neither 'use' nor 'agent'; only allowed for an orchestrator-native step (delegation: orchestrator)")
+
+        depends = n.get("depends_on") or []
+        for d in depends:
+            if d not in id_set:
+                add(issues, "block", f"nodes/{nid}/depends_on", f"references unknown node '{d}'")
+
+        # ${<id>.output...} in a node's own fields must be declared in depends_on.
+        scoped = {k: n.get(k) for k in ("inputs", "prompt", "when", "for_each") if k in n}
+        for inner in refs_in(scoped):
+            for ref_id in NODE_OUTPUT_RE.findall(inner):
+                if ref_id not in id_set:
+                    add(issues, "block", f"nodes/{nid}", f"references output of unknown node '{ref_id}'")
+                elif ref_id not in depends and ref_id != nid:
+                    add(issues, "block", f"nodes/{nid}",
+                        f"uses ${{{ref_id}.output...}} but '{ref_id}' is not in depends_on")
+
+        # for_each fan-out requires an `as` binding that is a safe identifier.
+        has_for_each = bool(n.get("for_each"))
+        as_var = n.get("as")
+        if has_for_each and not as_var:
+            add(issues, "block", f"nodes/{nid}/for_each",
+                "for_each requires an 'as' loop-variable name")
+        if as_var and not AS_RE.match(str(as_var)):
+            add(issues, "block", f"nodes/{nid}",
+                f"'as' must match ^[a-z][a-z0-9_]*$ (safe identifier), got '{as_var}'")
+        if as_var and not has_for_each:
+            add(issues, "warn", f"nodes/{nid}", "'as' declared without 'for_each'; it has no effect")
+
+    # --- Cycle detection over depends_on ---
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color = {nid: WHITE for nid in id_set}
+
+    def visit(u, stack):
+        color[u] = GRAY
+        for d in (node_by_id[u].get("depends_on") or []):
+            if d not in color:
+                continue
+            if color[d] == GRAY:
+                add(issues, "block", "nodes", f"dependency cycle: {' -> '.join(stack + [u, d])}")
+                return
+            if color[d] == WHITE:
+                visit(d, stack + [u])
+        color[u] = BLACK
+
+    for nid in id_set:
+        if color[nid] == WHITE:
+            visit(nid, [])
+
+    # --- Gates anchoring ---
+    for g in merged.get("gates") or []:
+        if not isinstance(g, dict):
+            continue
+        after = g.get("after")
+        if after and after not in id_set:
+            add(issues, "block", f"gates/{g.get('id','?')}", f"'after' references unknown node '{after}'")
+
+    # --- Loop anchoring ---
+    loop = merged.get("loop")
+    if isinstance(loop, dict):
+        for b in loop.get("body") or []:
+            if b not in id_set:
+                add(issues, "block", "loop/body", f"references unknown node '{b}'")
+            elif node_by_id.get(b, {}).get("for_each"):
+                add(issues, "block", "loop/body",
+                    f"node '{b}' uses for_each; fan-out inside a loop body is unsupported")
+        if "max_iters" not in loop:
+            add(issues, "block", "loop", "missing required 'max_iters' cap")
+        for inner in refs_in({"while": loop.get("while"), "carry": loop.get("carry")}):
+            for ref_id in NODE_OUTPUT_RE.findall(inner):
+                if ref_id not in id_set:
+                    add(issues, "block", "loop", f"references output of unknown node '{ref_id}'")
+
+    # --- output anchoring ---
+    out = merged.get("output")
+    if isinstance(out, dict) and out.get("from") and out["from"] not in id_set:
+        add(issues, "block", "output", f"'from' references unknown node '{out['from']}'")
+
+    passed = not any(i["severity"] == "block" for i in issues)
+    print(json.dumps({"pass": passed, "issues": issues}, indent=2))
+    sys.exit(0 if passed else 1)
+
+
+if __name__ == "__main__":
+    main()

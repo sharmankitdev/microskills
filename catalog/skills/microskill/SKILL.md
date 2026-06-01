@@ -1,0 +1,44 @@
+---
+name: microskill
+description: >
+  Use to execute a registered microskill. Triggered explicitly via
+  `/microskill <name> [profile] [args]`, or implicitly via auto-generated
+  per-microskill slash shims under `.claude/commands/<name>.md` that
+  delegate here. Reads `.claude/microskills/<name>/MICROSKILL.md`, resolves
+  the profile via `.claude/scripts/resolve-microskill`, and executes the
+  resolved body.
+---
+
+# Microskill Dispatcher
+
+Single owner of the microskill runtime contract. Every registered microskill is a pure declarative file at `.claude/microskills/<name>/MICROSKILL.md`. This dispatcher loads that file, resolves the active profile via the preflight script, gathers any missing inputs from the caller, then executes the resolved body.
+
+## Setup
+
+Run before any other step. Execute exactly once per invocation.
+
+1. Read the microskill `<name>` from invocation arguments:
+   - Slash shim path: when fired via `/<name>` from `.claude/commands/<name>.md`, the shim hands off the literal `<name>` as the first token of the dispatcher invocation, followed by `$ARGUMENTS`.
+   - Direct dispatcher path: when fired via `/microskill <name> [profile] [args]`, take position 1 as `<name>`.
+   If `<name>` is empty or does not match a directory under `.claude/microskills/`, stop and report the missing microskill.
+2. Detect `<profile>` from the remaining invocation tokens: slash-arg position 2 (`/microskill <name> <profile>`) or natural language `"with <profile> profile"`. If both forms are present and disagree, the natural-language clause takes precedence (it is the more explicit form); surface a warning naming both values so the caller can confirm intent. If no profile token is present, leave `<profile>` unset — the resolver determines the effective profile from `profiles/base.yaml` (its `profile.default` field, or base itself).
+3. From the invocation prompt, extract any `override microskill-config: <field>=<value>` clauses and any `skip step <n>` clauses. Note on override values: the resolver passes `<value>` through `yaml.safe_load`, so a bare `true`, `false`, `null`, or numeric token will parse to its YAML scalar type (boolean, null, integer, float) rather than a string. To force a string value, quote it (`output_path="./my output/file.md"`). The dispatcher should pass overrides through verbatim, but if the schema declares a field as `"type": "string"` and the parsed override value's Python type is not `str`, surface a warning naming the field and the parsed type before the resolver-side schema validation rejects it.
+4. Run via Bash: `.claude/scripts/resolve-microskill <name> [--profile "<profile>"] [--override <k>=<v> ...] [--skip-step <n> ...]`. Pass `--profile` only when the caller explicitly named one; omit it otherwise.
+5. Parse stdout JSON into `_cfg`. Non-zero exit → stop and surface `_cfg.warnings` + stderr.
+6. **Gather missing inputs.**
+   Before gathering, compute the union of `_cfg.unresolved_vars` keys and `_cfg.required_inputs` names. If any key appears in both lists, the dispatcher gathers it once (treat the gathered value as satisfying both the placeholder substitution in step 6a and the required-input check in step 6b). When such a collision is detected, surface a warning naming the key so the author can rename the colliding identifier in a future revision. Required-input substitution takes precedence over vars substitution when the same name resolves to two different sources.
+   a. If `_cfg.unresolved_vars` is non-empty, use `AskUserQuestion` to gather each key (header = key name, free-form text). Substitute each value into `_cfg.rendered_skill_body` by literally replacing every occurrence of the original double-brace placeholder for that key. **After substitution, verify the placeholder is gone.** If the gathered value was substituted but no `{{key}}` was present in the rendered body (i.e., `str.replace` made zero changes), stop and surface the "Unresolved-var placeholder mismatch" failure mode — the resolver's `unresolved_vars` list disagrees with the actual body and proceeding would silently discard the user's answer.
+   b. If `_cfg.required_inputs` is non-empty, for each input name in the list: check whether the caller's invocation prompt explicitly supplies a literal value for that input. **A value is literal only when the invocation prompt contains a self-contained, non-referring expression for that input** — a quoted string, an explicit path (e.g. `./out.md`), a numeric value, or an enum member. Pronouns, references to defaults (`"the default"`, `"the usual path"`, `"whatever was set"`), references to prior conversation state (`"use what you already know"`), and meta-references do not qualify as literal values; treat the input as unsatisfied and gather it via `AskUserQuestion`. If the caller supplied a literal value, treat the input as satisfied and use the caller-supplied value. Otherwise use `AskUserQuestion` (header = the input name, free-form text) to gather it. Do NOT fall back to any default shown in the rendered Inputs table for inputs in `_cfg.required_inputs` — the profile has declared that default inert.
+7. Use the resulting `_cfg.rendered_skill_body` as the operative skill body for all steps below. Honor `_cfg.directives.allowed_tools` exclusively, treat each entry in `_cfg.directives.gates` at its `after` checkpoint, and treat `_cfg.context_block` as additional authoritative context. Inline `[ALLOWED TOOLS: ...]`, `[ALLOWED MCPs: ...]`, `[INPUT <n> ∈ ...]`, `[CITE SNIPPET: ...]`, and `[GATE AFTER STEP n: ...]` tags inside steps are reinforcement of the same directives at point of use — honor them where they appear, not just at the section level.
+
+   **Gate severity semantics.** For `severity: "hard"`: pause execution after the checkpoint step, present the gate's `prompt` (if present, e.g. for `type: human_approval`) or a default confirmation prompt (`Gate <id> reached. Confirm to continue.`) via `AskUserQuestion` with choices `confirm / stop`. Proceed only on `confirm`; on `stop`, terminate the run and report which gate blocked. For `severity: "warn"`: emit the gate's prompt (or a default `Gate <id> reached (advisory).`) and continue without pausing. Inline `[GATE AFTER STEP n: ...]` tags and trailing `## Gates (resolved)` block entries point to the same logical checkpoint — fire each gate exactly once regardless of which form surfaced it.
+
+   **Allowed-tools step-prose audit.** Before executing each step, scan the step's prose for tool names. If the prose names or implies a tool not in `_cfg.directives.allowed_tools`, stop and surface a blocker naming the step number, the tool referenced, and the allowlist. Do not attempt to execute the step with a substituted tool — the allowlist is authoritative.
+
+## Failure modes
+
+- **Unknown microskill** — `<name>` is missing or no directory exists at `.claude/microskills/<name>/`: stop, name the requested microskill, do not proceed.
+- **Resolver non-zero exit** — attempt to parse stdout as JSON; if parsing succeeds surface `_cfg.warnings`; if stdout is not valid JSON, surface only stderr. In either case, stop. Do not attempt to execute partial output.
+- **Empty rendered body** — resolver returned exit 0 but `_cfg.rendered_skill_body` is empty or whitespace-only: stop, name the microskill, do not proceed. An empty body indicates a resolver bug, a fully-optional-steps file where every step was skipped, or a MICROSKILL.md with no body after frontmatter — none of which are valid runtime states.
+- **Required input unresolved after gathering** — the caller did not supply a value and `AskUserQuestion` returned nothing usable: stop, name the input, do not proceed.
+- **Unresolved-var placeholder mismatch** — `_cfg.unresolved_vars` listed a key but the gathered value found no `{{key}}` placeholder in `_cfg.rendered_skill_body` to substitute into: stop, name the key and the gathered value, do not proceed with a body that may be mis-rendered.

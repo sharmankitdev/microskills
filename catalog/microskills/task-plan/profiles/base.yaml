@@ -1,0 +1,27 @@
+version: 1
+
+# Default domain = microskill creation. The `workflow` overlay overrides the
+# contract doc, executor agent, and output_schema for the workflow domain.
+vars:
+  contract_doc: .claude/workflow-defs/microskill-create/references/planner.md
+
+inputs:
+  requirement:
+    required: true
+  staging_dir:
+    required: true
+
+# Executor identity for workflow use: nodes — run AS this agent on this model
+# (background segments can't nest-dispatch, so the executor IS the planner).
+runtime:
+  agent: microskill-planner
+  model: opus
+
+# Default plan-output contract (microskill-domain shape). A profile overlay may
+# override this wholesale — the resolver REPLACES output_schema across layers.
+output_schema:
+  type: object
+  required: [plan_path, scope_advisory]
+  properties:
+    plan_path: { type: ["string", "null"] }
+    scope_advisory: { type: ["object", "null"] }

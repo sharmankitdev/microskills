@@ -1,0 +1,24 @@
+version: 1
+
+# Default domain = microskill creation. The `workflow` overlay swaps the executor
+# agent + contract doc. output_schema is identical across domains, so it stays here.
+vars:
+  contract_doc: .claude/workflow-defs/microskill-create/references/implementer.md
+
+inputs:
+  plan_path:
+    required: true
+  staging_dir:
+    required: true
+
+runtime:
+  agent: microskill-implementer
+  model: opus
+
+output_schema:
+  type: object
+  required: [staging_paths]
+  properties:
+    staging_paths:
+      type: array
+      items: { type: string }

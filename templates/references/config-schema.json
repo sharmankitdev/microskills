@@ -1,0 +1,228 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://anthropic.com/microskills/config-schema.json",
+  "title": "Microskill config",
+  "description": "Runtime configuration for a microskill. Profile YAMLs live under <skill>/profiles/<profile>.yaml. The base profile (profiles/base.yaml) is always loaded; overlays deep-merge over it. Closed grammar: unknown fields at any level are rejected.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version"],
+  "properties": {
+    "version": {
+      "const": 1,
+      "description": "Schema version. Only 1 is recognized today."
+    },
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Profile routing metadata. Allowed only in profiles/base.yaml; rejected in overlays at resolve time (semantic, not schema-enforced).",
+      "properties": {
+        "default": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Name of the profile to use when the caller does not pass --profile. Must resolve to a file profiles/<value>.yaml. Absent means base.yaml itself is the effective profile."
+        }
+      }
+    },
+    "vars": {
+      "type": "object",
+      "description": "Flat map of template variable substitutions. Every key becomes {{key}} in SKILL.md prose and in generated output.",
+      "additionalProperties": { "type": "string" }
+    },
+    "inputs": {
+      "type": "object",
+      "description": "Customize entries from the skill's Inputs table. Keys are input names declared in SKILL.md.",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "required": {
+            "type": "boolean",
+            "description": "When true, the resolver adds this input to the required_inputs ledger in the payload and rewrites the rendered Inputs table row to show required=yes with the default nullified. The Setup step then gates execution: if the caller did not supply a value in the invocation prompt, AskUserQuestion is used to gather it. The input's declared default in SKILL.md is treated as inert — it does not satisfy this requirement. If inject_from is also present and resolves successfully, the input is considered satisfied and is not added to required_inputs."
+          },
+          "allowed_values": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": { "type": "string", "minLength": 1 },
+            "description": "Restrict caller-supplied value to an enumerated, non-empty, unique list of strings."
+          },
+          "inject_from": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Auto-inject value from an external source. Exactly one source key.",
+            "properties": {
+              "git_config": { "type": "string", "minLength": 1, "description": "Runs `git config <key>`. Empty result -> unresolved." },
+              "env":        { "type": "string", "minLength": 1, "description": "Reads environment variable. Empty/unset -> unresolved." },
+              "file":       { "type": "string", "minLength": 1, "description": "Reads (and trims) file contents. Path relative to config file." },
+              "command":    { "type": "string", "minLength": 1, "description": "Runs shell command, uses trimmed stdout. Use sparingly." }
+            },
+            "oneOf": [
+              { "required": ["git_config"] },
+              { "required": ["env"] },
+              { "required": ["file"] },
+              { "required": ["command"] }
+            ]
+          },
+          "default": {
+            "type": "string",
+            "description": "Default value shown in the rendered Inputs table Default column. String only. The resolver substitutes this into the MICROSKILL.md `—` cell at render time. Allowed only in profiles/base.yaml — overlays may not redeclare it (semantic, not schema-enforced)."
+          }
+        }
+      }
+    },
+    "steps": {
+      "type": "object",
+      "description": "Override numbered steps from SKILL.md. Keys are step numbers as strings.",
+      "additionalProperties": false,
+      "patternProperties": {
+        "^[0-9]+$": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "optional": {
+              "type": "boolean",
+              "description": "When true, runtime skips this step entirely."
+            },
+            "mandate_tool": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Force this step to use a specific tool name (e.g. WebSearch, Bash, Read)."
+            }
+          }
+        }
+      }
+    },
+    "gates": {
+      "type": "object",
+      "description": "Customize validation / approval gates. Existing gates keyed by id (declared in SKILL.md with <!-- gate-id: <id> -->). New gates inserted via add[].",
+      "additionalProperties": false,
+      "properties": {
+        "add": {
+          "type": "array",
+          "description": "Insert new gates the skill does not declare.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "after", "type"],
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9_-]*$",
+                "description": "Stable kebab/snake-case identifier."
+              },
+              "after": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Step id or phase id after which the gate fires."
+              },
+              "type": {
+                "enum": ["human_approval", "verification", "tool_check"],
+                "description": "Kind of gate."
+              },
+              "prompt": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Text shown to the user. Required when type == human_approval."
+              },
+              "severity": {
+                "enum": ["warn", "hard"],
+                "default": "hard",
+                "description": "warn = emit warning and continue; hard = block until satisfied."
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": { "type": { "const": "human_approval" } },
+                  "required": ["type"]
+                },
+                "then": { "required": ["prompt"] }
+              }
+            ]
+          }
+        }
+      },
+      "patternProperties": {
+        "^(?!add$)[a-z][a-z0-9_-]*$": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "severity": {
+              "enum": ["warn", "hard"],
+              "description": "Soften (warn) or harden (hard) an existing gate."
+            }
+          }
+        }
+      }
+    },
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Inject reference material.",
+      "properties": {
+        "refs": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Paths (relative to the config file's directory) read as authoritative reference. Missing path blocks."
+        },
+        "snippets": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "text"],
+            "properties": {
+              "name": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9_-]*$",
+                "description": "Short kebab/snake-case identifier the skill may use to cite the snippet."
+              },
+              "text": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Short inline authoritative fact (sentence or short paragraph)."
+              }
+            }
+          }
+        },
+        "extend": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Path to an existing output artifact to revise in place. Missing path blocks."
+        }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Tool & MCP restrictions, and (for workflow composition) the executor agent/model.",
+      "properties": {
+        "allowed_tools": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Confine the skill to these tool names. Absent -> skill picks tools at discretion."
+        },
+        "allowed_mcps": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "description": "MCP server identifiers the skill may query. Absent/empty -> no MCP queries."
+        },
+        "agent": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Agent type (registered under .claude/agents/<name>/) to execute this microskill AS when composed in a workflow `use:` node. The compiler spawns the executor with this agentType so the agent's persona applies. Overridable per profile. Absent -> the generic workflow-subagent runs the body. (Background workflow segments cannot spawn nested agents, so the executor itself must be the intended agent.)"
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Model alias the executor runs on in a workflow `use:` node (e.g. 'opus', 'sonnet', 'haiku'). The compiler passes it to the agent() call. Absent -> the segment default (today Sonnet). Set this to pin the agent's intended model, since background segments do not auto-honor the agent's AGENT.md model frontmatter."
+        }
+      }
+    },
+    "output_schema": {
+      "type": "object",
+      "minProperties": 1,
+      "description": "Optional JSON Schema fragment declaring the microskill's structured output contract. When present, the resolver appends a directive instructing the skill to return ONLY a JSON object matching this schema (so the skill emits structured output whether run standalone or composed inside a workflow), and a workflow `use:` node can rely on this shape. Lives in base.yaml as the default contract; a profile overlay may override it wholesale (the resolver REPLACES output_schema across layers — it does not merge — so a profile can declare a domain-specific shape, and a profile that omits it inherits the base default)."
+    }
+  }
+}

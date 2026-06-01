@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+"""
+validate-microskill — validates a microskill MICROSKILL.md and (optionally) its config files.
+
+Usage:
+  validate-microskill <MICROSKILL.md> [<config.yml> ...]
+
+Output (stdout): JSON {pass: bool, issues: [{severity, location, message}]}
+Exit codes:
+  0  — pass (no block-level issues)
+  1  — at least one block-level issue
+  2  — script / environment error (missing dep, file not found)
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+try:
+    import yaml
+except ImportError:
+    print(json.dumps({
+        "pass": False,
+        "issues": [{
+            "severity": "block",
+            "location": "environment",
+            "message": "PyYAML not installed. Install with: pip3 install pyyaml"
+        }]
+    }, indent=2))
+    sys.exit(2)
+
+try:
+    from jsonschema import Draft202012Validator
+except ImportError:
+    print(json.dumps({
+        "pass": False,
+        "issues": [{
+            "severity": "block",
+            "location": "environment",
+            "message": "jsonschema not installed. Install with: pip3 install jsonschema"
+        }]
+    }, indent=2))
+    sys.exit(2)
+
+REQUIRED_SECTIONS = ["## Purpose", "## Inputs", "## Steps", "## Output", "## Failure modes"]
+NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
+STEP_RE = re.compile(r"^\d+\.", re.MULTILINE)
+BRANCH_RE = re.compile(
+    r"\b("
+    r"if\b|else\b|for each\b|repeat\b|retry\b|when\b.*then\b|based on\b|"
+    r"depending on|either\b|go to step|otherwise|or if|unless"
+    r")\b",
+    re.IGNORECASE,
+)
+
+SCRIPT = Path(__file__).resolve()
+
+
+def _templates_root(script):
+    """Locate templates/ (schemas + component templates): prefer the materialized runtime
+    copy under .claude/, then ${CLAUDE_PLUGIN_ROOT}, then the in-repo dogfood source."""
+    proj = script.parents[2]
+    cands = [proj / ".claude" / "templates"]
+    env = os.environ.get("CLAUDE_PLUGIN_ROOT")
+    if env:
+        cands.append(Path(env) / "templates")
+    cands.append(proj / "templates")
+    return next((c for c in cands if c.is_dir()), cands[0])
+
+
+SCHEMA_PATH = _templates_root(SCRIPT) / "references" / "config-schema.json"
+
+
+def add(issues, severity, location, message):
+    issues.append({"severity": severity, "location": location, "message": message})
+
+
+def parse_frontmatter(text):
+    if not text.startswith("---\n"):
+        return None, text
+    end = text.find("\n---\n", 4)
+    if end == -1:
+        end_alt = text.find("\n---", 4)
+        if end_alt != -1 and end_alt == len(text) - 4:
+            fm_text = text[4:end_alt]
+            body = ""
+            try:
+                return yaml.safe_load(fm_text), body
+            except yaml.YAMLError:
+                return False, body
+        return None, text
+    fm_text = text[4:end]
+    body = text[end + 5:]
+    try:
+        return yaml.safe_load(fm_text), body
+    except yaml.YAMLError:
+        return False, body
+
+
+def check_skill(path, issues):
+    p = Path(path)
+    if not p.exists():
+        add(issues, "block", "file", f"MICROSKILL.md not found at {path}")
+        return
+    text = p.read_text()
+
+    fm, body = parse_frontmatter(text)
+    if fm is None:
+        add(issues, "block", "frontmatter", "missing YAML frontmatter (--- delimited block at top of file)")
+        return
+    if fm is False:
+        add(issues, "block", "frontmatter", "frontmatter is not valid YAML")
+        return
+    if not isinstance(fm, dict):
+        add(issues, "block", "frontmatter", "frontmatter must be a YAML mapping")
+        return
+
+    name = fm.get("name")
+    desc = fm.get("description")
+
+    if not name:
+        add(issues, "block", "frontmatter", "missing 'name' field")
+    elif not isinstance(name, str) or not NAME_RE.match(name):
+        add(issues, "block", "frontmatter", f"name '{name}' does not match ^[a-z][a-z0-9-]*$")
+
+    if not desc:
+        add(issues, "block", "frontmatter", "missing 'description' field")
+    elif not isinstance(desc, str):
+        add(issues, "block", "frontmatter", "description must be a string")
+
+    if isinstance(name, str) and isinstance(desc, str):
+        wc = len((name + " " + desc).split())
+        if wc > 100:
+            add(issues, "block", "frontmatter",
+                f"name + description = {wc} words; hard cap is 100")
+
+    for section in REQUIRED_SECTIONS:
+        pattern = rf"^{re.escape(section)}\s*$"
+        if not re.search(pattern, body, re.MULTILINE):
+            ci_pattern = rf"^{re.escape(section)}\s*$"
+            ci_match = re.search(ci_pattern, body, re.MULTILINE | re.IGNORECASE)
+            if ci_match:
+                found = ci_match.group(0).strip()
+                add(issues, "block", "structure",
+                    f"missing section heading: {section} (found {found!r}; check casing — section names are case-sensitive)")
+            else:
+                add(issues, "block", "structure", f"missing section heading: {section}")
+
+    if re.search(r"^## Setup\s*$", body, re.MULTILINE):
+        add(issues, "block", "structure",
+            "## Setup section found — microskills must not carry Setup; "
+            "the dispatcher Skill at .claude/skills/microskill/ owns the runtime contract")
+
+    m_steps = re.search(r"^## Steps\s*$([\s\S]*?)(?=^## |\Z)", body, re.MULTILINE)
+    if m_steps:
+        steps_body = m_steps.group(1)
+        count = len(STEP_RE.findall(steps_body))
+        if count == 0:
+            add(issues, "block", "steps", "no numbered steps found under ## Steps")
+        elif count > 10:
+            add(issues, "warn", "steps",
+                f"{count} numbered steps; consider whether this is still one atomic task")
+        for match in BRANCH_RE.finditer(steps_body):
+            snippet = match.string[max(0, match.start()-20):match.end()+20].replace("\n", " ")
+            add(issues, "block", "steps",
+                f"branching language detected: \"…{snippet.strip()}…\" — steps must form a single linear path (no branches, conditionals, loops, or parallel tracks)")
+
+    m_inputs = re.search(r"^## Inputs\s*$([\s\S]*?)(?=^## |\Z)", body, re.MULTILINE)
+    if m_inputs:
+        inputs_body = m_inputs.group(1)
+        data_row_count = 0
+        for line in inputs_body.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("|"):
+                continue
+            if re.match(r"^\s*\|\s*Name\s*\|", line, re.IGNORECASE):
+                continue
+            if re.match(r"^\s*\|[-| :]+\|\s*$", line):
+                continue
+            parts = line.split("|")
+            if len(parts) < 7:
+                add(issues, "block", "inputs",
+                    f"Inputs table row has fewer than 5 columns (expected: Name | Required | Type | Description | Default): {line.strip()!r}")
+                continue
+            if len(parts) > 7:
+                add(issues, "block", "inputs",
+                    f"Inputs table row has more than 5 columns — likely an unescaped `|` inside a Description cell shifted later columns. "
+                    f"Row: {line.strip()!r}. Replace any `|` in prose with a different separator or escape as `\\|`.")
+                continue
+            data_row_count += 1
+            name_cell = parts[1].strip()
+            default_cell = parts[5].strip()
+            if default_cell not in ("—", ""):
+                add(issues, "block", "inputs",
+                    f"Inputs row '{name_cell}' Default column is {default_cell!r}; must be literally `—`. "
+                    f"Declare real defaults in profiles/base.yaml under inputs.<name>.default; "
+                    f"the resolver rewrites the column at runtime.")
+        if data_row_count == 0:
+            add(issues, "warn", "inputs", "## Inputs section has no data rows")
+
+
+def check_config(path, issues):
+    p = Path(path)
+    if not p.exists():
+        add(issues, "block", "config", f"config file not found at {path}")
+        return
+
+    if not SCHEMA_PATH.exists():
+        add(issues, "block", "config", f"config-schema.json not found at {SCHEMA_PATH}")
+        return
+
+    try:
+        doc = yaml.safe_load(p.read_text())
+    except yaml.YAMLError as e:
+        add(issues, "block", "config", f"{p.name}: YAML parse error — {e}")
+        return
+
+    schema = json.loads(SCHEMA_PATH.read_text())
+    v = Draft202012Validator(schema)
+    errors = sorted(v.iter_errors(doc), key=lambda e: list(e.path))
+    for err in errors:
+        path_str = "/".join(str(part) for part in err.path) or "<root>"
+        add(issues, "block", "config", f"{p.name}@{path_str}: {err.message}")
+
+    if p.name != "base.yaml" and isinstance(doc, dict) and "profile" in doc:
+        add(issues, "block", "config",
+            f"{p.name}: top-level 'profile' block is only allowed in base.yaml")
+    if p.name != "base.yaml" and isinstance(doc, dict):
+        overlay_defaults = [
+            name for name, spec in (doc.get("inputs") or {}).items()
+            if isinstance(spec, dict) and "default" in spec
+        ]
+        if overlay_defaults:
+            add(issues, "block", "config",
+                f"{p.name}: inputs.<name>.default is base-only; found in: {overlay_defaults}")
+
+
+def extract_skill_identifiers(skill_path):
+    p = Path(skill_path)
+    if not p.exists():
+        return None
+    text = p.read_text()
+    _, body = parse_frontmatter(text)
+    if not isinstance(body, str):
+        return None
+    input_names = set()
+    required_inputs = set()
+    m_inputs = re.search(r"^## Inputs\s*$([\s\S]*?)(?=^## |\Z)", body, re.MULTILINE)
+    if m_inputs:
+        for line in m_inputs.group(1).splitlines():
+            if not line.strip().startswith("|"):
+                continue
+            if re.match(r"^\s*\|\s*Name\s*\|", line, re.IGNORECASE):
+                continue
+            if re.match(r"^\s*\|[-| :]+\|\s*$", line):
+                continue
+            parts = line.split("|")
+            if len(parts) >= 7:
+                name = parts[1].strip()
+                if name:
+                    input_names.add(name)
+                    if parts[2].strip().lower() == "yes":
+                        required_inputs.add(name)
+    step_numbers = set()
+    m_steps = re.search(r"^## Steps\s*$([\s\S]*?)(?=^## |\Z)", body, re.MULTILINE)
+    if m_steps:
+        for m in re.finditer(r"^(\d+)\.\s", m_steps.group(1), re.MULTILINE):
+            step_numbers.add(int(m.group(1)))
+    gate_ids = set(re.findall(r"<!--\s*gate-id:\s*([a-z][a-z0-9_-]*)\s*-->", body))
+    return {"inputs": input_names, "required_inputs": required_inputs,
+            "steps": step_numbers, "gates": gate_ids}
+
+
+def cross_check(skill_meta, config_path, issues):
+    p = Path(config_path)
+    if not p.exists() or skill_meta is None:
+        return
+    try:
+        doc = yaml.safe_load(p.read_text())
+    except yaml.YAMLError:
+        return
+    if not isinstance(doc, dict):
+        return
+    for name in (doc.get("inputs") or {}).keys():
+        if name not in skill_meta["inputs"]:
+            add(issues, "warn", "config",
+                f"{p.name}: inputs.{name} is not declared in MICROSKILL.md Inputs table")
+    for key in (doc.get("steps") or {}).keys():
+        try:
+            n = int(key)
+        except (TypeError, ValueError):
+            continue
+        if n not in skill_meta["steps"]:
+            add(issues, "warn", "config",
+                f"{p.name}: steps.\"{key}\" references step {n} which does not exist in MICROSKILL.md")
+    for key in (doc.get("gates") or {}).keys():
+        if key == "add":
+            continue
+        if key not in skill_meta["gates"]:
+            add(issues, "warn", "config",
+                f"{p.name}: gates.{key} references a gate id with no matching <!-- gate-id: {key} --> comment in MICROSKILL.md")
+
+    # Required-input fidelity: an input marked Required=yes in the table is only
+    # gathered at runtime if base.yaml declares inputs.<name>.required (or supplies
+    # it via inject_from). Otherwise the resolver treats it as optional and the
+    # "required" input is silently never collected. Check against base.yaml only.
+    if p.name == "base.yaml":
+        cfg_inputs = doc.get("inputs") or {}
+        for name in sorted(skill_meta.get("required_inputs") or set()):
+            spec = cfg_inputs.get(name) or {}
+            if isinstance(spec, dict) and "inject_from" in spec:
+                continue  # auto-supplied; not gathered from the caller
+            if not (isinstance(spec, dict) and spec.get("required") is True):
+                add(issues, "block", "config",
+                    f"{p.name}: input '{name}' is marked Required=yes in the MICROSKILL.md table "
+                    f"but base.yaml does not set inputs.{name}.required: true — the resolver will not "
+                    f"gather it at runtime. Add inputs.{name}.required: true (or an inject_from source).")
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Validate a microskill MICROSKILL.md (and optional config files)."
+    )
+    ap.add_argument("skill", help="Path to MICROSKILL.md")
+    ap.add_argument("configs", nargs="*", help="Optional paths to profile YAML files (e.g. profiles/base.yaml, profiles/<name>.yaml)")
+    args = ap.parse_args()
+
+    issues = []
+    check_skill(args.skill, issues)
+    skill_meta = extract_skill_identifiers(args.skill)
+    for cfg in args.configs:
+        check_config(cfg, issues)
+        cross_check(skill_meta, cfg, issues)
+
+    blocks = [i for i in issues if i["severity"] == "block"]
+    passed = len(blocks) == 0
+
+    print(json.dumps({"pass": passed, "issues": issues}, indent=2))
+    sys.exit(0 if passed else 1)
+
+
+if __name__ == "__main__":
+    main()

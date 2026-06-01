@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://anthropic.com/microskills/harness-schema.json",
+  "title": "Harness manifest",
+  "description": "Declares the working set of components a project uses. harness.yaml lives under harness/ (harness/harness.yaml). Two component lists — microskills and workflows — each entry tagged by source. source 'plugin' = materialized from the plugin catalog by `initialize-harness` (referenced, never vendored into harness/). source 'custom' = authored locally under harness/<kind-dir>/<name>/ and reconciled by `harness-sync`. The generated runtime is .claude/; .claude/.harness-state.json is the ownership ledger. Closed grammar: unknown fields at any level are rejected.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version"],
+  "properties": {
+    "version": {
+      "const": 2,
+      "description": "Manifest schema version. Only 2 is recognized."
+    },
+    "microskills": {
+      "$ref": "#/$defs/componentList",
+      "description": "Microskills this project uses. Deploy target: .claude/microskills/<name>/ (+ generated shim .claude/commands/<name>.md). source 'plugin' read from <catalog>/microskills/<name>/; source 'custom' read from harness/microskills/<name>/."
+    },
+    "workflows": {
+      "$ref": "#/$defs/componentList",
+      "description": "Workflows this project uses. Deploy target: .claude/workflow-defs/<name>/ (+ generated shim .claude/commands/<name>.md). source 'plugin' read from <catalog>/workflow-defs/<name>/; source 'custom' read from harness/workflow-defs/<name>/."
+    }
+  },
+  "$defs": {
+    "componentList": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "source"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]*$",
+            "description": "Component directory name. Kebab-case; matches the microskill/workflow name regex."
+          },
+          "source": {
+            "enum": ["plugin", "custom"],
+            "description": "Provenance and ownership. 'plugin' = pulled from the plugin catalog and materialized into .claude/ by initialize-harness; harness-sync NEVER touches these. 'custom' = authored under harness/ and reconciled into .claude/ by harness-sync."
+          },
+          "profiles": {
+            "description": "Which profile overlays to vend for this component. Either an explicit, non-empty, unique list of profile names, or the wildcard string \"*\" meaning 'all profiles present in the source'. Omit to mean all. For 'plugin' the named overlays are selected from the catalog source; for 'custom' the bytes under harness/.../profiles/ are authoritative and the named overlays must already exist there.",
+            "oneOf": [
+              {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" }
+              },
+              { "const": "*" }
+            ]
+          },
+          "version": {
+            "type": "string",
+            "description": "Optional provenance pin for 'plugin' (which catalog version was materialized). Ignored for 'custom'. The seam for a future upstream-drift check."
+          }
+        }
+      }
+    }
+  }
+}
