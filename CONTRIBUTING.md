@@ -81,5 +81,41 @@ No test may touch the real repo. Tests that exercise the real catalog point at
 
 ## Commits
 
-Keep the working tree's tests green per commit. Describe the *why*, not just the
-*what*.
+This repo uses [Conventional Commits](https://www.conventionalcommits.org/) — the
+prefix drives automated releases (see Releases). Keep the working tree's tests
+green per commit and describe the *why*, not just the *what*.
+
+Format: `<type>(<scope>): <subject>`
+
+- **Types:** `feat`, `fix`, `perf`, `refactor`, `revert`, `docs`, `chore`, `ci`,
+  `test`, `build`.
+- **Scopes (optional):** `harness`, `microskill`, `workflow`, `scripts`, `ci`.
+- **Breaking:** add a `!` (`feat!: …`) or a `BREAKING CHANGE:` footer.
+
+PRs are squash-merged, so the **PR title** must be a valid Conventional Commit —
+CI (`pr-title.yml`) enforces this.
+
+## Releases
+
+Releases are fully automated by
+[semantic-release](https://semantic-release.gitbook.io/) on every push to `main`
+(`release.yml`). It reads the conventional-commit history since the last tag,
+computes the next version, writes it into `.claude-plugin/plugin.json` (the
+canonical version — **never hand-edit it**), updates `CHANGELOG.md`, creates the
+`vX.Y.Z` tag, and publishes the GitHub Release.
+
+The project is intentionally pre-stable (`0.x`). Bump mapping while in `0.x`:
+
+| Commit | Bump | Example |
+|---|---|---|
+| `fix:` | patch | bug fix in a script / dispatcher / microskill body |
+| `feat:` | minor | new microskill / workflow / agent / script capability |
+| `feat!:` / `BREAKING CHANGE:` | minor | harness-schema, dispatcher-contract, or component rename/removal |
+
+Nothing bumps the major while in `0.x`. The jump to `1.0.0` is a deliberate manual
+release made when the harness contract is frozen — not produced automatically.
+Commits of type `docs`, `chore`, `ci`, `test`, or `build` alone do not trigger a
+release.
+
+> The plugin release version is independent of the harness manifest schema
+> version (`harness/harness.yaml` `version: 2`) — the two are not coupled.
