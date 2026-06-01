@@ -1,6 +1,6 @@
 {
   "name": "microskills",
-  "description": "Composable microskills + workflows engine + dynamic AI harness. Exposes a single command — initialize-harness — that bootstraps a project's runtime from the plugin catalog; every other dispatcher, script, agent, and per-component shim is materialized into the project's .claude/ at init. The catalog (microskills, workflow-defs, agents, scripts, dispatcher skills) ships as dormant data and is never auto-registered.",
+  "description": "Build atomic microskills, compose them into declarative DAG workflows, assemble into a dynamic AI harness",
   "version": "0.1.0",
   "author": {
     "name": "Ankit Sharma"

@@ -7,7 +7,7 @@
     {
       "name": "microskills",
       "source": "./",
-      "description": "Composable microskills + workflows engine. Run /microskills:initialize-harness once per project to bootstrap the runtime from the catalog, then /sync-harness for your own source:custom components."
+      "description": "Build atomic microskills, compose them into declarative DAG workflows, assemble into a dynamic AI harness"
     }
   ]
 }
