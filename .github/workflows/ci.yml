@@ -20,5 +20,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Install dependencies
         run: python -m pip install --upgrade pip pyyaml jsonschema pytest
+      - name: Rebuild runtime from catalog
+        run: catalog/scripts/initialize-harness --apply --project-root . --catalog ./catalog
       - name: Run tests
-        run: python -m pytest .claude/scripts/tests/ -v
+        run: python -m pytest catalog/scripts/tests/ scripts/tests/ -v
