@@ -1,4 +1,0 @@
-version: 1
-inputs:
-  person:
-    default: there

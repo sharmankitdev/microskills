@@ -23,4 +23,4 @@ jobs:
       - name: Rebuild runtime from catalog
         run: catalog/scripts/initialize-harness --apply --project-root . --catalog ./catalog
       - name: Run tests
-        run: python -m pytest catalog/scripts/tests/ scripts/tests/ -v
+        run: python -m pytest catalog/scripts/tests/ scripts/tests/ hooks/tests/ -v
