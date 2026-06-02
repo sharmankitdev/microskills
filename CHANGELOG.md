@@ -1,3 +1,9 @@
+## [0.3.0](https://github.com/sharmankitdev/microskills/compare/v0.2.0...v0.3.0) (2026-06-02)
+
+### Features
+
+* **hooks:** surface harness-drift advisory to the user and offer to run it ([8889943](https://github.com/sharmankitdev/microskills/commit/88899439af57370cff170d28097d4424224b07f8))
+
 ## [0.2.0](https://github.com/sharmankitdev/microskills/compare/v0.1.0...v0.2.0) (2026-06-02)
 
 ### Features
