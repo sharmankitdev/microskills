@@ -180,7 +180,7 @@ harness/microskills|workflow-defs/<name>/   # committed bytes of source:custom c
 >
 > ```bash
 > catalog/scripts/initialize-harness --apply --project-root . --catalog ./catalog
-> catalog/scripts/harness-sync --apply             # any source:custom components (e.g. greet-user)
+> catalog/scripts/harness-sync --apply             # any source:custom components you author under harness/
 > ```
 
 ## Engine

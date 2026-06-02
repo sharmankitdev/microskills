@@ -14,9 +14,6 @@ microskills:
     source: plugin
   - name: validate-microskill
     source: plugin
-  - name: greet-user
-    source: custom
-    profiles: [base]
 workflows:
   - name: microskill-create
     source: plugin
