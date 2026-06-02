@@ -33,7 +33,7 @@ microskills is a lightweight set of **building blocks** you piece together to co
 
 ```mermaid
 flowchart TB
-    subgraph compose["① Author + compose — declarative"]
+    subgraph compose["Author + compose — declarative"]
         direction LR
         MS["<b>Microskill</b><br/>atomic · linear · single-purpose"]
         WF["<b>Workflow</b><br/>DAG of microskills + agents + nested workflows"]
@@ -44,16 +44,16 @@ flowchart TB
     PR -.-> MS
     PR -.-> WF
 
-    WF ==>|"compile-workflow · same inputs → byte-identical output"| SEG
-
-    subgraph run["② Run — deterministic"]
+    subgraph run["Run — deterministic"]
         direction LR
         SEG["Autonomous background segments<br/>(Claude Code Workflow engine)"]
         CHK["Human checkpoints<br/>gates · orchestrator nodes"]
         SEG <--> CHK
     end
 
-    subgraph harness["③ Assemble — your team's harness"]
+    WF ==>|"compile-workflow · same inputs → byte-identical output"| run
+
+    subgraph harness["Assemble — your team's harness"]
         direction LR
         CAT["catalog/<br/>canonical source"] -->|initialize-harness| CL[".claude/<br/>generated runtime"]
         HY["harness.yaml<br/>your selection"] --> CL
@@ -138,15 +138,19 @@ loop:                         # retry implement→evaluate until it passes
   body: [implement, evaluate]
 ```
 
-**Customize without forking.** The same microskill runs in a different domain by overlaying a profile — here `task-implement` is retargeted from the microskill domain to the workflow domain:
+**Customize without forking.** The same microskill serves two domains by overlaying a profile. `task-implement` ships a `microskill` profile (the default — it inherits `base` verbatim) and a `workflow` overlay. The entire delta is **two lines** — contract doc and executor agent; the model, inputs, and output schema are all inherited:
 
-```yaml
-# task-implement/profiles/workflow.yaml
-version: 1
-vars:
-  contract_doc: .claude/workflow-defs/workflow-create/references/implementer.md
-runtime:
-  agent: workflow-implementer   # swapped; model (opus) inherited from base
+```diff
+# task-implement/profiles/ — one microskill, two domains (full delta = 2 lines)
+  version: 1
+  vars:
+-   contract_doc: .claude/workflow-defs/microskill-create/references/implementer.md   # microskill profile (= base)
++   contract_doc: .claude/workflow-defs/workflow-create/references/implementer.md     # workflow overlay
+  runtime:
+-   agent: microskill-implementer
++   agent: workflow-implementer
+    model: opus      # shared — inherited from base; neither profile overrides it
+# inputs + output_schema are identical across domains, so they live once in base
 ```
 
 **Run.** `compile-workflow` turns the YAML into background segments + checkpoints; the `workflow` dispatcher then conducts: it runs each segment autonomously on the native engine, pauses at each human checkpoint (where `AskUserQuestion` works), and threads outputs forward. The autonomous engine can't pause for a human — so *all* interaction lives at the checkpoints between segments.
