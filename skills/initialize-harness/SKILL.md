@@ -48,9 +48,16 @@ Run before any other step. Execute exactly once per invocation.
    `harness.yaml`, and confirm `state_written`. Tell the user
    the project is initialized — they can now run `/sync-harness` for any `source: custom`
    components they author under `harness/`, plus the create flows (`/microskill-create`,
-   `/workflow-create`). **Tell them to restart Claude Code**: the materialized dispatchers,
-   per-component command shims, and agents register only on the next session start, so
-   those commands and the agents will not resolve until they restart.
+   `/workflow-create`).
+   Then tell them how to **activate** what changed — branch on the plan:
+   - If `_plan.seeded_harness_yaml` is true **or** `_plan.engine.action` is `add` / `update`
+     (first-time init, or the engine was materialized/changed): **restart Claude Code**. The
+     engine's **agents** (`.claude/agents/`) register only on the next session start, so the
+     create flows and per-component agents will not resolve until they restart.
+   - Otherwise (engine `noop` — only `source: plugin` components were added/updated): they only
+     need to run **`/reload-skills`** to register the new command shims. The dispatchers read
+     each component's data (`MICROSKILL.md` / `WORKFLOW.yaml`) fresh at runtime, so no restart
+     is required.
 
 ## Failure modes
 
