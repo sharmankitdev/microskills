@@ -4,12 +4,13 @@
 #
 # It re-specifies the gates list (deep-merge replaces top-level lists) to soften
 # the approve_plan gate from `hard` to `warn`. A human_approval gate ALWAYS flushes
-# the segment (compile-workflow), so the implement/evaluate loop stays in its own
-# segment; but on `warn` the dispatcher emits the prompt and continues WITHOUT
-# pausing. Net effect: same compiled shape, no human pause.
+# the segment (compile-workflow), so the `build` orchestrator node stays after its own
+# boundary; but on `warn` the dispatcher emits the prompt and continues WITHOUT pausing.
+# Net effect: same compiled shape, no human pause.
 #
-# finalize stays non-interactive as long as the caller supplies a fresh,
-# collision-free workflow name (a collision would escalate).
+# The build half (the implement ↔ evaluate loop + finalize) runs inside
+# build-workflow-from-plan, which `build` invokes; it stays non-interactive as long as the
+# caller supplies a fresh, collision-free workflow name (a collision would escalate).
 version: 1
 
 gates:

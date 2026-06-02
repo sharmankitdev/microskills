@@ -1,0 +1,126 @@
+version: 1
+name: build-workflow-from-plan
+base: true
+description: >
+  Build a workflow from an already-approved plan — the implement ↔ evaluate loop plus the
+  canonical finalize (vendor into harness/, upsert the manifest, sync, compile). The shared
+  build half of workflow-create: callers (workflow-create, decompose-monolith-orchestrator)
+  run their own plan + approval gate + provision, then invoke this with the approved plan.
+  Has no plan node, no approval gate, and no provision — it starts from plan_path, so there
+  is exactly one finalize and the two creators cannot drift.
+
+# Caller-supplied inputs. plan_path/name/requirement are produced by the caller's own plan;
+# the harness_* plumbing mirrors workflow-create's finalize so the vendoring is identical.
+inputs:
+  plan_path:
+    type: string
+    required: true
+    description: Path to the approved WORKFLOW.yaml-design plan file under staging_dir.
+  name:
+    type: string
+    required: true
+    description: Target workflow name (kebab-case) the implementer staged under <staging_dir>/<name>/.
+  requirement:
+    type: string
+    required: true
+    description: The originating requirement — the evaluator's semantic ground truth.
+  harness_root:
+    type: string
+    required: false
+    default: harness
+    description: Committed harness source-of-truth root. Finalize vendors the workflow to <harness_root>/workflow-defs/<name>/; sync-harness then generates the .claude/ runtime copy + shim, and finalize compiles it.
+  harness_yaml:
+    type: string
+    required: false
+    default: harness/harness.yaml
+    description: Harness manifest. Finalize upserts the component's entry here (source custom) before syncing.
+  staging_dir:
+    type: string
+    required: true
+    description: Sandbox dir; the implementer writes <staging_dir>/<name>/ before finalize moves it.
+
+imports:
+  - microskills/task-implement
+  - microskills/task-evaluate
+
+# No plan node and no approval gate (those live in the caller). The whole workflow is one
+# background segment (the implement ↔ evaluate loop) followed by the orchestrator finalize.
+nodes:
+  # Seg 1 (background): the implement ↔ evaluate loop assembling and validating the
+  # WORKFLOW.yaml from the approved plan.
+  - id: implement
+    use: task-implement
+    customize: { profile: workflow }
+    inputs:
+      plan_path: ${workflow.inputs.plan_path}
+      staging_dir: ${workflow.inputs.staging_dir}
+      last_findings: ${loop.carry.last_findings}
+    output_schema:
+      type: object
+      required: [staging_paths]
+      properties:
+        staging_paths: { type: array, items: { type: string } }
+
+  - id: evaluate
+    use: task-evaluate
+    customize: { profile: workflow }
+    depends_on: [implement]
+    inputs:
+      staging_paths: ${implement.output.staging_paths}
+      requirement: ${workflow.inputs.requirement}
+      plan_path: ${workflow.inputs.plan_path}
+      name: ${workflow.inputs.name}
+      staging_base: ${workflow.inputs.staging_dir}
+    output_schema:
+      type: object
+      required: [pass, issues]
+      properties:
+        pass: { type: boolean }
+        issues: { type: array, items: { type: object } }
+
+  # Checkpoint (orchestrator): THE canonical workflow finalize. Vendor the approved workflow
+  # into harness/ (source of truth), upsert the manifest, let sync-harness generate the
+  # .claude/ runtime copy + shim + ledger, THEN compile-workflow to populate .compiled/
+  # (sync does not compile). Shared by every creator so the vendoring can never diverge.
+  - id: finalize
+    delegation: orchestrator
+    depends_on: [implement, evaluate]
+    prompt: >
+      Finalize by vendoring the approved workflow into the harness source-of-truth and syncing
+      it into the runtime. The approved plan is at ${workflow.inputs.plan_path}; staged files are
+      ${implement.output.staging_paths}; evaluator verdict ${evaluate.output.pass} with issues
+      ${evaluate.output.issues}.
+      FIRST, if issues is non-empty (e.g. warn-severity findings that passed but were never
+      fixed), present each as severity + message and AskUserQuestion (fix-and-finalize /
+      accept-as-is / abandon): for fix-and-finalize, apply the fixes to the staged files before
+      moving them; for abandon, stop and clean staging.
+      THEN take <name> = ${workflow.inputs.name}. Compute dest = ${workflow.inputs.harness_root}/workflow-defs/<name>.
+      If dest already exists OR ${workflow.inputs.harness_yaml} already lists a workflow named
+      <name>, AskUserQuestion (overwrite / pick-new-name / abandon); pick-new-name re-computes dest.
+      Move the staged files into dest (WORKFLOW.yaml + profiles/* + references/*); do NOT include
+      any .compiled/ dir, and do NOT write a shim or copy into .claude/ directly — sync owns those.
+      THEN upsert the manifest (v2 shape): read ${workflow.inputs.harness_yaml}, and under the
+      top-level `workflows:` list add (or replace in place if already present) the entry
+      {name: <name>, source: custom, profiles: [the profile stems under dest/profiles]},
+      preserving every other entry under `microskills:`/`workflows:` and the `version` field,
+      and write it back.
+      THEN run `.claude/scripts/harness-sync --apply` from the project root and parse its JSON.
+      Exit 2 → surface and stop. Exit 1 (an unmanaged .claude/ path of the same name exists) →
+      present the conflict and AskUserQuestion (overwrite / abandon); on overwrite re-run
+      `.claude/scripts/harness-sync --apply --resolve <name>=overwrite`. Exit 0 → proceed.
+      FINALLY, now that sync has vendored the source into .claude/workflow-defs/<name>/, run
+      `.claude/scripts/compile-workflow <name>` to populate its .compiled/ run manifest (sync does
+      not compile). Print a summary: the harness/ source path, the synced .claude/ paths + generated
+      shim, and that .compiled/ was regenerated. Do not claim success on an unresolved sync conflict
+      or a failed compile.
+
+# Guarded loop: repeat implement→evaluate until the evaluator passes or the cap.
+loop:
+  while: ${!evaluate.output.pass}
+  max_iters: 3
+  body: [implement, evaluate]
+  carry:
+    last_findings: ${evaluate.output}
+
+output:
+  from: finalize

@@ -1,0 +1,4 @@
+# Profile overlay for build-workflow-from-plan. Deep-merged onto WORKFLOW.yaml by
+# compile-workflow. This workflow has no approval gate (the gate lives in the caller),
+# so there is nothing to soften for an autonomous run — base is the only profile.
+version: 1

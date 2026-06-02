@@ -31,8 +31,7 @@ inputs:
 
 imports:
   - microskills/task-plan
-  - microskills/task-implement
-  - microskills/task-evaluate
+  - workflow-defs/build-workflow-from-plan
 
 # Node definition order is load-bearing: orchestrator nodes (provision, advise)
 # come BEFORE the loop body so they don't split the implement/evaluate segment.
@@ -96,77 +95,28 @@ nodes:
       kind=adapt, name the existing workflow that already covers this. Do not
       implement anything — stop here.
 
-  # Seg 2 (background): the implement ↔ evaluate loop. Both body nodes are guarded
-  # so the advisory path skips the loop entirely (the compiled loop breaks on a
-  # fully-skipped iteration).
-  - id: implement
-    use: task-implement
-    customize: { profile: workflow }
-    when: ${plan.output.scope_advisory == null}
-    depends_on: [plan, provision]
-    inputs:
-      plan_path: ${plan.output.plan_path}
-      staging_dir: ${workflow.inputs.staging_dir}
-      last_findings: ${loop.carry.last_findings}
-    output_schema:
-      type: object
-      required: [staging_paths]
-      properties:
-        staging_paths: { type: array, items: { type: string } }
-
-  - id: evaluate
-    use: task-evaluate
-    customize: { profile: workflow }
-    when: ${plan.output.scope_advisory == null}
-    depends_on: [implement, plan]
-    inputs:
-      staging_paths: ${implement.output.staging_paths}
-      requirement: ${workflow.inputs.requirement}
-      plan_path: ${plan.output.plan_path}
-      name: ${plan.output.name}
-      staging_base: ${workflow.inputs.staging_dir}
-    output_schema:
-      type: object
-      required: [pass, issues]
-      properties:
-        pass: { type: boolean }
-        issues: { type: array, items: { type: object } }
-
-  # Checkpoint (orchestrator): vendor the approved workflow into harness/ (source of
-  # truth), upsert the manifest, let sync-harness generate the .claude/ runtime copy +
-  # shim + ledger, THEN compile-workflow to populate .compiled/ (sync does not compile).
-  - id: finalize
+  # Checkpoint (orchestrator): build the approved plan into a finalized workflow by
+  # invoking the shared build-workflow-from-plan workflow (implement ↔ evaluate loop +
+  # the canonical vendor→manifest→sync→compile finalize). Runs in the main loop — the only
+  # place a node may invoke a nested workflow. Guarded so the advisory path skips it. The
+  # build half lives in ONE place so workflow-create and decompose-monolith-orchestrator
+  # cannot drift. build-workflow-from-plan invokes no further nested workflow, so recursion
+  # stays bounded.
+  - id: build
     delegation: orchestrator
     when: ${plan.output.scope_advisory == null}
-    depends_on: [plan, implement, evaluate]
+    depends_on: [plan, provision]
     prompt: >
-      Finalize by vendoring the approved workflow into the harness source-of-truth and syncing
-      it into the runtime. The approved plan is at ${plan.output.plan_path}; staged files are
-      ${implement.output.staging_paths}; evaluator verdict ${evaluate.output.pass} with issues
-      ${evaluate.output.issues}.
-      FIRST, if issues is non-empty (e.g. warn-severity findings that passed but were never
-      fixed), present each as severity + message and AskUserQuestion (fix-and-finalize /
-      accept-as-is / abandon): for fix-and-finalize, apply the fixes to the staged files before
-      moving them; for abandon, stop and clean staging.
-      THEN take <name> = ${plan.output.name}. Compute dest = ${workflow.inputs.harness_root}/workflow-defs/<name>.
-      If dest already exists OR ${workflow.inputs.harness_yaml} already lists a workflow named
-      <name>, AskUserQuestion (overwrite / pick-new-name / abandon); pick-new-name re-computes dest.
-      Move the staged files into dest (WORKFLOW.yaml + profiles/* + references/*); do NOT include
-      any .compiled/ dir, and do NOT write a shim or copy into .claude/ directly — sync owns those.
-      THEN upsert the manifest (v2 shape): read ${workflow.inputs.harness_yaml}, and under the
-      top-level `workflows:` list add (or replace in place if already present) the entry
-      {name: <name>, source: custom, profiles: [the profile stems under dest/profiles]},
-      preserving every other entry under `microskills:`/`workflows:` and the `version` field,
-      and write it back.
-      THEN run `.claude/scripts/harness-sync --apply` from the project root and parse its JSON.
-      Exit 2 → surface and stop. Exit 1 (an unmanaged .claude/ path of the same name exists) →
-      present the conflict and AskUserQuestion (overwrite / abandon); on overwrite re-run
-      `.claude/scripts/harness-sync --apply --resolve <name>=overwrite`. Exit 0 → proceed.
-      FINALLY, now that sync has vendored the source into .claude/workflow-defs/<name>/, run
-      `.claude/scripts/compile-workflow <name>` to populate its .compiled/ run manifest (sync does
-      not compile). Print a summary: the harness/ source path, the synced .claude/ paths + generated
-      shim, and that .compiled/ was regenerated. Do not claim success on an unresolved sync conflict
-      or a failed compile.
+      Build and finalize the approved workflow. Invoke the build-workflow-from-plan workflow
+      (via the `workflow` skill) supplying plan_path = ${plan.output.plan_path},
+      name = ${plan.output.name}, requirement = ${workflow.inputs.requirement},
+      harness_root = ${workflow.inputs.harness_root}, harness_yaml = ${workflow.inputs.harness_yaml},
+      and staging_dir = ${workflow.inputs.staging_dir}. That flow runs the implement ↔ evaluate
+      loop, then vendors the workflow into harness/workflow-defs/${plan.output.name}/, upserts
+      harness.yaml (source custom), runs sync-harness to install .claude/workflow-defs/${plan.output.name}/
+      + its shim, and compiles .compiled/. Surface its result — the harness/ source path, the synced
+      .claude/ paths + generated shim, and that .compiled/ was regenerated. If the build fails or
+      its evaluator never passes, stop and surface the error — do not claim success.
 
 # Human-approval gate after `plan`: the segment boundary. Approving the plan also
 # authorizes creation of the microskills it lists under missing_microskills.
@@ -178,13 +128,8 @@ gates:
     prompt: Review the plan (node graph, reuse/profile decisions, microskills to be created). Approve to build, revise to re-plan, or abandon.
     options: [approve, revise, abandon]
 
-# Guarded loop: repeat implement→evaluate until the evaluator passes or the cap.
-loop:
-  while: ${!evaluate.output.pass}
-  max_iters: 3
-  body: [implement, evaluate]
-  carry:
-    last_findings: ${evaluate.output}
+# The implement ↔ evaluate retry loop now lives inside build-workflow-from-plan, which the
+# `build` node invokes; workflow-create no longer carries its own loop.
 
 output:
-  from: finalize
+  from: build
