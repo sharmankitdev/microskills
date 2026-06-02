@@ -18,7 +18,7 @@ A composition layer for reliable, long-running multi-agent orchestration — rid
 
 ## The problem
 
-If you've ever tried to build a multi-agent execution pipeline, you've probably fought the **determinism of the orchestration**. Today you get two bad options:
+If you've ever tried to build a multi-agent execution pipeline, you've probably fought the **determinism of the orchestration**. Today you have two choices:
 
 - **Build it as a Skill** — but Skills are *instructive* by nature, so their behavior is non-deterministic. As the pipeline grows, the orchestrator turns into a fat, rigid, verbose monolith with little room for customization.
 - **Bake it into your platform's harness** — expensive, and rarely worth it: a harness that works for *you* doesn't work for *others*, because different people and teams have different styles of working.
