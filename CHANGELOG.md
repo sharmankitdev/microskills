@@ -1,3 +1,10 @@
+## [0.2.0](https://github.com/sharmankitdev/microskills/compare/v0.1.0...v0.2.0) (2026-06-02)
+
+### Features
+
+* **catalog:** tag monolith-orchestrator components as base ([ff80007](https://github.com/sharmankitdev/microskills/commit/ff80007833c92403e48184492dd0815251be9017))
+* **initialize-harness:** detect + adopt newly-released base components ([0261024](https://github.com/sharmankitdev/microskills/commit/0261024112629a537ee37887fe6f85e0d5539063))
+
 # Changelog
 
 All notable changes to this project are documented here. Format follows
