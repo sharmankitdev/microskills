@@ -3,8 +3,9 @@ name: initialize-harness
 description: >
   Bootstrap a project's runtime from the plugin catalog. Seeds harness/harness.yaml from
   the catalog base set (if absent), then materializes the engine + every source:plugin
-  component into .claude/. The one global entry point — run once per project, and again to
-  re-pull after a plugin update. Triggered via `/initialize-harness`.
+  component into .claude/. The one global entry point — run once per project, and again
+  after a plugin update to refresh drifted components and adopt newly-released base ones.
+  Triggered via `/initialize-harness`.
 ---
 
 # Initialize Harness
@@ -27,16 +28,24 @@ Run before any other step. Execute exactly once per invocation.
 2. **Present.** Report `_plan.seeded_harness_yaml` (whether a fresh `harness.yaml` will be
    written from the base set), `_plan.engine` (action + file count), the `_plan.summary`
    counts, then list each `_plan.actions` (action · name), each `_plan.conflicts`
-   (name · path · reason), and each `_plan.errors` (name · reason). If there is nothing to
-   do (engine `noop`, no actions, no fresh seed, no conflicts/errors), report "already
-   initialized — nothing to do" and stop.
-3. **Confirm.** If there is anything to do, use `AskUserQuestion` (`apply` / `cancel`). On
-   `cancel`, stop and report that nothing was changed (the plan wrote nothing).
+   (name · path · reason), and each `_plan.errors` (name · reason). Also list
+   `_plan.available_base` (name · kind) — base components released in the catalog but not yet
+   in this project's `harness.yaml` (e.g. after a plugin update). If there is nothing to do
+   (engine `noop`, no actions, no fresh seed, **no `available_base`**, no conflicts/errors),
+   report "already initialized — nothing to do" and stop.
+3. **Confirm.** If there is anything to do, use `AskUserQuestion`. When `_plan.available_base`
+   is non-empty, offer three choices: `apply` (materialize the listed actions only),
+   `apply + adopt base` (also add the `available_base` components to `harness.yaml` as
+   `source: plugin` and materialize them), or `cancel`. When `available_base` is empty, offer
+   `apply` / `cancel`. On `cancel`, stop and report that nothing was changed (the plan wrote
+   nothing).
 4. **Apply.** Run via Bash:
-   `${CLAUDE_PLUGIN_ROOT}/catalog/scripts/initialize-harness --apply`.
+   `${CLAUDE_PLUGIN_ROOT}/catalog/scripts/initialize-harness --apply` — append `--adopt-base`
+   iff the user chose "apply + adopt base" in step 3.
    Parse stdout JSON. Exit `2` → stop and surface `error`. Exit `0` or `1` → continue.
 5. **Report.** Summarize: whether `harness.yaml` was seeded, the engine materialized, the
-   `source: plugin` components added/updated, and confirm `state_written`. Tell the user
+   `source: plugin` components added/updated, any `_result.adopted_base` newly added to
+   `harness.yaml`, and confirm `state_written`. Tell the user
    the project is initialized — they can now run `/sync-harness` for any `source: custom`
    components they author under `harness/`, plus the create flows (`/microskill-create`,
    `/workflow-create`). **Tell them to restart Claude Code**: the materialized dispatchers,

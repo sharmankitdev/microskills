@@ -174,6 +174,8 @@ harness/microskills|workflow-defs/<name>/   # committed bytes of source:custom c
 
 `initialize-harness` is the one globally-registered plugin command. On first run it seeds `harness.yaml` from the catalog's base set, lays down the engine, and materializes every `source: plugin` component. `harness-sync` then owns ONLY `source: custom` components and **never touches** plugin/engine entries (and vice versa). Both are scoped and non-destructive: a path with no ledger entry is never modified or removed.
 
+**After a plugin update**, re-run `initialize-harness`. It refreshes any `source: plugin` / engine components whose catalog bytes drifted (hash-gated update), and reports `available_base` — base components newly released in the catalog that your `harness.yaml` predates (it only *seeds* the base set on first run, when `harness.yaml` is absent — it never silently rewrites an existing manifest). Re-run with `--adopt-base` (or pick "apply + adopt base" at the `/initialize-harness` confirm gate) to append those entries as `source: plugin` and materialize them. `harness-sync` does **not** pull new base components — it is scoped to `source: custom`; a first session touching the `microskill` / `workflow` / `sync-harness` skills surfaces a one-line drift advisory pointing here.
+
 > **This repository is the plugin source.** `catalog/` is the committed source of truth; the runtime `.claude/` is **generated and gitignored — even here** (the repo dogfoods the consumer flow). After cloning, rebuild it:
 >
 > ```bash

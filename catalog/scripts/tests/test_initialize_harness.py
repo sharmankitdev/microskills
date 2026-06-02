@@ -78,3 +78,94 @@ def test_init_is_idempotent(tmp_path):
     assert second["engine"]["action"] == "noop"
     assert second["summary"]["add"] == 0
     assert second["summary"]["update"] == 0
+
+
+# --- base-offering drift detection + gated adopt --------------------------------------------
+
+# A manifest that PREDATES two base components being tagged base in the catalog — exactly the
+# reported bug. Header comment + a source:custom entry must survive an adopt rewrite.
+PARTIAL_MANIFEST = """\
+# Harness manifest (v2) — the components this project uses.
+# source: plugin → materialized by initialize-harness; source: custom → reconciled by harness-sync.
+version: 2
+microskills:
+  - name: task-plan
+    source: plugin
+  - name: task-implement
+    source: plugin
+  - name: task-evaluate
+    source: plugin
+  - name: validate-microskill
+    source: plugin
+  - name: greet-user
+    source: custom
+    profiles: [base]
+workflows:
+  - name: microskill-create
+    source: plugin
+  - name: workflow-create
+    source: plugin
+"""
+
+# Base-tagged catalog components absent from PARTIAL_MANIFEST.
+MISSING_BASE = {"analyze-monolith-orchestrator", "decompose-monolith-orchestrator"}
+
+
+def write_manifest(tmp, text):
+    hy = tmp / "harness" / "harness.yaml"
+    hy.parent.mkdir(parents=True, exist_ok=True)
+    hy.write_text(text)
+    return hy
+
+
+def run_init(tmp, *flags):
+    env = {**os.environ, "CLAUDE_PLUGIN_ROOT": str(REPO)}
+    proc = subprocess.run(
+        [sys.executable, str(INIT), *flags, "--project-root", str(tmp), "--catalog",
+         str(REPO / "catalog")],
+        capture_output=True, text=True, env=env)
+    assert proc.returncode in (0, 1), proc.stderr
+    return json.loads(proc.stdout)
+
+
+def test_available_base_detects_missing(tmp_path):
+    write_manifest(tmp_path, PARTIAL_MANIFEST)
+    plan = run_init(tmp_path, "--plan")
+    names = {b["name"] for b in plan["available_base"]}
+    assert MISSING_BASE <= names, plan["available_base"]
+    assert plan["adopted_base"] == []
+    # informational only — not materialized without adopt
+    assert {a["name"] for a in plan["actions"] if a["action"] == "add"}.isdisjoint(MISSING_BASE)
+
+
+def test_available_base_empty_when_all_listed(tmp_path):
+    init_project(tmp_path)  # seeds the FULL base set
+    plan = run_init(tmp_path, "--plan")
+    assert plan["available_base"] == []
+
+
+def test_adopt_base_appends_and_materializes(tmp_path):
+    hy = write_manifest(tmp_path, PARTIAL_MANIFEST)
+    res = run_init(tmp_path, "--apply", "--adopt-base")
+    assert {b["name"] for b in res["adopted_base"]} == MISSING_BASE
+    assert res["available_base"] == []
+    # harness.yaml now lists both, tagged source: plugin
+    text = hy.read_text()
+    for name in MISSING_BASE:
+        assert name in text
+    # materialized into .claude/
+    assert (tmp_path / ".claude" / "microskills" / "analyze-monolith-orchestrator").is_dir()
+    assert (tmp_path / ".claude" / "workflow-defs" / "decompose-monolith-orchestrator").is_dir()
+    # idempotent: re-run sees no drift and nothing new to add
+    second = run_init(tmp_path, "--plan")
+    assert second["available_base"] == []
+    assert {a["name"] for a in second["actions"] if a["action"] == "add"}.isdisjoint(MISSING_BASE)
+
+
+def test_adopt_base_preserves_header_and_custom_entry(tmp_path):
+    hy = write_manifest(tmp_path, PARTIAL_MANIFEST)
+    run_init(tmp_path, "--apply", "--adopt-base")
+    text = hy.read_text()
+    assert text.startswith("# Harness manifest (v2)")  # header comment survived
+    assert "name: greet-user" in text and "source: custom" in text  # custom entry survived
+    assert "profiles: [base]" in text  # custom entry's profiles survived
