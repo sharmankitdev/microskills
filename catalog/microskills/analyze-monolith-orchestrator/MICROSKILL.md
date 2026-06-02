@@ -1,5 +1,6 @@
 ---
 name: analyze-monolith-orchestrator
+base: true
 description: Use when you have a monolith orchestrator SKILL.md — a fat skill bundling many responsibilities and inline steps — and need to decompose it for the microskills pattern. Reads the file at skill_path and produces a structured decomposition brief that classifies each responsibility by control-flow shape, routes only the genuinely atomic ones to microskills (as pure single-action cores), hoists cross-cutting orchestration to the workflow layer, flags required sub-agents, and emits a single planner-ready decomposition_requirement string.
 ---
 

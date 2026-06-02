@@ -1,5 +1,6 @@
 version: 1
 name: decompose-monolith-orchestrator
+base: true
 description: >
   Decompose a monolith orchestrator SKILL.md into the microskills design pattern —
   analyze the monolith orchestrator into a decomposition brief, plan the
