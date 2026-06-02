@@ -108,7 +108,8 @@ workflows:
 """
 
 # Base-tagged catalog components absent from PARTIAL_MANIFEST.
-MISSING_BASE = {"analyze-monolith-orchestrator", "decompose-monolith-orchestrator"}
+MISSING_BASE = {"analyze-monolith-orchestrator", "decompose-monolith-orchestrator",
+                "build-workflow-from-plan"}
 
 
 def write_manifest(tmp, text):
@@ -156,6 +157,7 @@ def test_adopt_base_appends_and_materializes(tmp_path):
     # materialized into .claude/
     assert (tmp_path / ".claude" / "microskills" / "analyze-monolith-orchestrator").is_dir()
     assert (tmp_path / ".claude" / "workflow-defs" / "decompose-monolith-orchestrator").is_dir()
+    assert (tmp_path / ".claude" / "workflow-defs" / "build-workflow-from-plan").is_dir()
     # idempotent: re-run sees no drift and nothing new to add
     second = run_init(tmp_path, "--plan")
     assert second["available_base"] == []
