@@ -107,7 +107,7 @@ Then build:
 
 ## How it works
 
-**Author + compose.** A workflow is just a DAG. Nodes `use:` a microskill (or run an `agent:`, or hand off to an `orchestrator` checkpoint); edges are `depends_on`; gates and loops are declared inline. Here's the spine of the built-in `microskill-create` workflow:
+**Author + compose.** A workflow is just a DAG. Nodes `use:` a microskill (or run an `agent:`, or hand off to an `orchestrator` checkpoint); edges are `depends_on`; gates and loops are declared inline. To hand-write one, the full construct reference is **[DAG-RULES.md](./DAG-RULES.md)**. Here's the spine of the built-in `microskill-create` workflow:
 
 ```yaml
 nodes:
