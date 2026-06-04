@@ -5,6 +5,7 @@ Covers schema + DAG checks via subprocess against tmp_path fixtures, plus an
 end-to-end check against the real microskill-create definition.
 """
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -12,12 +13,15 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[3]
 SCRIPT = REPO / "catalog" / "scripts" / "validate-workflow"
 REAL_FLOW = REPO / "catalog" / "workflow-defs" / "microskill-create"
+# Pin the in-repo source schema (committed templates/) so tests don't read a
+# possibly-stale .claude/templates copy.
+_ENV = {**os.environ, "MICROSKILLS_TEMPLATES_ROOT": str(REPO / "templates")}
 
 
 def run(*paths):
     proc = subprocess.run(
         [sys.executable, str(SCRIPT), *[str(p) for p in paths]],
-        capture_output=True, text=True, cwd=str(REPO))
+        capture_output=True, text=True, cwd=str(REPO), env=_ENV)
     data = json.loads(proc.stdout) if proc.stdout.strip() else None
     return proc.returncode, data, proc.stderr
 
@@ -318,3 +322,147 @@ gates:
     over = _overlay(tmp_path, "gates:\n  patch:\n    - id: g1\n      prompt: PATCHED approve?\n")
     rc, data, _ = run(wf, over)
     assert rc == 0 and data["pass"] is True
+
+
+# --- N3 / N4: first-class nested workflow node (workflow: <name>) ---
+
+def run_defs(defs_root, wf_path, *extra):
+    """Run validate-workflow with an explicit --defs-root flag."""
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPT), str(wf_path), "--defs-root", str(defs_root), *[str(p) for p in extra]],
+        capture_output=True, text=True, cwd=str(REPO), env=_ENV)
+    data = json.loads(proc.stdout) if proc.stdout.strip() else None
+    return proc.returncode, data, proc.stderr
+
+
+def make_def(defs_root, name, body):
+    """Write a synthetic <defs-root>/<name>/WORKFLOW.yaml; return its path."""
+    d = defs_root / name
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / "WORKFLOW.yaml"
+    p.write_text(body)
+    return p
+
+
+# A simple leaf child with one required input and no nested workflow: node.
+CHILD = """\
+version: 1
+name: child-flow
+imports: []
+inputs:
+  seed:
+    type: string
+    required: true
+nodes:
+  - id: work
+    agent: ag
+    prompt: work on ${workflow.inputs.seed}
+output:
+  from: work
+"""
+
+# A valid parent referencing child-flow, satisfying its required `seed` input.
+PARENT = """\
+version: 1
+name: parent-flow
+imports: [child-flow]
+nodes:
+  - id: a
+    agent: ag
+    prompt: do a
+  - id: build
+    workflow: child-flow
+    depends_on: [a]
+    inputs:
+      seed: ${a.output.x}
+"""
+
+
+def test_workflow_and_use_together_blocks(tmp_path):
+    # A workflow: node may not also carry use: (or agent:). Pure shape check —
+    # fires WITHOUT --defs-root.
+    body = """\
+version: 1
+name: bad-flow
+nodes:
+  - id: build
+    workflow: child-flow
+    use: some-microskill
+    prompt: nope
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    assert any("more than one of use/agent/workflow" in i["message"] for i in data["issues"])
+
+
+def test_lone_workflow_node_passes_without_defs_root(tmp_path):
+    # Without --defs-root the nested-resolution checks are skipped, so a lone
+    # parent carrying a workflow: node still passes schema + shape (backward
+    # compatible single-file invocation).
+    rc, data, _ = run(write_wf(tmp_path, PARENT))
+    assert rc == 0, data
+    assert data["pass"] is True
+
+
+def test_valid_parent_and_child_passes_with_defs_root(tmp_path):
+    make_def(tmp_path, "child-flow", CHILD)
+    parent = make_def(tmp_path, "parent-flow", PARENT)
+    rc, data, _ = run_defs(tmp_path, parent)
+    assert rc == 0, data
+    assert data["pass"] is True
+
+
+def test_workflow_target_not_in_imports_blocks(tmp_path):
+    make_def(tmp_path, "child-flow", CHILD)
+    body = PARENT.replace("imports: [child-flow]\n", "imports: []\n")
+    parent = make_def(tmp_path, "parent-flow", body)
+    rc, data, _ = run_defs(tmp_path, parent)
+    assert rc == 1 and data["pass"] is False
+    assert any("imports" in i["message"] and "child-flow" in i["message"] for i in data["issues"])
+
+
+def test_workflow_unknown_child_blocks(tmp_path):
+    # imports lists the target but no <defs-root>/child-flow/WORKFLOW.yaml exists.
+    parent = make_def(tmp_path, "parent-flow", PARENT)
+    rc, data, _ = run_defs(tmp_path, parent)
+    assert rc == 1 and data["pass"] is False
+    assert any("does not resolve" in i["message"] or "not found" in i["message"]
+               for i in data["issues"])
+
+
+def test_workflow_import_cycle_blocks(tmp_path):
+    # parent -> child -> parent forms an import cycle.
+    child = CHILD.replace("imports: []\n", "imports: [parent-flow]\n").replace(
+        "  - id: work\n    agent: ag\n    prompt: work on ${workflow.inputs.seed}\n",
+        "  - id: work\n    workflow: parent-flow\n    inputs:\n      seed: hi\n")
+    make_def(tmp_path, "child-flow", child)
+    parent = make_def(tmp_path, "parent-flow", PARENT)
+    rc, data, _ = run_defs(tmp_path, parent)
+    assert rc == 1 and data["pass"] is False
+    assert any("cycle" in i["message"] for i in data["issues"])
+
+
+def test_workflow_depth_two_blocks(tmp_path):
+    # The child itself contains a workflow: node (grandchild) → depth-2 blocked.
+    grandchild = CHILD.replace("name: child-flow", "name: grand-flow").replace(
+        "imports: []", "imports: []")
+    make_def(tmp_path, "grand-flow", grandchild)
+    child = CHILD.replace("imports: []\n", "imports: [grand-flow]\n").replace(
+        "  - id: work\n    agent: ag\n    prompt: work on ${workflow.inputs.seed}\n",
+        "  - id: work\n    workflow: grand-flow\n    inputs:\n      seed: hi\n")
+    make_def(tmp_path, "child-flow", child)
+    parent = make_def(tmp_path, "parent-flow", PARENT)
+    rc, data, _ = run_defs(tmp_path, parent)
+    assert rc == 1 and data["pass"] is False
+    assert any("depth" in i["message"] or "grandchild" in i["message"]
+               for i in data["issues"])
+
+
+def test_workflow_missing_required_child_input_blocks(tmp_path):
+    # The child requires `seed`, but the parent's workflow: node omits it.
+    make_def(tmp_path, "child-flow", CHILD)
+    body = PARENT.replace("    inputs:\n      seed: ${a.output.x}\n", "")
+    parent = make_def(tmp_path, "parent-flow", body)
+    rc, data, _ = run_defs(tmp_path, parent)
+    assert rc == 1 and data["pass"] is False
+    assert any("requires input 'seed'" in i["message"] for i in data["issues"])

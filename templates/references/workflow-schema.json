@@ -19,8 +19,8 @@
     },
     "imports": {
       "type": "array",
-      "items": { "type": "string" },
-      "description": "Optional, advisory: paths to the microskills/agents this composes. The compiler resolves names directly, so this documents dependencies."
+      "items": { "type": "string", "pattern": "^[a-z][a-z0-9-]*(/[a-z][a-z0-9-]*)?$" },
+      "description": "Load-bearing child-workflow allowlist for `workflow:` nodes: every bare child-workflow name a `workflow:` node may invoke MUST be listed here (used by validate-workflow for nested-target resolution + import-cycle detection). A legacy `<dir>/<name>` advisory form is still accepted for un-migrated defs but is ignored by the nested-resolution pass."
     },
     "inputs": {
       "type": "object",
@@ -48,6 +48,7 @@
           "id": { "type": "string", "pattern": "^[a-z][a-z0-9_-]*$", "description": "Unique node id within the workflow." },
           "use": { "type": "string", "description": "Bare microskill name (resolved via resolve-microskill)." },
           "agent": { "type": "string", "description": "Agent type to invoke for this node (e.g. microskill-planner)." },
+          "workflow": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$", "description": "Bare child-workflow name (kebab-case) invoked as an orchestrator checkpoint. Must be listed in the top-level `imports` allowlist. Mutually exclusive with use:/agent:; carries inputs/depends_on/when/for_each/as." },
           "depends_on": { "type": "array", "items": { "type": "string" }, "description": "Upstream node ids. Every ${<id>.output...} reference MUST be declared here." },
           "when": { "type": "string", "description": "Deterministic JS condition (inner of ${...}); false → node skipped." },
           "for_each": { "type": "string", "description": "Expression resolving to a collection → fan-out one instance per item." },

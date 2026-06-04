@@ -39,10 +39,17 @@ SCRIPT = Path(__file__).resolve()
 
 
 def _templates_root(script):
-    """Locate templates/ (schemas + component templates): prefer the materialized runtime
-    copy under .claude/, then ${CLAUDE_PLUGIN_ROOT}, then the in-repo dogfood source."""
+    """Locate templates/ (schemas + component templates): an explicit
+    MICROSKILLS_TEMPLATES_ROOT override wins (used by hermetic tests to pin the
+    in-repo source schema before a reconcile materializes .claude/), then prefer
+    the materialized runtime copy under .claude/, then ${CLAUDE_PLUGIN_ROOT},
+    then the in-repo dogfood source."""
     proj = script.parents[2]
-    cands = [proj / ".claude" / "templates"]
+    cands = []
+    override = os.environ.get("MICROSKILLS_TEMPLATES_ROOT")
+    if override:
+        cands.append(Path(override))
+    cands.append(proj / ".claude" / "templates")
     env = os.environ.get("CLAUDE_PLUGIN_ROOT")
     if env:
         cands.append(Path(env) / "templates")
@@ -91,10 +98,43 @@ def refs_in(obj):
     return out
 
 
+def load_child_doc(defs_root, name):
+    """PURE child read: load <defs-root>/<name>/WORKFLOW.yaml as a dict.
+    Never touches the child's .compiled/manifest.json (compile/validate must stay
+    byte-identical-deterministic w.r.t. a single source — the WORKFLOW.yaml).
+    Returns (doc, error_message): doc is None when the file is missing/unparseable."""
+    wf = Path(defs_root) / name / "WORKFLOW.yaml"
+    if not wf.exists():
+        return None, f"does not resolve to {wf}"
+    try:
+        return (yaml.safe_load(wf.read_text()) or {}), None
+    except yaml.YAMLError as e:
+        return None, f"child '{name}' WORKFLOW.yaml parse error: {e}"
+
+
+def workflow_node_targets(doc):
+    """The child-workflow names referenced by this doc's workflow: nodes (in order)."""
+    out = []
+    for n in (doc.get("nodes") or []):
+        if isinstance(n, dict) and n.get("workflow"):
+            out.append(n["workflow"])
+    return out
+
+
+def required_inputs_of(doc):
+    """Names of inputs marked required:true in a (parent or child) doc."""
+    return {name for name, spec in (doc.get("inputs") or {}).items()
+            if isinstance(spec, dict) and spec.get("required")}
+
+
 def main():
     ap = argparse.ArgumentParser(description="Validate a WORKFLOW.yaml (+ optional profile overlays).")
     ap.add_argument("workflow", help="Path to WORKFLOW.yaml")
     ap.add_argument("configs", nargs="*", help="Optional profile YAML overlays to merge before validation")
+    ap.add_argument("--defs-root", default=None,
+                    help="Workflow-defs root enabling nested-workflow (workflow:) resolution checks "
+                         "(import allowlist, target resolution, import-cycle, depth=1, required-child-input). "
+                         "Absent → those checks are skipped (backward-compatible single-file validation).")
     args = ap.parse_args()
 
     issues = []
@@ -167,10 +207,17 @@ def main():
     for nid, n in node_by_id.items():
         has_use = bool(n.get("use"))
         has_agent = bool(n.get("agent"))
+        has_wf = bool(n.get("workflow"))
         is_orch = n.get("delegation") == "orchestrator"
-        if has_use and has_agent:
-            add(issues, "block", f"nodes/{nid}", "node has both 'use' and 'agent'; choose one")
-        if not has_use and not has_agent and not is_orch:
+        # The three node kinds (use:/agent:/workflow:) are mutually exclusive.
+        kinds = [k for k, present in
+                 (("use", has_use), ("agent", has_agent), ("workflow", has_wf)) if present]
+        if len(kinds) > 1:
+            add(issues, "block", f"nodes/{nid}",
+                f"node has more than one of use/agent/workflow ({', '.join(kinds)}); choose one")
+        # A workflow: node is its own kind (an orchestrator checkpoint) — it is
+        # exempt from the neither-use-nor-agent block.
+        if not has_use and not has_agent and not has_wf and not is_orch:
             add(issues, "block", f"nodes/{nid}",
                 "node has neither 'use' nor 'agent'; only allowed for an orchestrator-native step (delegation: orchestrator)")
 
@@ -262,6 +309,103 @@ def main():
     out = merged.get("output")
     if isinstance(out, dict) and out.get("from") and out["from"] not in id_set:
         add(issues, "block", "output", f"'from' references unknown node '{out['from']}'")
+
+    # --- Nested-workflow (workflow:) resolution — only with --defs-root ---
+    # LOCKED: when --defs-root is ABSENT these checks are skipped, so existing
+    # single-file invocations of validate-workflow stay backward-compatible.
+    wf_nodes = [(nid, n) for nid, n in node_by_id.items() if n.get("workflow")]
+    if args.defs_root and wf_nodes:
+        defs_root = Path(args.defs_root)
+        imports_set = {imp for imp in (merged.get("imports") or []) if isinstance(imp, str)}
+
+        # Resolve + cache every reachable child doc once (PURE: WORKFLOW.yaml only).
+        child_cache = {}
+
+        def child_doc(name):
+            if name not in child_cache:
+                child_cache[name] = load_child_doc(defs_root, name)
+            return child_cache[name]
+
+        for nid, n in wf_nodes:
+            target = n["workflow"]
+            # (a) target must be declared in the imports allowlist.
+            if target not in imports_set:
+                add(issues, "block", f"nodes/{nid}",
+                    f"workflow: '{target}' is not listed in the top-level 'imports' allowlist")
+                continue
+            # (b) target must resolve to a child WORKFLOW.yaml.
+            doc, err = child_doc(target)
+            if doc is None:
+                add(issues, "block", f"nodes/{nid}",
+                    f"workflow: '{target}' {err}")
+                continue
+            # (c) DEPTH=1: a child that itself contains a workflow: node is a
+            # grandchild nesting — hard-blocked (no dispatcher re-entrancy guard).
+            gtargets = workflow_node_targets(doc)
+            if gtargets:
+                add(issues, "block", f"nodes/{nid}",
+                    f"workflow: '{target}' itself contains a nested workflow: node "
+                    f"({', '.join(sorted(set(gtargets)))}); nesting depth > 1 is not allowed")
+            # (d) N4 child contract (PURE, from child WORKFLOW.yaml): every
+            # required child input must be supplied by this node's inputs.
+            supplied = set((n.get("inputs") or {}).keys())
+            for req in sorted(required_inputs_of(doc)):
+                if req not in supplied:
+                    add(issues, "block", f"nodes/{nid}",
+                        f"workflow: '{target}' requires input '{req}' but the node's inputs omit it")
+            # (e) N4 output-shape reference: WARN (not block) when a
+            # ${<nid>.output.<field>} ref names a field the child's declared output
+            # node does not expose.
+            child_out = doc.get("output")
+            child_fields = None
+            if isinstance(child_out, dict) and child_out.get("from"):
+                cby = {cn.get("id"): cn for cn in (doc.get("nodes") or [])
+                       if isinstance(cn, dict)}
+                producer = cby.get(child_out["from"])
+                if isinstance(producer, dict):
+                    osch = producer.get("output_schema")
+                    if isinstance(osch, dict) and isinstance(osch.get("properties"), dict):
+                        child_fields = set(osch["properties"].keys())
+            if child_fields is not None:
+                pat = re.compile(r"\b" + re.escape(nid) + r"\.output\.([a-zA-Z0-9_]+)")
+                for other_id, other in node_by_id.items():
+                    refsrc = {k: other.get(k) for k in
+                              ("inputs", "prompt", "when", "for_each") if k in other}
+                    for s in collect_strings(refsrc):
+                        for fld in pat.findall(s):
+                            if fld not in child_fields:
+                                add(issues, "warn", f"nodes/{other_id}",
+                                    f"references ${{{nid}.output.{fld}}} but child workflow "
+                                    f"'{target}' output does not declare field '{fld}'")
+
+        # (f) Import-cycle DFS over the IMPORT graph reachable from this workflow.
+        # 3-color: a GRAY back-edge is a cycle. Adjacency = a doc's workflow: targets
+        # restricted to its own imports allowlist (only resolvable children).
+        root_name = merged.get("name")
+        IWHITE, IGRAY, IBLACK = 0, 1, 2
+        icolor = {}
+
+        def doc_imports(doc):
+            return {imp for imp in (doc.get("imports") or []) if isinstance(imp, str)}
+
+        def ivisit(name, doc, stack):
+            icolor[name] = IGRAY
+            allow = doc_imports(doc)
+            for tgt in workflow_node_targets(doc):
+                if tgt not in allow:
+                    continue  # already reported as not-in-imports for the root
+                if icolor.get(tgt) == IGRAY:
+                    add(issues, "block", "imports",
+                        f"workflow import cycle: {' -> '.join(stack + [name, tgt])}")
+                    continue
+                if icolor.get(tgt, IWHITE) == IWHITE:
+                    cdoc, _ = child_doc(tgt)
+                    if cdoc is not None:
+                        ivisit(tgt, cdoc, stack + [name])
+            icolor[name] = IBLACK
+
+        if root_name:
+            ivisit(root_name, merged, [])
 
     passed = not any(i["severity"] == "block" for i in issues)
     print(json.dumps({"pass": passed, "issues": issues}, indent=2))

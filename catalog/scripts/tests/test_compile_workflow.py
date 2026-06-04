@@ -5,6 +5,7 @@ Hermetic fixtures use --defs-root pointing at tmp_path; one end-to-end test
 compiles the real microskill-create.
 """
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -14,12 +15,15 @@ SCRIPT = REPO / "catalog" / "scripts" / "compile-workflow"
 # REAL_DEFS stays the runtime: compile writes .compiled/ here and resolves the use:
 # microskills it references from .claude/microskills (both require a dogfood init first).
 REAL_DEFS = REPO / ".claude" / "workflow-defs"
+# Pin the in-repo source schema so tests exercise the committed templates/ rather
+# than a possibly-stale .claude/templates materialized by an earlier reconcile.
+_ENV = {**os.environ, "MICROSKILLS_TEMPLATES_ROOT": str(REPO / "templates")}
 
 
 def run(defs_root, name, *args):
     proc = subprocess.run(
         [sys.executable, str(SCRIPT), name, "--defs-root", str(defs_root), *args],
-        capture_output=True, text=True, cwd=str(REPO))
+        capture_output=True, text=True, cwd=str(REPO), env=_ENV)
     data = json.loads(proc.stdout) if proc.stdout.strip().startswith("{") else None
     return proc.returncode, data, proc.stdout, proc.stderr
 
@@ -370,3 +374,98 @@ def test_node_verb_error_emits_clean_json(tmp_path):
     assert rc == 1
     assert data is not None and "list-verb error" in data["error"]
     assert "Traceback" not in err
+
+
+# --- N2: first-class nested workflow node (workflow: <name>) ---
+
+NESTED = """\
+version: 1
+name: parent-flow
+imports: [child-flow]
+inputs:
+  topic:
+    type: string
+    required: true
+nodes:
+  - id: a
+    agent: ag
+    prompt: do a
+  - id: build
+    workflow: child-flow
+    depends_on: [a]
+    inputs:
+      seed: ${a.output.x}
+      topic: ${workflow.inputs.topic}
+"""
+
+
+def _manifest(tmp_path, name):
+    return json.loads((tmp_path / name / ".compiled" / "manifest.json").read_text())
+
+
+def test_nested_workflow_node_is_orchestrator_checkpoint(tmp_path):
+    # A workflow: node classifies as an orchestrator checkpoint and forces a
+    # split: the preceding agent node `a` is its own segment.
+    make_flow(tmp_path, "parent-flow", NESTED)
+    rc, data, out, err = run(tmp_path, "parent-flow")
+    assert rc == 0, err
+    assert data["segments"] == 1
+    assert data["sequence"] == ["segment[a]", "nested_workflow"]
+
+
+def test_nested_workflow_checkpoint_shape(tmp_path):
+    # The emitted checkpoint carries checkpoint_type nested_workflow, the child
+    # name, the node id, depends_on, and the inputs dict with ${...} refs
+    # preserved verbatim (resolved later by the dispatcher).
+    make_flow(tmp_path, "parent-flow", NESTED)
+    rc, data, out, err = run(tmp_path, "parent-flow")
+    assert rc == 0, err
+    m = _manifest(tmp_path, "parent-flow")
+    chk = [s for s in m["steps"] if s["kind"] == "checkpoint"][0]
+    assert chk["checkpoint_type"] == "nested_workflow"
+    assert chk["workflow"] == "child-flow"
+    assert chk["node"] == "build"
+    assert chk["depends_on"] == ["a"]
+    assert chk["inputs"] == {"seed": "${a.output.x}", "topic": "${workflow.inputs.topic}"}
+
+
+def test_nested_workflow_when_for_each_as_copied(tmp_path):
+    body = """\
+version: 1
+name: fe-parent
+imports: [child-flow]
+inputs:
+  items:
+    type: array
+    required: true
+nodes:
+  - id: gate_in
+    agent: ag
+    prompt: gate
+  - id: fan
+    workflow: child-flow
+    depends_on: [gate_in]
+    when: ${gate_in.output.ok}
+    for_each: ${workflow.inputs.items}
+    as: item
+    inputs:
+      one: ${item}
+"""
+    make_flow(tmp_path, "fe-parent", body)
+    rc, data, out, err = run(tmp_path, "fe-parent")
+    assert rc == 0, err
+    m = _manifest(tmp_path, "fe-parent")
+    chk = [s for s in m["steps"] if s["kind"] == "checkpoint"][0]
+    assert chk["checkpoint_type"] == "nested_workflow"
+    assert chk["when"] == "${gate_in.output.ok}"
+    assert chk["for_each"] == "${workflow.inputs.items}"
+    assert chk["as"] == "item"
+
+
+def test_nested_workflow_deterministic(tmp_path):
+    make_flow(tmp_path, "parent-flow", NESTED)
+    run(tmp_path, "parent-flow")
+    first = {p.name: p.read_text() for p in (tmp_path / "parent-flow" / ".compiled").iterdir()}
+    run(tmp_path, "parent-flow")
+    second = {p.name: p.read_text() for p in (tmp_path / "parent-flow" / ".compiled").iterdir()}
+    assert first == second

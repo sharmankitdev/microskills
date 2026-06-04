@@ -55,10 +55,17 @@ DEFAULT_DEFS_ROOT = PROJECT_ROOT / ".claude" / "workflow-defs"
 
 
 def _templates_root(script):
-    """Locate templates/ (schemas + component templates): prefer the materialized runtime
-    copy under .claude/, then ${CLAUDE_PLUGIN_ROOT}, then the in-repo dogfood source."""
+    """Locate templates/ (schemas + component templates): an explicit
+    MICROSKILLS_TEMPLATES_ROOT override wins (used by hermetic tests to pin the
+    in-repo source schema before a reconcile materializes .claude/), then prefer
+    the materialized runtime copy under .claude/, then ${CLAUDE_PLUGIN_ROOT},
+    then the in-repo dogfood source."""
     proj = script.parents[2]
-    cands = [proj / ".claude" / "templates"]
+    cands = []
+    override = os.environ.get("MICROSKILLS_TEMPLATES_ROOT")
+    if override:
+        cands.append(Path(override))
+    cands.append(proj / ".claude" / "templates")
     env = os.environ.get("CLAUDE_PLUGIN_ROOT")
     if env:
         cands.append(Path(env) / "templates")
@@ -150,6 +157,11 @@ def classify(node, gates_after, defs_root):
         return "orchestrator"
     if deleg == "auto":
         return "background"
+    # A nested-workflow node is always an orchestrator checkpoint (background
+    # segments can't re-enter the dispatcher). Classify it BEFORE use/agent so it
+    # never reaches microskill resolution.
+    if node.get("workflow"):
+        return "orchestrator"
     has_use = bool(node.get("use"))
     has_agent = bool(node.get("agent"))
     if not has_use and not has_agent:
@@ -461,8 +473,17 @@ def main():
         klass = classify(node, gates_after, defs_root)
         if klass == "orchestrator":
             flush_segment()
-            chk = {"kind": "checkpoint", "checkpoint_type": "orchestrator_node", "node": nid,
-                   "prompt": node.get("prompt", ""), "depends_on": node.get("depends_on") or []}
+            if node.get("workflow"):
+                # Nested-workflow checkpoint: the dispatcher re-enters the workflow
+                # skill on this child. inputs values stay as raw ${...} refs —
+                # the dispatcher resolves them against workflow inputs + upstream
+                # node results at run time.
+                chk = {"kind": "checkpoint", "checkpoint_type": "nested_workflow", "node": nid,
+                       "workflow": node["workflow"], "inputs": node.get("inputs") or {},
+                       "depends_on": node.get("depends_on") or []}
+            else:
+                chk = {"kind": "checkpoint", "checkpoint_type": "orchestrator_node", "node": nid,
+                       "prompt": node.get("prompt", ""), "depends_on": node.get("depends_on") or []}
             # when/for_each/as are handled by the dispatcher for orchestrator nodes.
             for k in ("when", "for_each", "as"):
                 if node.get(k) is not None:
