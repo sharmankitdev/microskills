@@ -1,3 +1,9 @@
+## [0.4.0](https://github.com/sharmankitdev/microskills/compare/v0.3.0...v0.4.0) (2026-06-04)
+
+### Features
+
+* **workflow:** profile-driven composition, nested workflows, and DAG safety/ergonomics ([#4](https://github.com/sharmankitdev/microskills/issues/4)) ([2f29bb9](https://github.com/sharmankitdev/microskills/commit/2f29bb994da7cdb43344b83ad8691dab666f137c)), closes [#3](https://github.com/sharmankitdev/microskills/issues/3) [#2](https://github.com/sharmankitdev/microskills/issues/2) [#1](https://github.com/sharmankitdev/microskills/issues/1)
+
 ## [0.3.0](https://github.com/sharmankitdev/microskills/compare/v0.2.0...v0.3.0) (2026-06-02)
 
 ### Features
