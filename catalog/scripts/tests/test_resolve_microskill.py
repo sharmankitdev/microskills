@@ -8,6 +8,8 @@ gates append, null deletion, output_schema).
 
 Run:  python3 -m pytest .claude/scripts/tests/ -v
 """
+import importlib.machinery
+import importlib.util
 import json
 import os
 import re
@@ -21,6 +23,16 @@ import pytest
 REPO = Path(__file__).resolve().parents[3]
 SCRIPT = REPO / "catalog" / "scripts" / "resolve-microskill"
 REAL_MICROSKILLS_ROOT = REPO / "catalog" / "microskills"
+
+
+def load_resolver():
+    """Load the extensionless resolve-microskill script as a module so its pure
+    helpers (deep_merge, apply_list_verbs) can be unit-tested directly."""
+    loader = importlib.machinery.SourceFileLoader("resolve_microskill", str(SCRIPT))
+    spec = importlib.util.spec_from_loader("resolve_microskill", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
 
 
 def run(skill, *args, skill_root=None, env=None):
@@ -1150,3 +1162,246 @@ def test_gate_anchored_to_nonexistent_step_warns(tmp_path):
     assert "## Gates (resolved)" in rendered
     assert "stray" in rendered
     assert any("stray" in w and "step 9" in w and "does not exist" in w for w in data["warnings"])
+
+
+# ---------------------------------------------------------------------------
+# P1.0 keyed-list deep_merge verb engine (apply_list_verbs + deep_merge routing)
+#
+# Unit tests load the resolver as a module and drive the pure helpers directly,
+# so verb mechanics are exercised on arbitrary lists without the closed config
+# schema interfering. Integration tests at the bottom route verbs through the
+# only schema-legal list-of-objects-with-id field (gates.add) via the subprocess.
+# ---------------------------------------------------------------------------
+
+
+def test_apply_list_verbs_patch_by_id_preserves_position():
+    mod = load_resolver()
+    base = [{"id": "a", "v": 1}, {"id": "b", "v": 2}, {"id": "c", "v": 3}]
+    out = mod.apply_list_verbs(base, {"patch": [{"id": "b", "v": 20, "extra": "x"}]}, path="lst")
+    # position of b preserved, fields deep-merged in place
+    assert [e["id"] for e in out] == ["a", "b", "c"]
+    assert out[1] == {"id": "b", "v": 20, "extra": "x"}
+    # original base untouched (new list returned)
+    assert base[1] == {"id": "b", "v": 2}
+
+
+def test_apply_list_verbs_remove_drops_and_preserves_order():
+    mod = load_resolver()
+    base = [{"id": "a"}, {"id": "b"}, {"id": "c"}]
+    out = mod.apply_list_verbs(base, {"remove": ["b"]}, path="lst")
+    assert [e["id"] for e in out] == ["a", "c"]
+    assert base == [{"id": "a"}, {"id": "b"}, {"id": "c"}]
+
+
+def test_apply_list_verbs_add_appends_at_end():
+    mod = load_resolver()
+    base = [{"id": "a"}, {"id": "b"}]
+    out = mod.apply_list_verbs(base, {"add": [{"id": "z", "v": 9}]}, path="lst")
+    assert [e["id"] for e in out] == ["a", "b", "z"]
+    assert out[-1] == {"id": "z", "v": 9}
+
+
+def test_apply_list_verbs_add_id_collision_raises():
+    mod = load_resolver()
+    base = [{"id": "a"}, {"id": "b"}]
+    with pytest.raises(ValueError) as ei:
+        mod.apply_list_verbs(base, {"add": [{"id": "a"}]}, path="lst")
+    assert "a" in str(ei.value)
+    assert "lst" in str(ei.value)
+
+
+def test_apply_list_verbs_remove_patch_add_combined_in_order():
+    mod = load_resolver()
+    base = [{"id": "a", "v": 1}, {"id": "b", "v": 2}, {"id": "c", "v": 3}]
+    # remove runs first (drops c), then patch (b in place), then add (append d).
+    # 'c' may be re-added by add because remove ran before the add collision check.
+    verbs = {
+        "remove": ["c"],
+        "patch": [{"id": "b", "v": 22}],
+        "add": [{"id": "d", "v": 4}, {"id": "c", "v": 30}],
+    }
+    out = mod.apply_list_verbs(base, verbs, path="lst")
+    assert [e["id"] for e in out] == ["a", "b", "d", "c"]
+    assert out[1] == {"id": "b", "v": 22}
+    assert out[3] == {"id": "c", "v": 30}
+
+
+def test_apply_list_verbs_missing_patch_id_raises():
+    mod = load_resolver()
+    base = [{"id": "a"}]
+    with pytest.raises(ValueError) as ei:
+        mod.apply_list_verbs(base, {"patch": [{"id": "ghost", "v": 1}]}, path="lst")
+    assert "ghost" in str(ei.value)
+    assert "lst" in str(ei.value)
+
+
+def test_apply_list_verbs_missing_remove_id_raises():
+    mod = load_resolver()
+    base = [{"id": "a"}]
+    with pytest.raises(ValueError) as ei:
+        mod.apply_list_verbs(base, {"remove": ["ghost"]}, path="lst")
+    assert "ghost" in str(ei.value)
+    assert "lst" in str(ei.value)
+
+
+def test_deep_merge_routes_verb_dict_over_list():
+    mod = load_resolver()
+    base = {"lst": [{"id": "a", "v": 1}, {"id": "b", "v": 2}]}
+    overlay = {"lst": {"patch": [{"id": "a", "v": 11}], "add": [{"id": "c"}]}}
+    out = mod.deep_merge(base, overlay)
+    assert [e["id"] for e in out["lst"]] == ["a", "b", "c"]
+    assert out["lst"][0] == {"id": "a", "v": 11}
+
+
+def test_deep_merge_mixed_key_dict_over_list_raises():
+    mod = load_resolver()
+    base = {"lst": [{"id": "a"}]}
+    # a dict with a non-verb key mixed in cannot merge onto a list
+    overlay = {"lst": {"add": [{"id": "b"}], "bogus": 1}}
+    with pytest.raises(ValueError) as ei:
+        mod.deep_merge(base, overlay)
+    assert "lst" in str(ei.value)
+
+
+def test_deep_merge_empty_dict_over_list_keeps_existing_behavior():
+    mod = load_resolver()
+    base = {"lst": [{"id": "a"}]}
+    # empty dict is NOT a verb dict (non-empty subset required) -> falls through to
+    # the existing wholesale-replace branch (dict replaces the list)
+    out = mod.deep_merge(base, {"lst": {}})
+    assert out["lst"] == {}
+
+
+def test_deep_merge_plain_list_over_list_still_replaces():
+    mod = load_resolver()
+    base = {"runtime": {"allowed_tools": ["Read", "Write"]}}
+    overlay = {"runtime": {"allowed_tools": ["Glob"]}}
+    out = mod.deep_merge(base, overlay)
+    assert out["runtime"]["allowed_tools"] == ["Glob"]
+
+
+def test_deep_merge_gates_add_literal_append_untouched():
+    mod = load_resolver()
+    base = {"gates": {"add": [{"id": "gate_one"}]}}
+    overlay = {"gates": {"add": [{"id": "gate_two"}]}}
+    out = mod.deep_merge(base, overlay)
+    # list-onto-list at gates.add still appends (regression — NOT routed to verbs)
+    assert [g["id"] for g in out["gates"]["add"]] == ["gate_one", "gate_two"]
+
+
+def test_deep_merge_remove_verb_and_null_delete_coexist():
+    mod = load_resolver()
+    base = {"lst": [{"id": "a"}, {"id": "b"}], "doomed": "x", "keep": 1}
+    # 'remove' verb drops the list entry 'a'; null over 'doomed' pops the key.
+    # The two mechanisms must not collide.
+    overlay = {"lst": {"remove": ["a"]}, "doomed": None}
+    out = mod.deep_merge(base, overlay)
+    assert [e["id"] for e in out["lst"]] == ["b"]
+    assert "doomed" not in out
+    assert out["keep"] == 1
+
+
+# --- Integration: verbs through the real resolver via gates.add (schema-legal) ---
+
+
+def test_resolver_verb_patch_through_gates_add(tmp_path):
+    body = MINIMAL_SKILL.format(name="verb-patch-fixture")
+    base_cfg = textwrap.dedent("""\
+        version: 1
+        gates:
+          add:
+            - id: gate_alpha
+              after: "1"
+              type: verification
+              severity: hard
+            - id: gate_beta
+              after: "2"
+              type: verification
+              severity: hard
+        """)
+    overlay_cfg = textwrap.dedent("""\
+        version: 1
+        gates:
+          add:
+            patch:
+              - id: gate_alpha
+                severity: warn
+        """)
+    make_skill(
+        tmp_path,
+        "verb-patch-fixture",
+        body,
+        default_cfg=base_cfg,
+        profiles={"soften": overlay_cfg},
+    )
+    code, data, _, err = run("verb-patch-fixture", "--profile", "soften", skill_root=tmp_path)
+    assert code == 0, err
+    add = data["config"]["gates"]["add"]
+    # order preserved, alpha patched in place, beta untouched
+    assert [g["id"] for g in add] == ["gate_alpha", "gate_beta"]
+    assert add[0]["severity"] == "warn"
+    assert add[1]["severity"] == "hard"
+
+
+def test_resolver_verb_remove_and_add_through_gates_add(tmp_path):
+    body = MINIMAL_SKILL.format(name="verb-rm-add-fixture")
+    base_cfg = textwrap.dedent("""\
+        version: 1
+        gates:
+          add:
+            - id: gate_alpha
+              after: "1"
+              type: verification
+            - id: gate_beta
+              after: "2"
+              type: verification
+        """)
+    overlay_cfg = textwrap.dedent("""\
+        version: 1
+        gates:
+          add:
+            remove: [gate_alpha]
+            add:
+              - id: gate_gamma
+                after: "2"
+                type: verification
+        """)
+    make_skill(
+        tmp_path,
+        "verb-rm-add-fixture",
+        body,
+        default_cfg=base_cfg,
+        profiles={"reshape": overlay_cfg},
+    )
+    code, data, _, err = run("verb-rm-add-fixture", "--profile", "reshape", skill_root=tmp_path)
+    assert code == 0, err
+    add = data["config"]["gates"]["add"]
+    assert [g["id"] for g in add] == ["gate_beta", "gate_gamma"]
+
+
+def test_resolver_verb_missing_remove_id_blocks(tmp_path):
+    body = MINIMAL_SKILL.format(name="verb-bad-rm-fixture")
+    base_cfg = textwrap.dedent("""\
+        version: 1
+        gates:
+          add:
+            - id: gate_alpha
+              after: "1"
+              type: verification
+        """)
+    overlay_cfg = textwrap.dedent("""\
+        version: 1
+        gates:
+          add:
+            remove: [no_such_gate]
+        """)
+    make_skill(
+        tmp_path,
+        "verb-bad-rm-fixture",
+        body,
+        default_cfg=base_cfg,
+        profiles={"reshape": overlay_cfg},
+    )
+    code, data, _, err = run("verb-bad-rm-fixture", "--profile", "reshape", skill_root=tmp_path)
+    assert code == 1, err
+    assert "no_such_gate" in data["error"]

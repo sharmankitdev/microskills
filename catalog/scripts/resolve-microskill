@@ -66,6 +66,62 @@ GATE_AFTER_STEP_RE = re.compile(r"^(?:step_)?(\d+)$")
 GATE_ID_COMMENT_RE = re.compile(r"<!--\s*gate-id:\s*([a-z][a-z0-9_-]*)\s*-->")
 
 
+LIST_VERBS = ("add", "patch", "remove")
+
+
+def apply_list_verbs(base_list, verbs, key="id", path=""):
+    """Apply id-addressable add/patch/remove verbs to a list-of-objects, returning
+    a NEW list (the input is never mutated).
+
+    Order is REMOVE -> PATCH -> ADD:
+      - remove: drop the base entry whose [key] == id, for each id in verbs['remove'].
+        A missing id is an error (it names something that isn't there).
+      - patch: for each object (carrying a [key]) in verbs['patch'], find the entry
+        by id and deep_merge the patch INTO it, preserving its position. Missing id -> error.
+      - add: append each object in verbs['add'] in order. An id that already exists
+        (after removes) is a collision error.
+
+    Entries without a [key] cannot be addressed; a verb referencing a missing id
+    already raises, so unaddressable entries simply survive untouched.
+    """
+    where = f" at '{path}'" if path else ""
+
+    def find_index(entries, target_id):
+        for i, e in enumerate(entries):
+            if isinstance(e, dict) and e.get(key) == target_id:
+                return i
+        return None
+
+    result = [dict(e) if isinstance(e, dict) else e for e in base_list]
+
+    for rid in verbs.get("remove", []) or []:
+        idx = find_index(result, rid)
+        if idx is None:
+            raise ValueError(
+                f"list-verb remove{where}: no entry with {key}={rid!r} to remove"
+            )
+        result.pop(idx)
+
+    for patch in verbs.get("patch", []) or []:
+        pid = patch.get(key) if isinstance(patch, dict) else None
+        idx = find_index(result, pid)
+        if idx is None:
+            raise ValueError(
+                f"list-verb patch{where}: no entry with {key}={pid!r} to patch"
+            )
+        result[idx] = deep_merge(result[idx], patch, path)
+
+    for add in verbs.get("add", []) or []:
+        aid = add.get(key) if isinstance(add, dict) else None
+        if find_index(result, aid) is not None:
+            raise ValueError(
+                f"list-verb add{where}: entry with {key}={aid!r} already exists (collision)"
+            )
+        result.append(add)
+
+    return result
+
+
 def deep_merge(base, overlay, path=""):
     if not isinstance(base, dict) or not isinstance(overlay, dict):
         return overlay
@@ -76,6 +132,21 @@ def deep_merge(base, overlay, path=""):
             result.pop(k, None)
             continue
         if k in result:
+            if isinstance(result[k], list) and isinstance(v, dict) and v:
+                # An overlay dict over a base list is the id-addressable list-verb
+                # form: {add:[...], patch:[...], remove:[ids]}. A non-empty dict whose
+                # keys are a subset of the verb set routes to apply_list_verbs (runs
+                # INSIDE the merge, before --override / strip_nulls, so REMOVE never
+                # fights the null-delete key-pop above). A dict carrying any non-verb
+                # key cannot meaningfully merge onto a list -> error. An EMPTY dict is
+                # not a verb dict and falls through to the legacy replace branch below.
+                if set(v.keys()) <= set(LIST_VERBS):
+                    result[k] = apply_list_verbs(result[k], v, path=cur_path)
+                    continue
+                raise ValueError(
+                    f"cannot merge dict with non-verb keys onto list at '{cur_path}': "
+                    f"{sorted(v.keys())} (allowed verbs: {sorted(LIST_VERBS)})"
+                )
             if cur_path == "output_schema":
                 # output_schema is a contract, not a knob: an overlay replaces it
                 # wholesale (never a recursive properties-merge that would let base
@@ -566,7 +637,13 @@ def main():
                 emit_and_exit({
                     "error": f"profile '{effective_profile}': inputs.<name>.default is base-only; found in: {overlay_default_inputs}"
                 }, 1)
-            cfg = deep_merge(cfg, overlay_cfg)
+            try:
+                cfg = deep_merge(cfg, overlay_cfg)
+            except ValueError as e:
+                sys.stderr.write(f"profile '{effective_profile}' list-verb error: {e}\n")
+                emit_and_exit({
+                    "error": f"profile '{effective_profile}' list-verb error: {e}"
+                }, 1)
         else:
             warnings.append(
                 f"profile '{effective_profile}' not found at profiles/{effective_profile}.yaml; using base"
