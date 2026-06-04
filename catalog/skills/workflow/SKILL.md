@@ -41,6 +41,7 @@ and track the 0-based position `i` as you walk. **Before running each step, prin
 - segment → its node ids as an action — `plan` → "Plan", `implement, evaluate` (a loop) → "Implement & evaluate (loop)".
 - gate → "Approval: {gate.id}".
 - orchestrator_node → its node id as an action — `finalize` → "Finalize", `provision` → "Provision missing microskills".
+- nested_workflow → the child workflow as an action — `build` (running `build-workflow-from-plan`) → "Build (nested workflow)".
 A skipped step (a `warn` gate, or an orchestrator node whose `when` is false) still gets a header, marked skipped.
 Walk `manifest.steps` in order:
 
@@ -109,6 +110,24 @@ Before executing, honor the conditional / fan-out fields if the step carries the
 The main loop is also the only place a node may invoke a **nested workflow** (e.g. a `provision`
 node running `microskill-create` with the autonomous profile, once per missing microskill via
 `for_each`). Background segments cannot — their subagents have no orchestration context.
+
+### `kind: "checkpoint"`, `checkpoint_type: "nested_workflow"`
+A first-class nested-workflow call — a `workflow: <name>` node. The child runs here in the main loop,
+never in a segment. Honor `when`/`for_each` exactly as for an orchestrator node above (a false `when`
+→ store `results[node] = null` and skip; `for_each` → run the child once per item, binding `${<as>}`,
+collecting an array into `results[node]`). Then:
+1. **Resolve the step's `inputs` map** — for each `key: value`, resolve any `${...}` references in
+   `value` against `inputs`/`results` (same rules as an orchestrator node). The resolved map is the
+   child's input set.
+2. **Re-enter this same `workflow` skill for `step.workflow`** — compile
+   `.claude/workflow-defs/${step.workflow}/WORKFLOW.yaml` and run its manifest, supplying the resolved
+   map as the child's gathered `inputs` (skip the interactive input-gathering step — the inputs are
+   already provided by the parent). The compiler guaranteed depth ≤ 1, so the child contains no
+   further nested call; recursion is bounded.
+3. **Store the child's result** — its `manifest.output.from` node output — into `results[node]`, and
+   emit a short recap (reuse the child's own wrap-up; don't replay its segments).
+4. If the child fails or its evaluator never passes, **stop and surface the error** — do not claim
+   success.
 
 ## Finish
 If `manifest.output.from` is set, report `results[<that node>]` as the workflow's result. Then print a

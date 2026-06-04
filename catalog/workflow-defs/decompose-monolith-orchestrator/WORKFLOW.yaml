@@ -38,7 +38,7 @@ inputs:
 imports:
   - microskills/analyze-monolith-orchestrator
   - microskills/task-plan
-  - workflow-defs/build-workflow-from-plan
+  - build-workflow-from-plan
 
 # After the approval gate the flow is all orchestrator nodes (provision, advise, build);
 # the implement <-> evaluate loop now lives inside build-workflow-from-plan, which `build`
@@ -223,23 +223,32 @@ nodes:
   # harness/ + harness.yaml. Runs in the main loop (the only place a node may invoke a nested
   # workflow). Guarded so the advisory path skips it. build-workflow-from-plan invokes no
   # further nested workflow, so recursion stays bounded.
+  # First-class nested workflow call: build-workflow-from-plan runs the implement <-> evaluate
+  # loop, vendors the decomposed workflow into harness/workflow-defs/<name>/, upserts harness.yaml,
+  # runs sync-harness to install .claude/workflow-defs/<name>/ + its slash shim, and compiles
+  # .compiled/. Orchestrator checkpoint, main loop only; bounded recursion (depth = 1).
   - id: build
-    delegation: orchestrator
+    workflow: build-workflow-from-plan
     when: ${plan.output.scope_advisory == null}
     depends_on: [plan, provision, analyze]
+    inputs:
+      plan_path: ${plan.output.plan_path}
+      name: ${plan.output.name}
+      requirement: ${analyze.output.decomposition_requirement}
+      harness_root: ${workflow.inputs.harness_root}
+      harness_yaml: ${workflow.inputs.harness_yaml}
+      staging_dir: ${workflow.inputs.staging_dir}
+
+  # Summary print, split out of the old prose build node (a workflow: node returns the child's
+  # result; the human-facing recap is its own orchestrator step).
+  - id: report
+    delegation: orchestrator
+    when: ${plan.output.scope_advisory == null}
+    depends_on: [plan, build, provision, analyze]
     prompt: >
-      Build and finalize the decomposed workflow. Invoke the build-workflow-from-plan workflow
-      (via the `workflow` skill) supplying plan_path = ${plan.output.plan_path},
-      name = ${plan.output.name}, requirement = ${analyze.output.decomposition_requirement},
-      harness_root = ${workflow.inputs.harness_root}, harness_yaml = ${workflow.inputs.harness_yaml},
-      and staging_dir = ${workflow.inputs.staging_dir}. That flow runs the implement <-> evaluate
-      loop, then vendors the workflow into harness/workflow-defs/${plan.output.name}/, upserts
-      harness.yaml (source custom), runs sync-harness to install
-      .claude/workflow-defs/${plan.output.name}/ + its slash shim, and compiles .compiled/. If the
-      build fails or its evaluator never passes, stop and surface the error — do not claim success.
-      THEN print a summary of the decomposition: the monolith orchestrator microskills created at
-      provision, the decomposed workflow graph, and the harness/ source + synced .claude/ paths
-      from the build result.
+      Print a summary of the decomposition: the monolith orchestrator microskills created at
+      provision (${provision.output}), the decomposed workflow graph (${analyze.output}), and the
+      harness/ source + synced .claude/ paths from the build result (${build.output}).
 
 # Human-approval gate after `plan`: the segment boundary, and the requirement's
 # "pause for human approval of the proposed decomposition before building". Approving

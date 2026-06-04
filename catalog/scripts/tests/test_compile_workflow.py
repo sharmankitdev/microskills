@@ -276,14 +276,14 @@ nodes:
 def test_real_workflow_create_compiles():
     # The implement/evaluate loop moved out into build-workflow-from-plan, so
     # workflow-create is now a single background segment (plan) followed by the
-    # provision/advise/build orchestrator checkpoints — `build` invokes the
-    # shared build half. No second background segment remains here.
+    # provision/advise orchestrator checkpoints and the `build` nested-workflow
+    # checkpoint (a first-class workflow: node invoking the shared build half).
     rc, data, out, err = run(REAL_DEFS, "workflow-create")
     assert rc == 0, err
     assert data["segments"] == 1
     assert data["sequence"] == [
         "segment[plan]", "gate", "orchestrator_node", "orchestrator_node",
-        "orchestrator_node"]
+        "nested_workflow"]
 
 
 def test_real_build_workflow_from_plan_compiles():
