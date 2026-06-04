@@ -175,6 +175,47 @@ def loop_contiguity_error(order, node_by_id, gates_after, loop):
     return None
 
 
+def loop_while_until_error(loop):
+    """SHARED while/until exclusivity check used by BOTH compile and validate.
+    Exactly ONE of while/until must be present on a loop. Returns an error message
+    string, or None."""
+    if not isinstance(loop, dict):
+        return None
+    has_while = "while" in loop and loop.get("while") is not None
+    has_until = "until" in loop and loop.get("until") is not None
+    if has_while and has_until:
+        return "loop may carry only one of 'while' / 'until', not both"
+    if not has_while and not has_until:
+        return "loop requires exactly one of 'while' / 'until'"
+    return None
+
+
+def desugar_loop_until(loop):
+    """SHARED until→while desugar used by BOTH compile and validate. `until: ${EXPR}`
+    is sugar for `while: ${!(EXPR)}` — negate the inner-of-${...} expression and
+    re-wrap, so the compiled output is byte-identical to a hand-written negated
+    while of that exact form. Mutates `loop` in place: replaces `until` with the
+    derived `while`. No-op when `until` is absent."""
+    if not isinstance(loop, dict) or loop.get("until") is None:
+        return
+    inner = strip_ref_wrapper(loop.pop("until"))
+    loop["while"] = "${!(" + inner + ")}"
+
+
+def loop_max_parallel_errors(nodes):
+    """SHARED max_parallel placement check used by BOTH compile and validate. A
+    `max_parallel` knob is only meaningful on a for_each fan-out node; on a node
+    WITHOUT for_each it silently does nothing. Returns a list of (node_id, message)."""
+    out = []
+    for n in nodes:
+        if not isinstance(n, dict) or not n.get("id"):
+            continue
+        if n.get("max_parallel") is not None and not n.get("for_each"):
+            out.append((n["id"],
+                        "max_parallel is only valid on a for_each node; this node has no for_each"))
+    return out
+
+
 def rel(p):
     """Display path relative to project root when possible, else absolute."""
     try:
@@ -219,23 +260,34 @@ def topo_sort(nodes):
 
 
 def resolve_microskill_directives(use_name, customize, defs_root):
-    """Run resolve-microskill to read a use: node's allowed_tools + gates.
-    Fail-safe: on any failure return None (caller treats as orchestrator)."""
+    """Run resolve-microskill to read a use: node's allowed_tools + gates AND its
+    fully-resolved (profile-merged, strip_nulls'd) output_schema. Returns a dict
+    {"directives": <dict|None>, "output_schema": <dict|None>}. Fail-safe: on any
+    failure return {"directives": None, "output_schema": None} (caller treats a
+    None directives as orchestrator).
+
+    skill-root is derived as the sibling `microskills/` of the defs root so a
+    hermetic tmp world resolves its own microskills; for the real runtime this is
+    `.claude/microskills` exactly as before, keeping compiled output byte-identical."""
     profile = (customize or {}).get("profile")
     cmd = [str(RESOLVE_SCRIPT), use_name]
     if profile:
         cmd += ["--profile", str(profile)]
+    skill_root = Path(defs_root).parent / "microskills"
+    cmd += ["--skill-root", str(skill_root)]
+    fail = {"directives": None, "output_schema": None}
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, cwd=str(PROJECT_ROOT))
     except Exception:
-        return None
+        return fail
     if proc.returncode not in (0, 1):
-        return None
+        return fail
     try:
         data = json.loads(proc.stdout)
     except Exception:
-        return None
-    return data.get("directives")
+        return fail
+    return {"directives": data.get("directives"),
+            "output_schema": data.get("output_schema")}
 
 
 def classify(node, gates_after, defs_root):
@@ -257,11 +309,17 @@ def classify(node, gates_after, defs_root):
     if has_agent:
         return "background"  # agents are autonomous unless a gate forces otherwise
     # use: microskill — inspect resolved directives (fail-safe → orchestrator)
-    directives = resolve_microskill_directives(node["use"], node.get("customize"), defs_root)
+    resolved = resolve_microskill_directives(node["use"], node.get("customize"), defs_root)
+    directives = resolved["directives"]
     # Stash the executor identity so node_call_js can bake it into the runMicroskill
     # call (background segments can't nest-dispatch, so the executor must BE this agent).
     node["_exec_agent"] = (directives or {}).get("agent")
     node["_exec_model"] = (directives or {}).get("model")
+    # Stash the FINALIZED (profile-merged, strip_nulls'd) output_schema so a node
+    # with no explicit output_schema inherits the microskill's. A profile that
+    # deleted the schema (output_schema: null) resolves to None here, so the
+    # deleted schema is NOT resurrected — inheritance is a default-for-ABSENT only.
+    node["_exec_schema"] = resolved["output_schema"]
     if directives is None:
         return "orchestrator"
     if "AskUserQuestion" in (directives.get("allowed_tools") or []):
@@ -334,7 +392,10 @@ def node_call_js(node, seg_var_ids, indent="  ", declare=True, track_ran=False):
     var = jsvar(nid)
     kw = "const " if declare else ""
     phase = nid
-    schema = node.get("output_schema")
+    # An EXPLICIT node-level output_schema always wins; otherwise a use: node
+    # inherits the microskill's resolved schema stashed on _exec_schema by classify().
+    # (_exec_schema is None when no microskill schema survived profile resolution.)
+    schema = node.get("output_schema") or node.get("_exec_schema")
     schema_js = json.dumps(schema, indent=2) if schema else "null"
     prompt = tmpl_literal(node.get("prompt") or f"Execute node {nid}.", seg_var_ids)
     if node.get("agent"):
@@ -361,11 +422,19 @@ def node_call_js(node, seg_var_ids, indent="  ", declare=True, track_ran=False):
 
     # for_each → fan out over a collection; `as` names the per-item var, which
     # ${<as>} refs resolve to (translate_ref leaves bare identifiers untouched).
+    # max_parallel: K bounds the fan-out to batches of K via parallelChunked (built
+    # only on the host parallel() global). WITHOUT max_parallel the emission is the
+    # unbounded parallel() exactly as before (byte-identical).
     fe = node.get("for_each")
     if fe:
         coll = translate_ref(strip_ref_wrapper(fe), seg_var_ids)
         as_var = node.get("as") or "item"
-        expr = f"await parallel((({coll}) || []).map(({as_var}) => () => {raw}))"
+        thunks = f"(({coll}) || []).map(({as_var}) => () => {raw})"
+        mp = node.get("max_parallel")
+        if mp is not None:
+            expr = f"await parallelChunked({thunks}, {int(mp)})"
+        else:
+            expr = f"await parallel({thunks})"
     else:
         expr = f"await {raw}"
 
@@ -400,6 +469,21 @@ async function runAgent(agentType, prompt, schema, phase, label) {
   return agent(prompt, { agentType, schema, phase, label })
 }
 function __ref(v) { return typeof v === 'string' ? v : JSON.stringify(v) }
+""".strip("\n")
+
+# Emitted ONLY into a segment that has a max_parallel for_each node. Built solely
+# on the host `parallel()` global + Array.slice — no Promise.allSettled, no timers.
+# Runs thunks in fixed-size batches of K, concatenating each batch's results so the
+# final array preserves input order (identical ordering to an unbounded parallel()).
+PARALLEL_CHUNKED_JS = r"""
+async function parallelChunked(thunks, k) {
+  const out = []
+  for (let i = 0; i < thunks.length; i += k) {
+    const batch = await parallel(thunks.slice(i, i + k))
+    for (const r of batch) out.push(r)
+  }
+  return out
+}
 """.strip("\n")
 
 
@@ -458,12 +542,14 @@ def emit_segment_js(seg_nodes, wf, loop, seg_index):
         # Loop segments also return __rounds (the iteration count) so the orchestrator
         # recap can state how many rounds ran. Not in `produces` → never stored as a node result.
         ret = "{ " + ", ".join(f"{json.dumps(i)}: {jsvar(i)}" for i in seg_ids) + ', "__rounds": __iter }'
+        loop_body_js = (f"{ran_init}{loop_calls}{break_line}{carry_assign}"
+                        f"  __iter++\n")
+        scaffold = (f"do {{\n{loop_body_js}"
+                    f"}} while (({while_js}) && __iter < __max)\n\n")
         body = (carry_init +
                 f"let __iter = 0\nconst __max = {max_iters}\n"
                 f"let {', '.join(jsvar(i) for i in seg_ids)}\n"
-                f"do {{\n{ran_init}{loop_calls}{break_line}{carry_assign}"
-                f"  __iter++\n"
-                f"}} while (({while_js}) && __iter < __max)\n\n"
+                + scaffold +
                 f"log(`{name}: ran ${{__iter}} iteration(s)`)\n"
                 f"return {ret}\n")
     else:
@@ -474,7 +560,12 @@ def emit_segment_js(seg_nodes, wf, loop, seg_index):
         ret = "{ " + ", ".join(f"{json.dumps(i)}: {jsvar(i)}" for i in seg_ids) + " }"
         body = calls + f"\nreturn {ret}\n"
 
-    js = head + HELPERS_JS + "\n\n" + guard + body
+    # The parallelChunked helper is appended ONLY when this segment has a
+    # max_parallel for_each node, so a segment without one stays byte-identical.
+    helpers = HELPERS_JS
+    if any(n.get("max_parallel") is not None and n.get("for_each") for n in seg_nodes):
+        helpers = HELPERS_JS + "\n" + PARALLEL_CHUNKED_JS
+    js = head + helpers + "\n\n" + guard + body
     needs_dict = {
         "wf_inputs": sorted(needs.wf_inputs),
         "nodes": sorted(needs.nodes),
@@ -539,6 +630,21 @@ def main():
     nodes = wf.get("nodes") or []
     node_by_id = {n["id"]: n for n in nodes}
     loop = wf.get("loop")
+
+    # --- LOOP ERGONOMICS: exactly-one-of while/until, then desugar until→while ---
+    # Desugar BEFORE emission so a loop authored with `until` compiles byte-identical
+    # to the hand-written negated `while`.
+    if loop is not None:
+        wu_err = loop_while_until_error(loop)
+        if wu_err:
+            die(wu_err, 1)
+        desugar_loop_until(loop)
+
+    # --- LOOP ERGONOMICS: max_parallel is only valid on a for_each node ---
+    mp_errs = loop_max_parallel_errors(nodes)
+    if mp_errs:
+        nid, msg = mp_errs[0]
+        die(f"node '{nid}': {msg}", 1)
 
     gates_after = {}
     for g in wf.get("gates") or []:

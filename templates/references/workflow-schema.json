@@ -59,7 +59,8 @@
             "description": "Wiring: input field → ${...} expression (workflow inputs, upstream outputs, loop carry, for_each item)."
           },
           "prompt": { "type": "string", "description": "For agent nodes: the task prompt template (may contain ${...} references)." },
-          "output_schema": { "type": "object", "description": "JSON Schema fragment forcing structured node output (passed to agent() schema)." },
+          "output_schema": { "type": "object", "description": "JSON Schema fragment forcing structured node output (passed to agent() schema). For a use: node, OMITTING this inherits the resolved microskill's output_schema; an explicit value here wins." },
+          "max_parallel": { "type": "integer", "minimum": 1, "description": "Only valid on a for_each node: bound the fan-out to batches of this size (parallelChunked) instead of one unbounded parallel()." },
           "customize": { "type": "object", "additionalProperties": true, "description": "Per-node knobs for a use: microskill — profile and/or dotted overrides." },
           "grant_tools": { "type": "array", "items": { "type": "string" }, "description": "Extra tools granted to this node's subagent." },
           "delegation": { "enum": ["auto", "orchestrator"], "description": "Override the auto-derived delegation classification." }
@@ -92,10 +93,11 @@
     "loop": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["while", "max_iters", "body"],
-      "description": "Guarded while loop over a subset of nodes. Compiled to a JS while inside a single autonomous segment.",
+      "required": ["max_iters", "body"],
+      "description": "Guarded loop over a subset of nodes. Compiled to a JS while/do-while inside a single autonomous segment. Exactly one of while/until must be present (enforced by compile/validate, not the schema).",
       "properties": {
-        "while": { "type": "string", "description": "Continue-condition (inner of ${...}) over the latest iteration's output." },
+        "while": { "type": "string", "description": "Continue-condition (inner of ${...}) over the latest iteration's output. Mutually exclusive with until." },
+        "until": { "type": "string", "description": "Stop-condition sugar (inner of ${...}): until: EXPR desugars to while: !(EXPR). Mutually exclusive with while." },
         "max_iters": { "type": "integer", "minimum": 1, "description": "Mandatory iteration cap." },
         "body": { "type": "array", "items": { "type": "string" }, "description": "Node ids that repeat each iteration." },
         "carry": { "type": "object", "additionalProperties": { "type": "string" }, "description": "State passed to the next iteration: var → ${...} expression." }

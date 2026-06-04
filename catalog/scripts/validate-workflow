@@ -80,6 +80,9 @@ _cw_loader.exec_module(_cw)
 union_edges = _cw.union_edges
 topo_sort = _cw.topo_sort
 loop_contiguity_error = _cw.loop_contiguity_error
+loop_while_until_error = _cw.loop_while_until_error
+desugar_loop_until = _cw.desugar_loop_until
+loop_max_parallel_errors = _cw.loop_max_parallel_errors
 NODE_OUTPUT_FIELD_RE = _cw.NODE_OUTPUT_FIELD_RE
 
 REF_RE = re.compile(r"\$\{([^}]*)\}")
@@ -328,9 +331,19 @@ def main():
         if after:
             gates_after.setdefault(after, []).append(g)
 
+    # --- max_parallel placement: only valid on a for_each node (shared with compile) ---
+    for mp_id, mp_msg in loop_max_parallel_errors(well_formed_nodes):
+        add(issues, "block", f"nodes/{mp_id}/max_parallel", mp_msg)
+
     # --- Loop anchoring ---
     loop = merged.get("loop")
     if isinstance(loop, dict):
+        # LOOP ERGONOMICS: exactly one of while/until, then desugar until→while so the
+        # ref/contiguity checks below run against the same condition compile emits.
+        wu_err = loop_while_until_error(loop)
+        if wu_err:
+            add(issues, "block", "loop", wu_err)
+        desugar_loop_until(loop)
         for b in loop.get("body") or []:
             if b not in id_set:
                 add(issues, "block", "loop/body", f"references unknown node '{b}'")

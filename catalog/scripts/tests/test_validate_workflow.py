@@ -706,3 +706,102 @@ def test_workflow_missing_required_child_input_blocks(tmp_path):
     rc, data, _ = run_defs(tmp_path, parent)
     assert rc == 1 and data["pass"] is False
     assert any("requires input 'seed'" in i["message"] for i in data["issues"])
+
+
+# --- LOOP ERGONOMICS: until / check / max_parallel validation ---
+
+LOOP_WHILE = """\
+version: 1
+name: loop-flow
+nodes:
+  - id: p
+    agent: ag
+    prompt: plan
+  - id: impl
+    agent: ag
+    depends_on: [p]
+    prompt: impl
+  - id: ev
+    agent: ag
+    depends_on: [impl]
+    prompt: ev
+loop:
+  while: ${!(ev.output.pass)}
+  max_iters: 3
+  body: [impl, ev]
+"""
+
+
+def test_until_only_loop_passes(tmp_path):
+    body = LOOP_WHILE.replace("  while: ${!(ev.output.pass)}\n", "  until: ${ev.output.pass}\n")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 0 and data["pass"] is True
+
+
+def test_both_while_and_until_blocks(tmp_path):
+    body = LOOP_WHILE.replace("  while: ${!(ev.output.pass)}\n",
+                              "  while: ${!(ev.output.pass)}\n  until: ${ev.output.pass}\n")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    assert any("only one of 'while' / 'until'" in i["message"] for i in data["issues"])
+
+
+def test_neither_while_nor_until_blocks(tmp_path):
+    body = LOOP_WHILE.replace("  while: ${!(ev.output.pass)}\n", "")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    assert any("exactly one of 'while' / 'until'" in i["message"] for i in data["issues"])
+
+
+def test_max_parallel_on_for_each_passes(tmp_path):
+    body = """\
+version: 1
+name: fe
+inputs:
+  items: { type: array, required: true }
+nodes:
+  - id: a
+    agent: ag
+    for_each: ${workflow.inputs.items}
+    as: item
+    max_parallel: 2
+    prompt: scan ${item}
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 0 and data["pass"] is True
+
+
+def test_max_parallel_without_for_each_blocks(tmp_path):
+    body = """\
+version: 1
+name: bad-mp
+nodes:
+  - id: a
+    agent: ag
+    max_parallel: 2
+    prompt: do a
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    assert any("max_parallel is only valid on a for_each node" in i["message"]
+               for i in data["issues"])
+
+
+def test_max_parallel_below_one_blocks_via_schema(tmp_path):
+    body = """\
+version: 1
+name: fe
+inputs:
+  items: { type: array, required: true }
+nodes:
+  - id: a
+    agent: ag
+    for_each: ${workflow.inputs.items}
+    as: item
+    max_parallel: 0
+    prompt: scan ${item}
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    assert any(i["location"].startswith("schema:") and "max_parallel" in i["location"]
+               for i in data["issues"])

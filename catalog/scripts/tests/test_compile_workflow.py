@@ -553,3 +553,258 @@ def test_inferred_edge_orders_segment(tmp_path):
     assert data["sequence"] == ["segment[a,b]"]
     m = json.loads((d / ".compiled" / "manifest.json").read_text())
     assert m["steps"][0]["nodes"] == ["a", "b"]
+
+
+# --- INF-SCHEMA: a use: node inherits the microskill's resolved output_schema ---
+# compile derives skill-root as the sibling `microskills/` of --defs-root, so a
+# hermetic world holds BOTH its workflow-defs and its microskills under tmp_path.
+
+ECHO_MS_MD = """\
+---
+name: echo-ms
+description: minimal echo microskill for inheritance tests
+---
+
+# Echo
+
+## Purpose
+
+Echo back.
+
+## Steps
+
+1. Return the result.
+"""
+
+ECHO_MS_BASE = """\
+version: 1
+output_schema:
+  type: object
+  required: [echoed]
+  properties:
+    echoed: { type: string }
+"""
+
+
+def make_inh_world(tmp_path, wf_yaml, ms_base=ECHO_MS_BASE, extra_profiles=None):
+    """Build a hermetic world: <tmp>/workflow-defs/inh-flow + <tmp>/microskills/echo-ms.
+    Returns (defs_root, def_dir)."""
+    defs_root = tmp_path / "workflow-defs"
+    ms_dir = tmp_path / "microskills" / "echo-ms" / "profiles"
+    ms_dir.mkdir(parents=True)
+    (tmp_path / "microskills" / "echo-ms" / "MICROSKILL.md").write_text(ECHO_MS_MD)
+    (ms_dir / "base.yaml").write_text(ms_base)
+    for pname, ptext in (extra_profiles or {}).items():
+        (ms_dir / f"{pname}.yaml").write_text(ptext)
+    d = defs_root / "inh-flow"
+    (d / "profiles").mkdir(parents=True)
+    (d / "WORKFLOW.yaml").write_text(wf_yaml)
+    (d / "profiles" / "base.yaml").write_text("version: 1\n")
+    return defs_root, d
+
+
+INHERIT_WF = """\
+version: 1
+name: inh-flow
+nodes:
+  - id: e
+    use: echo-ms
+"""
+
+
+def test_use_node_inherits_microskill_output_schema(tmp_path):
+    # The use: node declares no output_schema; it must inherit the microskill's
+    # resolved schema and bake it into the runMicroskill schema arg.
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF)
+    rc, data, out, err = run(defs_root, "inh-flow")
+    assert rc == 0, err
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert '"echoed"' in seg                       # inherited property name present
+    assert "schema: null" not in seg               # NOT emitted as a schema-less call
+
+
+EXPLICIT_OVERRIDE_WF = """\
+version: 1
+name: inh-flow
+nodes:
+  - id: e
+    use: echo-ms
+    output_schema:
+      type: object
+      required: [overridden]
+      properties:
+        overridden: { type: boolean }
+"""
+
+
+def test_explicit_node_output_schema_wins_over_inherited(tmp_path):
+    # An explicit node-level output_schema beats the inherited microskill schema.
+    defs_root, d = make_inh_world(tmp_path, EXPLICIT_OVERRIDE_WF)
+    rc, data, out, err = run(defs_root, "inh-flow")
+    assert rc == 0, err
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert '"overridden"' in seg                   # explicit schema baked in
+    assert '"echoed"' not in seg                    # inherited schema NOT used
+
+
+MS_NOSCHEMA_PROFILE = "version: 1\noutput_schema: null\n"
+
+PROFILE_DELETED_WF = """\
+version: 1
+name: inh-flow
+nodes:
+  - id: e
+    use: echo-ms
+    customize:
+      profile: noschema
+"""
+
+
+def test_profile_deleted_schema_is_not_resurrected(tmp_path):
+    # GATING #1: inheritance is default-for-ABSENT only. A profile that set
+    # output_schema: null resolves to a finalized schema of None, so the node
+    # (with no explicit schema) compiles with NO inherited schema — the deleted
+    # schema is NOT resurrected.
+    defs_root, d = make_inh_world(
+        tmp_path, PROFILE_DELETED_WF, extra_profiles={"noschema": MS_NOSCHEMA_PROFILE})
+    rc, data, out, err = run(defs_root, "inh-flow")
+    assert rc == 0, err
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert "schema: null" in seg                   # no schema inherited
+    assert '"echoed"' not in seg                    # base schema NOT resurrected
+
+
+# --- LOOP ERGONOMICS: until / check / max_parallel ---
+
+# A canonical hand-written negated-while loop, and the until-sugar that must
+# desugar to byte-identical compiled output.
+WHILE_LOOP = """\
+version: 1
+name: loop-flow
+nodes:
+  - id: p
+    agent: ag
+    prompt: plan
+  - id: impl
+    agent: ag
+    depends_on: [p]
+    prompt: impl
+  - id: ev
+    agent: ag
+    depends_on: [impl]
+    prompt: ev
+gates:
+  - id: g
+    after: p
+    type: human_approval
+    prompt: ok?
+loop:
+  while: ${!(ev.output.pass)}
+  max_iters: 3
+  body: [impl, ev]
+"""
+
+UNTIL_LOOP = WHILE_LOOP.replace("  while: ${!(ev.output.pass)}\n",
+                                "  until: ${ev.output.pass}\n")
+
+
+def test_until_desugars_byte_identical_to_negated_while(tmp_path):
+    # `until: ${EXPR}` is sugar for `while: ${!(EXPR)}` — the compiled segment must
+    # be byte-identical to the hand-written negated while.
+    make_flow(tmp_path, "loop-flow", WHILE_LOOP)
+    rc1, _, _, err1 = run(tmp_path, "loop-flow")
+    assert rc1 == 0, err1
+    while_js = (tmp_path / "loop-flow" / ".compiled" / "seg-2.js").read_text()
+
+    make_flow(tmp_path / "u", "loop-flow", UNTIL_LOOP)
+    rc2, _, _, err2 = run(tmp_path / "u", "loop-flow")
+    assert rc2 == 0, err2
+    until_js = (tmp_path / "u" / "loop-flow" / ".compiled" / "seg-2.js").read_text()
+
+    assert until_js == while_js
+
+
+def test_both_while_and_until_blocks(tmp_path):
+    body = WHILE_LOOP.replace("  while: ${!(ev.output.pass)}\n",
+                              "  while: ${!(ev.output.pass)}\n  until: ${ev.output.pass}\n")
+    make_flow(tmp_path, "loop-flow", body)
+    rc, data, out, err = run(tmp_path, "loop-flow")
+    assert rc == 1
+    assert data is not None and "only one of 'while' / 'until'" in data["error"]
+
+
+def test_neither_while_nor_until_blocks(tmp_path):
+    body = WHILE_LOOP.replace("  while: ${!(ev.output.pass)}\n", "")
+    make_flow(tmp_path, "loop-flow", body)
+    rc, data, out, err = run(tmp_path, "loop-flow")
+    assert rc == 1
+    assert data is not None and "exactly one of 'while' / 'until'" in data["error"]
+
+
+def test_loop_emits_do_while(tmp_path):
+    # The loop scaffold is always do{ body }while(cond) (>=1 iteration).
+    make_flow(tmp_path, "loop-flow", WHILE_LOOP)
+    rc, data, out, err = run(tmp_path, "loop-flow")
+    assert rc == 0, err
+    seg = (tmp_path / "loop-flow" / ".compiled" / "seg-2.js").read_text()
+    assert "do {" in seg
+    assert "} while ((" in seg
+
+
+FE_PLAIN = """\
+version: 1
+name: fe-flow
+inputs:
+  items:
+    type: array
+    required: true
+nodes:
+  - id: scan
+    agent: ag
+    for_each: ${workflow.inputs.items}
+    as: item
+    prompt: scan ${item}
+"""
+
+FE_MAX_PARALLEL = FE_PLAIN.replace("    as: item\n", "    as: item\n    max_parallel: 2\n")
+
+
+def test_for_each_without_max_parallel_byte_identical(tmp_path):
+    # A for_each node WITHOUT max_parallel must emit exactly today's unbounded
+    # parallel() and NOT pull in the parallelChunked helper.
+    make_flow(tmp_path, "fe-flow", FE_PLAIN)
+    rc, data, out, err = run(tmp_path, "fe-flow")
+    assert rc == 0, err
+    seg = (tmp_path / "fe-flow" / ".compiled" / "seg-1.js").read_text()
+    assert "await parallel(((_args.wf_items) || []).map((item) => () => runAgent" in seg
+    assert "parallelChunked" not in seg
+
+
+def test_max_parallel_emits_parallel_chunked(tmp_path):
+    # max_parallel: K chunks the fan-out via parallelChunked, which is built only on
+    # the existing parallel() global + Array.slice (no Promise.allSettled, no timers).
+    make_flow(tmp_path, "fe-flow", FE_MAX_PARALLEL)
+    rc, data, out, err = run(tmp_path, "fe-flow")
+    assert rc == 0, err
+    seg = (tmp_path / "fe-flow" / ".compiled" / "seg-1.js").read_text()
+    assert "await parallelChunked(((_args.wf_items) || []).map((item) => () => runAgent" in seg
+    assert "function parallelChunked(thunks, k)" in seg          # helper emitted
+    assert "await parallel(thunks.slice(i, i + k))" in seg       # built on parallel + slice
+    assert "Promise.allSettled" not in seg
+    assert "setTimeout" not in seg
+
+
+def test_max_parallel_without_for_each_blocks(tmp_path):
+    body = """\
+version: 1
+name: bad-mp
+nodes:
+  - id: a
+    agent: ag
+    max_parallel: 2
+    prompt: do a
+"""
+    make_flow(tmp_path, "bad-mp", body)
+    rc, data, out, err = run(tmp_path, "bad-mp")
+    assert rc == 1
+    assert data is not None and "max_parallel is only valid on a for_each node" in data["error"]
