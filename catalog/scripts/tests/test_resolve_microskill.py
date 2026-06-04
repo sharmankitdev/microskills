@@ -1028,13 +1028,53 @@ def test_explicit_profile_base_skips_overlay(tmp_path):
     assert data["config"]["vars"]["who"] == "base-value"
 
 
-def test_missing_base_yaml_exits_2(tmp_path):
+def test_missing_base_yaml_resolves_with_empty_overlay(tmp_path):
+    # RANK15: an ABSENT profiles/base.yaml is now tolerated (mirrors
+    # compile-workflow's already-tolerant behavior) — it resolves with an empty
+    # overlay, defaulting version to 1, NOT an error.
     sdir = tmp_path / "no-base-fixture"
     sdir.mkdir()
     (sdir / "MICROSKILL.md").write_text(MINIMAL_SKILL.format(name="no-base-fixture"))
     code, data, _, err = run("no-base-fixture", skill_root=tmp_path)
-    assert code == 2, err
-    assert "profiles/base.yaml not found" in data["error"]
+    assert code == 0, err
+    # The MICROSKILL.md body still renders.
+    assert "1. **First**" in data["rendered_skill_body"]
+    # version defaulted to 1 — schema validation still ran (config is non-empty).
+    assert data["config"] == {"version": 1}
+
+
+def test_missing_base_yaml_still_validates_md_derived_config(tmp_path):
+    # An absent base.yaml must NOT silently skip schema validation: the resolver
+    # setdefault('version', 1)s so a non-empty config is validated. A required
+    # input declared in the MICROSKILL.md Inputs table is still handled (the
+    # rendered body + payload are produced rather than crashing).
+    sdir = tmp_path / "no-base-md"
+    sdir.mkdir()
+    (sdir / "MICROSKILL.md").write_text(MINIMAL_SKILL.format(name="no-base-md"))
+    code, data, _, err = run("no-base-md", skill_root=tmp_path)
+    assert code == 0, err
+    assert "version" in data["config"] and data["config"]["version"] == 1
+    assert data["profile_used"] == "base"
+
+
+def test_version_omitted_in_base_yaml_defaults_to_one(tmp_path):
+    # A base.yaml that omits version is no longer a schema block — version
+    # defaults to 1 before validation.
+    body = MINIMAL_SKILL.format(name="noversion-ms")
+    make_skill(tmp_path, "noversion-ms", body, default_cfg="vars:\n  x: y\n")
+    code, data, _, err = run("noversion-ms", skill_root=tmp_path)
+    assert code == 0, err
+    assert data["config"]["version"] == 1
+    assert data["config"]["vars"] == {"x": "y"}
+
+
+def test_explicit_wrong_version_in_base_yaml_blocks(tmp_path):
+    # An EXPLICIT wrong version still blocks (the const:1 check is intact).
+    body = MINIMAL_SKILL.format(name="badversion-ms")
+    make_skill(tmp_path, "badversion-ms", body, default_cfg="version: 2\n")
+    code, data, _, err = run("badversion-ms", skill_root=tmp_path)
+    assert code == 1, err
+    assert any("version" in w for w in data.get("warnings", [])) or "version" in str(data)
 
 
 # ---------------------------------------------------------------------------

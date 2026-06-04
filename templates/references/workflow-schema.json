@@ -5,9 +5,9 @@
   "description": "Declarative composition of microskills and agents into a deterministic DAG. Compiled to Claude Code Workflow-JS segments + a run manifest; segments run on the native Workflow engine, the dispatcher orchestrates segments and human checkpoints.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["version", "name", "nodes"],
+  "required": ["name", "nodes"],
   "properties": {
-    "version": { "const": 1 },
+    "version": { "const": 1, "description": "Schema version. Only 1 is recognized. Omitting it defaults to 1 (set by compile/validate before validation); an explicit value other than 1 still blocks." },
     "name": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$", "description": "Bare workflow identifier (kebab-case)." },
     "description": { "type": "string", "description": "One-line description of the workflow." },
     "base": { "type": "boolean", "description": "Catalog curation hint: true marks this as a base component that initialize-harness seeds into a new project's harness.yaml. Ignored by the compiler." },
@@ -63,7 +63,8 @@
           "max_parallel": { "type": "integer", "minimum": 1, "description": "Only valid on a for_each node: bound the fan-out to batches of this size (parallelChunked) instead of one unbounded parallel()." },
           "customize": { "type": "object", "additionalProperties": true, "description": "Per-node knobs for a use: microskill — profile and/or dotted overrides." },
           "grant_tools": { "type": "array", "items": { "type": "string" }, "description": "Extra tools granted to this node's subagent." },
-          "delegation": { "enum": ["auto", "orchestrator"], "description": "Override the auto-derived delegation classification." }
+          "delegation": { "enum": ["auto", "orchestrator"], "description": "Override the auto-derived delegation classification." },
+          "side_effect": { "type": "boolean", "description": "Readable alias for delegation: orchestrator. true normalizes to delegation: orchestrator before classification, so the node runs as an orchestrator checkpoint (where filesystem side effects and human interaction are allowed)." }
         }
       }
     },

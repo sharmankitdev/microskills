@@ -808,3 +808,225 @@ nodes:
     rc, data, out, err = run(tmp_path, "bad-mp")
     assert rc == 1
     assert data is not None and "max_parallel is only valid on a for_each node" in data["error"]
+
+
+# --- RANK6: --plan dry-run (writes nothing) + --explain (reason + de-anon) ---
+
+
+def test_plan_writes_nothing_and_prints_plan(tmp_path):
+    # --plan computes + prints the full plan but writes NOTHING to .compiled/
+    # (no mkdir, no seg files, no manifest.json).
+    make_flow(tmp_path, "gated-flow", GATED.replace("name: linear-flow", "name: gated-flow"))
+    rc, data, out, err = run(tmp_path, "gated-flow", "--plan")
+    assert rc == 0, err
+    # The plan summary is still printed (segments/checkpoints/sequence).
+    assert data["segments"] == 2
+    assert data["checkpoints"] == 1
+    assert data["sequence"] == ["segment[a]", "gate", "segment[b]"]
+    # Nothing on disk: the .compiled/ directory was never created.
+    compiled = tmp_path / "gated-flow" / ".compiled"
+    assert not compiled.exists()
+
+
+def test_plan_does_not_clobber_existing_compiled(tmp_path):
+    # A prior real compile populated .compiled/. A subsequent --plan must NOT
+    # touch those bytes (no stale-clean unlink, no manifest rewrite).
+    d = make_flow(tmp_path, "gated-flow", GATED.replace("name: linear-flow", "name: gated-flow"))
+    rc, _, _, err = run(tmp_path, "gated-flow")
+    assert rc == 0, err
+    before = {p.name: p.read_text() for p in (d / ".compiled").iterdir()}
+    rc2, _, _, err2 = run(tmp_path, "gated-flow", "--plan")
+    assert rc2 == 0, err2
+    after = {p.name: p.read_text() for p in (d / ".compiled").iterdir()}
+    assert before == after
+
+
+def test_default_compile_byte_identical_to_explain_compiled_bytes(tmp_path):
+    # The compiled segment bytes (the runtime artifact) must be byte-identical
+    # whether or not --explain is passed: --explain only adds stdout/manifest
+    # metadata, never changes the emitted JS.
+    d1 = make_flow(tmp_path / "plain", "gated-flow",
+                   GATED.replace("name: linear-flow", "name: gated-flow"))
+    rc1, _, _, e1 = run(tmp_path / "plain", "gated-flow")
+    assert rc1 == 0, e1
+    plain = {p.name: p.read_text() for p in (d1 / ".compiled").glob("seg-*.js")}
+
+    d2 = make_flow(tmp_path / "expl", "gated-flow",
+                   GATED.replace("name: linear-flow", "name: gated-flow"))
+    rc2, _, _, e2 = run(tmp_path / "expl", "gated-flow", "--explain")
+    assert rc2 == 0, e2
+    expl = {p.name: p.read_text() for p in (d2 / ".compiled").glob("seg-*.js")}
+    assert plain == expl
+
+
+def test_default_summary_byte_identical_no_manifest_hash(tmp_path):
+    # With neither flag the stdout summary stays exactly as today: no
+    # manifest_hash key, no classification reasons, bare sequence labels.
+    make_flow(tmp_path, "gated-flow", GATED.replace("name: linear-flow", "name: gated-flow"))
+    rc, data, out, err = run(tmp_path, "gated-flow")
+    assert rc == 0, err
+    assert "manifest_hash" not in data
+    assert "classification" not in data
+    assert data["sequence"] == ["segment[a]", "gate", "segment[b]"]
+
+
+def test_explain_surfaces_classification_reason(tmp_path):
+    # --explain adds a per-node classification with a human reason explaining WHY
+    # each node is background vs orchestrator.
+    make_flow(tmp_path, "orch-flow", ORCH)
+    rc, data, out, err = run(tmp_path, "orch-flow", "--explain")
+    assert rc == 0, err
+    classification = data["classification"]
+    by_node = {c["node"]: c for c in classification}
+    assert by_node["a"]["class"] == "background"
+    assert by_node["fin"]["class"] == "orchestrator"
+    # The orchestrator reason names the explicit delegation override.
+    assert "delegation" in by_node["fin"]["reason"].lower()
+    # The agent reason explains the background classification.
+    assert "agent" in by_node["a"]["reason"].lower()
+
+
+def test_explain_deanonymizes_sequence(tmp_path):
+    # WITHOUT --explain the gate is the bare 'gate'; WITH --explain it carries the
+    # gate id so the sequence is no longer lossy.
+    make_flow(tmp_path, "gated-flow", GATED.replace("name: linear-flow", "name: gated-flow"))
+    rc, data, out, err = run(tmp_path, "gated-flow", "--explain")
+    assert rc == 0, err
+    seq = data["sequence"]
+    assert any("g1" in s for s in seq), seq
+    # The orchestrator-node case is de-anonymized too.
+    make_flow(tmp_path, "orch-flow", ORCH)
+    rc2, data2, _, err2 = run(tmp_path, "orch-flow", "--explain")
+    assert rc2 == 0, err2
+    assert any("fin" in s for s in data2["sequence"]), data2["sequence"]
+
+
+def test_manifest_hash_present_and_deterministic(tmp_path):
+    # Under --explain the manifest carries a manifest_hash; two compiles of the
+    # same workflow produce the SAME hash (deterministic).
+    d = make_flow(tmp_path, "gated-flow", GATED.replace("name: linear-flow", "name: gated-flow"))
+    rc, data, out, err = run(tmp_path, "gated-flow", "--explain")
+    assert rc == 0, err
+    assert "manifest_hash" in data
+    m = json.loads((d / ".compiled" / "manifest.json").read_text())
+    assert "manifest_hash" in m
+    h1 = m["manifest_hash"]
+    assert isinstance(h1, str) and len(h1) == 64    # sha256 hex
+    assert data["manifest_hash"] == h1              # summary matches manifest
+    rc2, data2, _, err2 = run(tmp_path, "gated-flow", "--explain")
+    assert rc2 == 0, err2
+    assert data2["manifest_hash"] == h1
+
+
+def test_manifest_hash_excludes_itself(tmp_path):
+    # The hash is computed over the manifest WITHOUT its own manifest_hash key —
+    # recomputing the hash over the on-disk manifest (sans manifest_hash) must
+    # reproduce the stored value.
+    import hashlib
+    d = make_flow(tmp_path, "gated-flow", GATED.replace("name: linear-flow", "name: gated-flow"))
+    rc, data, out, err = run(tmp_path, "gated-flow", "--explain")
+    assert rc == 0, err
+    m = json.loads((d / ".compiled" / "manifest.json").read_text())
+    stored = m.pop("manifest_hash")
+    recomputed = hashlib.sha256(
+        json.dumps(m, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    assert recomputed == stored
+
+
+def test_manifest_hash_changes_when_workflow_changes(tmp_path):
+    make_flow(tmp_path / "one", "gated-flow",
+              GATED.replace("name: linear-flow", "name: gated-flow"))
+    rc1, data1, _, e1 = run(tmp_path / "one", "gated-flow", "--explain")
+    assert rc1 == 0, e1
+    # A different workflow (extra node appended to the nodes section, before the
+    # gates block) must produce a different hash.
+    changed = GATED.replace("name: linear-flow", "name: gated-flow").replace(
+        "gates:\n",
+        "  - id: c\n    agent: ag\n    depends_on: [b]\n    prompt: use ${b.output.z}\n"
+        "gates:\n")
+    make_flow(tmp_path / "two", "gated-flow", changed)
+    rc2, data2, _, e2 = run(tmp_path / "two", "gated-flow", "--explain")
+    assert rc2 == 0, e2
+    assert data1["manifest_hash"] != data2["manifest_hash"]
+
+
+def test_plan_can_emit_manifest_hash_without_writing(tmp_path):
+    # --plan --explain prints the manifest_hash but still writes nothing.
+    make_flow(tmp_path, "gated-flow", GATED.replace("name: linear-flow", "name: gated-flow"))
+    rc, data, out, err = run(tmp_path, "gated-flow", "--plan", "--explain")
+    assert rc == 0, err
+    assert "manifest_hash" in data
+    assert not (tmp_path / "gated-flow" / ".compiled").exists()
+
+
+# --- RANK15: version default + side_effect alias ---
+
+
+def test_version_omitted_defaults_to_one_and_compiles(tmp_path):
+    body = """\
+name: noversion-flow
+nodes:
+  - id: a
+    agent: ag
+    prompt: do a
+"""
+    make_flow(tmp_path, "noversion-flow", body)
+    rc, data, out, err = run(tmp_path, "noversion-flow")
+    assert rc == 0, err
+    assert data["segments"] == 1
+
+
+def test_explicit_wrong_version_blocks(tmp_path):
+    body = """\
+version: 2
+name: badversion-flow
+nodes:
+  - id: a
+    agent: ag
+    prompt: do a
+"""
+    make_flow(tmp_path, "badversion-flow", body)
+    rc, data, out, err = run(tmp_path, "badversion-flow")
+    assert rc == 1
+    assert data is not None and "schema_errors" in data
+
+
+def test_side_effect_true_classifies_as_orchestrator(tmp_path):
+    # side_effect: true is a readable alias for delegation: orchestrator. The node
+    # must classify as an orchestrator checkpoint.
+    body = """\
+version: 1
+name: se-flow
+nodes:
+  - id: a
+    agent: ag
+    prompt: do a
+  - id: fin
+    side_effect: true
+    depends_on: [a]
+    prompt: finalize using ${a.output.x}
+"""
+    make_flow(tmp_path, "se-flow", body)
+    rc, data, out, err = run(tmp_path, "se-flow")
+    assert rc == 0, err
+    assert data["sequence"] == ["segment[a]", "orchestrator_node"]
+
+
+def test_side_effect_explain_reason(tmp_path):
+    body = """\
+version: 1
+name: se-flow
+nodes:
+  - id: a
+    agent: ag
+    prompt: do a
+  - id: fin
+    side_effect: true
+    depends_on: [a]
+    prompt: finalize using ${a.output.x}
+"""
+    make_flow(tmp_path, "se-flow", body)
+    rc, data, out, err = run(tmp_path, "se-flow", "--explain")
+    assert rc == 0, err
+    by_node = {c["node"]: c for c in data["classification"]}
+    assert by_node["fin"]["class"] == "orchestrator"

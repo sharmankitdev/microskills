@@ -24,14 +24,26 @@ checkpoint in the main loop (where `AskUserQuestion` works), and threads outputs
    token from a shim). If no `.claude/workflow-defs/<name>/WORKFLOW.yaml` exists, stop and report.
 2. **Profile / overrides** — detect `<profile>` (slash position 2 or `"with <profile> profile"`) and
    any `override workflow-config: <field>=<value>` clauses.
-3. **Compile** — run via Bash: `.claude/scripts/compile-workflow <name> [--profile "<profile>"]
-   [--override <k>=<v> ...]`. Non-zero exit → stop and surface the JSON `error` / `schema_errors`.
+3. **Compile** — run via Bash: `.claude/scripts/compile-workflow <name> --explain [--profile "<profile>"]
+   [--override <k>=<v> ...]`. Pass `--explain` so the compile summary and the written manifest carry
+   `manifest_hash` (the resume check in step 6 needs it). Non-zero exit → stop and surface the JSON
+   `error` / `schema_errors`. (Never pass `--plan` here — that is a dry-run that writes nothing.)
 4. **Read the manifest** — read the `manifest_path` from the compile summary
-   (`.claude/workflow-defs/<name>/.compiled/manifest.json`).
+   (`.claude/workflow-defs/<name>/.compiled/manifest.json`). Note `manifest.manifest_hash`.
 5. **Gather inputs** — initialize `inputs = {}`. For each name in `manifest.required_inputs`: if the
    caller's prompt supplies a literal value, use it; otherwise gather via `AskUserQuestion`. Apply
    `manifest.input_defaults` for any non-required input not supplied. (Do not fall back to a default
    for a required input.)
+6. **Resume check** — look for `.claude/workflow-defs/<name>/.compiled/.run-state.json` (the dispatcher's
+   own runtime state, written by "Execute the manifest" below — NOT a compiled artifact; the compiler's
+   stale-clean only globs `seg-*.js` and never deletes it). If it exists AND its `manifest_hash` equals
+   `manifest.manifest_hash`, the stored run targets the same compiled workflow: **offer to resume** via
+   `AskUserQuestion` ("Resume from step {step_index+1}, or start fresh?"). On resume, seed `results` from
+   the stored `results` map and set the start position `i = step_index` (re-using completed work — this
+   avoids re-running expensive opus planner segments). On "start fresh", begin at `i = 0`. If the file is
+   absent, or its `manifest_hash` DIFFERS from `manifest.manifest_hash` (the workflow was recompiled /
+   changed, so stored node outputs no longer line up), **ignore the stale run-state** and start fresh at
+   `i = 0`.
 
 ## Execute the manifest
 
@@ -43,7 +55,17 @@ and track the 0-based position `i` as you walk. **Before running each step, prin
 - orchestrator_node → its node id as an action — `finalize` → "Finalize", `provision` → "Provision missing microskills".
 - nested_workflow → the child workflow as an action — `build` (running `build-workflow-from-plan`) → "Build (nested workflow)".
 A skipped step (a `warn` gate, or an orchestrator node whose `when` is false) still gets a header, marked skipped.
-Walk `manifest.steps` in order:
+Walk `manifest.steps` in order (starting at the resume position `i` from the Setup resume check, default 0):
+
+**Persist run-state after each step.** After a step completes (and its output is stored into `results`),
+write `.claude/workflow-defs/<name>/.compiled/.run-state.json` as
+`{ "manifest_hash": manifest.manifest_hash, "step_index": <the index of the NEXT step to run>, "results": results }`.
+This is purely the dispatcher's in-memory `results{}` checkpointed to disk so a run that dies mid-way can
+resume (see the Setup resume check) instead of restarting from step 0 and re-running expensive segments.
+It is dispatcher runtime state, quarantined from the compiled bytes — the compiler never reads it and its
+stale-clean (which globs only `seg-*.js`) never deletes it, so determinism is untouched. On a clean finish
+the file may be left in place (a later run with a matching `manifest_hash` whose `step_index` is past the
+last step simply has nothing to resume) or removed — do not let writing it block the run.
 
 ### `kind: "segment"`
 1. Build the `args` object the segment expects:

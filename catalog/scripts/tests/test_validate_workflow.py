@@ -787,6 +787,57 @@ nodes:
                for i in data["issues"])
 
 
+# --- RANK15: version default + side_effect alias (validate side) ---
+
+
+def test_version_omitted_validates(tmp_path):
+    # An OMITTED version defaults to 1 and validates clean.
+    body = """\
+name: noversion-flow
+nodes:
+  - id: a
+    agent: ag
+    prompt: do a
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 0 and data["pass"] is True
+
+
+def test_explicit_wrong_version_blocks_validate(tmp_path):
+    body = """\
+version: 2
+name: badversion-flow
+nodes:
+  - id: a
+    agent: ag
+    prompt: do a
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    assert any(i["location"].startswith("schema:") for i in data["issues"])
+
+
+def test_side_effect_node_validates(tmp_path):
+    # A node carrying side_effect: true (the orchestrator alias) and neither
+    # use nor agent must validate clean — the node-shape check exempts it.
+    body = """\
+version: 1
+name: se-flow
+nodes:
+  - id: a
+    agent: ag
+    prompt: do a
+  - id: fin
+    side_effect: true
+    depends_on: [a]
+    prompt: finalize using ${a.output.x}
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 0, data
+    assert data["pass"] is True
+    assert not any("neither 'use' nor 'agent'" in i["message"] for i in data["issues"])
+
+
 def test_max_parallel_below_one_blocks_via_schema(tmp_path):
     body = """\
 version: 1

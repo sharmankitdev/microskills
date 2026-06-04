@@ -28,6 +28,7 @@ Exit codes: 0 OK · 1 block (schema/DAG error) · 2 environment/script error.
 """
 
 import argparse
+import hashlib
 import importlib.machinery
 import importlib.util
 import json
@@ -291,23 +292,26 @@ def resolve_microskill_directives(use_name, customize, defs_root):
 
 
 def classify(node, gates_after, defs_root):
-    """Return 'orchestrator' or 'background'."""
+    """Return (class, reason) where class is 'orchestrator' or 'background' and
+    reason is a short human string explaining WHY. The reason is surfaced only
+    under --explain; the class drives partitioning exactly as before. (side_effect
+    is already normalized to delegation: orchestrator before this is called.)"""
     deleg = node.get("delegation")
     if deleg == "orchestrator":
-        return "orchestrator"
+        return "orchestrator", "explicit delegation:orchestrator"
     if deleg == "auto":
-        return "background"
+        return "background", "explicit delegation:auto"
     # A nested-workflow node is always an orchestrator checkpoint (background
     # segments can't re-enter the dispatcher). Classify it BEFORE use/agent so it
     # never reaches microskill resolution.
     if node.get("workflow"):
-        return "orchestrator"
+        return "orchestrator", f"nested workflow: {node['workflow']}"
     has_use = bool(node.get("use"))
     has_agent = bool(node.get("agent"))
     if not has_use and not has_agent:
-        return "orchestrator"  # orchestrator-native step
+        return "orchestrator", "orchestrator-native step (neither use nor agent)"
     if has_agent:
-        return "background"  # agents are autonomous unless a gate forces otherwise
+        return "background", "agent node -> background (autonomous)"
     # use: microskill — inspect resolved directives (fail-safe → orchestrator)
     resolved = resolve_microskill_directives(node["use"], node.get("customize"), defs_root)
     directives = resolved["directives"]
@@ -321,13 +325,13 @@ def classify(node, gates_after, defs_root):
     # deleted schema is NOT resurrected — inheritance is a default-for-ABSENT only.
     node["_exec_schema"] = resolved["output_schema"]
     if directives is None:
-        return "orchestrator"
+        return "orchestrator", f"use: {node['use']} resolution failed (fail-safe -> orchestrator)"
     if "AskUserQuestion" in (directives.get("allowed_tools") or []):
-        return "orchestrator"
+        return "orchestrator", f"use: {node['use']} exposes AskUserQuestion"
     for g in directives.get("gates") or []:
         if g.get("severity", "hard") == "hard":
-            return "orchestrator"
-    return "background"
+            return "orchestrator", f"use: {node['use']} carries a hard gate forces checkpoint"
+    return "background", f"use: {node['use']} -> background (autonomous)"
 
 
 def translate_ref(inner, seg_var_ids):
@@ -580,6 +584,13 @@ def main():
     ap.add_argument("--profile", default=None)
     ap.add_argument("--override", action="append", default=[])
     ap.add_argument("--defs-root", default=str(DEFAULT_DEFS_ROOT))
+    ap.add_argument("--plan", action="store_true",
+                    help="Dry-run: compute and print the full plan but write NOTHING to "
+                         ".compiled/ (no mkdir, no stale-clean, no seg files, no manifest).")
+    ap.add_argument("--explain", action="store_true",
+                    help="Add per-node classification reasons, de-anonymize the sequence "
+                         "summary, and surface manifest_hash. Output-only — never changes "
+                         "the emitted segment bytes.")
     args = ap.parse_args()
 
     defs_root = Path(args.defs_root).resolve()
@@ -619,6 +630,11 @@ def main():
 
     wf = strip_nulls(wf)
 
+    # An OMITTED version defaults to 1 BEFORE schema validation (the const:1 check
+    # stays intact, so an EXPLICIT wrong version still blocks). Mirrors the
+    # resolve-microskill ergonomic.
+    wf.setdefault("version", 1)
+
     if not SCHEMA_PATH.exists():
         die(f"workflow schema not found: {SCHEMA_PATH}", 1)
     schema = json.loads(SCHEMA_PATH.read_text())
@@ -628,6 +644,14 @@ def main():
         die("merged workflow fails schema validation", 1, schema_errors=msgs)
 
     nodes = wf.get("nodes") or []
+
+    # side_effect: true is a readable alias for delegation: orchestrator. Normalize
+    # it BEFORE classify so the node classifies as an orchestrator checkpoint. An
+    # explicit delegation already present wins (side_effect only sets the default).
+    for n in nodes:
+        if isinstance(n, dict) and n.pop("side_effect", None) is True:
+            n.setdefault("delegation", "orchestrator")
+
     node_by_id = {n["id"]: n for n in nodes}
     loop = wf.get("loop")
 
@@ -662,6 +686,9 @@ def main():
     # --- partition into manifest steps ---
     steps = []
     seg = []
+    # Per-node classification record (node id → reason), in topological order.
+    # Surfaced only under --explain; never affects partitioning or emitted bytes.
+    classification = []
 
     def flush_segment():
         nonlocal seg
@@ -671,7 +698,8 @@ def main():
 
     for nid in order:
         node = node_by_id[nid]
-        klass = classify(node, gates_after, defs_root)
+        klass, reason = classify(node, gates_after, defs_root)
+        classification.append({"node": nid, "class": klass, "reason": reason})
         if klass == "orchestrator":
             flush_segment()
             if node.get("workflow"):
@@ -699,11 +727,19 @@ def main():
     flush_segment()
 
     # --- emit segments ---
+    # ALL disk-mutating operations are guarded behind `not args.plan`. Under --plan
+    # we still compute the full plan (segment JS, needs, produces, manifest) so the
+    # summary is identical to a real compile, but write nothing: no mkdir, no
+    # stale-clean unlink, no seg files, no manifest.json. This mirrors the harness
+    # reconcile loops' --plan-by-default ergonomics.
     compiled_dir = def_dir / ".compiled"
-    compiled_dir.mkdir(parents=True, exist_ok=True)
-    # clean stale segment files for determinism
-    for old in compiled_dir.glob("seg-*.js"):
-        old.unlink()
+    if not args.plan:
+        compiled_dir.mkdir(parents=True, exist_ok=True)
+        # clean stale segment files for determinism. (Note: only seg-*.js are
+        # globbed — manifest.json is overwritten below, and the dispatcher's
+        # .run-state.json is intentionally NOT touched.)
+        for old in compiled_dir.glob("seg-*.js"):
+            old.unlink()
 
     seg_index = 0
     manifest_steps = []
@@ -713,7 +749,8 @@ def main():
             seg_nodes = [node_by_id[i] for i in step["nodes"]]
             js, needs, produces = emit_segment_js(seg_nodes, wf, loop, seg_index)
             fname = f"seg-{seg_index}.js"
-            (compiled_dir / fname).write_text(js)
+            if not args.plan:
+                (compiled_dir / fname).write_text(js)
             manifest_steps.append({
                 "kind": "segment",
                 "index": seg_index,
@@ -742,8 +779,37 @@ def main():
         "output": wf.get("output"),
         "steps": manifest_steps,
     }
+    # Deterministic content hash over the canonical (sorted-key, compact) JSON of
+    # the manifest — computed over the manifest WITHOUT its own manifest_hash key,
+    # so the hash can never depend on itself. Same inputs → same hash; any change
+    # to the partition/needs/produces changes it. (rank14's dispatcher consumes it
+    # to decide whether stored run-state matches the just-compiled workflow.)
+    manifest_hash = hashlib.sha256(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
     manifest_path = compiled_dir / "manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    # manifest_hash is additive/opt-in: included in the WRITTEN manifest only under
+    # --explain, so a default compile's .compiled/ bytes stay byte-identical to
+    # before. The dispatcher obtains it via --explain.
+    out_manifest = dict(manifest)
+    if args.explain:
+        out_manifest["manifest_hash"] = manifest_hash
+    if not args.plan:
+        manifest_path.write_text(json.dumps(out_manifest, indent=2) + "\n")
+
+    def seq_label(s):
+        """A segment's bracketed node list, or a checkpoint label. WITHOUT --explain
+        a checkpoint stays the bare lossy type ('gate'/'orchestrator_node'); WITH
+        --explain it is de-anonymized with the gate/node id."""
+        if s["kind"] != "checkpoint":
+            return f"segment[{','.join(s['nodes'])}]"
+        ctype = s.get("checkpoint_type", "checkpoint")
+        if not args.explain:
+            return ctype
+        if ctype == "gate":
+            return f"gate:{s.get('gate', {}).get('id', '?')}"
+        return f"{ctype}:{s.get('node', '?')}"
 
     summary = {
         "name": wf["name"],
@@ -752,8 +818,15 @@ def main():
         "manifest_path": rel(manifest_path),
         "segments": sum(1 for s in manifest_steps if s["kind"] == "segment"),
         "checkpoints": sum(1 for s in manifest_steps if s["kind"] == "checkpoint"),
-        "sequence": [s.get("checkpoint_type", "segment") if s["kind"] == "checkpoint" else f"segment[{','.join(s['nodes'])}]" for s in manifest_steps],
+        "sequence": [seq_label(s) for s in manifest_steps],
     }
+    # --explain (and --plan, the dry-run preview) are additive: they only ADD keys.
+    # With neither flag the summary is byte-identical to before.
+    if args.explain:
+        summary["manifest_hash"] = manifest_hash
+        summary["classification"] = classification
+    if args.plan:
+        summary["plan"] = True
     print(json.dumps(summary, indent=2))
     sys.exit(0)
 

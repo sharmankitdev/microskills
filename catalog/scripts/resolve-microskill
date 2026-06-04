@@ -698,14 +698,18 @@ def main():
 
     profiles_dir = skill_dir / "profiles"
     base_path = profiles_dir / "base.yaml"
-    if not base_path.exists():
-        sys.stderr.write(f"profiles/base.yaml not found: {base_path}\n")
-        emit_and_exit({"error": f"profiles/base.yaml not found: {base_path}"}, 2)
-    try:
-        cfg = yaml.safe_load(base_path.read_text()) or {}
-    except yaml.YAMLError as e:
-        sys.stderr.write(f"base.yaml parse error: {e}\n")
-        emit_and_exit({"error": f"base.yaml parse error: {e}"}, 1)
+    # An ABSENT profiles/base.yaml resolves with an empty overlay (mirrors
+    # compile-workflow's already-tolerant base handling) rather than erroring;
+    # version is defaulted to 1 below so the MICROSKILL.md-derived config is still
+    # schema-validated (not silently skipped).
+    if base_path.exists():
+        try:
+            cfg = yaml.safe_load(base_path.read_text()) or {}
+        except yaml.YAMLError as e:
+            sys.stderr.write(f"base.yaml parse error: {e}\n")
+            emit_and_exit({"error": f"base.yaml parse error: {e}"}, 1)
+    else:
+        cfg = {}
 
     base_default_profile = (cfg.get("profile") or {}).get("default")
     if args.profile is not None:
@@ -771,6 +775,13 @@ def main():
             emit_and_exit({"error": f"override apply failed: {e}"}, 1)
 
     cfg = strip_nulls(cfg)
+
+    # An OMITTED version defaults to 1 BEFORE schema validation, so a base.yaml
+    # (or an absent base.yaml) that does not declare version still resolves. The
+    # const:1 check stays intact, so an EXPLICIT wrong version still blocks. This
+    # also makes an empty {} config non-empty, so the schema check below is NOT
+    # silently skipped for a microskill with no base.yaml.
+    cfg.setdefault("version", 1)
 
     if cfg and not SCHEMA_PATH.exists():
         emit_and_exit({"error": f"config-schema.json not found: {SCHEMA_PATH}"}, 1)

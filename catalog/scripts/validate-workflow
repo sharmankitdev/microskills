@@ -189,6 +189,12 @@ def main():
 
     merged = strip_nulls(merged)
 
+    # An OMITTED version defaults to 1 BEFORE schema validation (mirrors
+    # compile-workflow / resolve-microskill). The const:1 check stays intact, so an
+    # EXPLICIT wrong version still blocks.
+    if isinstance(merged, dict):
+        merged.setdefault("version", 1)
+
     # --- Schema validation (on the merged document) ---
     if SCHEMA_PATH.exists():
         schema = json.loads(SCHEMA_PATH.read_text())
@@ -236,7 +242,10 @@ def main():
         has_use = bool(n.get("use"))
         has_agent = bool(n.get("agent"))
         has_wf = bool(n.get("workflow"))
-        is_orch = n.get("delegation") == "orchestrator"
+        # side_effect: true is a readable alias for delegation: orchestrator
+        # (compile normalizes it before classify); treat it as orchestrator here so
+        # a side_effect node with neither use nor agent is exempt from the shape block.
+        is_orch = n.get("delegation") == "orchestrator" or n.get("side_effect") is True
         # The three node kinds (use:/agent:/workflow:) are mutually exclusive.
         kinds = [k for k, present in
                  (("use", has_use), ("agent", has_agent), ("workflow", has_wf)) if present]

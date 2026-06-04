@@ -5,11 +5,10 @@
   "description": "Runtime configuration for a microskill. Profile YAMLs live under <skill>/profiles/<profile>.yaml. The base profile (profiles/base.yaml) is always loaded; overlays deep-merge over it. Closed grammar: unknown fields at any level are rejected.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["version"],
   "properties": {
     "version": {
       "const": 1,
-      "description": "Schema version. Only 1 is recognized today."
+      "description": "Schema version. Only 1 is recognized. Omitting it defaults to 1 (set by resolve-microskill before validation); an explicit value other than 1 still blocks."
     },
     "profile": {
       "type": "object",
