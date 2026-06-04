@@ -17,6 +17,12 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: true
+          # Admin-owned fine-grained PAT so semantic-release's version-bump push is
+          # attributed to an admin (the only bypass actor on the main ruleset).
+          # Without it the push runs as github-actions[bot] and is rejected by the
+          # "require pull request" rule. Falls back to GITHUB_TOKEN if unset (push
+          # will then fail the ruleset — set the RELEASE_TOKEN secret).
+          token: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -36,4 +42,6 @@ jobs:
       - name: Release
         run: npx semantic-release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Same admin PAT for @semantic-release/github (tag + release creation) and
+          # the @semantic-release/git back-push; falls back to the default token.
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
