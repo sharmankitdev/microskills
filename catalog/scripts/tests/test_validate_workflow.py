@@ -805,3 +805,130 @@ nodes:
     assert rc == 1 and data["pass"] is False
     assert any(i["location"].startswith("schema:") and "max_parallel" in i["location"]
                for i in data["issues"])
+
+
+# --- Phase 4b: gate-choice branching (a gate id is a legal ${...} ref target) ---
+
+def test_gate_choice_ref_passes(tmp_path):
+    # A downstream node's `when` reads ${g.output.choice} where g is a GATE id (not
+    # a node). It must be ACCEPTED — no 'references output of unknown node' block —
+    # and must NOT require g in depends_on (a gate is a checkpoint, not a node).
+    body = VALID + """\
+  - id: c
+    agent: some-agent
+    when: ${g.output.choice}
+    prompt: branch on the human pick
+gates:
+  - id: g
+    after: a
+    type: human_approval
+    prompt: approve?
+    options: [approve, revise]
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 0, data
+    assert data["pass"] is True
+    # No unknown-node block for the gate id, and no depends_on requirement.
+    assert not any("unknown node 'g'" in i["message"] for i in data["issues"])
+    assert not any("output of unknown node 'g'" in i["message"] for i in data["issues"])
+
+
+def test_ghost_output_ref_still_blocks_with_gates_present(tmp_path):
+    # A ${ghost.output} ref to a non-existent id STILL blocks, even when real gates
+    # exist (the gate-id allowance must not swallow genuine typos).
+    body = VALID + """\
+  - id: c
+    agent: some-agent
+    when: ${ghost.output.choice}
+    prompt: branch on a non-existent producer
+gates:
+  - id: g
+    after: a
+    type: human_approval
+    prompt: approve?
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    assert any("output of unknown node 'ghost'" in i["message"] for i in data["issues"])
+
+
+def test_gate_id_ref_creates_no_dependency_edge(tmp_path):
+    # A gate-id ref must NOT become a dependency edge (a gate isn't in the node set;
+    # an edge would break topo_sort). Construct a flow where the only thing that
+    # could order `c` before/after anything is a real ref (to `a`) PLUS a gate-id
+    # ref (to `g`). The gate-id ref must contribute no ordering/cycle side-effect:
+    # the doc validates clean (no cycle), proving the gate ref made no edge.
+    body = VALID + """\
+  - id: c
+    agent: some-agent
+    when: ${g.output.choice}
+    prompt: use ${a.output.x} and branch on ${g.output.choice}
+gates:
+  - id: g
+    after: b
+    type: human_approval
+    prompt: approve?
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 0, data
+    assert data["pass"] is True
+    # No cycle reported (a gate-id edge a/b<->g could only manifest as ordering noise;
+    # the clean pass with the real a->c edge intact proves the gate ref added no edge).
+    assert not any("cycle" in i["message"] for i in data["issues"])
+
+
+# --- Phase 4b: branch-exclusivity lint (WARN-only, never a block) ---
+
+def test_identical_when_siblings_warn(tmp_path):
+    # Two sibling nodes with the SAME depends_on set and TEXTUALLY IDENTICAL when
+    # conditions form a malformed advisory fork (both fire). Emit a WARN; pass stays true.
+    body = """\
+version: 1
+name: fork
+nodes:
+  - id: p
+    agent: ag
+    prompt: plan
+  - id: x
+    agent: ag
+    depends_on: [p]
+    when: ${p.output.ok}
+    prompt: branch x
+  - id: y
+    agent: ag
+    depends_on: [p]
+    when: ${p.output.ok}
+    prompt: branch y
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 0 and data["pass"] is True
+    warns = [i for i in data["issues"] if i["severity"] == "warn"]
+    assert any("mutually exclusive" in i["message"] or "fork" in i["message"].lower()
+               for i in warns), data["issues"]
+
+
+def test_opposite_when_fork_no_warn(tmp_path):
+    # A proper opposite-when fork (cond vs !(cond)) is provably exclusive — NO warn.
+    body = """\
+version: 1
+name: fork
+nodes:
+  - id: p
+    agent: ag
+    prompt: plan
+  - id: x
+    agent: ag
+    depends_on: [p]
+    when: ${p.output.ok}
+    prompt: branch x
+  - id: y
+    agent: ag
+    depends_on: [p]
+    when: ${!(p.output.ok)}
+    prompt: branch y
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 0 and data["pass"] is True
+    warns = [i for i in data["issues"] if i["severity"] == "warn"]
+    assert not any("mutually exclusive" in i["message"] or "fork" in i["message"].lower()
+                   for i in warns), data["issues"]

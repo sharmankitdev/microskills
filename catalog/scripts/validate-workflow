@@ -219,6 +219,18 @@ def main():
 
     id_set = set(node_ids)
 
+    # Gate-choice branching: a gate id is a legal ${<gate-id>.output.choice} ref
+    # target (the dispatcher records the human's pick as results[gate.id]). Collect
+    # the gate ids up front so the per-node ref check below ACCEPTS a gate-id ref
+    # (not 'unknown node') and the typed-producer field-check SKIPS it (a gate has
+    # no output_schema → treat as 'any', never flag). gate-0 already guarantees gate
+    # ids are unique among gates AND disjoint from node ids, so this set is unambiguous.
+    # Note: a gate-id ref must NOT become a dependency edge — the SHARED union_edges
+    # helper only keeps refs whose id is a NODE id (a gate isn't in the node set), so a
+    # gate-id ref contributes no edge and cannot perturb topo_sort.
+    gate_id_set = {g.get("id") for g in (merged.get("gates") or [])
+                   if isinstance(g, dict) and g.get("id")}
+
     # --- Per-node shape + ref-completeness ---
     for nid, n in node_by_id.items():
         has_use = bool(n.get("use"))
@@ -252,10 +264,14 @@ def main():
         for s in collect_strings(scoped):
             for inner in REF_RE.findall(s):
                 for ref_id in NODE_OUTPUT_RE.findall(inner):
-                    if ref_id not in id_set:
+                    # A gate-id ref (e.g. ${g.output.choice}) is legal — a gate is a
+                    # checkpoint, not a node; accept it and require no depends_on edge.
+                    if ref_id not in id_set and ref_id not in gate_id_set:
                         add(issues, "block", f"nodes/{nid}",
                             f"references output of unknown node '{ref_id}'")
                 for prod_id, field in NODE_OUTPUT_FIELD_RE.findall(inner):
+                    if prod_id in gate_id_set:
+                        continue  # gate has no output_schema → 'any', never field-check
                     if prod_id not in id_set:
                         continue  # already reported by the unknown-node guard above
                     osch = node_by_id[prod_id].get("output_schema")
@@ -279,6 +295,39 @@ def main():
                 f"'as' must match ^[a-z][a-z0-9_]*$ (safe identifier), got '{as_var}'")
         if as_var and not has_for_each:
             add(issues, "warn", f"nodes/{nid}", "'as' declared without 'for_each'; it has no effect")
+
+    # --- Branch-exclusivity lint (rank12): WARN-only, never a block ---
+    # Catches the malformed-fork footgun: two+ sibling nodes that form an advisory
+    # fork which is NOT provably mutually exclusive, so more than one branch fires.
+    # SOUND + CONSERVATIVE heuristic — fires ONLY on the clearest case: two sibling
+    # nodes whose effective dependency set is IDENTICAL and whose `when` conditions
+    # are TEXTUALLY IDENTICAL (after whitespace normalization). Both guards on the
+    # same condition off the same producers => both always run together. Deliberately
+    # NO general expression analysis: an opposite-when fork (cond vs !(cond)) has
+    # DIFFERENT when-text and is therefore never flagged, and a node with no `when`
+    # (unconditional) is never a fork branch. This composes with gate-choice branching
+    # (forks guarded on ${gate.output.choice} are exclusive only if their texts differ).
+    def _norm_when(w):
+        return re.sub(r"\s+", "", str(w)) if w else None
+
+    # Effective sibling key = the UNION edge set (explicit depends_on + ref-implied),
+    # so siblings are compared on what actually gates them, not just literal depends_on.
+    fork_edges = union_edges([n for n in nodes if isinstance(n, dict) and n.get("id")])
+    fork_groups = {}
+    for nid in node_ids:
+        w = _norm_when(node_by_id[nid].get("when"))
+        if not w:
+            continue  # an unconditional node is not a guarded fork branch
+        key = (frozenset(fork_edges.get(nid, set())), w)
+        fork_groups.setdefault(key, []).append(nid)
+    for (dep_set, _w), members in fork_groups.items():
+        if len(members) > 1:
+            sib = ", ".join(sorted(members))
+            dep_desc = ("{" + ", ".join(sorted(dep_set)) + "}") if dep_set else "{}"
+            add(issues, "warn", "nodes",
+                f"sibling nodes [{sib}] share dependencies {dep_desc} and have "
+                f"textually identical 'when' conditions; this advisory fork is not "
+                f"mutually exclusive (all branches fire). Did you mean to negate one?")
 
     # --- Cycle detection over the UNION edge set (refs + depends_on) ---
     # CRITICAL: a ref-only cycle (A reads ${B.output}, B reads ${A.output}, neither

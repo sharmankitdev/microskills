@@ -82,14 +82,22 @@ A human-approval / hard gate. First **render `results[gate.after]` as readable m
 Then ask via `AskUserQuestion`: `gate.prompt` is the question, `gate.options` the choices (default
 `confirm / stop`). **Give each option a one-line `description` of its consequence** — `approve`/`confirm`
 → "Continue to the next step."; `revise` → "Re-run this segment with your notes."; `abandon`/`stop` →
-"Stop the run and clean up staging." (map other labels to the nearest). Then act:
+"Stop the run and clean up staging." (map other labels to the nearest).
+
+**Record the human's pick — `results[gate.id] = { choice: <selected option> }`** (the chosen option's
+label, verbatim). A gate id is a legal `${...}` ref target: a later node/segment whose `when` or `inputs`
+reads `${<gate-id>.output.choice}` resolves against this stored object (the gate-choice branching feature
+validate-workflow accepts). This is in addition to — not instead of — the approve/revise/abandon handling
+below; always store the pick, then act on it. Then act:
 - An `approve`/`confirm` choice → continue to the next step.
 - A `revise`-style choice → **ask the user what to change** (a follow-up `AskUserQuestion` or their
   free-text note), then re-run the segment that produced the gate's `after` node: re-invoke that
   segment's script (no re-compile) with fresh `args` that fold the revision notes into the relevant
-  input (e.g. append them to the `requirement` arg). Then re-render the output and re-present the gate.
+  input (e.g. append them to the `requirement` arg). Then re-render the output and re-present the gate
+  (re-recording `results[gate.id]` on the re-presented choice).
 - An `abandon`/`stop` choice → stop the run cleanly (clean up any staging the segments created).
-For `severity: warn` gates, render the output + emit the prompt, then continue without pausing.
+For `severity: warn` gates, render the output + emit the prompt, then continue without pausing — still
+record `results[gate.id] = { choice: <selected option> }` so a downstream branch on the warn-gate pick resolves.
 
 ### `kind: "checkpoint"`, `checkpoint_type: "orchestrator_node"`
 An orchestrator-native step (a node with neither `use` nor `agent`, or `delegation: orchestrator`).
