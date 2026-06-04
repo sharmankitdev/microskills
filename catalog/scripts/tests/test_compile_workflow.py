@@ -1030,3 +1030,246 @@ nodes:
     assert rc == 0, err
     by_node = {c["node"]: c for c in data["classification"]}
     assert by_node["fin"]["class"] == "orchestrator"
+
+
+# --- PHASE 5b FEATURE A: ${<id>.items} the per-item-results array ref form ---
+
+# A for_each fan-out producer, then a downstream node that consumes the WHOLE
+# per-item-results array via ${scan.items} (no explicit depends_on).
+ITEMS_REF = """\
+version: 1
+name: items-flow
+inputs:
+  items:
+    type: array
+    required: true
+nodes:
+  - id: scan
+    agent: ag
+    for_each: ${workflow.inputs.items}
+    as: item
+    prompt: scan ${item}
+  - id: collect
+    agent: ag
+    prompt: summarize the results ${scan.items}
+"""
+
+
+def test_items_ref_resolves_to_producer_array_var_in_segment(tmp_path):
+    # ${scan.items} resolves to the same in-segment array var the for_each node
+    # produces (n_scan) — NOT a .field access. The inferred edge scan->collect
+    # keeps both in one ordered segment.
+    d = make_flow(tmp_path, "items-flow", ITEMS_REF)
+    rc, data, out, err = run(tmp_path, "items-flow")
+    assert rc == 0, err
+    assert data["sequence"] == ["segment[scan,collect]"]
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    # The ref renders as the producer's array var, not n_scan.items / .output.
+    assert "${__ref(n_scan)}" in seg
+    assert "n_scan.items" not in seg
+    assert "n_scan.output" not in seg
+
+
+def test_output_field_named_items_compiles_correctly(tmp_path):
+    # Regression: a producer output field literally named `items`, referenced
+    # in-segment as ${prod.output.items}, must translate to the field access
+    # n_prod.items — NOT collide with the ${id.items} fan-out form (which would
+    # mis-emit _args["n_prod"]). translate_ref resolves .items before .output.
+    body = """\
+version: 1
+name: items-field
+nodes:
+  - id: prod
+    agent: ag
+    prompt: make
+    output_schema:
+      type: object
+      properties:
+        items: { type: array }
+  - id: c
+    agent: ag
+    depends_on: [prod]
+    prompt: use ${prod.output.items}
+"""
+    d = make_flow(tmp_path, "items-field", body)
+    rc, data, out, err = run(tmp_path, "items-field")
+    assert rc == 0, err
+    assert data["sequence"] == ["segment[prod,c]"]
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert "n_prod.items" in seg            # correct field access
+    assert '_args["n_prod"]' not in seg     # not the miscompiled fan-out form
+
+
+ITEMS_REF_REVERSED = """\
+version: 1
+name: items-rev
+inputs:
+  items:
+    type: array
+    required: true
+nodes:
+  - id: collect
+    agent: ag
+    prompt: summarize the results ${scan.items}
+  - id: scan
+    agent: ag
+    for_each: ${workflow.inputs.items}
+    as: item
+    prompt: scan ${item}
+"""
+
+
+def test_items_ref_infers_dependency_edge(tmp_path):
+    # `collect` is defined BEFORE `scan` but reads ${scan.items} (no depends_on).
+    # The inferred edge scan->collect must reorder scan before collect — load-bearing
+    # (without the edge, definition order would put collect first).
+    d = make_flow(tmp_path, "items-rev", ITEMS_REF_REVERSED)
+    rc, data, out, err = run(tmp_path, "items-rev")
+    assert rc == 0, err
+    m = json.loads((d / ".compiled" / "manifest.json").read_text())
+    assert m["steps"][0]["nodes"] == ["scan", "collect"]
+
+
+# A producer in an EARLIER segment (split by an orchestrator node before it),
+# consumed cross-segment via ${scan.items}.
+ITEMS_REF_XSEG = """\
+version: 1
+name: items-xseg
+inputs:
+  items:
+    type: array
+    required: true
+nodes:
+  - id: scan
+    agent: ag
+    for_each: ${workflow.inputs.items}
+    as: item
+    prompt: scan ${item}
+  - id: mid
+    delegation: orchestrator
+    depends_on: [scan]
+    prompt: checkpoint
+  - id: collect
+    agent: ag
+    depends_on: [mid]
+    prompt: summarize ${scan.items}
+"""
+
+
+def test_items_ref_cross_segment_resolves_to_args(tmp_path):
+    # When the producer lives in an earlier segment, ${scan.items} resolves to the
+    # cross-segment results[scan] handle (_args["scan"]), same as its segment var.
+    d = make_flow(tmp_path, "items-xseg", ITEMS_REF_XSEG)
+    rc, data, out, err = run(tmp_path, "items-xseg")
+    assert rc == 0, err
+    # scan is its own segment, then the orchestrator checkpoint, then collect.
+    seg_files = sorted((d / ".compiled").glob("seg-*.js"))
+    collect_seg = [p.read_text() for p in seg_files if "n_collect" in p.read_text()][0]
+    assert '_args["scan"]' in collect_seg
+    assert '_args["scan"].items' not in collect_seg
+    # The cross-segment producer is recorded in needs.nodes.
+    m = json.loads((d / ".compiled" / "manifest.json").read_text())
+    collect_step = [s for s in m["steps"]
+                    if s["kind"] == "segment" and "collect" in s["nodes"]][0]
+    assert "scan" in collect_step["needs"]["nodes"]
+
+
+def test_no_items_ref_byte_identical(tmp_path):
+    # DETERMINISM: a workflow that uses no .items ref compiles byte-identically.
+    # Recompiling the SAME def is byte-identical (manifest included), and the
+    # emitted segment JS is identical across two independent worlds (only the
+    # manifest's absolute `script` path is path-dependent, so seg-*.js is the
+    # path-free determinism surface).
+    d = make_flow(tmp_path, "fe-flow", FE_PLAIN)
+    run(tmp_path, "fe-flow")
+    first = {p.name: p.read_text() for p in (d / ".compiled").iterdir()}
+    run(tmp_path, "fe-flow")
+    second = {p.name: p.read_text() for p in (d / ".compiled").iterdir()}
+    assert first == second
+    d2 = make_flow(tmp_path / "b", "fe-flow", FE_PLAIN)
+    run(tmp_path / "b", "fe-flow")
+    segs1 = {p.name: p.read_text() for p in (d / ".compiled").glob("seg-*.js")}
+    segs2 = {p.name: p.read_text() for p in (d2 / ".compiled").glob("seg-*.js")}
+    assert segs1 == segs2
+
+
+# --- PHASE 5b FEATURE B: intra-def vars (double-brace {{key}} pre-pass) ---
+
+VARS_FLOW = """\
+version: 1
+name: vars-flow
+vars:
+  topic: kubernetes
+  depth: 3
+  field: ok
+nodes:
+  - id: a
+    agent: ag
+    prompt: research {{topic}} at depth {{depth}}
+  - id: b
+    agent: ag
+    when: ${a.output.{{field}}}
+    prompt: use {{topic}}
+"""
+
+
+def test_vars_substituted_in_prompt_and_when(tmp_path):
+    # {{topic}} / {{depth}} / {{field}} are substituted throughout the merged doc
+    # before schema validation, so the compiled segment carries the resolved
+    # literals in BOTH the prompt template and the rendered `when` condition.
+    d = make_flow(tmp_path, "vars-flow", VARS_FLOW)
+    rc, data, out, err = run(tmp_path, "vars-flow")
+    assert rc == 0, err
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert "research kubernetes at depth 3" in seg     # prompt substituted
+    assert "n_a.ok" in seg                              # when ${a.output.{{field}}} -> ok
+    assert "{{topic}}" not in seg
+    assert "{{field}}" not in seg
+
+
+def test_vars_overridable_by_profile(tmp_path):
+    # A profile overlay deep-merges over vars, so a profile-set var wins (the
+    # substitution runs AFTER the merge).
+    base = "version: 1\nvars:\n  topic: serverless\n"
+    d = make_flow(tmp_path, "vars-flow", VARS_FLOW, base=base)
+    rc, data, out, err = run(tmp_path, "vars-flow")
+    assert rc == 0, err
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert "research serverless at depth 3" in seg
+
+
+def test_unresolved_var_does_not_crash(tmp_path):
+    # An unresolved {{key}} warns (not crash): the token is left intact and the
+    # compile still succeeds.
+    body = """\
+version: 1
+name: vars-flow
+vars:
+  topic: kubernetes
+nodes:
+  - id: a
+    agent: ag
+    prompt: research {{topic}} but {{missing}} is unknown
+"""
+    d = make_flow(tmp_path, "vars-flow", body)
+    rc, data, out, err = run(tmp_path, "vars-flow")
+    assert rc == 0, err
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert "research kubernetes but {{missing}} is unknown" in seg
+
+
+def test_no_vars_byte_identical(tmp_path):
+    # DETERMINISM: a workflow with no vars: compiles byte-identically. Same-def
+    # recompile is fully byte-identical; segment JS is identical across worlds.
+    src = GATED.replace("name: linear-flow", "name: gated-flow")
+    d = make_flow(tmp_path, "gated-flow", src)
+    run(tmp_path, "gated-flow")
+    first = {p.name: p.read_text() for p in (d / ".compiled").iterdir()}
+    run(tmp_path, "gated-flow")
+    second = {p.name: p.read_text() for p in (d / ".compiled").iterdir()}
+    assert first == second
+    d2 = make_flow(tmp_path / "b", "gated-flow", src)
+    run(tmp_path / "b", "gated-flow")
+    segs1 = {p.name: p.read_text() for p in (d / ".compiled").glob("seg-*.js")}
+    segs2 = {p.name: p.read_text() for p in (d2 / ".compiled").glob("seg-*.js")}
+    assert segs1 == segs2

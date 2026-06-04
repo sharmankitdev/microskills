@@ -68,6 +68,7 @@ _rm = importlib.util.module_from_spec(_spec)
 _loader.exec_module(_rm)
 deep_merge = _rm.deep_merge
 strip_nulls = _rm.strip_nulls
+substitute_vars = _rm.substitute_vars
 
 # Reuse compile-workflow's SHARED DAG helpers so the two tools can never disagree
 # on the edge model, topological order, or loop-body contiguity. compile-workflow
@@ -83,7 +84,9 @@ loop_contiguity_error = _cw.loop_contiguity_error
 loop_while_until_error = _cw.loop_while_until_error
 desugar_loop_until = _cw.desugar_loop_until
 loop_max_parallel_errors = _cw.loop_max_parallel_errors
+apply_workflow_vars = _cw.apply_workflow_vars
 NODE_OUTPUT_FIELD_RE = _cw.NODE_OUTPUT_FIELD_RE
+NODE_ITEMS_RE = _cw.NODE_ITEMS_RE
 
 REF_RE = re.compile(r"\$\{([^}]*)\}")
 NODE_OUTPUT_RE = re.compile(r"\b([a-z][a-z0-9_-]*)\.output\b")
@@ -189,6 +192,17 @@ def main():
 
     merged = strip_nulls(merged)
 
+    # --- INTRA-DEF VARS: double-brace {{key}} pre-pass (Phase 5b) ---
+    # Mirror compile-workflow EXACTLY (shared apply_workflow_vars): substitute {{key}}
+    # tokens throughout the merged doc from the top-level vars: map AFTER deep-merge +
+    # strip_nulls (so a profile may override a var) and BEFORE schema validation. An
+    # unresolved {{key}} is left intact and surfaced as a WARN (never a crash/block),
+    # consistent with resolve-microskill. A doc with no {{...}} tokens is unchanged.
+    if isinstance(merged, dict):
+        merged, unresolved_vars = apply_workflow_vars(merged)
+        for uk in unresolved_vars:
+            add(issues, "warn", "vars", f"unresolved variable '{{{{{uk}}}}}' left intact")
+
     # An OMITTED version defaults to 1 BEFORE schema validation (mirrors
     # compile-workflow / resolve-microskill). The const:1 check stays intact, so an
     # EXPLICIT wrong version still blocks.
@@ -292,6 +306,22 @@ def main():
                         add(issues, "block", f"nodes/{nid}",
                             f"references ${{{prod_id}.output.{field}}} but node "
                             f"'{prod_id}' output_schema does not declare property '{field}'")
+                # FEATURE A: ${<id>.items} consumes the WHOLE per-item-results array of a
+                # fan-out node <id>. Like ${<id>.output} it implies the edge <id>->nid
+                # (handled by the SHARED scoped_ref_ids/union_edges). Here the typo +
+                # misuse guards: unknown <id> blocks; an <id> that is a node but NOT a
+                # for_each node blocks (no per-item array to consume — clear misuse).
+                # NODE_OUTPUT_FIELD_RE never matches `.items`, so the typed-producer
+                # field-check above cannot interfere.
+                for ref_id in NODE_ITEMS_RE.findall(inner):
+                    if ref_id not in id_set:
+                        add(issues, "block", f"nodes/{nid}",
+                            f"references per-item results of unknown node '{ref_id}' "
+                            f"(${{{ref_id}.items}})")
+                    elif not node_by_id[ref_id].get("for_each"):
+                        add(issues, "block", f"nodes/{nid}",
+                            f"references ${{{ref_id}.items}} but node '{ref_id}' is not a "
+                            f"for_each node; there is no per-item results array to consume")
 
         # for_each fan-out requires an `as` binding that is a safe identifier.
         has_for_each = bool(n.get("for_each"))

@@ -983,3 +983,203 @@ nodes:
     warns = [i for i in data["issues"] if i["severity"] == "warn"]
     assert not any("mutually exclusive" in i["message"] or "fork" in i["message"].lower()
                    for i in warns), data["issues"]
+
+
+# --- PHASE 5b FEATURE A: ${<id>.items} the per-item-results array ref form ---
+
+ITEMS_REF = """\
+version: 1
+name: items-flow
+inputs:
+  items: { type: array, required: true }
+nodes:
+  - id: scan
+    agent: ag
+    for_each: ${workflow.inputs.items}
+    as: item
+    prompt: scan ${item}
+  - id: collect
+    agent: ag
+    prompt: summarize ${scan.items}
+"""
+
+
+def test_items_ref_on_for_each_producer_passes(tmp_path):
+    # ${scan.items} where scan IS a for_each node is accepted and infers the edge
+    # scan->collect (no explicit depends_on required, no unknown-node/misuse block).
+    rc, data, _ = run(write_wf(tmp_path, ITEMS_REF))
+    assert rc == 0, data
+    assert data["pass"] is True
+    assert not any("not in depends_on" in i["message"] for i in data["issues"])
+    # Specifically: no 'for_each' misuse block and no unknown-node block for scan.
+    assert not any("for_each" in i["message"] and "scan" in i["message"]
+                   for i in data["issues"] if i["severity"] == "block")
+    assert not any("unknown node 'scan'" in i["message"] for i in data["issues"])
+
+
+def test_items_ref_on_non_for_each_producer_blocks(tmp_path):
+    # ${a.items} where a is NOT a for_each node is a clear misuse — there is no
+    # per-item array to consume. Block it.
+    body = """\
+version: 1
+name: items-bad
+nodes:
+  - id: a
+    agent: ag
+    prompt: plan
+  - id: b
+    agent: ag
+    prompt: consume ${a.items}
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    assert any("a.items" in i["message"] or
+               ("'a'" in i["message"] and "for_each" in i["message"])
+               for i in data["issues"]), data["issues"]
+
+
+def test_items_ref_unknown_node_blocks(tmp_path):
+    # ${ghost.items} names a node that does not exist — still a typo guard block.
+    body = """\
+version: 1
+name: items-ghost
+nodes:
+  - id: scan
+    agent: ag
+    for_each: ${workflow.inputs.items}
+    as: item
+    prompt: scan ${item}
+  - id: collect
+    agent: ag
+    prompt: summarize ${ghost.items}
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    assert any("ghost" in i["message"] and
+               ("unknown" in i["message"] or "does not" in i["message"])
+               for i in data["issues"]), data["issues"]
+
+
+def test_items_ref_only_cycle_blocks(tmp_path):
+    # A ref-only cycle through .items must be caught by the union-cycle check: both
+    # are for_each producers, each consuming the other's .items array.
+    body = """\
+version: 1
+name: items-cyc
+inputs:
+  items: { type: array, required: true }
+nodes:
+  - id: a
+    agent: ag
+    for_each: ${b.items}
+    as: item
+    prompt: scan ${item}
+  - id: b
+    agent: ag
+    for_each: ${a.items}
+    as: item
+    prompt: scan ${item}
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    assert any("cycle" in i["message"] for i in data["issues"])
+
+
+def test_items_field_check_not_triggered(tmp_path):
+    # The typed-producer field-check (NODE_OUTPUT_FIELD_RE) must not interfere:
+    # .items is not .output.<field>, so a for_each producer with a typed
+    # output_schema is never field-flagged for a .items ref.
+    body = """\
+version: 1
+name: items-typed
+inputs:
+  items: { type: array, required: true }
+nodes:
+  - id: scan
+    agent: ag
+    for_each: ${workflow.inputs.items}
+    as: item
+    prompt: scan ${item}
+    output_schema:
+      type: object
+      properties:
+        ok: { type: boolean }
+  - id: collect
+    agent: ag
+    prompt: summarize ${scan.items}
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 0, data
+    assert data["pass"] is True
+    assert not any("does not declare" in i["message"] for i in data["issues"])
+
+
+# --- PHASE 5b FEATURE B: intra-def vars (double-brace {{key}} pre-pass) ---
+
+def test_vars_substituted_before_validation(tmp_path):
+    # {{name}} tokens are substituted from vars BEFORE schema validation; a var
+    # resolving the workflow name yields a clean pass.
+    body = """\
+version: 1
+name: vars-flow
+vars:
+  who: alice
+nodes:
+  - id: a
+    agent: ag
+    prompt: greet {{who}}
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 0, data
+    assert data["pass"] is True
+
+
+def test_vars_overridable_by_profile(tmp_path):
+    # A profile overlay can override a var; the substitution runs after the merge so
+    # the overridden value is what gets validated.
+    body = """\
+version: 1
+name: vars-flow
+vars:
+  who: alice
+nodes:
+  - id: a
+    agent: ag
+    when: ${a.output.{{who}}}
+    prompt: greet {{who}}
+"""
+    over = _overlay(tmp_path, "vars:\n  who: bob\n")
+    # With who=bob the when-ref becomes ${a.output.bob}; a is its own producer so
+    # there is no unknown-node block — what we assert is that the merge+substitution
+    # ran (no leftover {{who}} causing a schema/ref anomaly) and it passes.
+    rc, data, _ = run(write_wf(tmp_path, body), over)
+    # `a` references its own output which is a self-edge dropped by union_edges
+    # (r != nid), so this validates clean.
+    assert rc == 0, data
+    assert data["pass"] is True
+
+
+def test_unresolved_var_does_not_crash(tmp_path):
+    # An unresolved {{missing}} warns (not crash): the token is left intact and
+    # validation still completes (here cleanly).
+    body = """\
+version: 1
+name: vars-flow
+vars:
+  who: alice
+nodes:
+  - id: a
+    agent: ag
+    prompt: greet {{who}} but {{missing}} stays
+"""
+    rc, data, err = run(write_wf(tmp_path, body))
+    assert "Traceback" not in err
+    assert rc == 0, data
+    assert data["pass"] is True
+
+
+def test_no_vars_validate_unchanged(tmp_path):
+    # A workflow with no vars: validates exactly as before.
+    rc, data, _ = run(write_wf(tmp_path, VALID))
+    assert rc == 0 and data["pass"] is True
+    assert data["issues"] == []

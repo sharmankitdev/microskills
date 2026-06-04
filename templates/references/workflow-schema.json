@@ -17,6 +17,11 @@
       "properties": { "default": { "type": "string", "minLength": 1 } },
       "description": "base.yaml only; names the default profile overlay applied when --profile is omitted."
     },
+    "vars": {
+      "type": "object",
+      "additionalProperties": { "type": ["string", "number", "boolean"] },
+      "description": "Intra-def variable map. Double-brace {{key}} tokens anywhere in the merged doc are substituted from this map by compile/validate AFTER deep-merge (so a profile may override a var) and BEFORE schema validation. Pure textual pre-compile transform — no file include / cross-file mechanism. An unresolved {{key}} is left intact (warns)."
+    },
     "imports": {
       "type": "array",
       "items": { "type": "string", "pattern": "^[a-z][a-z0-9-]*(/[a-z][a-z0-9-]*)?$" },

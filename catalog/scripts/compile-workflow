@@ -85,14 +85,51 @@ _loader.exec_module(_rm)
 deep_merge = _rm.deep_merge
 apply_override = _rm.apply_override
 strip_nulls = _rm.strip_nulls
+substitute_vars = _rm.substitute_vars
 
 REF_RE = re.compile(r"\$\{([^}]*)\}")
 # Id-only match for edge inference (a node id immediately before `.output`).
 NODE_OUTPUT_RE = re.compile(r"\b([a-z][a-z0-9_-]*)\.output\b")
+# Id-only match for the ${<id>.items} per-item-results array ref form. Like
+# NODE_OUTPUT_RE it implies a dependency edge into the referencing node, so the
+# SHARED scoped_ref_ids helper unions its matches with NODE_OUTPUT_RE's. The
+# (?<!\.) lookbehind keeps it from mis-firing on a dotted tail like
+# ${workflow.inputs.items}, where the `items` segment is NOT a node id.
+NODE_ITEMS_RE = re.compile(r"(?<!\.)\b([a-z][a-z0-9_-]*)\.items\b")
 # Id + first field after `.output.` for the typed-producer field-ref check.
 NODE_OUTPUT_FIELD_RE = re.compile(r"\b([a-z][a-z0-9_-]*)\.output\.([a-zA-Z0-9_]+)")
-# Fields that may carry ${id.output} refs that imply a dependency edge.
+# Fields that may carry ${id.output} / ${id.items} refs that imply a dependency edge.
 SCOPED_REF_FIELDS = ("inputs", "prompt", "when", "for_each")
+
+
+def substitute_vars_deep(obj, vars_map, unresolved):
+    """Recursively apply substitute_vars (the resolve-microskill {{key}} substituter)
+    to every string in a nested structure, returning a NEW structure. Dict keys are
+    substituted too so a templated key stays consistent. Pure textual transform."""
+    if isinstance(obj, str):
+        return substitute_vars(obj, vars_map, unresolved)
+    if isinstance(obj, dict):
+        return {substitute_vars_deep(k, vars_map, unresolved): substitute_vars_deep(v, vars_map, unresolved)
+                for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [substitute_vars_deep(v, vars_map, unresolved) for v in obj]
+    return obj
+
+
+def apply_workflow_vars(wf):
+    """SHARED intra-def vars pre-pass used by BOTH compile and validate. Substitute
+    double-brace {{key}} tokens throughout the merged doc from the top-level vars:
+    map (reusing resolve-microskill's substitute_vars). Returns (new_doc, unresolved).
+
+    vars values are coerced to str by substitute_vars at substitution time. A doc
+    with no vars: (empty/absent map) still walks the tree but replaces nothing — a
+    {{key}} with no matching var is left intact and recorded in `unresolved`. With
+    NO {{...}} tokens at all the output is byte-identical to the input doc."""
+    if not isinstance(wf, dict):
+        return wf, []
+    vars_map = wf.get("vars") or {}
+    unresolved = []
+    return substitute_vars_deep(wf, vars_map, unresolved), unresolved
 
 
 def collect_strings(obj):
@@ -108,13 +145,17 @@ def collect_strings(obj):
 
 
 def scoped_ref_ids(node):
-    """Node ids referenced via ${<id>.output...} in a node's scoped fields
-    (inputs/prompt/when/for_each). These imply a dependency edge into this node."""
+    """Node ids referenced via ${<id>.output...} OR ${<id>.items} in a node's
+    scoped fields (inputs/prompt/when/for_each). Both forms imply a dependency edge
+    into this node — a ${<id>.items} ref consumes the whole per-item-results array
+    of the fan-out node <id>, so it depends on <id> exactly like ${<id>.output}."""
     out = set()
     scoped = {k: node.get(k) for k in SCOPED_REF_FIELDS if k in node}
     for s in collect_strings(scoped):
         for inner in REF_RE.findall(s):
             for rid in NODE_OUTPUT_RE.findall(inner):
+                out.add(rid)
+            for rid in NODE_ITEMS_RE.findall(inner):
                 out.add(rid)
     return out
 
@@ -341,6 +382,20 @@ def translate_ref(inner, seg_var_ids):
     s = re.sub(r"\bworkflow\.inputs\.([a-zA-Z0-9_]+)", r"_args.wf_\1", s)
     s = re.sub(r"\bloop\.carry\.([a-zA-Z0-9_]+)", r"carry_\1", s)
 
+    # ${<id>.items} resolves to the producer's whole per-item-results array — the
+    # SAME handle as its segment var (n_<id> in-segment, _args[<id>] cross-segment),
+    # with NO trailing .field access (the for_each node's result IS the array).
+    # This MUST run BEFORE the .output pass, on the raw expression: NODE_ITEMS_RE's
+    # (?<!\.) lookbehind keeps it from matching a `.output.items` FIELD tail here, but
+    # once .output rewrites `prod.output.items` -> `n_prod.items` the bare `n_prod`
+    # token would mis-match (no preceding dot). Resolving items first avoids that
+    # collision so a producer field literally named `items` compiles correctly.
+    def repl_items(m):
+        nid = m.group(1)
+        return jsvar(nid) if nid in seg_var_ids else f'_args[{json.dumps(nid)}]'
+
+    s = NODE_ITEMS_RE.sub(repl_items, s)
+
     def repl_out(m):
         nid, rest = m.group(1), m.group(2) or ""
         if nid in seg_var_ids:
@@ -366,6 +421,11 @@ class Needs:
             for m in re.finditer(r"\bloop\.carry\.([a-zA-Z0-9_]+)", inner):
                 self.carry.add(m.group(1))
             for m in re.finditer(r"\b([a-z][a-z0-9_-]*)\.output\b", inner):
+                if m.group(1) not in seg_var_ids:
+                    self.nodes.add(m.group(1))
+            # ${<id>.items} consumes a cross-segment producer's array exactly like
+            # ${<id>.output}: a producer outside this segment is a `needs` node.
+            for m in NODE_ITEMS_RE.finditer(inner):
                 if m.group(1) not in seg_var_ids:
                     self.nodes.add(m.group(1))
 
@@ -629,6 +689,17 @@ def main():
         apply_override(wf, path.strip(), val.strip())
 
     wf = strip_nulls(wf)
+
+    # --- INTRA-DEF VARS: double-brace {{key}} pre-pass (Phase 5b) ---
+    # Substitute {{key}} tokens throughout the merged doc from the top-level vars:
+    # map, using the SAME substitute_vars resolve-microskill already ships. Runs
+    # AFTER deep-merge + strip_nulls (so a profile may override a var) and BEFORE
+    # schema validation. Pure textual pre-compile transform → deterministic; a
+    # workflow with no vars: leaves every string byte-identical. An unresolved
+    # {{key}} is left intact and recorded (warned), consistent with resolve-microskill.
+    wf, unresolved_vars = apply_workflow_vars(wf)
+    for _uk in unresolved_vars:
+        sys.stderr.write(f"warning: unresolved workflow var '{_uk}' left intact\n")
 
     # An OMITTED version defaults to 1 BEFORE schema validation (the const:1 check
     # stays intact, so an EXPLICIT wrong version still blocks). Mirrors the
