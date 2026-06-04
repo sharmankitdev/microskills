@@ -216,10 +216,23 @@ def main():
         if color[nid] == WHITE:
             visit(nid, [])
 
-    # --- Gates anchoring ---
+    # --- Gates anchoring + id uniqueness/disjointness ---
+    # Gate ids share the ${<id>.output} namespace with node ids, so they must be
+    # unique among gates AND disjoint from node ids — otherwise a future feature
+    # keying off a gate id (e.g. recording a human choice in results[gate.id])
+    # produces an ambiguous reference.
+    seen_gate_ids = set()
     for g in merged.get("gates") or []:
         if not isinstance(g, dict):
             continue
+        gid = g.get("id")
+        if gid:
+            if gid in seen_gate_ids:
+                add(issues, "block", f"gates/{gid}", f"duplicate gate id '{gid}'")
+            if gid in id_set:
+                add(issues, "block", f"gates/{gid}",
+                    f"gate id '{gid}' collides with a node id; ids must be disjoint across nodes and gates")
+            seen_gate_ids.add(gid)
         after = g.get("after")
         if after and after not in id_set:
             add(issues, "block", f"gates/{g.get('id','?')}", f"'after' references unknown node '{after}'")

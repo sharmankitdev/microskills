@@ -214,3 +214,51 @@ def test_real_workflow_create_passes():
     rc, data, _ = run(wc / "WORKFLOW.yaml", wc / "profiles" / "base.yaml")
     assert rc == 0, data
     assert data["pass"] is True
+
+
+# --- gate-0: gate-id uniqueness + gate/node-id disjointness ---
+
+def test_duplicate_gate_id_blocks(tmp_path):
+    body = VALID + """\
+gates:
+  - id: g1
+    after: a
+    type: human_approval
+    prompt: approve?
+  - id: g1
+    after: b
+    type: human_approval
+    prompt: approve again?
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    assert any("duplicate gate id 'g1'" in i["message"] for i in data["issues"])
+
+
+def test_gate_node_id_collision_blocks(tmp_path):
+    body = VALID + """\
+gates:
+  - id: a
+    after: b
+    type: human_approval
+    prompt: approve?
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    assert any("collides with a node id" in i["message"] for i in data["issues"])
+
+
+def test_distinct_gate_ids_pass(tmp_path):
+    body = VALID + """\
+gates:
+  - id: g1
+    after: a
+    type: human_approval
+    prompt: approve?
+  - id: g2
+    after: b
+    type: human_approval
+    prompt: approve more?
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 0 and data["pass"] is True
