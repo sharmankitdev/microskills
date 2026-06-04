@@ -13,6 +13,8 @@ Exit codes:
 """
 
 import argparse
+import importlib.machinery
+import importlib.util
 import json
 import os
 import re
@@ -47,16 +49,23 @@ except ImportError:
 
 REQUIRED_SECTIONS = ["## Purpose", "## Inputs", "## Steps", "## Output", "## Failure modes"]
 NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
-STEP_RE = re.compile(r"^\d+\.", re.MULTILINE)
-BRANCH_RE = re.compile(
-    r"\b("
-    r"if\b|else\b|for each\b|repeat\b|retry\b|when\b.*then\b|based on\b|"
-    r"depending on|either\b|go to step|otherwise|or if|unless"
-    r")\b",
-    re.IGNORECASE,
-)
 
 SCRIPT = Path(__file__).resolve()
+
+# Shared linear-path vocabulary (STEP_RE / BRANCH_RE / STEP_CAP) lives in
+# microskill_steps.py so resolve-microskill's profile add/patch re-check cannot
+# drift from this author-time lint. Loaded via SourceFileLoader to match the
+# extension-less-script pattern used across the engine.
+_STEPS_MOD_PATH = SCRIPT.parent / "microskill_steps.py"
+_steps_loader = importlib.machinery.SourceFileLoader(
+    "microskill_steps", str(_STEPS_MOD_PATH)
+)
+_steps_spec = importlib.util.spec_from_loader("microskill_steps", _steps_loader)
+_steps_mod = importlib.util.module_from_spec(_steps_spec)
+_steps_loader.exec_module(_steps_mod)
+STEP_RE = _steps_mod.STEP_RE
+BRANCH_RE = _steps_mod.BRANCH_RE
+STEP_CAP = _steps_mod.STEP_CAP
 
 
 def _templates_root(script):
@@ -160,7 +169,7 @@ def check_skill(path, issues):
         count = len(STEP_RE.findall(steps_body))
         if count == 0:
             add(issues, "block", "steps", "no numbered steps found under ## Steps")
-        elif count > 10:
+        elif count > STEP_CAP:
             add(issues, "warn", "steps",
                 f"{count} numbered steps; consider whether this is still one atomic task")
         for match in BRANCH_RE.finditer(steps_body):

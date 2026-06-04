@@ -72,8 +72,56 @@
     },
     "steps": {
       "type": "object",
-      "description": "Override numbered steps from SKILL.md. Keys are step numbers as strings.",
+      "description": "Override the SKILL.md '## Steps' section. Numeric string keys (^[0-9]+$) annotate an existing step in place (optional / mandate_tool), keyed by its ORIGINAL number. The reserved keys add/patch/remove restructure the Steps markdown — also keyed by ORIGINAL step number — and are applied REMOVE -> PATCH -> ADD, after which the surviving + added steps are renumbered contiguously. These are markdown-line directives, NOT the deep_merge list-verb engine. A patched/added step whose text introduces branching language (if/else/for each/retry/when…then) is rejected at resolve time; >10 merged steps stays an advisory warning.",
       "additionalProperties": false,
+      "properties": {
+        "remove": {
+          "type": "array",
+          "description": "Original step numbers (>=1) to elide. Renumbering closes the gap. A gate anchored after a removed step falls back to the trailing 'Gates (resolved)' block (it is not silently dropped). A number that names no step in SKILL.md is an error.",
+          "items": { "type": "integer", "minimum": 1 },
+          "uniqueItems": true
+        },
+        "patch": {
+          "type": "object",
+          "description": "Replace a step's text in place, keyed by ORIGINAL step number (as a string). The step keeps its position; only its prose changes. A key that names no step in SKILL.md is an error.",
+          "additionalProperties": false,
+          "patternProperties": {
+            "^[0-9]+$": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["text"],
+              "properties": {
+                "text": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "New step body (everything after the renumbered 'N. ' prefix). Single linear path only — no branching language."
+                }
+              }
+            }
+          }
+        },
+        "add": {
+          "type": "array",
+          "description": "Insert new steps. Applied after remove + patch, in declared order. Each lands after the original step named by 'after' (0 = prepend before the first surviving step). An 'after' that names no original step (other than 0) is an error.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["after", "text"],
+            "properties": {
+              "after": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "ORIGINAL step number to insert after; 0 prepends before the first step."
+              },
+              "text": {
+                "type": "string",
+                "minLength": 1,
+                "description": "New step body (everything after the renumbered 'N. ' prefix). Single linear path only — no branching language."
+              }
+            }
+          }
+        }
+      },
       "patternProperties": {
         "^[0-9]+$": {
           "type": "object",

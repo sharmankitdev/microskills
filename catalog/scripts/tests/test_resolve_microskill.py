@@ -23,6 +23,11 @@ import pytest
 REPO = Path(__file__).resolve().parents[3]
 SCRIPT = REPO / "catalog" / "scripts" / "resolve-microskill"
 REAL_MICROSKILLS_ROOT = REPO / "catalog" / "microskills"
+# Pin the resolver to the canonical catalog templates/ (config-schema.json) so
+# these hermetic tests validate against the source of truth, never a stale
+# generated .claude/ mirror. _templates_root honors this env var with highest
+# precedence; unset, the resolver's runtime precedence is unchanged.
+CATALOG_TEMPLATES_ROOT = REPO / "templates"
 
 
 def load_resolver():
@@ -39,11 +44,13 @@ def run(skill, *args, skill_root=None, env=None):
     cmd = [sys.executable, str(SCRIPT), skill, *args]
     if skill_root is not None:
         cmd.extend(["--skill-root", str(skill_root)])
+    run_env = dict(env if env is not None else os.environ.copy())
+    run_env.setdefault("MICROSKILLS_TEMPLATES_ROOT", str(CATALOG_TEMPLATES_ROOT))
     proc = subprocess.run(
         cmd,
         capture_output=True,
         text=True,
-        env=env if env is not None else os.environ.copy(),
+        env=run_env,
     )
     try:
         data = json.loads(proc.stdout) if proc.stdout.strip() else None
@@ -1405,3 +1412,272 @@ def test_resolver_verb_missing_remove_id_blocks(tmp_path):
     code, data, _, err = run("verb-bad-rm-fixture", "--profile", "reshape", skill_root=tmp_path)
     assert code == 1, err
     assert "no_such_gate" in data["error"]
+
+
+# ---------------------------------------------------------------------------
+# P1.1 microskill steps.add / steps.patch / steps.remove
+#
+# A microskill PROFILE may add / patch / remove markdown "## Steps" entries,
+# keyed by each step's ORIGINAL number, after which the surviving + added steps
+# are renumbered contiguously. Distinct from the deep_merge list-verb engine:
+# steps are markdown numbered lines, not a YAML list.
+#
+# Shape (consistent with the keyed-by-number steps map):
+#   steps:
+#     remove: [<orig_n>, ...]            # elide steps, keyed by original number
+#     patch:  { "<orig_n>": {text: ...}} # replace a step's text, position kept
+#     add:    [{after: <orig_n|0>, text: ...}, ...]  # 0 prepends, N inserts after orig N
+# Apply order: REMOVE -> PATCH -> ADD -> renumber.
+# ---------------------------------------------------------------------------
+
+
+def test_steps_patch_replaces_text_and_preserves_position(tmp_path):
+    body = MINIMAL_SKILL.format(name="patch-step-fixture")
+    cfg = textwrap.dedent("""\
+        version: 1
+        steps:
+          patch:
+            "2":
+              text: "**Replaced** — the new second step."
+        """)
+    make_skill(tmp_path, "patch-step-fixture", body, default_cfg=cfg)
+    code, data, _, err = run("patch-step-fixture", skill_root=tmp_path)
+    assert code == 0, err
+    rendered = data["rendered_skill_body"]
+    step_lines = [ln for ln in rendered.splitlines() if re.match(r"^\d+\.", ln)]
+    assert step_lines[0].startswith("1. **First**")
+    assert step_lines[1] == "2. **Replaced** — the new second step."
+    assert step_lines[2].startswith("3. **Third**")
+    assert "**Second**" not in rendered
+    assert len(step_lines) == 3
+
+
+def test_steps_remove_elides_and_renumbers(tmp_path):
+    body = MINIMAL_SKILL.format(name="remove-step-fixture")
+    cfg = textwrap.dedent("""\
+        version: 1
+        steps:
+          remove: [2]
+        """)
+    make_skill(tmp_path, "remove-step-fixture", body, default_cfg=cfg)
+    code, data, _, err = run("remove-step-fixture", skill_root=tmp_path)
+    assert code == 0, err
+    rendered = data["rendered_skill_body"]
+    step_lines = [ln for ln in rendered.splitlines() if re.match(r"^\d+\.", ln)]
+    assert len(step_lines) == 2
+    assert step_lines[0].startswith("1. **First**")
+    assert step_lines[1].startswith("2. **Third**")
+    assert "**Second**" not in rendered
+
+
+def test_steps_add_after_number_inserts_and_renumbers(tmp_path):
+    body = MINIMAL_SKILL.format(name="add-step-fixture")
+    cfg = textwrap.dedent("""\
+        version: 1
+        steps:
+          add:
+            - after: 1
+              text: "**Inserted** — brand new step."
+        """)
+    make_skill(tmp_path, "add-step-fixture", body, default_cfg=cfg)
+    code, data, _, err = run("add-step-fixture", skill_root=tmp_path)
+    assert code == 0, err
+    rendered = data["rendered_skill_body"]
+    step_lines = [ln for ln in rendered.splitlines() if re.match(r"^\d+\.", ln)]
+    assert len(step_lines) == 4
+    assert step_lines[0].startswith("1. **First**")
+    assert step_lines[1] == "2. **Inserted** — brand new step."
+    assert step_lines[2].startswith("3. **Second**")
+    assert step_lines[3].startswith("4. **Third**")
+
+
+def test_steps_add_after_zero_prepends(tmp_path):
+    body = MINIMAL_SKILL.format(name="prepend-step-fixture")
+    cfg = textwrap.dedent("""\
+        version: 1
+        steps:
+          add:
+            - after: 0
+              text: "**Zeroth** — runs before everything."
+        """)
+    make_skill(tmp_path, "prepend-step-fixture", body, default_cfg=cfg)
+    code, data, _, err = run("prepend-step-fixture", skill_root=tmp_path)
+    assert code == 0, err
+    rendered = data["rendered_skill_body"]
+    step_lines = [ln for ln in rendered.splitlines() if re.match(r"^\d+\.", ln)]
+    assert len(step_lines) == 4
+    assert step_lines[0] == "1. **Zeroth** — runs before everything."
+    assert step_lines[1].startswith("2. **First**")
+
+
+def test_steps_gate_anchored_after_removed_step_falls_back(tmp_path):
+    # MUST-FIX #3: a gate anchored after a REMOVED step must hit the same
+    # trailing 'Gates (resolved)' fallback as a skipped step — never silently drop.
+    body = MINIMAL_SKILL.format(name="remove-gate-fixture")
+    cfg = textwrap.dedent("""\
+        version: 1
+        steps:
+          remove: [2]
+        gates:
+          add:
+            - id: orphaned
+              after: "2"
+              type: verification
+              severity: hard
+        """)
+    make_skill(tmp_path, "remove-gate-fixture", body, default_cfg=cfg)
+    code, data, _, err = run("remove-gate-fixture", skill_root=tmp_path)
+    assert code == 0, err
+    rendered = data["rendered_skill_body"]
+    # the step is gone, the gate is NOT inlined, but it survives in the trailing block
+    assert "**Second**" not in rendered
+    assert "[GATE AFTER STEP" not in rendered
+    assert "## Gates (resolved)" in rendered
+    assert "orphaned" in rendered
+    assert any(
+        "orphaned" in w and "2" in w and "Gates (resolved)" in w
+        for w in data["warnings"]
+    )
+
+
+def test_steps_add_branching_language_blocks(tmp_path):
+    body = MINIMAL_SKILL.format(name="branch-add-fixture")
+    cfg = textwrap.dedent("""\
+        version: 1
+        steps:
+          add:
+            - after: 1
+              text: "**Branchy** — if the file exists then read it otherwise skip."
+        """)
+    make_skill(tmp_path, "branch-add-fixture", body, default_cfg=cfg)
+    code, data, _, err = run("branch-add-fixture", skill_root=tmp_path)
+    assert code == 1, err
+    assert "error" in data
+    assert "branch" in data["error"].lower()
+
+
+def test_steps_patch_branching_language_blocks(tmp_path):
+    body = MINIMAL_SKILL.format(name="branch-patch-fixture")
+    cfg = textwrap.dedent("""\
+        version: 1
+        steps:
+          patch:
+            "2":
+              text: "**Looped** — for each item in the list, process it."
+        """)
+    make_skill(tmp_path, "branch-patch-fixture", body, default_cfg=cfg)
+    code, data, _, err = run("branch-patch-fixture", skill_root=tmp_path)
+    assert code == 1, err
+    assert "error" in data
+    assert "branch" in data["error"].lower()
+
+
+def test_steps_over_ten_merged_warns_not_blocks(tmp_path):
+    body = MINIMAL_SKILL.format(name="overten-fixture")
+    # start with 3 steps, add 9 more -> 12 merged steps
+    adds = "\n".join(
+        f"    - after: 3\n      text: \"**Extra{i}** — additional step number {i}.\""
+        for i in range(9)
+    )
+    cfg = "version: 1\nsteps:\n  add:\n" + adds + "\n"
+    make_skill(tmp_path, "overten-fixture", body, default_cfg=cfg)
+    code, data, _, err = run("overten-fixture", skill_root=tmp_path)
+    assert code == 0, err
+    rendered = data["rendered_skill_body"]
+    step_lines = [ln for ln in rendered.splitlines() if re.match(r"^\d+\.", ln)]
+    assert len(step_lines) == 12
+    assert any("12" in w and "atomic" in w for w in data["warnings"])
+
+
+def test_steps_patch_missing_number_blocks(tmp_path):
+    body = MINIMAL_SKILL.format(name="patch-ghost-fixture")
+    cfg = textwrap.dedent("""\
+        version: 1
+        steps:
+          patch:
+            "9":
+              text: "**Nope** — there is no step nine."
+        """)
+    make_skill(tmp_path, "patch-ghost-fixture", body, default_cfg=cfg)
+    code, data, _, err = run("patch-ghost-fixture", skill_root=tmp_path)
+    assert code == 1, err
+    assert "error" in data
+    assert "9" in data["error"]
+
+
+def test_steps_remove_missing_number_blocks(tmp_path):
+    body = MINIMAL_SKILL.format(name="remove-ghost-fixture")
+    cfg = textwrap.dedent("""\
+        version: 1
+        steps:
+          remove: [9]
+        """)
+    make_skill(tmp_path, "remove-ghost-fixture", body, default_cfg=cfg)
+    code, data, _, err = run("remove-ghost-fixture", skill_root=tmp_path)
+    assert code == 1, err
+    assert "error" in data
+    assert "9" in data["error"]
+
+
+def test_steps_add_after_missing_anchor_blocks(tmp_path):
+    body = MINIMAL_SKILL.format(name="add-ghost-fixture")
+    cfg = textwrap.dedent("""\
+        version: 1
+        steps:
+          add:
+            - after: 9
+              text: "**Nope** — anchored to a missing step."
+        """)
+    make_skill(tmp_path, "add-ghost-fixture", body, default_cfg=cfg)
+    code, data, _, err = run("add-ghost-fixture", skill_root=tmp_path)
+    assert code == 1, err
+    assert "error" in data
+    assert "9" in data["error"]
+
+
+def test_steps_directives_preserve_optional_mandate_skip(tmp_path):
+    # REGRESSION: the legacy optional / mandate_tool / --skip-step path is unchanged
+    # even when keyed-by-number step config coexists with the new verb keys.
+    body = MINIMAL_SKILL.format(name="legacy-coexist-fixture")
+    cfg = textwrap.dedent("""\
+        version: 1
+        steps:
+          "1":
+            mandate_tool: Read
+          "3":
+            optional: true
+          patch:
+            "2":
+              text: "**Patched Second** — replaced body."
+        """)
+    make_skill(tmp_path, "legacy-coexist-fixture", body, default_cfg=cfg)
+    code, data, _, err = run(
+        "legacy-coexist-fixture", "--skip-step", "3", skill_root=tmp_path
+    )
+    assert code == 0, err
+    rendered = data["rendered_skill_body"]
+    step_lines = [ln for ln in rendered.splitlines() if re.match(r"^\d+\.", ln)]
+    # step 3 skipped, step 2 patched, step 1 mandate-tagged
+    assert len(step_lines) == 2
+    assert "[REQUIRED TOOL: Read]" in step_lines[0]
+    assert step_lines[1].endswith("**Patched Second** — replaced body.")
+    assert "**Third**" not in rendered
+    assert data["directives"]["mandated_tools"] == {"1": "Read"}
+
+
+def test_shared_atomicity_module_vocabulary_matches_validate(tmp_path):
+    # The branching-language vocabulary must be the SAME object used by
+    # validate-microskill — loaded from the shared module, not duplicated.
+    import importlib.machinery as _m
+    import importlib.util as _u
+
+    shared_path = REPO / "catalog" / "scripts" / "microskill_steps.py"
+    loader = _m.SourceFileLoader("microskill_steps", str(shared_path))
+    spec = _u.spec_from_loader("microskill_steps", loader)
+    mod = _u.module_from_spec(spec)
+    loader.exec_module(mod)
+    # branching language is detected; plain linear prose is not
+    assert mod.BRANCH_RE.search("if the file exists then read it")
+    assert not mod.BRANCH_RE.search("read the supplied text and write the document")
+    # step-line counter matches a simple numbered block
+    assert mod.STEP_RE.search("1. do thing")

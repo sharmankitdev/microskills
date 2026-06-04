@@ -20,6 +20,8 @@ Exit codes: 0 OK · 1 block · 2 environment / script error.
 """
 
 import argparse
+import importlib.machinery
+import importlib.util
 import json
 import os
 import re
@@ -45,8 +47,16 @@ DEFAULT_SKILL_ROOT = PROJECT_ROOT / ".claude" / "microskills"
 
 
 def _templates_root(script):
-    """Locate templates/ (schemas + component templates): prefer the materialized runtime
-    copy under .claude/, then ${CLAUDE_PLUGIN_ROOT}, then the in-repo dogfood source."""
+    """Locate templates/ (schemas + component templates).
+
+    When MICROSKILLS_TEMPLATES_ROOT is set it wins outright — an explicit pin used
+    by hermetic tests (and any caller) to bind the canonical catalog templates/
+    instead of a possibly-stale generated mirror. When unset, behavior is
+    unchanged: prefer the materialized runtime copy under .claude/, then
+    ${CLAUDE_PLUGIN_ROOT}, then the in-repo dogfood source."""
+    pin = os.environ.get("MICROSKILLS_TEMPLATES_ROOT")
+    if pin:
+        return Path(pin)
     proj = script.parents[2]
     cands = [proj / ".claude" / "templates"]
     env = os.environ.get("CLAUDE_PLUGIN_ROOT")
@@ -57,6 +67,18 @@ def _templates_root(script):
 
 
 SCHEMA_PATH = _templates_root(SCRIPT) / "references" / "config-schema.json"
+
+# Shared linear-path vocabulary (STEP_RE / BRANCH_RE / STEP_CAP). The SAME module
+# backs validate-microskill's author-time lint, so a profile that adds/patches a
+# step cannot smuggle branching language past a check the validator would catch.
+# Loaded via SourceFileLoader to match the engine's extension-less-script pattern.
+_STEPS_MOD_PATH = SCRIPT.parent / "microskill_steps.py"
+_steps_loader = importlib.machinery.SourceFileLoader(
+    "microskill_steps", str(_STEPS_MOD_PATH)
+)
+_steps_spec = importlib.util.spec_from_loader("microskill_steps", _steps_loader)
+microskill_steps = importlib.util.module_from_spec(_steps_spec)
+_steps_loader.exec_module(microskill_steps)
 
 PLACEHOLDER_RE = re.compile(r"\{\{([\w-]+)\}\}")
 STEP_LINE_RE = re.compile(r"^(\d+)\.\s", re.MULTILINE)
@@ -365,11 +387,26 @@ def parse_gate_after_step(after_val):
     return int(m.group(1)) if m else None
 
 
+class StepDirectiveError(ValueError):
+    """A steps.add/patch/remove directive referenced a step that does not exist,
+    or introduced disallowed branching language. Surfaced as a clean JSON error."""
+
+
 def apply_step_directives(body, cfg, skip_steps, warnings):
-    """Renumber, skip, and annotate the Steps section.
+    """Restructure, renumber, skip, and annotate the Steps section.
+
+    Profile step directives (keyed by ORIGINAL step number) are applied
+    REMOVE -> PATCH -> ADD, then the surviving + added steps are renumbered
+    contiguously by the same counter loop that handles --skip-step. A step
+    removed via steps.remove participates in the SAME gate-anchor fallback as a
+    skipped step (MUST-FIX #3): a gate anchored after it falls back to the
+    trailing 'Gates (resolved)' block rather than silently vanishing.
 
     Returns (rendered_body, inline_gate_ids: set[str]) so the trailing
     `## Gates (resolved)` block can skip gates already emitted inline.
+
+    Raises StepDirectiveError if a patch/remove names a missing original step,
+    or an add anchors after an absent original step.
     """
     before, steps_block, after = parse_steps_section(body)
     if steps_block is None:
@@ -387,6 +424,51 @@ def apply_step_directives(body, cfg, skip_steps, warnings):
     gates_cfg = cfg.get("gates") or {}
     gates_add = gates_cfg.get("add") or []
 
+    existing_step_numbers = {n for (_, _, n) in steps}
+
+    # --- steps.remove / steps.patch / steps.add directives (keyed by ORIGINAL n) ---
+    remove_list = steps_cfg.get("remove") or []
+    patch_map = steps_cfg.get("patch") or {}
+    add_list = steps_cfg.get("add") or []
+
+    removed = set()
+    for rn in remove_list:
+        if rn not in existing_step_numbers:
+            raise StepDirectiveError(
+                f"steps.remove: step {rn} does not exist in MICROSKILL.md"
+            )
+        removed.add(rn)
+
+    patch_text = {}
+    for key, spec in patch_map.items():
+        try:
+            pn = int(key)
+        except (TypeError, ValueError):
+            raise StepDirectiveError(f"steps.patch: non-numeric step key {key!r}")
+        if pn not in existing_step_numbers:
+            raise StepDirectiveError(
+                f"steps.patch: step {pn} does not exist in MICROSKILL.md"
+            )
+        if pn in removed:
+            raise StepDirectiveError(
+                f"steps.patch: step {pn} was removed by steps.remove; cannot patch"
+            )
+        patch_text[pn] = (spec or {}).get("text") or ""
+
+    # ADD anchors resolve against the SURVIVING original step numbers (post-remove)
+    # plus 0 (prepend). Preserve declared order for adds sharing an anchor.
+    surviving_numbers = existing_step_numbers - removed
+    adds_after = {}  # original-anchor -> [text, ...]
+    for entry in add_list:
+        anchor = (entry or {}).get("after")
+        text = (entry or {}).get("text") or ""
+        if anchor != 0 and anchor not in surviving_numbers:
+            raise StepDirectiveError(
+                f"steps.add: anchor 'after: {anchor}' names no surviving step in MICROSKILL.md"
+            )
+        adds_after.setdefault(anchor, []).append(text)
+
+    # --- step-anchored gate bookkeeping ---
     step_anchored_gates = {}
     for g in gates_add:
         n_orig = parse_gate_after_step(g.get("after"))
@@ -406,13 +488,19 @@ def apply_step_directives(body, cfg, skip_steps, warnings):
                 f"--skip-step {n} ignored: step {n} is not marked optional in config"
             )
 
+    # A step elided either by --skip-step OR steps.remove drops out of the
+    # renumbered body; both MUST trigger the gate-anchor fallback (MUST-FIX #3).
+    elided = valid_skips | removed
+
     inline_gate_ids = set()
-    existing_step_numbers = {n for (_, _, n) in steps}
     for n_orig in list(step_anchored_gates.keys()):
-        if n_orig in valid_skips:
+        if n_orig in elided:
+            reason = (
+                "removed step" if n_orig in removed else "skipped step"
+            )
             for g in step_anchored_gates[n_orig]:
                 warnings.append(
-                    f"gate '{g['id']}' anchored after skipped step {n_orig}; "
+                    f"gate '{g['id']}' anchored after {reason} {n_orig}; "
                     f"falling back to trailing 'Gates (resolved)' block"
                 )
             del step_anchored_gates[n_orig]
@@ -427,12 +515,27 @@ def apply_step_directives(body, cfg, skip_steps, warnings):
     head = steps_block[: steps[0][0]]
     counter = 0
     out_chunks = []
+
+    def emit_added(anchor):
+        """Render any steps added after `anchor` (original number, or 0 for prepend)."""
+        nonlocal counter
+        for text in adds_after.get(anchor, []):
+            counter += 1
+            out_chunks.append(f"{counter}. {text}\n")
+
+    # prepended adds (after: 0) land before the first surviving step
+    emit_added(0)
+
     for (s, e, n) in steps:
-        if n in valid_skips:
+        if n in elided:
             continue
         counter += 1
         chunk = steps_block[s:e]
-        chunk = re.sub(r"^\d+\.\s", f"{counter}. ", chunk, count=1)
+        if n in patch_text:
+            # PATCH replaces the body wholesale, keeping the renumbered prefix.
+            chunk = f"{counter}. {patch_text[n]}\n"
+        else:
+            chunk = re.sub(r"^\d+\.\s", f"{counter}. ", chunk, count=1)
         scfg = (steps_cfg.get(str(n)) or {}) if steps_cfg else {}
 
         tags = []
@@ -484,6 +587,9 @@ def apply_step_directives(body, cfg, skip_steps, warnings):
                 chunk = chunk[: first_nl + 1] + insertion + chunk[first_nl + 1:]
 
         out_chunks.append(chunk)
+
+        # adds anchored after this ORIGINAL step land immediately after it
+        emit_added(n)
 
     return before + head + "".join(out_chunks) + after, inline_gate_ids
 
@@ -737,12 +843,43 @@ def main():
     }
     rendered = rewrite_inputs_table(rendered, profile_overrides_inputs, base_defaults)
 
-    rendered, inline_gate_ids = apply_step_directives(
-        rendered,
-        cfg,
-        args.skip_step,
-        warnings,
-    )
+    try:
+        rendered, inline_gate_ids = apply_step_directives(
+            rendered,
+            cfg,
+            args.skip_step,
+            warnings,
+        )
+    except StepDirectiveError as e:
+        sys.stderr.write(f"step directive error: {e}\n")
+        emit_and_exit({"error": f"step directive error: {e}"}, 1)
+
+    # Atomicity re-check on the MERGED Steps (LOCKED decision: inline, shared
+    # module). A profile add/patch could introduce branching language the
+    # author-time validator never saw; reject it with the SAME BRANCH_RE the
+    # validator uses. The >STEP_CAP cap stays an advisory WARN (not a block),
+    # consistent with validate-microskill's documented advisory cap.
+    _, merged_steps_block, _ = parse_steps_section(rendered)
+    if merged_steps_block:
+        branch_hits = microskill_steps.find_branch_language(merged_steps_block)
+        if branch_hits:
+            snippet, _span = branch_hits[0]
+            sys.stderr.write(
+                f"merged steps introduce branching language: \"…{snippet}…\"\n"
+            )
+            emit_and_exit({
+                "error": (
+                    f"profile step directive introduced branching language into the "
+                    f"merged Steps — microskills must form a single linear path "
+                    f"(no branches, conditionals, loops): \"…{snippet}…\""
+                )
+            }, 1)
+        merged_count = microskill_steps.count_steps(merged_steps_block)
+        if merged_count > microskill_steps.STEP_CAP:
+            warnings.append(
+                f"{merged_count} merged numbered steps; consider whether this is "
+                f"still one atomic task"
+            )
 
     gates_cfg = cfg.get("gates") or {}
     declared_gate_ids = set(GATE_ID_COMMENT_RE.findall(body))
