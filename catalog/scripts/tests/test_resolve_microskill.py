@@ -8,6 +8,8 @@ gates append, null deletion, output_schema).
 
 Run:  python3 -m pytest .claude/scripts/tests/ -v
 """
+import importlib.machinery
+import importlib.util
 import json
 import os
 import re
@@ -21,17 +23,34 @@ import pytest
 REPO = Path(__file__).resolve().parents[3]
 SCRIPT = REPO / "catalog" / "scripts" / "resolve-microskill"
 REAL_MICROSKILLS_ROOT = REPO / "catalog" / "microskills"
+# Pin the resolver to the canonical catalog templates/ (config-schema.json) so
+# these hermetic tests validate against the source of truth, never a stale
+# generated .claude/ mirror. _templates_root honors this env var with highest
+# precedence; unset, the resolver's runtime precedence is unchanged.
+CATALOG_TEMPLATES_ROOT = REPO / "templates"
+
+
+def load_resolver():
+    """Load the extensionless resolve-microskill script as a module so its pure
+    helpers (deep_merge, apply_list_verbs) can be unit-tested directly."""
+    loader = importlib.machinery.SourceFileLoader("resolve_microskill", str(SCRIPT))
+    spec = importlib.util.spec_from_loader("resolve_microskill", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
 
 
 def run(skill, *args, skill_root=None, env=None):
     cmd = [sys.executable, str(SCRIPT), skill, *args]
     if skill_root is not None:
         cmd.extend(["--skill-root", str(skill_root)])
+    run_env = dict(env if env is not None else os.environ.copy())
+    run_env.setdefault("MICROSKILLS_TEMPLATES_ROOT", str(CATALOG_TEMPLATES_ROOT))
     proc = subprocess.run(
         cmd,
         capture_output=True,
         text=True,
-        env=env if env is not None else os.environ.copy(),
+        env=run_env,
     )
     try:
         data = json.loads(proc.stdout) if proc.stdout.strip() else None
@@ -1009,13 +1028,53 @@ def test_explicit_profile_base_skips_overlay(tmp_path):
     assert data["config"]["vars"]["who"] == "base-value"
 
 
-def test_missing_base_yaml_exits_2(tmp_path):
+def test_missing_base_yaml_resolves_with_empty_overlay(tmp_path):
+    # RANK15: an ABSENT profiles/base.yaml is now tolerated (mirrors
+    # compile-workflow's already-tolerant behavior) — it resolves with an empty
+    # overlay, defaulting version to 1, NOT an error.
     sdir = tmp_path / "no-base-fixture"
     sdir.mkdir()
     (sdir / "MICROSKILL.md").write_text(MINIMAL_SKILL.format(name="no-base-fixture"))
     code, data, _, err = run("no-base-fixture", skill_root=tmp_path)
-    assert code == 2, err
-    assert "profiles/base.yaml not found" in data["error"]
+    assert code == 0, err
+    # The MICROSKILL.md body still renders.
+    assert "1. **First**" in data["rendered_skill_body"]
+    # version defaulted to 1 — schema validation still ran (config is non-empty).
+    assert data["config"] == {"version": 1}
+
+
+def test_missing_base_yaml_still_validates_md_derived_config(tmp_path):
+    # An absent base.yaml must NOT silently skip schema validation: the resolver
+    # setdefault('version', 1)s so a non-empty config is validated. A required
+    # input declared in the MICROSKILL.md Inputs table is still handled (the
+    # rendered body + payload are produced rather than crashing).
+    sdir = tmp_path / "no-base-md"
+    sdir.mkdir()
+    (sdir / "MICROSKILL.md").write_text(MINIMAL_SKILL.format(name="no-base-md"))
+    code, data, _, err = run("no-base-md", skill_root=tmp_path)
+    assert code == 0, err
+    assert "version" in data["config"] and data["config"]["version"] == 1
+    assert data["profile_used"] == "base"
+
+
+def test_version_omitted_in_base_yaml_defaults_to_one(tmp_path):
+    # A base.yaml that omits version is no longer a schema block — version
+    # defaults to 1 before validation.
+    body = MINIMAL_SKILL.format(name="noversion-ms")
+    make_skill(tmp_path, "noversion-ms", body, default_cfg="vars:\n  x: y\n")
+    code, data, _, err = run("noversion-ms", skill_root=tmp_path)
+    assert code == 0, err
+    assert data["config"]["version"] == 1
+    assert data["config"]["vars"] == {"x": "y"}
+
+
+def test_explicit_wrong_version_in_base_yaml_blocks(tmp_path):
+    # An EXPLICIT wrong version still blocks (the const:1 check is intact).
+    body = MINIMAL_SKILL.format(name="badversion-ms")
+    make_skill(tmp_path, "badversion-ms", body, default_cfg="version: 2\n")
+    code, data, _, err = run("badversion-ms", skill_root=tmp_path)
+    assert code == 1, err
+    assert any("version" in w for w in data.get("warnings", [])) or "version" in str(data)
 
 
 # ---------------------------------------------------------------------------
@@ -1150,3 +1209,515 @@ def test_gate_anchored_to_nonexistent_step_warns(tmp_path):
     assert "## Gates (resolved)" in rendered
     assert "stray" in rendered
     assert any("stray" in w and "step 9" in w and "does not exist" in w for w in data["warnings"])
+
+
+# ---------------------------------------------------------------------------
+# P1.0 keyed-list deep_merge verb engine (apply_list_verbs + deep_merge routing)
+#
+# Unit tests load the resolver as a module and drive the pure helpers directly,
+# so verb mechanics are exercised on arbitrary lists without the closed config
+# schema interfering. Integration tests at the bottom route verbs through the
+# only schema-legal list-of-objects-with-id field (gates.add) via the subprocess.
+# ---------------------------------------------------------------------------
+
+
+def test_apply_list_verbs_patch_by_id_preserves_position():
+    mod = load_resolver()
+    base = [{"id": "a", "v": 1}, {"id": "b", "v": 2}, {"id": "c", "v": 3}]
+    out = mod.apply_list_verbs(base, {"patch": [{"id": "b", "v": 20, "extra": "x"}]}, path="lst")
+    # position of b preserved, fields deep-merged in place
+    assert [e["id"] for e in out] == ["a", "b", "c"]
+    assert out[1] == {"id": "b", "v": 20, "extra": "x"}
+    # original base untouched (new list returned)
+    assert base[1] == {"id": "b", "v": 2}
+
+
+def test_apply_list_verbs_remove_drops_and_preserves_order():
+    mod = load_resolver()
+    base = [{"id": "a"}, {"id": "b"}, {"id": "c"}]
+    out = mod.apply_list_verbs(base, {"remove": ["b"]}, path="lst")
+    assert [e["id"] for e in out] == ["a", "c"]
+    assert base == [{"id": "a"}, {"id": "b"}, {"id": "c"}]
+
+
+def test_apply_list_verbs_add_appends_at_end():
+    mod = load_resolver()
+    base = [{"id": "a"}, {"id": "b"}]
+    out = mod.apply_list_verbs(base, {"add": [{"id": "z", "v": 9}]}, path="lst")
+    assert [e["id"] for e in out] == ["a", "b", "z"]
+    assert out[-1] == {"id": "z", "v": 9}
+
+
+def test_apply_list_verbs_add_id_collision_raises():
+    mod = load_resolver()
+    base = [{"id": "a"}, {"id": "b"}]
+    with pytest.raises(ValueError) as ei:
+        mod.apply_list_verbs(base, {"add": [{"id": "a"}]}, path="lst")
+    assert "a" in str(ei.value)
+    assert "lst" in str(ei.value)
+
+
+def test_apply_list_verbs_remove_patch_add_combined_in_order():
+    mod = load_resolver()
+    base = [{"id": "a", "v": 1}, {"id": "b", "v": 2}, {"id": "c", "v": 3}]
+    # remove runs first (drops c), then patch (b in place), then add (append d).
+    # 'c' may be re-added by add because remove ran before the add collision check.
+    verbs = {
+        "remove": ["c"],
+        "patch": [{"id": "b", "v": 22}],
+        "add": [{"id": "d", "v": 4}, {"id": "c", "v": 30}],
+    }
+    out = mod.apply_list_verbs(base, verbs, path="lst")
+    assert [e["id"] for e in out] == ["a", "b", "d", "c"]
+    assert out[1] == {"id": "b", "v": 22}
+    assert out[3] == {"id": "c", "v": 30}
+
+
+def test_apply_list_verbs_missing_patch_id_raises():
+    mod = load_resolver()
+    base = [{"id": "a"}]
+    with pytest.raises(ValueError) as ei:
+        mod.apply_list_verbs(base, {"patch": [{"id": "ghost", "v": 1}]}, path="lst")
+    assert "ghost" in str(ei.value)
+    assert "lst" in str(ei.value)
+
+
+def test_apply_list_verbs_missing_remove_id_raises():
+    mod = load_resolver()
+    base = [{"id": "a"}]
+    with pytest.raises(ValueError) as ei:
+        mod.apply_list_verbs(base, {"remove": ["ghost"]}, path="lst")
+    assert "ghost" in str(ei.value)
+    assert "lst" in str(ei.value)
+
+
+def test_deep_merge_routes_verb_dict_over_list():
+    mod = load_resolver()
+    base = {"lst": [{"id": "a", "v": 1}, {"id": "b", "v": 2}]}
+    overlay = {"lst": {"patch": [{"id": "a", "v": 11}], "add": [{"id": "c"}]}}
+    out = mod.deep_merge(base, overlay)
+    assert [e["id"] for e in out["lst"]] == ["a", "b", "c"]
+    assert out["lst"][0] == {"id": "a", "v": 11}
+
+
+def test_deep_merge_mixed_key_dict_over_list_raises():
+    mod = load_resolver()
+    base = {"lst": [{"id": "a"}]}
+    # a dict with a non-verb key mixed in cannot merge onto a list
+    overlay = {"lst": {"add": [{"id": "b"}], "bogus": 1}}
+    with pytest.raises(ValueError) as ei:
+        mod.deep_merge(base, overlay)
+    assert "lst" in str(ei.value)
+
+
+def test_deep_merge_empty_dict_over_list_keeps_existing_behavior():
+    mod = load_resolver()
+    base = {"lst": [{"id": "a"}]}
+    # empty dict is NOT a verb dict (non-empty subset required) -> falls through to
+    # the existing wholesale-replace branch (dict replaces the list)
+    out = mod.deep_merge(base, {"lst": {}})
+    assert out["lst"] == {}
+
+
+def test_deep_merge_plain_list_over_list_still_replaces():
+    mod = load_resolver()
+    base = {"runtime": {"allowed_tools": ["Read", "Write"]}}
+    overlay = {"runtime": {"allowed_tools": ["Glob"]}}
+    out = mod.deep_merge(base, overlay)
+    assert out["runtime"]["allowed_tools"] == ["Glob"]
+
+
+def test_deep_merge_gates_add_literal_append_untouched():
+    mod = load_resolver()
+    base = {"gates": {"add": [{"id": "gate_one"}]}}
+    overlay = {"gates": {"add": [{"id": "gate_two"}]}}
+    out = mod.deep_merge(base, overlay)
+    # list-onto-list at gates.add still appends (regression — NOT routed to verbs)
+    assert [g["id"] for g in out["gates"]["add"]] == ["gate_one", "gate_two"]
+
+
+def test_deep_merge_remove_verb_and_null_delete_coexist():
+    mod = load_resolver()
+    base = {"lst": [{"id": "a"}, {"id": "b"}], "doomed": "x", "keep": 1}
+    # 'remove' verb drops the list entry 'a'; null over 'doomed' pops the key.
+    # The two mechanisms must not collide.
+    overlay = {"lst": {"remove": ["a"]}, "doomed": None}
+    out = mod.deep_merge(base, overlay)
+    assert [e["id"] for e in out["lst"]] == ["b"]
+    assert "doomed" not in out
+    assert out["keep"] == 1
+
+
+# --- Integration: verbs through the real resolver via gates.add (schema-legal) ---
+
+
+def test_resolver_verb_patch_through_gates_add(tmp_path):
+    body = MINIMAL_SKILL.format(name="verb-patch-fixture")
+    base_cfg = textwrap.dedent("""\
+        version: 1
+        gates:
+          add:
+            - id: gate_alpha
+              after: "1"
+              type: verification
+              severity: hard
+            - id: gate_beta
+              after: "2"
+              type: verification
+              severity: hard
+        """)
+    overlay_cfg = textwrap.dedent("""\
+        version: 1
+        gates:
+          add:
+            patch:
+              - id: gate_alpha
+                severity: warn
+        """)
+    make_skill(
+        tmp_path,
+        "verb-patch-fixture",
+        body,
+        default_cfg=base_cfg,
+        profiles={"soften": overlay_cfg},
+    )
+    code, data, _, err = run("verb-patch-fixture", "--profile", "soften", skill_root=tmp_path)
+    assert code == 0, err
+    add = data["config"]["gates"]["add"]
+    # order preserved, alpha patched in place, beta untouched
+    assert [g["id"] for g in add] == ["gate_alpha", "gate_beta"]
+    assert add[0]["severity"] == "warn"
+    assert add[1]["severity"] == "hard"
+
+
+def test_resolver_verb_remove_and_add_through_gates_add(tmp_path):
+    body = MINIMAL_SKILL.format(name="verb-rm-add-fixture")
+    base_cfg = textwrap.dedent("""\
+        version: 1
+        gates:
+          add:
+            - id: gate_alpha
+              after: "1"
+              type: verification
+            - id: gate_beta
+              after: "2"
+              type: verification
+        """)
+    overlay_cfg = textwrap.dedent("""\
+        version: 1
+        gates:
+          add:
+            remove: [gate_alpha]
+            add:
+              - id: gate_gamma
+                after: "2"
+                type: verification
+        """)
+    make_skill(
+        tmp_path,
+        "verb-rm-add-fixture",
+        body,
+        default_cfg=base_cfg,
+        profiles={"reshape": overlay_cfg},
+    )
+    code, data, _, err = run("verb-rm-add-fixture", "--profile", "reshape", skill_root=tmp_path)
+    assert code == 0, err
+    add = data["config"]["gates"]["add"]
+    assert [g["id"] for g in add] == ["gate_beta", "gate_gamma"]
+
+
+def test_resolver_verb_missing_remove_id_blocks(tmp_path):
+    body = MINIMAL_SKILL.format(name="verb-bad-rm-fixture")
+    base_cfg = textwrap.dedent("""\
+        version: 1
+        gates:
+          add:
+            - id: gate_alpha
+              after: "1"
+              type: verification
+        """)
+    overlay_cfg = textwrap.dedent("""\
+        version: 1
+        gates:
+          add:
+            remove: [no_such_gate]
+        """)
+    make_skill(
+        tmp_path,
+        "verb-bad-rm-fixture",
+        body,
+        default_cfg=base_cfg,
+        profiles={"reshape": overlay_cfg},
+    )
+    code, data, _, err = run("verb-bad-rm-fixture", "--profile", "reshape", skill_root=tmp_path)
+    assert code == 1, err
+    assert "no_such_gate" in data["error"]
+
+
+# ---------------------------------------------------------------------------
+# P1.1 microskill steps.add / steps.patch / steps.remove
+#
+# A microskill PROFILE may add / patch / remove markdown "## Steps" entries,
+# keyed by each step's ORIGINAL number, after which the surviving + added steps
+# are renumbered contiguously. Distinct from the deep_merge list-verb engine:
+# steps are markdown numbered lines, not a YAML list.
+#
+# Shape (consistent with the keyed-by-number steps map):
+#   steps:
+#     remove: [<orig_n>, ...]            # elide steps, keyed by original number
+#     patch:  { "<orig_n>": {text: ...}} # replace a step's text, position kept
+#     add:    [{after: <orig_n|0>, text: ...}, ...]  # 0 prepends, N inserts after orig N
+# Apply order: REMOVE -> PATCH -> ADD -> renumber.
+# ---------------------------------------------------------------------------
+
+
+def test_steps_patch_replaces_text_and_preserves_position(tmp_path):
+    body = MINIMAL_SKILL.format(name="patch-step-fixture")
+    cfg = textwrap.dedent("""\
+        version: 1
+        steps:
+          patch:
+            "2":
+              text: "**Replaced** — the new second step."
+        """)
+    make_skill(tmp_path, "patch-step-fixture", body, default_cfg=cfg)
+    code, data, _, err = run("patch-step-fixture", skill_root=tmp_path)
+    assert code == 0, err
+    rendered = data["rendered_skill_body"]
+    step_lines = [ln for ln in rendered.splitlines() if re.match(r"^\d+\.", ln)]
+    assert step_lines[0].startswith("1. **First**")
+    assert step_lines[1] == "2. **Replaced** — the new second step."
+    assert step_lines[2].startswith("3. **Third**")
+    assert "**Second**" not in rendered
+    assert len(step_lines) == 3
+
+
+def test_steps_remove_elides_and_renumbers(tmp_path):
+    body = MINIMAL_SKILL.format(name="remove-step-fixture")
+    cfg = textwrap.dedent("""\
+        version: 1
+        steps:
+          remove: [2]
+        """)
+    make_skill(tmp_path, "remove-step-fixture", body, default_cfg=cfg)
+    code, data, _, err = run("remove-step-fixture", skill_root=tmp_path)
+    assert code == 0, err
+    rendered = data["rendered_skill_body"]
+    step_lines = [ln for ln in rendered.splitlines() if re.match(r"^\d+\.", ln)]
+    assert len(step_lines) == 2
+    assert step_lines[0].startswith("1. **First**")
+    assert step_lines[1].startswith("2. **Third**")
+    assert "**Second**" not in rendered
+
+
+def test_steps_add_after_number_inserts_and_renumbers(tmp_path):
+    body = MINIMAL_SKILL.format(name="add-step-fixture")
+    cfg = textwrap.dedent("""\
+        version: 1
+        steps:
+          add:
+            - after: 1
+              text: "**Inserted** — brand new step."
+        """)
+    make_skill(tmp_path, "add-step-fixture", body, default_cfg=cfg)
+    code, data, _, err = run("add-step-fixture", skill_root=tmp_path)
+    assert code == 0, err
+    rendered = data["rendered_skill_body"]
+    step_lines = [ln for ln in rendered.splitlines() if re.match(r"^\d+\.", ln)]
+    assert len(step_lines) == 4
+    assert step_lines[0].startswith("1. **First**")
+    assert step_lines[1] == "2. **Inserted** — brand new step."
+    assert step_lines[2].startswith("3. **Second**")
+    assert step_lines[3].startswith("4. **Third**")
+
+
+def test_steps_add_after_zero_prepends(tmp_path):
+    body = MINIMAL_SKILL.format(name="prepend-step-fixture")
+    cfg = textwrap.dedent("""\
+        version: 1
+        steps:
+          add:
+            - after: 0
+              text: "**Zeroth** — runs before everything."
+        """)
+    make_skill(tmp_path, "prepend-step-fixture", body, default_cfg=cfg)
+    code, data, _, err = run("prepend-step-fixture", skill_root=tmp_path)
+    assert code == 0, err
+    rendered = data["rendered_skill_body"]
+    step_lines = [ln for ln in rendered.splitlines() if re.match(r"^\d+\.", ln)]
+    assert len(step_lines) == 4
+    assert step_lines[0] == "1. **Zeroth** — runs before everything."
+    assert step_lines[1].startswith("2. **First**")
+
+
+def test_steps_gate_anchored_after_removed_step_falls_back(tmp_path):
+    # MUST-FIX #3: a gate anchored after a REMOVED step must hit the same
+    # trailing 'Gates (resolved)' fallback as a skipped step — never silently drop.
+    body = MINIMAL_SKILL.format(name="remove-gate-fixture")
+    cfg = textwrap.dedent("""\
+        version: 1
+        steps:
+          remove: [2]
+        gates:
+          add:
+            - id: orphaned
+              after: "2"
+              type: verification
+              severity: hard
+        """)
+    make_skill(tmp_path, "remove-gate-fixture", body, default_cfg=cfg)
+    code, data, _, err = run("remove-gate-fixture", skill_root=tmp_path)
+    assert code == 0, err
+    rendered = data["rendered_skill_body"]
+    # the step is gone, the gate is NOT inlined, but it survives in the trailing block
+    assert "**Second**" not in rendered
+    assert "[GATE AFTER STEP" not in rendered
+    assert "## Gates (resolved)" in rendered
+    assert "orphaned" in rendered
+    assert any(
+        "orphaned" in w and "2" in w and "Gates (resolved)" in w
+        for w in data["warnings"]
+    )
+
+
+def test_steps_add_branching_language_blocks(tmp_path):
+    body = MINIMAL_SKILL.format(name="branch-add-fixture")
+    cfg = textwrap.dedent("""\
+        version: 1
+        steps:
+          add:
+            - after: 1
+              text: "**Branchy** — if the file exists then read it otherwise skip."
+        """)
+    make_skill(tmp_path, "branch-add-fixture", body, default_cfg=cfg)
+    code, data, _, err = run("branch-add-fixture", skill_root=tmp_path)
+    assert code == 1, err
+    assert "error" in data
+    assert "branch" in data["error"].lower()
+
+
+def test_steps_patch_branching_language_blocks(tmp_path):
+    body = MINIMAL_SKILL.format(name="branch-patch-fixture")
+    cfg = textwrap.dedent("""\
+        version: 1
+        steps:
+          patch:
+            "2":
+              text: "**Looped** — for each item in the list, process it."
+        """)
+    make_skill(tmp_path, "branch-patch-fixture", body, default_cfg=cfg)
+    code, data, _, err = run("branch-patch-fixture", skill_root=tmp_path)
+    assert code == 1, err
+    assert "error" in data
+    assert "branch" in data["error"].lower()
+
+
+def test_steps_over_ten_merged_warns_not_blocks(tmp_path):
+    body = MINIMAL_SKILL.format(name="overten-fixture")
+    # start with 3 steps, add 9 more -> 12 merged steps
+    adds = "\n".join(
+        f"    - after: 3\n      text: \"**Extra{i}** — additional step number {i}.\""
+        for i in range(9)
+    )
+    cfg = "version: 1\nsteps:\n  add:\n" + adds + "\n"
+    make_skill(tmp_path, "overten-fixture", body, default_cfg=cfg)
+    code, data, _, err = run("overten-fixture", skill_root=tmp_path)
+    assert code == 0, err
+    rendered = data["rendered_skill_body"]
+    step_lines = [ln for ln in rendered.splitlines() if re.match(r"^\d+\.", ln)]
+    assert len(step_lines) == 12
+    assert any("12" in w and "atomic" in w for w in data["warnings"])
+
+
+def test_steps_patch_missing_number_blocks(tmp_path):
+    body = MINIMAL_SKILL.format(name="patch-ghost-fixture")
+    cfg = textwrap.dedent("""\
+        version: 1
+        steps:
+          patch:
+            "9":
+              text: "**Nope** — there is no step nine."
+        """)
+    make_skill(tmp_path, "patch-ghost-fixture", body, default_cfg=cfg)
+    code, data, _, err = run("patch-ghost-fixture", skill_root=tmp_path)
+    assert code == 1, err
+    assert "error" in data
+    assert "9" in data["error"]
+
+
+def test_steps_remove_missing_number_blocks(tmp_path):
+    body = MINIMAL_SKILL.format(name="remove-ghost-fixture")
+    cfg = textwrap.dedent("""\
+        version: 1
+        steps:
+          remove: [9]
+        """)
+    make_skill(tmp_path, "remove-ghost-fixture", body, default_cfg=cfg)
+    code, data, _, err = run("remove-ghost-fixture", skill_root=tmp_path)
+    assert code == 1, err
+    assert "error" in data
+    assert "9" in data["error"]
+
+
+def test_steps_add_after_missing_anchor_blocks(tmp_path):
+    body = MINIMAL_SKILL.format(name="add-ghost-fixture")
+    cfg = textwrap.dedent("""\
+        version: 1
+        steps:
+          add:
+            - after: 9
+              text: "**Nope** — anchored to a missing step."
+        """)
+    make_skill(tmp_path, "add-ghost-fixture", body, default_cfg=cfg)
+    code, data, _, err = run("add-ghost-fixture", skill_root=tmp_path)
+    assert code == 1, err
+    assert "error" in data
+    assert "9" in data["error"]
+
+
+def test_steps_directives_preserve_optional_mandate_skip(tmp_path):
+    # REGRESSION: the legacy optional / mandate_tool / --skip-step path is unchanged
+    # even when keyed-by-number step config coexists with the new verb keys.
+    body = MINIMAL_SKILL.format(name="legacy-coexist-fixture")
+    cfg = textwrap.dedent("""\
+        version: 1
+        steps:
+          "1":
+            mandate_tool: Read
+          "3":
+            optional: true
+          patch:
+            "2":
+              text: "**Patched Second** — replaced body."
+        """)
+    make_skill(tmp_path, "legacy-coexist-fixture", body, default_cfg=cfg)
+    code, data, _, err = run(
+        "legacy-coexist-fixture", "--skip-step", "3", skill_root=tmp_path
+    )
+    assert code == 0, err
+    rendered = data["rendered_skill_body"]
+    step_lines = [ln for ln in rendered.splitlines() if re.match(r"^\d+\.", ln)]
+    # step 3 skipped, step 2 patched, step 1 mandate-tagged
+    assert len(step_lines) == 2
+    assert "[REQUIRED TOOL: Read]" in step_lines[0]
+    assert step_lines[1].endswith("**Patched Second** — replaced body.")
+    assert "**Third**" not in rendered
+    assert data["directives"]["mandated_tools"] == {"1": "Read"}
+
+
+def test_shared_atomicity_module_vocabulary_matches_validate(tmp_path):
+    # The branching-language vocabulary must be the SAME object used by
+    # validate-microskill — loaded from the shared module, not duplicated.
+    import importlib.machinery as _m
+    import importlib.util as _u
+
+    shared_path = REPO / "catalog" / "scripts" / "microskill_steps.py"
+    loader = _m.SourceFileLoader("microskill_steps", str(shared_path))
+    spec = _u.spec_from_loader("microskill_steps", loader)
+    mod = _u.module_from_spec(spec)
+    loader.exec_module(mod)
+    # branching language is detected; plain linear prose is not
+    assert mod.BRANCH_RE.search("if the file exists then read it")
+    assert not mod.BRANCH_RE.search("read the supplied text and write the document")
+    # step-line counter matches a simple numbered block
+    assert mod.STEP_RE.search("1. do thing")

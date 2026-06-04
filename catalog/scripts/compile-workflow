@@ -28,6 +28,7 @@ Exit codes: 0 OK · 1 block (schema/DAG error) · 2 environment/script error.
 """
 
 import argparse
+import hashlib
 import importlib.machinery
 import importlib.util
 import json
@@ -55,10 +56,17 @@ DEFAULT_DEFS_ROOT = PROJECT_ROOT / ".claude" / "workflow-defs"
 
 
 def _templates_root(script):
-    """Locate templates/ (schemas + component templates): prefer the materialized runtime
-    copy under .claude/, then ${CLAUDE_PLUGIN_ROOT}, then the in-repo dogfood source."""
+    """Locate templates/ (schemas + component templates): an explicit
+    MICROSKILLS_TEMPLATES_ROOT override wins (used by hermetic tests to pin the
+    in-repo source schema before a reconcile materializes .claude/), then prefer
+    the materialized runtime copy under .claude/, then ${CLAUDE_PLUGIN_ROOT},
+    then the in-repo dogfood source."""
     proj = script.parents[2]
-    cands = [proj / ".claude" / "templates"]
+    cands = []
+    override = os.environ.get("MICROSKILLS_TEMPLATES_ROOT")
+    if override:
+        cands.append(Path(override))
+    cands.append(proj / ".claude" / "templates")
     env = os.environ.get("CLAUDE_PLUGIN_ROOT")
     if env:
         cands.append(Path(env) / "templates")
@@ -77,8 +85,177 @@ _loader.exec_module(_rm)
 deep_merge = _rm.deep_merge
 apply_override = _rm.apply_override
 strip_nulls = _rm.strip_nulls
+substitute_vars = _rm.substitute_vars
 
 REF_RE = re.compile(r"\$\{([^}]*)\}")
+# Id-only match for edge inference (a node id immediately before `.output`).
+NODE_OUTPUT_RE = re.compile(r"\b([a-z][a-z0-9_-]*)\.output\b")
+# Id-only match for the ${<id>.items} per-item-results array ref form. Like
+# NODE_OUTPUT_RE it implies a dependency edge into the referencing node, so the
+# SHARED scoped_ref_ids helper unions its matches with NODE_OUTPUT_RE's. The
+# (?<!\.) lookbehind keeps it from mis-firing on a dotted tail like
+# ${workflow.inputs.items}, where the `items` segment is NOT a node id.
+NODE_ITEMS_RE = re.compile(r"(?<!\.)\b([a-z][a-z0-9_-]*)\.items\b")
+# Id + first field after `.output.` for the typed-producer field-ref check.
+NODE_OUTPUT_FIELD_RE = re.compile(r"\b([a-z][a-z0-9_-]*)\.output\.([a-zA-Z0-9_]+)")
+# Fields that may carry ${id.output} / ${id.items} refs that imply a dependency edge.
+SCOPED_REF_FIELDS = ("inputs", "prompt", "when", "for_each")
+
+
+def substitute_vars_deep(obj, vars_map, unresolved):
+    """Recursively apply substitute_vars (the resolve-microskill {{key}} substituter)
+    to every string in a nested structure, returning a NEW structure. Dict keys are
+    substituted too so a templated key stays consistent. Pure textual transform."""
+    if isinstance(obj, str):
+        return substitute_vars(obj, vars_map, unresolved)
+    if isinstance(obj, dict):
+        return {substitute_vars_deep(k, vars_map, unresolved): substitute_vars_deep(v, vars_map, unresolved)
+                for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [substitute_vars_deep(v, vars_map, unresolved) for v in obj]
+    return obj
+
+
+def apply_workflow_vars(wf):
+    """SHARED intra-def vars pre-pass used by BOTH compile and validate. Substitute
+    double-brace {{key}} tokens throughout the merged doc from the top-level vars:
+    map (reusing resolve-microskill's substitute_vars). Returns (new_doc, unresolved).
+
+    vars values are coerced to str by substitute_vars at substitution time. A doc
+    with no vars: (empty/absent map) still walks the tree but replaces nothing — a
+    {{key}} with no matching var is left intact and recorded in `unresolved`. With
+    NO {{...}} tokens at all the output is byte-identical to the input doc."""
+    if not isinstance(wf, dict):
+        return wf, []
+    vars_map = wf.get("vars") or {}
+    unresolved = []
+    return substitute_vars_deep(wf, vars_map, unresolved), unresolved
+
+
+def collect_strings(obj):
+    """Yield every string value anywhere in a nested structure."""
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            yield from collect_strings(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from collect_strings(v)
+
+
+def scoped_ref_ids(node):
+    """Node ids referenced via ${<id>.output...} OR ${<id>.items} in a node's
+    scoped fields (inputs/prompt/when/for_each). Both forms imply a dependency edge
+    into this node — a ${<id>.items} ref consumes the whole per-item-results array
+    of the fan-out node <id>, so it depends on <id> exactly like ${<id>.output}."""
+    out = set()
+    scoped = {k: node.get(k) for k in SCOPED_REF_FIELDS if k in node}
+    for s in collect_strings(scoped):
+        for inner in REF_RE.findall(s):
+            for rid in NODE_OUTPUT_RE.findall(inner):
+                out.add(rid)
+            for rid in NODE_ITEMS_RE.findall(inner):
+                out.add(rid)
+    return out
+
+
+def union_edges(nodes):
+    """SHARED edge model used by BOTH compile and validate. For each node id,
+    the set of upstream ids it depends on = explicit depends_on UNION every
+    ${<id>.output} ref in its scoped fields. Only ids that are actual nodes are
+    kept (unknown-id refs are reported separately as typo guards). Returns
+    {node_id: set(dep_ids)}."""
+    ids = {n["id"] for n in nodes if isinstance(n, dict) and n.get("id")}
+    edges = {}
+    for n in nodes:
+        if not isinstance(n, dict) or not n.get("id"):
+            continue
+        nid = n["id"]
+        deps = set(d for d in (n.get("depends_on") or []) if d in ids)
+        deps |= {r for r in scoped_ref_ids(n) if r in ids and r != nid}
+        edges[nid] = deps
+    return edges
+
+
+def loop_contiguity_error(order, node_by_id, gates_after, loop):
+    """SHARED loop-body contiguity check used by BOTH compile and validate.
+    Given the topological `order`, a loop.body must occupy a CONTIGUOUS window
+    with NO interleaved orchestrator-classified node and NO hard/human_approval
+    gate anchored between body nodes. Returns an error message string, or None.
+
+    `gates_after`: {node_id: [gate dicts]}. `is_orchestrator(nid)` is inlined via
+    the caller-supplied classification through node_by_id flags below."""
+    if not isinstance(loop, dict):
+        return None
+    body = [b for b in (loop.get("body") or []) if b in node_by_id]
+    if len(body) < 2:
+        return None
+    body_set = set(body)
+    positions = [i for i, nid in enumerate(order) if nid in body_set]
+    if not positions:
+        return None
+    lo, hi = min(positions), max(positions)
+    window = order[lo:hi + 1]
+    # Every node in the window between the first and last body node must itself be
+    # a body node — an interleaved non-body node splits the body.
+    for nid in window:
+        if nid not in body_set:
+            return (f"loop.body must be contiguous in topological order, but node "
+                    f"'{nid}' is interleaved between body nodes; an orchestrator or "
+                    f"out-of-body node inside the loop window silently breaks the "
+                    f"do/while scaffold")
+    # No hard / human_approval gate anchored between body nodes (after a body node
+    # that is not the LAST body node) — that gate is a checkpoint splitting the body.
+    for nid in window[:-1]:
+        for g in gates_after.get(nid, []):
+            if g.get("type") == "human_approval" or g.get("severity", "hard") == "hard":
+                return (f"loop.body must be contiguous, but a "
+                        f"{g.get('type') or 'hard'} gate is anchored after body node "
+                        f"'{nid}'; a checkpoint between body nodes silently breaks the "
+                        f"do/while scaffold")
+    return None
+
+
+def loop_while_until_error(loop):
+    """SHARED while/until exclusivity check used by BOTH compile and validate.
+    Exactly ONE of while/until must be present on a loop. Returns an error message
+    string, or None."""
+    if not isinstance(loop, dict):
+        return None
+    has_while = "while" in loop and loop.get("while") is not None
+    has_until = "until" in loop and loop.get("until") is not None
+    if has_while and has_until:
+        return "loop may carry only one of 'while' / 'until', not both"
+    if not has_while and not has_until:
+        return "loop requires exactly one of 'while' / 'until'"
+    return None
+
+
+def desugar_loop_until(loop):
+    """SHARED until→while desugar used by BOTH compile and validate. `until: ${EXPR}`
+    is sugar for `while: ${!(EXPR)}` — negate the inner-of-${...} expression and
+    re-wrap, so the compiled output is byte-identical to a hand-written negated
+    while of that exact form. Mutates `loop` in place: replaces `until` with the
+    derived `while`. No-op when `until` is absent."""
+    if not isinstance(loop, dict) or loop.get("until") is None:
+        return
+    inner = strip_ref_wrapper(loop.pop("until"))
+    loop["while"] = "${!(" + inner + ")}"
+
+
+def loop_max_parallel_errors(nodes):
+    """SHARED max_parallel placement check used by BOTH compile and validate. A
+    `max_parallel` knob is only meaningful on a for_each fan-out node; on a node
+    WITHOUT for_each it silently does nothing. Returns a list of (node_id, message)."""
+    out = []
+    for n in nodes:
+        if not isinstance(n, dict) or not n.get("id"):
+            continue
+        if n.get("max_parallel") is not None and not n.get("for_each"):
+            out.append((n["id"],
+                        "max_parallel is only valid on a for_each node; this node has no for_each"))
+    return out
 
 
 def rel(p):
@@ -101,13 +278,14 @@ def jsvar(node_id):
 
 
 def topo_sort(nodes):
-    """Kahn's algorithm; ties broken by definition order (deterministic)."""
+    """Kahn's algorithm over the UNION edge set (explicit depends_on UNION
+    ${id.output} refs in scoped fields); ties broken by definition order
+    (deterministic). Ordering over the union keeps segment order consistent with
+    ref-implied dependencies so validate and compile never disagree."""
     ids = [n["id"] for n in nodes]
-    deps = {n["id"]: [d for d in (n.get("depends_on") or []) if d in ids] for n in nodes}
-    indeg = {i: 0 for i in ids}
-    for i in ids:
-        for d in deps[i]:
-            indeg[i] += 1
+    edges = union_edges(nodes)  # {id: set(dep_ids)}
+    deps = {i: edges.get(i, set()) for i in ids}
+    indeg = {i: len(deps[i]) for i in ids}
     order = []
     ready = [i for i in ids if indeg[i] == 0]  # preserves definition order
     while ready:
@@ -124,52 +302,77 @@ def topo_sort(nodes):
 
 
 def resolve_microskill_directives(use_name, customize, defs_root):
-    """Run resolve-microskill to read a use: node's allowed_tools + gates.
-    Fail-safe: on any failure return None (caller treats as orchestrator)."""
+    """Run resolve-microskill to read a use: node's allowed_tools + gates AND its
+    fully-resolved (profile-merged, strip_nulls'd) output_schema. Returns a dict
+    {"directives": <dict|None>, "output_schema": <dict|None>}. Fail-safe: on any
+    failure return {"directives": None, "output_schema": None} (caller treats a
+    None directives as orchestrator).
+
+    skill-root is derived as the sibling `microskills/` of the defs root so a
+    hermetic tmp world resolves its own microskills; for the real runtime this is
+    `.claude/microskills` exactly as before, keeping compiled output byte-identical."""
     profile = (customize or {}).get("profile")
     cmd = [str(RESOLVE_SCRIPT), use_name]
     if profile:
         cmd += ["--profile", str(profile)]
+    skill_root = Path(defs_root).parent / "microskills"
+    cmd += ["--skill-root", str(skill_root)]
+    fail = {"directives": None, "output_schema": None}
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, cwd=str(PROJECT_ROOT))
     except Exception:
-        return None
+        return fail
     if proc.returncode not in (0, 1):
-        return None
+        return fail
     try:
         data = json.loads(proc.stdout)
     except Exception:
-        return None
-    return data.get("directives")
+        return fail
+    return {"directives": data.get("directives"),
+            "output_schema": data.get("output_schema")}
 
 
 def classify(node, gates_after, defs_root):
-    """Return 'orchestrator' or 'background'."""
+    """Return (class, reason) where class is 'orchestrator' or 'background' and
+    reason is a short human string explaining WHY. The reason is surfaced only
+    under --explain; the class drives partitioning exactly as before. (side_effect
+    is already normalized to delegation: orchestrator before this is called.)"""
     deleg = node.get("delegation")
     if deleg == "orchestrator":
-        return "orchestrator"
+        return "orchestrator", "explicit delegation:orchestrator"
     if deleg == "auto":
-        return "background"
+        return "background", "explicit delegation:auto"
+    # A nested-workflow node is always an orchestrator checkpoint (background
+    # segments can't re-enter the dispatcher). Classify it BEFORE use/agent so it
+    # never reaches microskill resolution.
+    if node.get("workflow"):
+        return "orchestrator", f"nested workflow: {node['workflow']}"
     has_use = bool(node.get("use"))
     has_agent = bool(node.get("agent"))
     if not has_use and not has_agent:
-        return "orchestrator"  # orchestrator-native step
+        return "orchestrator", "orchestrator-native step (neither use nor agent)"
     if has_agent:
-        return "background"  # agents are autonomous unless a gate forces otherwise
+        return "background", "agent node -> background (autonomous)"
     # use: microskill — inspect resolved directives (fail-safe → orchestrator)
-    directives = resolve_microskill_directives(node["use"], node.get("customize"), defs_root)
+    resolved = resolve_microskill_directives(node["use"], node.get("customize"), defs_root)
+    directives = resolved["directives"]
     # Stash the executor identity so node_call_js can bake it into the runMicroskill
     # call (background segments can't nest-dispatch, so the executor must BE this agent).
     node["_exec_agent"] = (directives or {}).get("agent")
     node["_exec_model"] = (directives or {}).get("model")
+    # Stash the FINALIZED (profile-merged, strip_nulls'd) output_schema so a node
+    # with no explicit output_schema inherits the microskill's. A profile that
+    # deleted the schema (output_schema: null) resolves to None here, so the
+    # deleted schema is NOT resurrected — inheritance is a default-for-ABSENT only.
+    node["_exec_schema"] = resolved["output_schema"]
     if directives is None:
-        return "orchestrator"
+        return "orchestrator", f"use: {node['use']} resolution failed (fail-safe -> orchestrator)"
     if "AskUserQuestion" in (directives.get("allowed_tools") or []):
-        return "orchestrator"
+        return "orchestrator", f"use: {node['use']} exposes AskUserQuestion"
     for g in directives.get("gates") or []:
         if g.get("severity", "hard") == "hard":
-            return "orchestrator"
-    return "background"
+            return "orchestrator", f"use: {node['use']} carries a hard gate forces checkpoint"
+    return "background", f"use: {node['use']} -> background (autonomous)"
 
 
 def translate_ref(inner, seg_var_ids):
@@ -178,6 +381,20 @@ def translate_ref(inner, seg_var_ids):
     s = inner.strip()
     s = re.sub(r"\bworkflow\.inputs\.([a-zA-Z0-9_]+)", r"_args.wf_\1", s)
     s = re.sub(r"\bloop\.carry\.([a-zA-Z0-9_]+)", r"carry_\1", s)
+
+    # ${<id>.items} resolves to the producer's whole per-item-results array — the
+    # SAME handle as its segment var (n_<id> in-segment, _args[<id>] cross-segment),
+    # with NO trailing .field access (the for_each node's result IS the array).
+    # This MUST run BEFORE the .output pass, on the raw expression: NODE_ITEMS_RE's
+    # (?<!\.) lookbehind keeps it from matching a `.output.items` FIELD tail here, but
+    # once .output rewrites `prod.output.items` -> `n_prod.items` the bare `n_prod`
+    # token would mis-match (no preceding dot). Resolving items first avoids that
+    # collision so a producer field literally named `items` compiles correctly.
+    def repl_items(m):
+        nid = m.group(1)
+        return jsvar(nid) if nid in seg_var_ids else f'_args[{json.dumps(nid)}]'
+
+    s = NODE_ITEMS_RE.sub(repl_items, s)
 
     def repl_out(m):
         nid, rest = m.group(1), m.group(2) or ""
@@ -204,6 +421,11 @@ class Needs:
             for m in re.finditer(r"\bloop\.carry\.([a-zA-Z0-9_]+)", inner):
                 self.carry.add(m.group(1))
             for m in re.finditer(r"\b([a-z][a-z0-9_-]*)\.output\b", inner):
+                if m.group(1) not in seg_var_ids:
+                    self.nodes.add(m.group(1))
+            # ${<id>.items} consumes a cross-segment producer's array exactly like
+            # ${<id>.output}: a producer outside this segment is a `needs` node.
+            for m in NODE_ITEMS_RE.finditer(inner):
                 if m.group(1) not in seg_var_ids:
                     self.nodes.add(m.group(1))
 
@@ -234,7 +456,10 @@ def node_call_js(node, seg_var_ids, indent="  ", declare=True, track_ran=False):
     var = jsvar(nid)
     kw = "const " if declare else ""
     phase = nid
-    schema = node.get("output_schema")
+    # An EXPLICIT node-level output_schema always wins; otherwise a use: node
+    # inherits the microskill's resolved schema stashed on _exec_schema by classify().
+    # (_exec_schema is None when no microskill schema survived profile resolution.)
+    schema = node.get("output_schema") or node.get("_exec_schema")
     schema_js = json.dumps(schema, indent=2) if schema else "null"
     prompt = tmpl_literal(node.get("prompt") or f"Execute node {nid}.", seg_var_ids)
     if node.get("agent"):
@@ -261,11 +486,19 @@ def node_call_js(node, seg_var_ids, indent="  ", declare=True, track_ran=False):
 
     # for_each → fan out over a collection; `as` names the per-item var, which
     # ${<as>} refs resolve to (translate_ref leaves bare identifiers untouched).
+    # max_parallel: K bounds the fan-out to batches of K via parallelChunked (built
+    # only on the host parallel() global). WITHOUT max_parallel the emission is the
+    # unbounded parallel() exactly as before (byte-identical).
     fe = node.get("for_each")
     if fe:
         coll = translate_ref(strip_ref_wrapper(fe), seg_var_ids)
         as_var = node.get("as") or "item"
-        expr = f"await parallel((({coll}) || []).map(({as_var}) => () => {raw}))"
+        thunks = f"(({coll}) || []).map(({as_var}) => () => {raw})"
+        mp = node.get("max_parallel")
+        if mp is not None:
+            expr = f"await parallelChunked({thunks}, {int(mp)})"
+        else:
+            expr = f"await parallel({thunks})"
     else:
         expr = f"await {raw}"
 
@@ -300,6 +533,21 @@ async function runAgent(agentType, prompt, schema, phase, label) {
   return agent(prompt, { agentType, schema, phase, label })
 }
 function __ref(v) { return typeof v === 'string' ? v : JSON.stringify(v) }
+""".strip("\n")
+
+# Emitted ONLY into a segment that has a max_parallel for_each node. Built solely
+# on the host `parallel()` global + Array.slice — no Promise.allSettled, no timers.
+# Runs thunks in fixed-size batches of K, concatenating each batch's results so the
+# final array preserves input order (identical ordering to an unbounded parallel()).
+PARALLEL_CHUNKED_JS = r"""
+async function parallelChunked(thunks, k) {
+  const out = []
+  for (let i = 0; i < thunks.length; i += k) {
+    const batch = await parallel(thunks.slice(i, i + k))
+    for (const r of batch) out.push(r)
+  }
+  return out
+}
 """.strip("\n")
 
 
@@ -358,12 +606,14 @@ def emit_segment_js(seg_nodes, wf, loop, seg_index):
         # Loop segments also return __rounds (the iteration count) so the orchestrator
         # recap can state how many rounds ran. Not in `produces` → never stored as a node result.
         ret = "{ " + ", ".join(f"{json.dumps(i)}: {jsvar(i)}" for i in seg_ids) + ', "__rounds": __iter }'
+        loop_body_js = (f"{ran_init}{loop_calls}{break_line}{carry_assign}"
+                        f"  __iter++\n")
+        scaffold = (f"do {{\n{loop_body_js}"
+                    f"}} while (({while_js}) && __iter < __max)\n\n")
         body = (carry_init +
                 f"let __iter = 0\nconst __max = {max_iters}\n"
                 f"let {', '.join(jsvar(i) for i in seg_ids)}\n"
-                f"do {{\n{ran_init}{loop_calls}{break_line}{carry_assign}"
-                f"  __iter++\n"
-                f"}} while (({while_js}) && __iter < __max)\n\n"
+                + scaffold +
                 f"log(`{name}: ran ${{__iter}} iteration(s)`)\n"
                 f"return {ret}\n")
     else:
@@ -374,7 +624,12 @@ def emit_segment_js(seg_nodes, wf, loop, seg_index):
         ret = "{ " + ", ".join(f"{json.dumps(i)}: {jsvar(i)}" for i in seg_ids) + " }"
         body = calls + f"\nreturn {ret}\n"
 
-    js = head + HELPERS_JS + "\n\n" + guard + body
+    # The parallelChunked helper is appended ONLY when this segment has a
+    # max_parallel for_each node, so a segment without one stays byte-identical.
+    helpers = HELPERS_JS
+    if any(n.get("max_parallel") is not None and n.get("for_each") for n in seg_nodes):
+        helpers = HELPERS_JS + "\n" + PARALLEL_CHUNKED_JS
+    js = head + helpers + "\n\n" + guard + body
     needs_dict = {
         "wf_inputs": sorted(needs.wf_inputs),
         "nodes": sorted(needs.nodes),
@@ -389,6 +644,13 @@ def main():
     ap.add_argument("--profile", default=None)
     ap.add_argument("--override", action="append", default=[])
     ap.add_argument("--defs-root", default=str(DEFAULT_DEFS_ROOT))
+    ap.add_argument("--plan", action="store_true",
+                    help="Dry-run: compute and print the full plan but write NOTHING to "
+                         ".compiled/ (no mkdir, no stale-clean, no seg files, no manifest).")
+    ap.add_argument("--explain", action="store_true",
+                    help="Add per-node classification reasons, de-anonymize the sequence "
+                         "summary, and surface manifest_hash. Output-only — never changes "
+                         "the emitted segment bytes.")
     args = ap.parse_args()
 
     defs_root = Path(args.defs_root).resolve()
@@ -402,20 +664,23 @@ def main():
     profiles_dir = def_dir / "profiles"
     base_path = profiles_dir / "base.yaml"
     profile_used = "base"
-    if base_path.exists():
-        base_cfg = yaml.safe_load(base_path.read_text()) or {}
-        # base.yaml carries only overlay fields (version etc.); merge onto def.
-        wf = deep_merge(wf, {k: v for k, v in base_cfg.items() if k != "version"})
-    default_profile = (wf.get("profile") or {}).get("default")
-    effective = args.profile or default_profile
-    if effective and effective != "base":
-        overlay_path = profiles_dir / f"{effective}.yaml"
-        if overlay_path.exists():
-            overlay = yaml.safe_load(overlay_path.read_text()) or {}
-            wf = deep_merge(wf, {k: v for k, v in overlay.items() if k != "version"})
-            profile_used = effective
-        else:
-            die(f"profile '{effective}' not found at {overlay_path}", 1)
+    try:
+        if base_path.exists():
+            base_cfg = yaml.safe_load(base_path.read_text()) or {}
+            # base.yaml carries only overlay fields (version etc.); merge onto def.
+            wf = deep_merge(wf, {k: v for k, v in base_cfg.items() if k != "version"})
+        default_profile = (wf.get("profile") or {}).get("default")
+        effective = args.profile or default_profile
+        if effective and effective != "base":
+            overlay_path = profiles_dir / f"{effective}.yaml"
+            if overlay_path.exists():
+                overlay = yaml.safe_load(overlay_path.read_text()) or {}
+                wf = deep_merge(wf, {k: v for k, v in overlay.items() if k != "version"})
+                profile_used = effective
+            else:
+                die(f"profile '{effective}' not found at {overlay_path}", 1)
+    except ValueError as e:
+        die(f"profile list-verb error: {e}", 1)
 
     for ov in args.override:
         if "=" not in ov:
@@ -424,6 +689,22 @@ def main():
         apply_override(wf, path.strip(), val.strip())
 
     wf = strip_nulls(wf)
+
+    # --- INTRA-DEF VARS: double-brace {{key}} pre-pass (Phase 5b) ---
+    # Substitute {{key}} tokens throughout the merged doc from the top-level vars:
+    # map, using the SAME substitute_vars resolve-microskill already ships. Runs
+    # AFTER deep-merge + strip_nulls (so a profile may override a var) and BEFORE
+    # schema validation. Pure textual pre-compile transform → deterministic; a
+    # workflow with no vars: leaves every string byte-identical. An unresolved
+    # {{key}} is left intact and recorded (warned), consistent with resolve-microskill.
+    wf, unresolved_vars = apply_workflow_vars(wf)
+    for _uk in unresolved_vars:
+        sys.stderr.write(f"warning: unresolved workflow var '{_uk}' left intact\n")
+
+    # An OMITTED version defaults to 1 BEFORE schema validation (the const:1 check
+    # stays intact, so an EXPLICIT wrong version still blocks). Mirrors the
+    # resolve-microskill ergonomic.
+    wf.setdefault("version", 1)
 
     if not SCHEMA_PATH.exists():
         die(f"workflow schema not found: {SCHEMA_PATH}", 1)
@@ -434,8 +715,31 @@ def main():
         die("merged workflow fails schema validation", 1, schema_errors=msgs)
 
     nodes = wf.get("nodes") or []
+
+    # side_effect: true is a readable alias for delegation: orchestrator. Normalize
+    # it BEFORE classify so the node classifies as an orchestrator checkpoint. An
+    # explicit delegation already present wins (side_effect only sets the default).
+    for n in nodes:
+        if isinstance(n, dict) and n.pop("side_effect", None) is True:
+            n.setdefault("delegation", "orchestrator")
+
     node_by_id = {n["id"]: n for n in nodes}
     loop = wf.get("loop")
+
+    # --- LOOP ERGONOMICS: exactly-one-of while/until, then desugar until→while ---
+    # Desugar BEFORE emission so a loop authored with `until` compiles byte-identical
+    # to the hand-written negated `while`.
+    if loop is not None:
+        wu_err = loop_while_until_error(loop)
+        if wu_err:
+            die(wu_err, 1)
+        desugar_loop_until(loop)
+
+    # --- LOOP ERGONOMICS: max_parallel is only valid on a for_each node ---
+    mp_errs = loop_max_parallel_errors(nodes)
+    if mp_errs:
+        nid, msg = mp_errs[0]
+        die(f"node '{nid}': {msg}", 1)
 
     gates_after = {}
     for g in wf.get("gates") or []:
@@ -443,9 +747,19 @@ def main():
 
     order = topo_sort(nodes)
 
+    # --- S-LOOP: loop body must stay contiguous (pre-emit, mirrors validate) ---
+    # A split body silently drops the do/while scaffold; die before any emit so
+    # compile and validate can never disagree.
+    contig_err = loop_contiguity_error(order, node_by_id, gates_after, loop)
+    if contig_err:
+        die(contig_err, 1)
+
     # --- partition into manifest steps ---
     steps = []
     seg = []
+    # Per-node classification record (node id → reason), in topological order.
+    # Surfaced only under --explain; never affects partitioning or emitted bytes.
+    classification = []
 
     def flush_segment():
         nonlocal seg
@@ -455,11 +769,21 @@ def main():
 
     for nid in order:
         node = node_by_id[nid]
-        klass = classify(node, gates_after, defs_root)
+        klass, reason = classify(node, gates_after, defs_root)
+        classification.append({"node": nid, "class": klass, "reason": reason})
         if klass == "orchestrator":
             flush_segment()
-            chk = {"kind": "checkpoint", "checkpoint_type": "orchestrator_node", "node": nid,
-                   "prompt": node.get("prompt", ""), "depends_on": node.get("depends_on") or []}
+            if node.get("workflow"):
+                # Nested-workflow checkpoint: the dispatcher re-enters the workflow
+                # skill on this child. inputs values stay as raw ${...} refs —
+                # the dispatcher resolves them against workflow inputs + upstream
+                # node results at run time.
+                chk = {"kind": "checkpoint", "checkpoint_type": "nested_workflow", "node": nid,
+                       "workflow": node["workflow"], "inputs": node.get("inputs") or {},
+                       "depends_on": node.get("depends_on") or []}
+            else:
+                chk = {"kind": "checkpoint", "checkpoint_type": "orchestrator_node", "node": nid,
+                       "prompt": node.get("prompt", ""), "depends_on": node.get("depends_on") or []}
             # when/for_each/as are handled by the dispatcher for orchestrator nodes.
             for k in ("when", "for_each", "as"):
                 if node.get(k) is not None:
@@ -474,11 +798,19 @@ def main():
     flush_segment()
 
     # --- emit segments ---
+    # ALL disk-mutating operations are guarded behind `not args.plan`. Under --plan
+    # we still compute the full plan (segment JS, needs, produces, manifest) so the
+    # summary is identical to a real compile, but write nothing: no mkdir, no
+    # stale-clean unlink, no seg files, no manifest.json. This mirrors the harness
+    # reconcile loops' --plan-by-default ergonomics.
     compiled_dir = def_dir / ".compiled"
-    compiled_dir.mkdir(parents=True, exist_ok=True)
-    # clean stale segment files for determinism
-    for old in compiled_dir.glob("seg-*.js"):
-        old.unlink()
+    if not args.plan:
+        compiled_dir.mkdir(parents=True, exist_ok=True)
+        # clean stale segment files for determinism. (Note: only seg-*.js are
+        # globbed — manifest.json is overwritten below, and the dispatcher's
+        # .run-state.json is intentionally NOT touched.)
+        for old in compiled_dir.glob("seg-*.js"):
+            old.unlink()
 
     seg_index = 0
     manifest_steps = []
@@ -488,7 +820,8 @@ def main():
             seg_nodes = [node_by_id[i] for i in step["nodes"]]
             js, needs, produces = emit_segment_js(seg_nodes, wf, loop, seg_index)
             fname = f"seg-{seg_index}.js"
-            (compiled_dir / fname).write_text(js)
+            if not args.plan:
+                (compiled_dir / fname).write_text(js)
             manifest_steps.append({
                 "kind": "segment",
                 "index": seg_index,
@@ -517,8 +850,37 @@ def main():
         "output": wf.get("output"),
         "steps": manifest_steps,
     }
+    # Deterministic content hash over the canonical (sorted-key, compact) JSON of
+    # the manifest — computed over the manifest WITHOUT its own manifest_hash key,
+    # so the hash can never depend on itself. Same inputs → same hash; any change
+    # to the partition/needs/produces changes it. (rank14's dispatcher consumes it
+    # to decide whether stored run-state matches the just-compiled workflow.)
+    manifest_hash = hashlib.sha256(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
     manifest_path = compiled_dir / "manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    # manifest_hash is additive/opt-in: included in the WRITTEN manifest only under
+    # --explain, so a default compile's .compiled/ bytes stay byte-identical to
+    # before. The dispatcher obtains it via --explain.
+    out_manifest = dict(manifest)
+    if args.explain:
+        out_manifest["manifest_hash"] = manifest_hash
+    if not args.plan:
+        manifest_path.write_text(json.dumps(out_manifest, indent=2) + "\n")
+
+    def seq_label(s):
+        """A segment's bracketed node list, or a checkpoint label. WITHOUT --explain
+        a checkpoint stays the bare lossy type ('gate'/'orchestrator_node'); WITH
+        --explain it is de-anonymized with the gate/node id."""
+        if s["kind"] != "checkpoint":
+            return f"segment[{','.join(s['nodes'])}]"
+        ctype = s.get("checkpoint_type", "checkpoint")
+        if not args.explain:
+            return ctype
+        if ctype == "gate":
+            return f"gate:{s.get('gate', {}).get('id', '?')}"
+        return f"{ctype}:{s.get('node', '?')}"
 
     summary = {
         "name": wf["name"],
@@ -527,8 +889,15 @@ def main():
         "manifest_path": rel(manifest_path),
         "segments": sum(1 for s in manifest_steps if s["kind"] == "segment"),
         "checkpoints": sum(1 for s in manifest_steps if s["kind"] == "checkpoint"),
-        "sequence": [s.get("checkpoint_type", "segment") if s["kind"] == "checkpoint" else f"segment[{','.join(s['nodes'])}]" for s in manifest_steps],
+        "sequence": [seq_label(s) for s in manifest_steps],
     }
+    # --explain (and --plan, the dry-run preview) are additive: they only ADD keys.
+    # With neither flag the summary is byte-identical to before.
+    if args.explain:
+        summary["manifest_hash"] = manifest_hash
+        summary["classification"] = classification
+    if args.plan:
+        summary["plan"] = True
     print(json.dumps(summary, indent=2))
     sys.exit(0)
 

@@ -74,21 +74,56 @@ Validate and compile from the project root:
 ## 3. Top-level keys
 
 The grammar is **closed** — `additionalProperties: false` everywhere. An unknown key fails schema
-validation. `version` + `name` + `nodes` are required; everything else is optional.
+validation. Only `name` + `nodes` are required; everything else is optional.
 
 | Key | Required | Purpose |
 |---|---|---|
-| `version` | ✅ | Must be the integer `1`. |
 | `name` | ✅ | Bare identifier, `^[a-z][a-z0-9-]*$` (kebab-case). Names the def dir and the compiled segments (`<name>__segN`). |
+| `nodes` | ✅ | The DAG vertices. ≥1. Each is a `use:`, an `agent:`, a `workflow:`, or an orchestrator node. |
+| `version` | — | **Now optional.** Defaults to `1` (compile/validate `setdefault` it before schema validation). An *explicit* value other than `1` still blocks. |
 | `description` | — | One-line summary. Surfaced in the manifest + dispatcher recap. |
+| `vars` | — | Intra-def variable map (see below). `{{key}}` substitution; profile-overridable; no file include. |
 | `inputs` | — | Caller-supplied typed inputs. Referenced as `${workflow.inputs.<name>}`. |
-| `nodes` | ✅ | The DAG vertices. ≥1. Each is a `use:`, an `agent:`, or an orchestrator node. |
 | `gates` | — | Checkpoints anchored `after:` a node. Hard / human-approval gates become segment boundaries. |
-| `loop` | — | At most one. A guarded `while` loop over a **contiguous** subset of nodes. |
+| `loop` | — | At most one. A guarded loop (`while` *or* `until`) over a **contiguous** subset of nodes. |
 | `output` | — | `{from: <node-id>}` — whose result is the workflow's aggregate output. |
 | `profile` | — | `base.yaml` only: `{default: <name>}` names the default overlay when `--profile` is omitted. |
-| `imports` | — | **Advisory only.** Documents the microskills/agents this composes; no runtime effect (the compiler resolves names directly). |
+| `imports` | — | **Now load-bearing.** The allowlist of child workflows a `workflow:` node may invoke (see below). |
 | `base` | — | **Advisory only.** Catalog-curation hint for `initialize-harness`; ignored by the compiler. |
+
+### `vars` — intra-def substitution
+
+```yaml
+vars:
+  model: opus
+  cap: 3
+nodes:
+  - id: plan
+    agent: planner
+    prompt: Plan with {{model}}.        # {{model}} → opus before schema validation
+loop:
+  max_iters: 3                          # (a {{cap}} token anywhere would resolve to 3)
+```
+
+A `{{key}}` token **anywhere** in the merged doc (values *and* dict keys) is textually replaced from
+the `vars:` map by **both** `compile-workflow` and `validate-workflow`, **after** deep-merge +
+strip-nulls (so a profile overlay may override a var) and **before** schema validation. Values coerce
+to string at substitution time. It is a **pure textual transform** — *not* `$include`, no cross-file
+mechanism. An unresolved `{{key}}` (no matching var) is **left intact** and surfaced as a `warn`
+(stderr from compile; a `warn` issue from validate) — never a block. A doc with no `{{...}}` tokens
+compiles byte-identically.
+
+### `imports` — the child-workflow allowlist
+
+```yaml
+imports: [build-workflow-from-plan]     # every `workflow:` node's target MUST be listed here
+```
+
+`imports` is the **load-bearing allowlist** of child workflows a `workflow:` node (§5d) may invoke:
+each bare child name a `workflow:` node targets **must** appear here, or validate (with `--defs-root`)
+blocks it. It also drives validate's nested-target resolution and import-cycle detection. A legacy
+`<dir>/<name>` advisory form is still *tolerated* by the schema (un-migrated defs) but is **ignored**
+by the nested-resolution pass. It still has no effect on the compiled segment bytes.
 
 ### `inputs`
 
@@ -114,40 +149,53 @@ type-checked at runtime.
 ## 4. The reference grammar — `${...}`
 
 Anywhere a string appears (prompts, `inputs` values, `when`, `for_each`, loop `while`/`carry`) you
-can embed references. There are exactly **four** forms:
+can embed references. There are these forms:
 
 | Form | Means | Compiles to (inside a segment) |
 |---|---|---|
 | `${workflow.inputs.<x>}` | A workflow-level input | `_args.wf_<x>` |
 | `${<node-id>.output.<field>...}` | An upstream node's output field | `n_<id>.<field>` if same segment, else `_args["<id>"].<field>` |
+| `${<node-id>.items}` | The **whole per-item-results array** of a `for_each` node | the producer's bare array handle: `n_<id>` if same segment, else `_args["<id>"]` |
 | `${loop.carry.<v>}` | A loop carry variable (loop body only) | `carry_<v>` |
 | `${<as>}` | The current `for_each` item (the `as` binding) | the bare loop variable |
+
+**`${<id>.items}`** consumes the *entire* fan-out result array of `for_each` node `<id>` — there is
+**no `.field` tail**, the node's result *is* the array. It implies a dependency edge into the
+referencing node exactly like `${<id>.output}` (§7). The producer `<id>` **must** be a `for_each`
+node — a `.items` ref to a non-fan-out node is a block, an unknown id is a block. (The compiler
+resolves `.items` *before* `.output` so a producer field literally named `items` still compiles.)
+
+**Gate ids are legal ref targets.** `${<gate-id>.output.choice}` resolves against the human's recorded
+pick at a gate (§8). A gate-id ref is *accepted* by validate (not "unknown node") and — unlike a node
+ref — creates **no** dependency edge (a gate isn't a node), so it can never perturb ordering.
 
 A reference may be a **whole value** (`requirement: ${workflow.inputs.requirement}`) or **embedded
 in text** (`prompt: > process ${ms_spec.name} at ${plan.output.path}`). In prompts and other text,
 each ref is wrapped in a `__ref()` helper that JSON-stringifies non-strings, so an object ref
 interpolates cleanly.
 
-### The one rule you cannot break
+### Refs imply edges (you no longer restate them in `depends_on`)
 
-> **Every `${<id>.output...}` reference a node uses MUST list `<id>` in that node's `depends_on`.**
+> **A `${<id>.output...}` or `${<id>.items}` reference now IMPLIES a dependency edge `<id> → this`.**
 
-The validator scans `inputs`, `prompt`, `when`, and `for_each` of each node; an output ref to a node
-not in `depends_on` is a **block**:
+The effective dependency set of a node is the **union** of its explicit `depends_on` and every
+`.output`/`.items` ref in its scoped fields (`inputs`, `prompt`, `when`, `for_each`). You do **not**
+have to restate a ref in `depends_on` anymore — the union is what the compiler topo-sorts and what
+both tools cycle-check (§7). `depends_on` remains useful for *pure ordering* edges that carry no ref
+(e.g. `build` waits for `provision`).
 
-```
-nodes/<nid>: uses ${<ref_id>.output...} but '<ref_id>' is not in depends_on
-```
-
-Referencing an output of a node that doesn't exist at all is also a block
-(`references output of unknown node '<id>'`). Note: only `.output` refs imply a dependency edge —
-`${workflow.inputs.output_path}` is a workflow input, not a dependency on a node named `output`.
+The validator still guards genuine typos: a ref to a node that doesn't exist is a **block**
+(`references output of unknown node '<id>'`). A `${workflow.inputs.x}` ref is a workflow input, not a
+dependency on a node named `workflow`; `${<gate-id>.output.choice}` is the accepted gate-id form and
+implies no edge.
 
 ---
 
-## 5. Nodes — the three kinds
+## 5. Nodes — the four kinds
 
-Every node has a unique `id` (`^[a-z][a-z0-9_-]*$`). A node is **exactly one of three kinds**:
+Every node has a unique `id` (`^[a-z][a-z0-9_-]*$`). A node is **exactly one of four kinds** (`use`,
+`agent`, `workflow` are mutually exclusive — declaring more than one is a block; the fourth kind
+declares none of them):
 
 ### (a) `use:` — invoke a registered microskill
 
@@ -201,23 +249,52 @@ agent.)
 ```
 
 Orchestrator nodes run in the **main loop**: they do filesystem side-effects, `AskUserQuestion`, and
-**nested-workflow invocation** (the only place that's allowed). They become checkpoints in the
-compiled sequence.
+**nested-workflow invocation**. They become checkpoints in the compiled sequence.
+
+### (d) `workflow:` — invoke a nested workflow (first-class)
+
+```yaml
+imports: [build-workflow-from-plan]    # the child MUST be allowlisted here
+nodes:
+  - id: build
+    workflow: build-workflow-from-plan  # bare child-workflow name (kebab-case)
+    depends_on: [plan]
+    inputs:
+      plan_path: ${plan.output.plan_path}   # raw refs — resolved by the dispatcher at run time
+```
+
+A `workflow:` node is its own kind — a **first-class nested-workflow call**. It is **always an
+orchestrator checkpoint** (`checkpoint_type: nested_workflow`); the compiler classifies it as
+orchestrator *before* any use/agent inspection, because a background segment can't re-enter the
+dispatcher. It carries `inputs` / `depends_on` / `when` / `for_each` + `as` like any node; its
+`inputs` values stay as raw `${...}` refs in the manifest and the dispatcher resolves them against
+workflow inputs + upstream results when it re-enters the `workflow` skill for the child.
+
+With `validate-workflow --defs-root <dir>`, the child contract is checked against `imports` **and**
+the child's `WORKFLOW.yaml`: the target must be in `imports` (else block), must resolve to a child
+`WORKFLOW.yaml` (else block), every `required` child input must be supplied by this node's `inputs`
+(else block), and `${<this-node>.output.<field>}` refs are cross-checked against the child's declared
+output node (mismatch → **warn**). **Nesting depth is 1**: a child that itself contains a `workflow:`
+node is blocked, and an import cycle across the reachable import graph is blocked. Without
+`--defs-root` these checks are skipped (backward-compatible single-file validation).
 
 ### Full node field reference
 
 | Field | Applies to | Meaning |
 |---|---|---|
-| `id` | all | Unique, `^[a-z][a-z0-9_-]*$`. |
-| `use` | (a) | Bare microskill name. Mutually exclusive with `agent`. |
-| `agent` | (b) | Agent type. Mutually exclusive with `use`. |
+| `id` | all | Unique, `^[a-z][a-z0-9_-]*$`. Must be disjoint from gate ids. |
+| `use` | (a) | Bare microskill name. Mutually exclusive with `agent`/`workflow`. |
+| `agent` | (b) | Agent type. Mutually exclusive with `use`/`workflow`. |
+| `workflow` | (d) | Bare child-workflow name (kebab-case). Mutually exclusive with `use`/`agent`; must be in `imports`. Always an orchestrator checkpoint. |
 | `delegation` | all | `orchestrator` forces a checkpoint; `auto` forces background. Overrides the auto-classification. |
-| `depends_on` | all | Upstream node ids → DAG edges. Every `${id.output}` ref must appear here. |
-| `inputs` | (a)(b) | Map of input field → `${...}` expression (or literal). Wires data in. |
+| `side_effect` | all | `true` is a **readable alias for `delegation: orchestrator`** — normalized to it before classification (an explicit `delegation` already present wins). Use it to mark a node that does filesystem side effects / human interaction. |
+| `depends_on` | all | Upstream node ids → DAG edges. Unioned with ref-implied edges (§7). |
+| `inputs` | (a)(b)(d) | Map of input field → `${...}` expression (or literal). Wires data in. |
 | `prompt` | (b)(c) | Task prompt template. May contain `${...}`. (For `use:` nodes the body comes from the microskill.) |
-| `output_schema` | (a)(b) | JSON-Schema fragment forcing structured output. Passed to `agent()`'s `schema`. |
+| `output_schema` | (a)(b) | JSON-Schema fragment forcing structured output. Passed to `agent()`'s `schema`. A `use:` node **omitting** this inherits the microskill's resolved schema (§11). |
 | `when` | all | Conditional guard (see §6). |
 | `for_each` + `as` | all | Fan-out over a collection (see §6). |
+| `max_parallel` | for_each only | Bound the fan-out to batches of K (`parallelChunked`) instead of one unbounded `parallel()`. **Only valid on a `for_each` node** — on a non-fan-out node it is a block. |
 | `customize` | (a) | `{profile: <name>}` selects the microskill's profile. **See the footgun in §13.** |
 | `grant_tools` | (a)(b) | **Declared but inert** — the compiler does not consume it. See §13. |
 
@@ -244,9 +321,9 @@ A node runs only if `when` (an inner-of-`${...}` JS expression) is truthy; other
 ```
 
 Inside a background segment, `when` compiles to a ternary: `(cond) ? await runAgent(...) : null`.
-A node it references must still be in `depends_on` (the edge is real even though the node may skip).
-For **orchestrator** nodes the dispatcher evaluates `when` in the main loop: false → store `null`,
-continue.
+A `${id.output}` ref inside `when` implies the dependency edge (the edge is real even though the node
+may skip — §7), so you needn't restate it in `depends_on`. For **orchestrator** nodes the dispatcher
+evaluates `when` in the main loop: false → store `null`, continue.
 
 > **Advisory-fork pattern** (used by every built-in creator): two nodes guarded by opposite
 > conditions (`== null` vs `!= null`) so exactly one runs. The main path builds; the advisory path
@@ -272,6 +349,12 @@ Run one instance per item in a collection. `as` names the per-item loop variable
   **warn** (no effect).
 - In a background segment, `for_each` compiles to `await parallel((collection || []).map((<as>) => () => ...))`
   — **fan-out runs in parallel**. An empty/absent collection → empty result.
+- **`max_parallel: K`** (for_each only) caps the fan-out to fixed-size batches of K via a
+  `parallelChunked` helper (emitted into the segment only when a `max_parallel` node is present), each
+  batch awaited in turn — output order is preserved, identical to the unbounded `parallel()`. Without
+  it, the emission is byte-identical to before. `max_parallel` on a node with no `for_each` is a
+  **block** in both validate and compile.
+- The whole fan-out result array is consumable downstream via **`${<id>.items}`** (§4).
 - **`for_each` is not allowed inside a `loop.body`** — fan-out inside a loop is a **block**
   (`fan-out inside a loop body is unsupported`).
 
@@ -279,13 +362,22 @@ Run one instance per item in a collection. `as` names the per-item loop variable
 
 ## 7. Edges, ordering, cycles
 
-- `depends_on` lists upstream node ids — these are the DAG edges.
-- The compiler runs **Kahn's topological sort**; ties break by **definition order** (this is what
-  makes output deterministic). Author your nodes in a sensible order and the compiled sequence
-  follows it.
+- The DAG edge set is the **UNION** of explicit `depends_on` **and** every `${<id>.output...}` /
+  `${<id>.items}` ref in a node's scoped fields (`inputs`/`prompt`/`when`/`for_each`). A ref therefore
+  **implies an edge** — you no longer have to restate it in `depends_on` (§4). (Only refs whose id is
+  a real node count; a gate-id ref contributes no edge.)
+- The compiler runs **Kahn's topological sort over the union edge set**; ties break by **definition
+  order** (this is what makes output deterministic). Author your nodes in a sensible order and the
+  compiled sequence follows it. Compile and validate share the *same* `union_edges`/`topo_sort`, so
+  they can never disagree on ordering.
 - A **dependency cycle is a block** (both validator and compiler reject it):
-  `dependency cycle: a -> b -> a`.
+  `dependency cycle: a -> b -> a`. Cycle detection runs over the **union** edges, so a *ref-only*
+  cycle (A reads `${B.output}`, B reads `${A.output}`, neither in `depends_on`) is still caught.
 - A `depends_on` entry that names a non-existent node is a **block** (`references unknown node`).
+- **Typed field-ref check:** an undeclared `${<producer>.output.<field>}` where `<producer>` has an
+  `output_schema` of `type: object` with declared `properties` and `<field>` is **not** among them is
+  a **block**. A schema-less producer (or one without an object schema) is treated as `any` and never
+  flagged.
 - Orchestrator nodes may have `depends_on` too — even though they all run in the main loop, the
   edges enforce ordering (e.g. `build` waits for `provision` so provisioned components exist first).
 
@@ -312,7 +404,7 @@ continues.
 
 | Field | Rule |
 |---|---|
-| `id` | `^[a-z][a-z0-9_-]*$`. |
+| `id` | `^[a-z][a-z0-9_-]*$`. **Must be unique among gates AND disjoint from node ids** (they share the `${id...}` ref namespace) — a collision is a block. |
 | `after` | Required. Must reference a known node (`'after' references unknown node` otherwise). |
 | `type` | `human_approval` \| `verification` \| `tool_check`. `human_approval` **requires** a `prompt`. |
 | `severity` | `hard` (default) \| `warn`. Hard → segment boundary + pause. |
@@ -322,6 +414,31 @@ continues.
 > Only `human_approval` gates are exercised by the built-in workflows. `verification` / `tool_check`
 > are valid `type` values in the schema; a `hard`-severity gate of any type still forms a segment
 > boundary.
+
+### Gate-choice branching
+
+The dispatcher records the human's pick at a gate as `results[<gate-id>] = { choice: <selected
+option> }` (the chosen label, verbatim — recorded for `warn` gates too). A downstream node can branch
+on that pick:
+
+```yaml
+gates:
+  - id: review
+    after: plan
+    type: human_approval
+    prompt: Approve, or send to deep review?
+    options: [approve, deep_review]
+nodes:
+  - id: deep_pass
+    agent: reviewer
+    when: ${review.output.choice == 'deep_review'}    # branch on the human's pick
+    depends_on: [plan]
+    prompt: Do the deep review of ${plan.output.spec}.
+```
+
+A `${<gate-id>.output.choice}` ref is **accepted** by validate (treated as `any`, never field-checked)
+and creates **no dependency edge** (a gate isn't a node), so it can't perturb ordering. This composes
+with the advisory-fork pattern — opposite-`choice` guards keep the branches mutually exclusive.
 
 ---
 
@@ -333,13 +450,21 @@ cap is hit.
 ```yaml
 loop:
   while: ${!evaluate.output.pass}    # continue-condition over the latest iteration's output
+  # or, equivalently:
+  # until: ${evaluate.output.pass}   # STOP-condition sugar — desugars to while: ${!(evaluate.output.pass)}
   max_iters: 3                       # MANDATORY cap
   body: [implement, evaluate]        # node ids that repeat each iteration (must be contiguous)
   carry:
     last_findings: ${evaluate.output}  # state threaded into the next iteration
 ```
 
-- `max_iters` is **required** (`missing required 'max_iters' cap` otherwise). It's an integer ≥ 1.
+- The schema requires **`max_iters` + `body`** (no longer `while`). It's an integer cap ≥ 1
+  (`missing required 'max_iters' cap` otherwise).
+- **Exactly one of `while` / `until`** must be present (enforced by compile + validate, not the
+  schema): neither → block, both → block. `until: ${EXPR}` is sugar that **desugars to
+  `while: ${!(EXPR)}`** (the inner expression is negated and re-wrapped) — the compiled output is
+  byte-identical to writing that negated `while` by hand. The desugar runs before every ref /
+  contiguity check, so both forms are validated identically.
 - `body` lists the node ids that repeat. Each must be a known node; a `for_each` node in the body is
   a **block**.
 - The body compiles to a JS `do { ... } while ((<while>) && __iter < max)` inside **one segment**.
@@ -353,9 +478,13 @@ loop:
 spinning to `max_iters` and reading a skipped node's `null` in the `while`). You don't write this; the
 compiler emits it when it sees a `when` in the body.
 
-> ### ⚠️ The loop-contiguity rule (the #1 hand-authoring footgun)
-> **An orchestrator node (or a hard gate) placed *between* two loop-body nodes splits the loop
-> segment and breaks the loop.** The loop body must compile into a single uninterrupted segment.
+> ### ⚠️ The loop-contiguity rule (now ENFORCED, formerly a silent footgun)
+> **An orchestrator node (or a hard/`human_approval` gate) placed *between* two loop-body nodes splits
+> the loop segment and would break the do/while scaffold.** The loop body must compile into a single
+> uninterrupted segment. This is **now a block in both `validate-workflow` and `compile-workflow`**
+> (shared `loop_contiguity_error`, run over the same topological order): a body that isn't a
+> contiguous window — an interleaved out-of-body / orchestrator node, or a hard gate anchored after a
+> non-last body node — fails before any emit. (Previously it compiled to a silently-broken loop.)
 > **Keep `loop.body` nodes contiguous in the topological order**, and place orchestrator nodes / gates
 > *before* or *after* the loop body — never inside it.
 
@@ -400,6 +529,32 @@ in.) Only `base.yaml` may carry a `profile:` block — an overlay declaring `pro
 **`--override a.b.c=value`** sets a dotted path; the value is parsed as YAML (so `=true` → boolean,
 `=[a,b]` → list, `=` → delete). After all merges/overrides, remaining `null`s are stripped.
 
+**List-verb overlays — edit `nodes:` / `gates:` by id.** Beyond wholesale list replacement, a profile
+overlay can surgically `add` / `patch` / `remove` workflow `nodes:` and `gates:` by id (the
+`resolve-microskill` deep-merge verbs, shared here):
+
+```yaml
+# profiles/autonomous.yaml
+gates:
+  patch: [{ id: approve_plan, severity: warn }]   # soften an existing gate by id
+nodes:
+  patch: [{ id: implement, customize: { profile: fast } }]
+  add:   [{ id: extra_check, agent: checker, depends_on: [implement] }]
+  remove: [advise]                                 # drop a node by id
+```
+
+`patch` deep-merges into the matching-id item; `add` appends new items; `remove` drops by id. A
+`remove` that **orphans a reference** — leaving a dangling `depends_on`, ref, `gate.after`,
+`output.from`, or `loop.body` entry — is caught at validate (as the corresponding unknown-node block).
+*(Microskills have the analogous `steps.add/patch/remove` on their step list — the microskill-side
+equivalent of this same mechanism.)*
+
+**`use:` node output_schema inheritance.** A `use:` node that **omits** `output_schema` now
+**inherits** its microskill's fully-resolved (profile-merged, null-stripped) `output_schema` — the
+compiler stashes it on the node and bakes it into the call. An explicit node-level `output_schema`
+wins. Inheritance is a default-for-*absent* only: a microskill profile that *deleted* its schema
+(`output_schema: null`) resolves to none, so a deleted schema is never resurrected.
+
 **Node-level `customize`:** on a `use:` node, `customize: { profile: <name> }` selects *which profile
 of that microskill* the node runs. That's the **only** `customize` key the compiler reads (see §13).
 
@@ -413,23 +568,31 @@ for a human.
 
 ### Classification — background vs orchestrator
 
-The compiler classifies each node:
+The compiler classifies each node (`side_effect: true` is normalized to `delegation: orchestrator`
+*before* this runs):
 
 1. `delegation: orchestrator` → **orchestrator** (explicit wins). `delegation: auto` → **background**.
-2. Neither `use` nor `agent` → **orchestrator** (an orchestrator-native step).
-3. `agent:` → **background**.
-4. `use:` → resolve the microskill's directives and inspect:
+2. `workflow:` → **orchestrator** (a nested-workflow checkpoint) — classified before any use/agent
+   inspection.
+3. Neither `use` nor `agent` (nor `workflow`) → **orchestrator** (an orchestrator-native step).
+4. `agent:` → **background**.
+5. `use:` → resolve the microskill's directives and inspect:
    - resolution **fails** → orchestrator (fail-safe);
    - resolved `allowed_tools` contains **`AskUserQuestion`** → orchestrator;
    - resolved directives carry a **hard-severity gate** → orchestrator;
    - otherwise → **background**.
 
+Under `--explain` the compiler surfaces a per-node **classification reason** (the short string behind
+each decision, e.g. `use: task-plan -> background (autonomous)`, `nested workflow: build-…`) so you
+can see *why* a node landed where it did.
+
 ### Segmentation
 
-Walk the topo order. Background nodes accumulate into the current segment. An orchestrator node or a
-hard/human-approval gate **flushes** the segment and emits a checkpoint. A loop's body stays inside
-one segment (`is_loop` segment). Result: an alternating sequence of `segment[...]` and checkpoint
-steps, written to `manifest.json`.
+Walk the topo order. Background nodes accumulate into the current segment. An orchestrator node, a
+`workflow:` node, or a hard/human-approval gate **flushes** the segment and emits a checkpoint
+(`orchestrator_node` / `nested_workflow` / `gate` respectively). A loop's body stays inside one
+segment (`is_loop` segment). Result: an alternating sequence of `segment[...]` and checkpoint steps,
+written to `manifest.json`.
 
 Example compiled sequences (from the real workflows):
 
@@ -454,17 +617,50 @@ For each manifest step in order:
   continue without pausing.
 - **`checkpoint` / orchestrator_node** → execute the node's `prompt` in the main loop, resolving
   `${...}` against `inputs`/`results`. Honor `when` (skip → `null`) and `for_each` (run per item,
-  bind `${as}`). This is where side-effects, `AskUserQuestion`, and nested workflows happen. Store
-  into `results[node]`.
+  bind `${as}`). This is where side-effects and `AskUserQuestion` happen. Store into `results[node]`.
+- **`checkpoint` / nested_workflow** (a `workflow:` node) → honor `when`/`for_each` as above, resolve
+  the step's `inputs` refs against `inputs`/`results`, then **re-enter the same `workflow` skill** for
+  the child (compile + run its manifest, feeding the resolved inputs and skipping interactive input
+  gathering). Depth ≤ 1 is compiler-guaranteed, so recursion is bounded. Store the child's
+  `output.from` result into `results[node]`.
 
 At the end, report `results[manifest.output.from]`.
+
+### `--plan` and `--explain` (compile flags)
+
+- **`compile-workflow … --plan`** — a **dry-run**: compute the full plan (segment JS, `needs`,
+  `produces`, manifest, summary) but **write nothing** — no `mkdir`, no stale-clean, no `seg-*.js`, no
+  `manifest.json`. The printed summary is identical to a real compile (plus `plan: true`). Mirrors the
+  harness reconcile loops' `--plan`-by-default ergonomics. (The dispatcher never passes `--plan`.)
+- **`compile-workflow … --explain`** — **output-only**, never changes emitted bytes. Adds: per-node
+  `classification` (id → class + reason), a **de-anonymized** `sequence` (checkpoints labelled
+  `gate:<id>` / `orchestrator_node:<id>` / `nested_workflow:<id>` instead of the bare lossy type), and
+  the **`manifest_hash`** — both in the summary *and* written into `manifest.json` (the only thing that
+  changes the written bytes vs a default compile). `manifest_hash` is a SHA-256 over the canonical
+  (sorted-key, compact) manifest *excluding its own hash field*; any change to the partition / needs /
+  produces changes it.
+
+### Dispatcher resume (`.run-state.json`)
+
+After each step the dispatcher checkpoints its `results{}` to
+`.compiled/.run-state.json` as `{manifest_hash, step_index, results}`. This is **dispatcher runtime
+state, not a compiled artifact** — the compiler never reads it, and its stale-clean globs only
+`seg-*.js`, so it is never deleted (determinism untouched). On the next run the dispatcher compiles
+with `--explain`, then if `.run-state.json` exists **and its `manifest_hash` matches** the freshly
+compiled manifest, it offers to **resume** from the stored `step_index` (re-using completed work — e.g.
+an expensive opus planner segment). A **mismatched** hash (the workflow was recompiled / changed, so
+stored node outputs no longer line up) or an absent file → start fresh at step 0.
 
 ---
 
 ## 13. Footguns & gotchas
 
-- **⚠️ Loop contiguity (§9).** An orchestrator node or hard gate between two `loop.body` nodes
-  splits the loop and breaks it. Keep body nodes contiguous.
+- **⚠️ Loop contiguity (§9) is now ENFORCED, not silent.** An orchestrator node or hard gate between
+  two `loop.body` nodes used to compile to a silently-broken loop; it is now a **block** in both
+  validate and compile. Keep body nodes contiguous.
+- **⚠️ Gate / node id collisions are blocked.** Gate ids share the `${id...}` ref namespace with node
+  ids, so a gate id must be unique among gates **and** disjoint from every node id — a collision is a
+  validate block.
 - **⚠️ `customize` only reads `.profile`.** The schema describes `customize` as "profile and/or
   dotted overrides," but the compiler reads **only** `customize.profile`. Arbitrary dotted overrides
   under `customize` are **silently ignored**. To override a microskill's resolved config per-node,
@@ -477,12 +673,18 @@ At the end, report `results[manifest.output.from]`.
   must be reclassified to orchestrator (it auto-classifies that way if its microskill's
   `allowed_tools` includes `AskUserQuestion` or it carries a hard gate). Asking inside a segment =
   silent fabrication.
-- **Nested workflows only from orchestrator nodes.** Background subagents have no orchestration
-  context. Put a `delegation: orchestrator` node whose `prompt` invokes the nested workflow.
+- **Nested workflows are checkpoints, never background.** Use the first-class `workflow:` node (§5d)
+  — it always classifies as an orchestrator checkpoint. Background subagents have no orchestration
+  context and can't re-enter the dispatcher. (You can still drive a nested workflow from a plain
+  `delegation: orchestrator` node's `prompt`, but `workflow:` gets you the import-allowlist + child-
+  contract checks.)
+- **`workflow:` targets must be in `imports`.** A `workflow:` node whose target isn't allowlisted in
+  `imports` is a validate block (with `--defs-root`); nesting depth > 1 and import cycles are blocked.
 - **`output_schema` replaces, never merges.** A profile that overrides `output_schema` must restate
-  the *whole* schema — base fields do not leak in.
-- **`imports` and `base` do nothing at runtime.** `imports` documents dependencies; `base` is a
-  catalog hint. Neither affects compilation.
+  the *whole* schema — base fields do not leak in. (A `use:` node that *omits* its own schema inherits
+  the microskill's — §11.)
+- **`base` does nothing at runtime;** `imports` is now load-bearing (§3) — it's the `workflow:`
+  allowlist, not mere documentation.
 - **Loop body can't fan out.** `for_each` inside `loop.body` is a hard block.
 
 ### YAML-syntax traps (these bite before any DAG rule does)
@@ -510,9 +712,9 @@ At the end, report `results[manifest.output.from]`.
 
 ---
 
-## 14. Three worked skeletons
+## 14. Worked skeletons
 
-All three below are **validated + compiled** — each is followed by the `sequence` the compiler emits.
+All below are **validated + compiled** — each is followed by the `sequence` the compiler emits.
 
 **Linear — one segment, no checkpoints → `segment[a,b]`:**
 ```yaml
@@ -623,21 +825,61 @@ output: { from: finalize }
 > instead, swap `agent: planner` → `use: task-plan` + `customize: { profile: microskill }` (and the
 > matching `task-implement` / `task-evaluate`), exactly as the real `microskill-create` does.
 
+**Nested workflow + fan-out — plan, then build each item via a child workflow →
+`segment[plan]` · gate · nested_workflow(build):**
+```yaml
+name: orchestrate                  # version omitted → defaults to 1
+imports: [build-workflow-from-plan]   # the child MUST be allowlisted
+inputs:
+  requirement: { type: string, required: true }
+nodes:
+  - id: plan
+    agent: planner
+    inputs:
+      requirement: ${workflow.inputs.requirement}
+    output_schema:
+      type: object
+      required: [units]
+      properties:
+        units: { type: array, items: { type: object } }
+  - id: build                       # first-class nested-workflow node → always a checkpoint
+    workflow: build-workflow-from-plan
+    for_each: ${plan.output.units}  # one child run per unit
+    as: unit
+    depends_on: [plan]              # ref-implied too; restated here for clarity
+    inputs:
+      plan_path: ${unit}            # raw refs — the dispatcher resolves them at run time
+gates:
+  - id: approve_plan
+    after: plan
+    type: human_approval
+    prompt: Approve the plan, or revise?
+    options: [approve, revise]
+output: { from: build }
+```
+> `build` carries `for_each`/`as` like any node; with `validate-workflow --defs-root <dir>` the child's
+> required inputs are checked against this node's `inputs`, and depth>1 / import cycles are blocked.
+
 ---
 
 ## 15. Authoring checklist
 
 Before you compile, confirm:
 
-- [ ] `version: 1`, `name` is kebab-case, `nodes` is non-empty.
-- [ ] Every node is exactly one of: `use:`, `agent:`, or `delegation: orchestrator` (never both `use`
-      and `agent`).
-- [ ] Every `${id.output...}` reference has `id` in that node's `depends_on`.
-- [ ] No dependency cycles; no `depends_on` / `gate.after` / `loop.body` / `output.from` pointing at a
-      non-existent node.
-- [ ] Every `for_each` has a safe-identifier `as`; no `for_each` inside `loop.body`.
-- [ ] `loop` has `max_iters`; `loop.body` nodes are contiguous with no orchestrator node / hard gate
-      between them.
+- [ ] `name` is kebab-case, `nodes` is non-empty. (`version` is optional — defaults to `1`; an
+      explicit non-`1` blocks.)
+- [ ] Every node is exactly one of: `use:`, `agent:`, `workflow:`, or orchestrator-native
+      (`delegation: orchestrator` / `side_effect: true`) — never more than one of use/agent/workflow.
+- [ ] Every `${id.output...}` / `${id.items}` ref names a real node (refs imply edges — `depends_on`
+      is the union, you needn't restate them); typed field refs match the producer's `output_schema`.
+- [ ] No dependency cycles (checked over the union edges); no `depends_on` / `gate.after` / `loop.body`
+      / `output.from` pointing at a non-existent node.
+- [ ] Every `for_each` has a safe-identifier `as`; `max_parallel` only on `for_each` nodes; no
+      `for_each` inside `loop.body`; `${id.items}` only targets a `for_each` node.
+- [ ] `loop` has `max_iters` + `body` and exactly one of `while`/`until`; `loop.body` nodes are
+      contiguous with no orchestrator node / hard gate between them (now enforced).
+- [ ] Gate ids are unique and disjoint from node ids.
+- [ ] Every `workflow:` target is in `imports`; validate with `--defs-root` to check child contracts.
 - [ ] Human-interaction nodes are orchestrator, not background.
 - [ ] No reliance on `customize` dotted-overrides or `grant_tools` (both inert).
 - [ ] Run `validate-workflow` (expect `pass: true`) then `compile-workflow` and eyeball the

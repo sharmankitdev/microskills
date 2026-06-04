@@ -39,10 +39,17 @@ SCRIPT = Path(__file__).resolve()
 
 
 def _templates_root(script):
-    """Locate templates/ (schemas + component templates): prefer the materialized runtime
-    copy under .claude/, then ${CLAUDE_PLUGIN_ROOT}, then the in-repo dogfood source."""
+    """Locate templates/ (schemas + component templates): an explicit
+    MICROSKILLS_TEMPLATES_ROOT override wins (used by hermetic tests to pin the
+    in-repo source schema before a reconcile materializes .claude/), then prefer
+    the materialized runtime copy under .claude/, then ${CLAUDE_PLUGIN_ROOT},
+    then the in-repo dogfood source."""
     proj = script.parents[2]
-    cands = [proj / ".claude" / "templates"]
+    cands = []
+    override = os.environ.get("MICROSKILLS_TEMPLATES_ROOT")
+    if override:
+        cands.append(Path(override))
+    cands.append(proj / ".claude" / "templates")
     env = os.environ.get("CLAUDE_PLUGIN_ROOT")
     if env:
         cands.append(Path(env) / "templates")
@@ -61,6 +68,25 @@ _rm = importlib.util.module_from_spec(_spec)
 _loader.exec_module(_rm)
 deep_merge = _rm.deep_merge
 strip_nulls = _rm.strip_nulls
+substitute_vars = _rm.substitute_vars
+
+# Reuse compile-workflow's SHARED DAG helpers so the two tools can never disagree
+# on the edge model, topological order, or loop-body contiguity. compile-workflow
+# guards main() under __name__=="__main__", so importing it is side-effect-free.
+_cw_loader = importlib.machinery.SourceFileLoader(
+    "compile_workflow", str(SCRIPT.parent / "compile-workflow"))
+_cw_spec = importlib.util.spec_from_loader("compile_workflow", _cw_loader)
+_cw = importlib.util.module_from_spec(_cw_spec)
+_cw_loader.exec_module(_cw)
+union_edges = _cw.union_edges
+topo_sort = _cw.topo_sort
+loop_contiguity_error = _cw.loop_contiguity_error
+loop_while_until_error = _cw.loop_while_until_error
+desugar_loop_until = _cw.desugar_loop_until
+loop_max_parallel_errors = _cw.loop_max_parallel_errors
+apply_workflow_vars = _cw.apply_workflow_vars
+NODE_OUTPUT_FIELD_RE = _cw.NODE_OUTPUT_FIELD_RE
+NODE_ITEMS_RE = _cw.NODE_ITEMS_RE
 
 REF_RE = re.compile(r"\$\{([^}]*)\}")
 NODE_OUTPUT_RE = re.compile(r"\b([a-z][a-z0-9_-]*)\.output\b")
@@ -91,10 +117,43 @@ def refs_in(obj):
     return out
 
 
+def load_child_doc(defs_root, name):
+    """PURE child read: load <defs-root>/<name>/WORKFLOW.yaml as a dict.
+    Never touches the child's .compiled/manifest.json (compile/validate must stay
+    byte-identical-deterministic w.r.t. a single source — the WORKFLOW.yaml).
+    Returns (doc, error_message): doc is None when the file is missing/unparseable."""
+    wf = Path(defs_root) / name / "WORKFLOW.yaml"
+    if not wf.exists():
+        return None, f"does not resolve to {wf}"
+    try:
+        return (yaml.safe_load(wf.read_text()) or {}), None
+    except yaml.YAMLError as e:
+        return None, f"child '{name}' WORKFLOW.yaml parse error: {e}"
+
+
+def workflow_node_targets(doc):
+    """The child-workflow names referenced by this doc's workflow: nodes (in order)."""
+    out = []
+    for n in (doc.get("nodes") or []):
+        if isinstance(n, dict) and n.get("workflow"):
+            out.append(n["workflow"])
+    return out
+
+
+def required_inputs_of(doc):
+    """Names of inputs marked required:true in a (parent or child) doc."""
+    return {name for name, spec in (doc.get("inputs") or {}).items()
+            if isinstance(spec, dict) and spec.get("required")}
+
+
 def main():
     ap = argparse.ArgumentParser(description="Validate a WORKFLOW.yaml (+ optional profile overlays).")
     ap.add_argument("workflow", help="Path to WORKFLOW.yaml")
     ap.add_argument("configs", nargs="*", help="Optional profile YAML overlays to merge before validation")
+    ap.add_argument("--defs-root", default=None,
+                    help="Workflow-defs root enabling nested-workflow (workflow:) resolution checks "
+                         "(import allowlist, target resolution, import-cycle, depth=1, required-child-input). "
+                         "Absent → those checks are skipped (backward-compatible single-file validation).")
     args = ap.parse_args()
 
     issues = []
@@ -124,9 +183,31 @@ def main():
             continue
         if p.name != "base.yaml" and "profile" in overlay:
             add(issues, "block", "config", f"{p.name}: 'profile' block is base.yaml-only")
-        merged = deep_merge(merged, overlay)
+        try:
+            merged = deep_merge(merged, overlay)
+        except ValueError as e:
+            add(issues, "block", "config", f"{p.name}: list-verb error: {e}")
+            print(json.dumps({"pass": False, "issues": issues}, indent=2))
+            sys.exit(1)
 
     merged = strip_nulls(merged)
+
+    # --- INTRA-DEF VARS: double-brace {{key}} pre-pass (Phase 5b) ---
+    # Mirror compile-workflow EXACTLY (shared apply_workflow_vars): substitute {{key}}
+    # tokens throughout the merged doc from the top-level vars: map AFTER deep-merge +
+    # strip_nulls (so a profile may override a var) and BEFORE schema validation. An
+    # unresolved {{key}} is left intact and surfaced as a WARN (never a crash/block),
+    # consistent with resolve-microskill. A doc with no {{...}} tokens is unchanged.
+    if isinstance(merged, dict):
+        merged, unresolved_vars = apply_workflow_vars(merged)
+        for uk in unresolved_vars:
+            add(issues, "warn", "vars", f"unresolved variable '{{{{{uk}}}}}' left intact")
+
+    # An OMITTED version defaults to 1 BEFORE schema validation (mirrors
+    # compile-workflow / resolve-microskill). The const:1 check stays intact, so an
+    # EXPLICIT wrong version still blocks.
+    if isinstance(merged, dict):
+        merged.setdefault("version", 1)
 
     # --- Schema validation (on the merged document) ---
     if SCHEMA_PATH.exists():
@@ -158,14 +239,36 @@ def main():
 
     id_set = set(node_ids)
 
+    # Gate-choice branching: a gate id is a legal ${<gate-id>.output.choice} ref
+    # target (the dispatcher records the human's pick as results[gate.id]). Collect
+    # the gate ids up front so the per-node ref check below ACCEPTS a gate-id ref
+    # (not 'unknown node') and the typed-producer field-check SKIPS it (a gate has
+    # no output_schema → treat as 'any', never flag). gate-0 already guarantees gate
+    # ids are unique among gates AND disjoint from node ids, so this set is unambiguous.
+    # Note: a gate-id ref must NOT become a dependency edge — the SHARED union_edges
+    # helper only keeps refs whose id is a NODE id (a gate isn't in the node set), so a
+    # gate-id ref contributes no edge and cannot perturb topo_sort.
+    gate_id_set = {g.get("id") for g in (merged.get("gates") or [])
+                   if isinstance(g, dict) and g.get("id")}
+
     # --- Per-node shape + ref-completeness ---
     for nid, n in node_by_id.items():
         has_use = bool(n.get("use"))
         has_agent = bool(n.get("agent"))
-        is_orch = n.get("delegation") == "orchestrator"
-        if has_use and has_agent:
-            add(issues, "block", f"nodes/{nid}", "node has both 'use' and 'agent'; choose one")
-        if not has_use and not has_agent and not is_orch:
+        has_wf = bool(n.get("workflow"))
+        # side_effect: true is a readable alias for delegation: orchestrator
+        # (compile normalizes it before classify); treat it as orchestrator here so
+        # a side_effect node with neither use nor agent is exempt from the shape block.
+        is_orch = n.get("delegation") == "orchestrator" or n.get("side_effect") is True
+        # The three node kinds (use:/agent:/workflow:) are mutually exclusive.
+        kinds = [k for k, present in
+                 (("use", has_use), ("agent", has_agent), ("workflow", has_wf)) if present]
+        if len(kinds) > 1:
+            add(issues, "block", f"nodes/{nid}",
+                f"node has more than one of use/agent/workflow ({', '.join(kinds)}); choose one")
+        # A workflow: node is its own kind (an orchestrator checkpoint) — it is
+        # exempt from the neither-use-nor-agent block.
+        if not has_use and not has_agent and not has_wf and not is_orch:
             add(issues, "block", f"nodes/{nid}",
                 "node has neither 'use' nor 'agent'; only allowed for an orchestrator-native step (delegation: orchestrator)")
 
@@ -174,15 +277,51 @@ def main():
             if d not in id_set:
                 add(issues, "block", f"nodes/{nid}/depends_on", f"references unknown node '{d}'")
 
-        # ${<id>.output...} in a node's own fields must be declared in depends_on.
+        # S-INFER: a ${<id>.output...} ref IMPLIES a dependency edge (no longer
+        # requires an explicit depends_on entry). We still guard genuine typos:
+        # the referenced id must be a real node. S-FIELD: when the referenced
+        # producer carries an object output_schema with declared properties, the
+        # FIRST field after .output must be one of them (a schema-less producer is
+        # treated as 'any' and never flagged).
         scoped = {k: n.get(k) for k in ("inputs", "prompt", "when", "for_each") if k in n}
-        for inner in refs_in(scoped):
-            for ref_id in NODE_OUTPUT_RE.findall(inner):
-                if ref_id not in id_set:
-                    add(issues, "block", f"nodes/{nid}", f"references output of unknown node '{ref_id}'")
-                elif ref_id not in depends and ref_id != nid:
-                    add(issues, "block", f"nodes/{nid}",
-                        f"uses ${{{ref_id}.output...}} but '{ref_id}' is not in depends_on")
+        for s in collect_strings(scoped):
+            for inner in REF_RE.findall(s):
+                for ref_id in NODE_OUTPUT_RE.findall(inner):
+                    # A gate-id ref (e.g. ${g.output.choice}) is legal — a gate is a
+                    # checkpoint, not a node; accept it and require no depends_on edge.
+                    if ref_id not in id_set and ref_id not in gate_id_set:
+                        add(issues, "block", f"nodes/{nid}",
+                            f"references output of unknown node '{ref_id}'")
+                for prod_id, field in NODE_OUTPUT_FIELD_RE.findall(inner):
+                    if prod_id in gate_id_set:
+                        continue  # gate has no output_schema → 'any', never field-check
+                    if prod_id not in id_set:
+                        continue  # already reported by the unknown-node guard above
+                    osch = node_by_id[prod_id].get("output_schema")
+                    if not (isinstance(osch, dict)
+                            and osch.get("type") == "object"
+                            and isinstance(osch.get("properties"), dict)):
+                        continue  # schema-less / non-object producer → 'any', never flagged
+                    if field not in osch["properties"]:
+                        add(issues, "block", f"nodes/{nid}",
+                            f"references ${{{prod_id}.output.{field}}} but node "
+                            f"'{prod_id}' output_schema does not declare property '{field}'")
+                # FEATURE A: ${<id>.items} consumes the WHOLE per-item-results array of a
+                # fan-out node <id>. Like ${<id>.output} it implies the edge <id>->nid
+                # (handled by the SHARED scoped_ref_ids/union_edges). Here the typo +
+                # misuse guards: unknown <id> blocks; an <id> that is a node but NOT a
+                # for_each node blocks (no per-item array to consume — clear misuse).
+                # NODE_OUTPUT_FIELD_RE never matches `.items`, so the typed-producer
+                # field-check above cannot interfere.
+                for ref_id in NODE_ITEMS_RE.findall(inner):
+                    if ref_id not in id_set:
+                        add(issues, "block", f"nodes/{nid}",
+                            f"references per-item results of unknown node '{ref_id}' "
+                            f"(${{{ref_id}.items}})")
+                    elif not node_by_id[ref_id].get("for_each"):
+                        add(issues, "block", f"nodes/{nid}",
+                            f"references ${{{ref_id}.items}} but node '{ref_id}' is not a "
+                            f"for_each node; there is no per-item results array to consume")
 
         # for_each fan-out requires an `as` binding that is a safe identifier.
         has_for_each = bool(n.get("for_each"))
@@ -196,37 +335,103 @@ def main():
         if as_var and not has_for_each:
             add(issues, "warn", f"nodes/{nid}", "'as' declared without 'for_each'; it has no effect")
 
-    # --- Cycle detection over depends_on ---
+    # --- Branch-exclusivity lint (rank12): WARN-only, never a block ---
+    # Catches the malformed-fork footgun: two+ sibling nodes that form an advisory
+    # fork which is NOT provably mutually exclusive, so more than one branch fires.
+    # SOUND + CONSERVATIVE heuristic — fires ONLY on the clearest case: two sibling
+    # nodes whose effective dependency set is IDENTICAL and whose `when` conditions
+    # are TEXTUALLY IDENTICAL (after whitespace normalization). Both guards on the
+    # same condition off the same producers => both always run together. Deliberately
+    # NO general expression analysis: an opposite-when fork (cond vs !(cond)) has
+    # DIFFERENT when-text and is therefore never flagged, and a node with no `when`
+    # (unconditional) is never a fork branch. This composes with gate-choice branching
+    # (forks guarded on ${gate.output.choice} are exclusive only if their texts differ).
+    def _norm_when(w):
+        return re.sub(r"\s+", "", str(w)) if w else None
+
+    # Effective sibling key = the UNION edge set (explicit depends_on + ref-implied),
+    # so siblings are compared on what actually gates them, not just literal depends_on.
+    fork_edges = union_edges([n for n in nodes if isinstance(n, dict) and n.get("id")])
+    fork_groups = {}
+    for nid in node_ids:
+        w = _norm_when(node_by_id[nid].get("when"))
+        if not w:
+            continue  # an unconditional node is not a guarded fork branch
+        key = (frozenset(fork_edges.get(nid, set())), w)
+        fork_groups.setdefault(key, []).append(nid)
+    for (dep_set, _w), members in fork_groups.items():
+        if len(members) > 1:
+            sib = ", ".join(sorted(members))
+            dep_desc = ("{" + ", ".join(sorted(dep_set)) + "}") if dep_set else "{}"
+            add(issues, "warn", "nodes",
+                f"sibling nodes [{sib}] share dependencies {dep_desc} and have "
+                f"textually identical 'when' conditions; this advisory fork is not "
+                f"mutually exclusive (all branches fire). Did you mean to negate one?")
+
+    # --- Cycle detection over the UNION edge set (refs + depends_on) ---
+    # CRITICAL: a ref-only cycle (A reads ${B.output}, B reads ${A.output}, neither
+    # in depends_on) must be caught — so we DFS the same union edges compile orders
+    # over, not depends_on alone.
+    well_formed_nodes = [n for n in nodes if isinstance(n, dict) and n.get("id")]
+    edges = union_edges(well_formed_nodes)
     WHITE, GRAY, BLACK = 0, 1, 2
     color = {nid: WHITE for nid in id_set}
+    cycle_found = [False]
 
     def visit(u, stack):
         color[u] = GRAY
-        for d in (node_by_id[u].get("depends_on") or []):
+        for d in sorted(edges.get(u, set())):
             if d not in color:
                 continue
             if color[d] == GRAY:
                 add(issues, "block", "nodes", f"dependency cycle: {' -> '.join(stack + [u, d])}")
+                cycle_found[0] = True
                 return
             if color[d] == WHITE:
                 visit(d, stack + [u])
         color[u] = BLACK
 
-    for nid in id_set:
+    for nid in sorted(id_set):
         if color[nid] == WHITE:
             visit(nid, [])
 
-    # --- Gates anchoring ---
+    # --- Gates anchoring + id uniqueness/disjointness ---
+    # Gate ids share the ${<id>.output} namespace with node ids, so they must be
+    # unique among gates AND disjoint from node ids — otherwise a future feature
+    # keying off a gate id (e.g. recording a human choice in results[gate.id])
+    # produces an ambiguous reference.
+    seen_gate_ids = set()
+    gates_after = {}
     for g in merged.get("gates") or []:
         if not isinstance(g, dict):
             continue
+        gid = g.get("id")
+        if gid:
+            if gid in seen_gate_ids:
+                add(issues, "block", f"gates/{gid}", f"duplicate gate id '{gid}'")
+            if gid in id_set:
+                add(issues, "block", f"gates/{gid}",
+                    f"gate id '{gid}' collides with a node id; ids must be disjoint across nodes and gates")
+            seen_gate_ids.add(gid)
         after = g.get("after")
         if after and after not in id_set:
             add(issues, "block", f"gates/{g.get('id','?')}", f"'after' references unknown node '{after}'")
+        if after:
+            gates_after.setdefault(after, []).append(g)
+
+    # --- max_parallel placement: only valid on a for_each node (shared with compile) ---
+    for mp_id, mp_msg in loop_max_parallel_errors(well_formed_nodes):
+        add(issues, "block", f"nodes/{mp_id}/max_parallel", mp_msg)
 
     # --- Loop anchoring ---
     loop = merged.get("loop")
     if isinstance(loop, dict):
+        # LOOP ERGONOMICS: exactly one of while/until, then desugar until→while so the
+        # ref/contiguity checks below run against the same condition compile emits.
+        wu_err = loop_while_until_error(loop)
+        if wu_err:
+            add(issues, "block", "loop", wu_err)
+        desugar_loop_until(loop)
         for b in loop.get("body") or []:
             if b not in id_set:
                 add(issues, "block", "loop/body", f"references unknown node '{b}'")
@@ -240,10 +445,122 @@ def main():
                 if ref_id not in id_set:
                     add(issues, "block", "loop", f"references output of unknown node '{ref_id}'")
 
+        # S-LOOP: loop.body must occupy a CONTIGUOUS window in topological order
+        # with no interleaved orchestrator/out-of-body node and no hard/human_approval
+        # gate anchored between body nodes. A split body silently drops the do/while
+        # scaffold in compile yet would otherwise pass:true here. Mirror compile's
+        # shared check (same topo order, same helper). Only safe to topo-sort when
+        # the union graph is acyclic — a cycle is already reported above.
+        body_ids = loop.get("body") or []
+        if (not cycle_found[0]
+                and all(b in id_set for b in body_ids)
+                and not any(node_by_id.get(b, {}).get("for_each") for b in body_ids)):
+            order = topo_sort(well_formed_nodes)
+            contig_err = loop_contiguity_error(order, node_by_id, gates_after, loop)
+            if contig_err:
+                add(issues, "block", "loop/body", contig_err)
+
     # --- output anchoring ---
     out = merged.get("output")
     if isinstance(out, dict) and out.get("from") and out["from"] not in id_set:
         add(issues, "block", "output", f"'from' references unknown node '{out['from']}'")
+
+    # --- Nested-workflow (workflow:) resolution — only with --defs-root ---
+    # LOCKED: when --defs-root is ABSENT these checks are skipped, so existing
+    # single-file invocations of validate-workflow stay backward-compatible.
+    wf_nodes = [(nid, n) for nid, n in node_by_id.items() if n.get("workflow")]
+    if args.defs_root and wf_nodes:
+        defs_root = Path(args.defs_root)
+        imports_set = {imp for imp in (merged.get("imports") or []) if isinstance(imp, str)}
+
+        # Resolve + cache every reachable child doc once (PURE: WORKFLOW.yaml only).
+        child_cache = {}
+
+        def child_doc(name):
+            if name not in child_cache:
+                child_cache[name] = load_child_doc(defs_root, name)
+            return child_cache[name]
+
+        for nid, n in wf_nodes:
+            target = n["workflow"]
+            # (a) target must be declared in the imports allowlist.
+            if target not in imports_set:
+                add(issues, "block", f"nodes/{nid}",
+                    f"workflow: '{target}' is not listed in the top-level 'imports' allowlist")
+                continue
+            # (b) target must resolve to a child WORKFLOW.yaml.
+            doc, err = child_doc(target)
+            if doc is None:
+                add(issues, "block", f"nodes/{nid}",
+                    f"workflow: '{target}' {err}")
+                continue
+            # (c) DEPTH=1: a child that itself contains a workflow: node is a
+            # grandchild nesting — hard-blocked (no dispatcher re-entrancy guard).
+            gtargets = workflow_node_targets(doc)
+            if gtargets:
+                add(issues, "block", f"nodes/{nid}",
+                    f"workflow: '{target}' itself contains a nested workflow: node "
+                    f"({', '.join(sorted(set(gtargets)))}); nesting depth > 1 is not allowed")
+            # (d) N4 child contract (PURE, from child WORKFLOW.yaml): every
+            # required child input must be supplied by this node's inputs.
+            supplied = set((n.get("inputs") or {}).keys())
+            for req in sorted(required_inputs_of(doc)):
+                if req not in supplied:
+                    add(issues, "block", f"nodes/{nid}",
+                        f"workflow: '{target}' requires input '{req}' but the node's inputs omit it")
+            # (e) N4 output-shape reference: WARN (not block) when a
+            # ${<nid>.output.<field>} ref names a field the child's declared output
+            # node does not expose.
+            child_out = doc.get("output")
+            child_fields = None
+            if isinstance(child_out, dict) and child_out.get("from"):
+                cby = {cn.get("id"): cn for cn in (doc.get("nodes") or [])
+                       if isinstance(cn, dict)}
+                producer = cby.get(child_out["from"])
+                if isinstance(producer, dict):
+                    osch = producer.get("output_schema")
+                    if isinstance(osch, dict) and isinstance(osch.get("properties"), dict):
+                        child_fields = set(osch["properties"].keys())
+            if child_fields is not None:
+                pat = re.compile(r"\b" + re.escape(nid) + r"\.output\.([a-zA-Z0-9_]+)")
+                for other_id, other in node_by_id.items():
+                    refsrc = {k: other.get(k) for k in
+                              ("inputs", "prompt", "when", "for_each") if k in other}
+                    for s in collect_strings(refsrc):
+                        for fld in pat.findall(s):
+                            if fld not in child_fields:
+                                add(issues, "warn", f"nodes/{other_id}",
+                                    f"references ${{{nid}.output.{fld}}} but child workflow "
+                                    f"'{target}' output does not declare field '{fld}'")
+
+        # (f) Import-cycle DFS over the IMPORT graph reachable from this workflow.
+        # 3-color: a GRAY back-edge is a cycle. Adjacency = a doc's workflow: targets
+        # restricted to its own imports allowlist (only resolvable children).
+        root_name = merged.get("name")
+        IWHITE, IGRAY, IBLACK = 0, 1, 2
+        icolor = {}
+
+        def doc_imports(doc):
+            return {imp for imp in (doc.get("imports") or []) if isinstance(imp, str)}
+
+        def ivisit(name, doc, stack):
+            icolor[name] = IGRAY
+            allow = doc_imports(doc)
+            for tgt in workflow_node_targets(doc):
+                if tgt not in allow:
+                    continue  # already reported as not-in-imports for the root
+                if icolor.get(tgt) == IGRAY:
+                    add(issues, "block", "imports",
+                        f"workflow import cycle: {' -> '.join(stack + [name, tgt])}")
+                    continue
+                if icolor.get(tgt, IWHITE) == IWHITE:
+                    cdoc, _ = child_doc(tgt)
+                    if cdoc is not None:
+                        ivisit(tgt, cdoc, stack + [name])
+            icolor[name] = IBLACK
+
+        if root_name:
+            ivisit(root_name, merged, [])
 
     passed = not any(i["severity"] == "block" for i in issues)
     print(json.dumps({"pass": passed, "issues": issues}, indent=2))
