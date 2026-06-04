@@ -58,11 +58,13 @@ def test_valid_passes(tmp_path):
     assert data["issues"] == []
 
 
-def test_undeclared_output_ref_blocks(tmp_path):
+def test_undeclared_output_ref_now_passes(tmp_path):
+    # S-INFER: a ${a.output.x} ref implies an edge a->b, so dropping the explicit
+    # depends_on no longer blocks — the edge is inferred from the ref.
     body = VALID.replace("    depends_on: [a]\n", "")
     rc, data, _ = run(write_wf(tmp_path, body))
-    assert rc == 1 and data["pass"] is False
-    assert any("not in depends_on" in i["message"] for i in data["issues"])
+    assert rc == 0 and data["pass"] is True
+    assert not any("not in depends_on" in i["message"] for i in data["issues"])
 
 
 def test_depends_on_unknown_blocks(tmp_path):
@@ -189,7 +191,9 @@ loop:
     assert any("fan-out inside a loop body" in i["message"] for i in data["issues"])
 
 
-def test_when_ref_needs_depends_on(tmp_path):
+def test_when_ref_infers_edge_passes(tmp_path):
+    # S-INFER: a ${a.output.ok} ref in `when` implies the edge a->b, so no explicit
+    # depends_on is required — this now passes.
     body = """\
 version: 1
 name: wf
@@ -203,8 +207,229 @@ nodes:
     prompt: go
 """
     rc, data, _ = run(write_wf(tmp_path, body))
-    assert rc == 1
-    assert any("not in depends_on" in i["message"] for i in data["issues"])
+    assert rc == 0 and data["pass"] is True
+    assert not any("not in depends_on" in i["message"] for i in data["issues"])
+
+
+# --- S-INFER: ref-implied edges + union-edge cycle detection ---
+
+def test_unknown_node_ref_still_blocks(tmp_path):
+    # A ${ghost.output.x} ref names a node that does not exist — still a typo guard.
+    body = """\
+version: 1
+name: wf
+nodes:
+  - id: a
+    agent: ag
+    prompt: use ${ghost.output.x}
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    assert any("output of unknown node 'ghost'" in i["message"] for i in data["issues"])
+
+
+def test_ref_only_cycle_blocks(tmp_path):
+    # A reads ${b.output}, B reads ${a.output}; neither lists depends_on. The cycle
+    # must be detected over the UNION edge set (refs + depends_on), not depends_on alone.
+    body = """\
+version: 1
+name: cyc
+nodes:
+  - id: a
+    agent: ag
+    prompt: use ${b.output.x}
+  - id: b
+    agent: ag
+    prompt: use ${a.output.y}
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    assert any("cycle" in i["message"] for i in data["issues"])
+
+
+def test_explicit_depends_on_still_honored(tmp_path):
+    # An explicit depends_on edge with no matching ref still passes (and is still
+    # checked for unknown targets, exercised elsewhere).
+    body = """\
+version: 1
+name: wf
+nodes:
+  - id: a
+    agent: ag
+    prompt: plan
+  - id: b
+    agent: ag
+    depends_on: [a]
+    prompt: go
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 0 and data["pass"] is True
+
+
+# --- S-FIELD: typed-producer field-ref check ---
+
+FIELD_PRODUCER = """\
+version: 1
+name: field-flow
+nodes:
+  - id: a
+    agent: ag
+    prompt: plan
+    output_schema:
+      type: object
+      properties:
+        ok: { type: boolean }
+        score: { type: number }
+  - id: b
+    agent: ag
+    depends_on: [a]
+    prompt: use ${a.output.%s}
+"""
+
+
+def test_unknown_field_on_typed_producer_blocks(tmp_path):
+    body = FIELD_PRODUCER % "ghostfield"
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    assert any("ghostfield" in i["message"] and "does not declare" in i["message"]
+               for i in data["issues"])
+
+
+def test_known_field_on_typed_producer_passes(tmp_path):
+    body = FIELD_PRODUCER % "ok"
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 0 and data["pass"] is True
+
+
+def test_field_on_schemaless_producer_not_flagged(tmp_path):
+    # Producer `a` carries no output_schema → treated as 'any' → never flagged.
+    body = """\
+version: 1
+name: field-flow
+nodes:
+  - id: a
+    agent: ag
+    prompt: plan
+  - id: b
+    agent: ag
+    depends_on: [a]
+    prompt: use ${a.output.whatever}
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 0 and data["pass"] is True
+
+
+def test_nested_field_path_checks_first_segment_only(tmp_path):
+    # ${a.output.ok.deeper.deepest} — only the FIRST segment (`ok`) is checked
+    # against the producer's declared properties; deeper paths are not.
+    body = FIELD_PRODUCER % "ok.deeper.deepest"
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 0 and data["pass"] is True
+    # And a bad first segment on a nested path DOES block.
+    body2 = FIELD_PRODUCER % "nope.deeper"
+    rc2, data2, _ = run(write_wf(tmp_path, body2))
+    assert rc2 == 1 and data2["pass"] is False
+    assert any("nope" in i["message"] and "does not declare" in i["message"]
+               for i in data2["issues"])
+
+
+# --- S-LOOP: loop-body contiguity ---
+
+def test_loop_body_split_by_orchestrator_blocks(tmp_path):
+    # An orchestrator node interleaved between the two loop-body nodes breaks the
+    # do/while scaffold silently in compile; validate must block it.
+    body = """\
+version: 1
+name: split-loop
+nodes:
+  - id: p
+    agent: ag
+    prompt: plan
+  - id: impl
+    agent: ag
+    depends_on: [p]
+    prompt: impl
+  - id: mid
+    delegation: orchestrator
+    depends_on: [impl]
+    prompt: interleaved orchestrator step
+  - id: ev
+    agent: ag
+    depends_on: [mid]
+    prompt: ev
+loop:
+  while: ${!ev.output.pass}
+  max_iters: 2
+  body: [impl, ev]
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    assert any("contiguous" in i["message"].lower() for i in data["issues"])
+
+
+def test_loop_body_split_by_gate_blocks(tmp_path):
+    # A human_approval gate anchored between the loop-body nodes also splits the
+    # body across a checkpoint — block.
+    body = """\
+version: 1
+name: split-loop-gate
+nodes:
+  - id: p
+    agent: ag
+    prompt: plan
+  - id: impl
+    agent: ag
+    depends_on: [p]
+    prompt: impl
+  - id: ev
+    agent: ag
+    depends_on: [impl]
+    prompt: ev
+gates:
+  - id: g
+    after: impl
+    type: human_approval
+    prompt: ok?
+loop:
+  while: ${!ev.output.pass}
+  max_iters: 2
+  body: [impl, ev]
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    assert any("contiguous" in i["message"].lower() for i in data["issues"])
+
+
+def test_contiguous_loop_body_passes(tmp_path):
+    # The classic contiguous loop body (impl, ev adjacent, gate before the loop)
+    # still passes.
+    body = """\
+version: 1
+name: ok-loop
+nodes:
+  - id: p
+    agent: ag
+    prompt: plan
+  - id: impl
+    agent: ag
+    depends_on: [p]
+    prompt: impl
+  - id: ev
+    agent: ag
+    depends_on: [impl]
+    prompt: use ${impl.output.x}
+gates:
+  - id: g
+    after: p
+    type: human_approval
+    prompt: ok?
+loop:
+  while: ${!ev.output.pass}
+  max_iters: 2
+  body: [impl, ev]
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 0 and data["pass"] is True
 
 
 def test_real_flow_passes():

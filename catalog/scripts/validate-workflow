@@ -69,6 +69,19 @@ _loader.exec_module(_rm)
 deep_merge = _rm.deep_merge
 strip_nulls = _rm.strip_nulls
 
+# Reuse compile-workflow's SHARED DAG helpers so the two tools can never disagree
+# on the edge model, topological order, or loop-body contiguity. compile-workflow
+# guards main() under __name__=="__main__", so importing it is side-effect-free.
+_cw_loader = importlib.machinery.SourceFileLoader(
+    "compile_workflow", str(SCRIPT.parent / "compile-workflow"))
+_cw_spec = importlib.util.spec_from_loader("compile_workflow", _cw_loader)
+_cw = importlib.util.module_from_spec(_cw_spec)
+_cw_loader.exec_module(_cw)
+union_edges = _cw.union_edges
+topo_sort = _cw.topo_sort
+loop_contiguity_error = _cw.loop_contiguity_error
+NODE_OUTPUT_FIELD_RE = _cw.NODE_OUTPUT_FIELD_RE
+
 REF_RE = re.compile(r"\$\{([^}]*)\}")
 NODE_OUTPUT_RE = re.compile(r"\b([a-z][a-z0-9_-]*)\.output\b")
 AS_RE = re.compile(r"^[a-z][a-z0-9_]*$")  # safe JS identifier for for_each `as`
@@ -226,15 +239,31 @@ def main():
             if d not in id_set:
                 add(issues, "block", f"nodes/{nid}/depends_on", f"references unknown node '{d}'")
 
-        # ${<id>.output...} in a node's own fields must be declared in depends_on.
+        # S-INFER: a ${<id>.output...} ref IMPLIES a dependency edge (no longer
+        # requires an explicit depends_on entry). We still guard genuine typos:
+        # the referenced id must be a real node. S-FIELD: when the referenced
+        # producer carries an object output_schema with declared properties, the
+        # FIRST field after .output must be one of them (a schema-less producer is
+        # treated as 'any' and never flagged).
         scoped = {k: n.get(k) for k in ("inputs", "prompt", "when", "for_each") if k in n}
-        for inner in refs_in(scoped):
-            for ref_id in NODE_OUTPUT_RE.findall(inner):
-                if ref_id not in id_set:
-                    add(issues, "block", f"nodes/{nid}", f"references output of unknown node '{ref_id}'")
-                elif ref_id not in depends and ref_id != nid:
-                    add(issues, "block", f"nodes/{nid}",
-                        f"uses ${{{ref_id}.output...}} but '{ref_id}' is not in depends_on")
+        for s in collect_strings(scoped):
+            for inner in REF_RE.findall(s):
+                for ref_id in NODE_OUTPUT_RE.findall(inner):
+                    if ref_id not in id_set:
+                        add(issues, "block", f"nodes/{nid}",
+                            f"references output of unknown node '{ref_id}'")
+                for prod_id, field in NODE_OUTPUT_FIELD_RE.findall(inner):
+                    if prod_id not in id_set:
+                        continue  # already reported by the unknown-node guard above
+                    osch = node_by_id[prod_id].get("output_schema")
+                    if not (isinstance(osch, dict)
+                            and osch.get("type") == "object"
+                            and isinstance(osch.get("properties"), dict)):
+                        continue  # schema-less / non-object producer → 'any', never flagged
+                    if field not in osch["properties"]:
+                        add(issues, "block", f"nodes/{nid}",
+                            f"references ${{{prod_id}.output.{field}}} but node "
+                            f"'{prod_id}' output_schema does not declare property '{field}'")
 
         # for_each fan-out requires an `as` binding that is a safe identifier.
         has_for_each = bool(n.get("for_each"))
@@ -248,23 +277,30 @@ def main():
         if as_var and not has_for_each:
             add(issues, "warn", f"nodes/{nid}", "'as' declared without 'for_each'; it has no effect")
 
-    # --- Cycle detection over depends_on ---
+    # --- Cycle detection over the UNION edge set (refs + depends_on) ---
+    # CRITICAL: a ref-only cycle (A reads ${B.output}, B reads ${A.output}, neither
+    # in depends_on) must be caught — so we DFS the same union edges compile orders
+    # over, not depends_on alone.
+    well_formed_nodes = [n for n in nodes if isinstance(n, dict) and n.get("id")]
+    edges = union_edges(well_formed_nodes)
     WHITE, GRAY, BLACK = 0, 1, 2
     color = {nid: WHITE for nid in id_set}
+    cycle_found = [False]
 
     def visit(u, stack):
         color[u] = GRAY
-        for d in (node_by_id[u].get("depends_on") or []):
+        for d in sorted(edges.get(u, set())):
             if d not in color:
                 continue
             if color[d] == GRAY:
                 add(issues, "block", "nodes", f"dependency cycle: {' -> '.join(stack + [u, d])}")
+                cycle_found[0] = True
                 return
             if color[d] == WHITE:
                 visit(d, stack + [u])
         color[u] = BLACK
 
-    for nid in id_set:
+    for nid in sorted(id_set):
         if color[nid] == WHITE:
             visit(nid, [])
 
@@ -274,6 +310,7 @@ def main():
     # keying off a gate id (e.g. recording a human choice in results[gate.id])
     # produces an ambiguous reference.
     seen_gate_ids = set()
+    gates_after = {}
     for g in merged.get("gates") or []:
         if not isinstance(g, dict):
             continue
@@ -288,6 +325,8 @@ def main():
         after = g.get("after")
         if after and after not in id_set:
             add(issues, "block", f"gates/{g.get('id','?')}", f"'after' references unknown node '{after}'")
+        if after:
+            gates_after.setdefault(after, []).append(g)
 
     # --- Loop anchoring ---
     loop = merged.get("loop")
@@ -304,6 +343,21 @@ def main():
             for ref_id in NODE_OUTPUT_RE.findall(inner):
                 if ref_id not in id_set:
                     add(issues, "block", "loop", f"references output of unknown node '{ref_id}'")
+
+        # S-LOOP: loop.body must occupy a CONTIGUOUS window in topological order
+        # with no interleaved orchestrator/out-of-body node and no hard/human_approval
+        # gate anchored between body nodes. A split body silently drops the do/while
+        # scaffold in compile yet would otherwise pass:true here. Mirror compile's
+        # shared check (same topo order, same helper). Only safe to topo-sort when
+        # the union graph is acyclic — a cycle is already reported above.
+        body_ids = loop.get("body") or []
+        if (not cycle_found[0]
+                and all(b in id_set for b in body_ids)
+                and not any(node_by_id.get(b, {}).get("for_each") for b in body_ids)):
+            order = topo_sort(well_formed_nodes)
+            contig_err = loop_contiguity_error(order, node_by_id, gates_after, loop)
+            if contig_err:
+                add(issues, "block", "loop/body", contig_err)
 
     # --- output anchoring ---
     out = merged.get("output")

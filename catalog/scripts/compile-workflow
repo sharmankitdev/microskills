@@ -86,6 +86,93 @@ apply_override = _rm.apply_override
 strip_nulls = _rm.strip_nulls
 
 REF_RE = re.compile(r"\$\{([^}]*)\}")
+# Id-only match for edge inference (a node id immediately before `.output`).
+NODE_OUTPUT_RE = re.compile(r"\b([a-z][a-z0-9_-]*)\.output\b")
+# Id + first field after `.output.` for the typed-producer field-ref check.
+NODE_OUTPUT_FIELD_RE = re.compile(r"\b([a-z][a-z0-9_-]*)\.output\.([a-zA-Z0-9_]+)")
+# Fields that may carry ${id.output} refs that imply a dependency edge.
+SCOPED_REF_FIELDS = ("inputs", "prompt", "when", "for_each")
+
+
+def collect_strings(obj):
+    """Yield every string value anywhere in a nested structure."""
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            yield from collect_strings(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from collect_strings(v)
+
+
+def scoped_ref_ids(node):
+    """Node ids referenced via ${<id>.output...} in a node's scoped fields
+    (inputs/prompt/when/for_each). These imply a dependency edge into this node."""
+    out = set()
+    scoped = {k: node.get(k) for k in SCOPED_REF_FIELDS if k in node}
+    for s in collect_strings(scoped):
+        for inner in REF_RE.findall(s):
+            for rid in NODE_OUTPUT_RE.findall(inner):
+                out.add(rid)
+    return out
+
+
+def union_edges(nodes):
+    """SHARED edge model used by BOTH compile and validate. For each node id,
+    the set of upstream ids it depends on = explicit depends_on UNION every
+    ${<id>.output} ref in its scoped fields. Only ids that are actual nodes are
+    kept (unknown-id refs are reported separately as typo guards). Returns
+    {node_id: set(dep_ids)}."""
+    ids = {n["id"] for n in nodes if isinstance(n, dict) and n.get("id")}
+    edges = {}
+    for n in nodes:
+        if not isinstance(n, dict) or not n.get("id"):
+            continue
+        nid = n["id"]
+        deps = set(d for d in (n.get("depends_on") or []) if d in ids)
+        deps |= {r for r in scoped_ref_ids(n) if r in ids and r != nid}
+        edges[nid] = deps
+    return edges
+
+
+def loop_contiguity_error(order, node_by_id, gates_after, loop):
+    """SHARED loop-body contiguity check used by BOTH compile and validate.
+    Given the topological `order`, a loop.body must occupy a CONTIGUOUS window
+    with NO interleaved orchestrator-classified node and NO hard/human_approval
+    gate anchored between body nodes. Returns an error message string, or None.
+
+    `gates_after`: {node_id: [gate dicts]}. `is_orchestrator(nid)` is inlined via
+    the caller-supplied classification through node_by_id flags below."""
+    if not isinstance(loop, dict):
+        return None
+    body = [b for b in (loop.get("body") or []) if b in node_by_id]
+    if len(body) < 2:
+        return None
+    body_set = set(body)
+    positions = [i for i, nid in enumerate(order) if nid in body_set]
+    if not positions:
+        return None
+    lo, hi = min(positions), max(positions)
+    window = order[lo:hi + 1]
+    # Every node in the window between the first and last body node must itself be
+    # a body node — an interleaved non-body node splits the body.
+    for nid in window:
+        if nid not in body_set:
+            return (f"loop.body must be contiguous in topological order, but node "
+                    f"'{nid}' is interleaved between body nodes; an orchestrator or "
+                    f"out-of-body node inside the loop window silently breaks the "
+                    f"do/while scaffold")
+    # No hard / human_approval gate anchored between body nodes (after a body node
+    # that is not the LAST body node) — that gate is a checkpoint splitting the body.
+    for nid in window[:-1]:
+        for g in gates_after.get(nid, []):
+            if g.get("type") == "human_approval" or g.get("severity", "hard") == "hard":
+                return (f"loop.body must be contiguous, but a "
+                        f"{g.get('type') or 'hard'} gate is anchored after body node "
+                        f"'{nid}'; a checkpoint between body nodes silently breaks the "
+                        f"do/while scaffold")
+    return None
 
 
 def rel(p):
@@ -108,13 +195,14 @@ def jsvar(node_id):
 
 
 def topo_sort(nodes):
-    """Kahn's algorithm; ties broken by definition order (deterministic)."""
+    """Kahn's algorithm over the UNION edge set (explicit depends_on UNION
+    ${id.output} refs in scoped fields); ties broken by definition order
+    (deterministic). Ordering over the union keeps segment order consistent with
+    ref-implied dependencies so validate and compile never disagree."""
     ids = [n["id"] for n in nodes]
-    deps = {n["id"]: [d for d in (n.get("depends_on") or []) if d in ids] for n in nodes}
-    indeg = {i: 0 for i in ids}
-    for i in ids:
-        for d in deps[i]:
-            indeg[i] += 1
+    edges = union_edges(nodes)  # {id: set(dep_ids)}
+    deps = {i: edges.get(i, set()) for i in ids}
+    indeg = {i: len(deps[i]) for i in ids}
     order = []
     ready = [i for i in ids if indeg[i] == 0]  # preserves definition order
     while ready:
@@ -457,6 +545,13 @@ def main():
         gates_after.setdefault(g["after"], []).append(g)
 
     order = topo_sort(nodes)
+
+    # --- S-LOOP: loop body must stay contiguous (pre-emit, mirrors validate) ---
+    # A split body silently drops the do/while scaffold; die before any emit so
+    # compile and validate can never disagree.
+    contig_err = loop_contiguity_error(order, node_by_id, gates_after, loop)
+    if contig_err:
+        die(contig_err, 1)
 
     # --- partition into manifest steps ---
     steps = []

@@ -469,3 +469,87 @@ def test_nested_workflow_deterministic(tmp_path):
     run(tmp_path, "parent-flow")
     second = {p.name: p.read_text() for p in (tmp_path / "parent-flow" / ".compiled").iterdir()}
     assert first == second
+
+
+# --- S-LOOP: loop-body contiguity is a pre-emit die() in compile too ---
+
+SPLIT_LOOP = """\
+version: 1
+name: split-loop
+nodes:
+  - id: p
+    agent: ag
+    prompt: plan
+  - id: impl
+    agent: ag
+    depends_on: [p]
+    prompt: impl
+  - id: mid
+    delegation: orchestrator
+    depends_on: [impl]
+    prompt: interleaved orchestrator step
+  - id: ev
+    agent: ag
+    depends_on: [mid]
+    prompt: ev
+loop:
+  while: ${!ev.output.pass}
+  max_iters: 2
+  body: [impl, ev]
+"""
+
+
+def test_split_loop_body_dies_before_emit(tmp_path):
+    make_flow(tmp_path, "split-loop", SPLIT_LOOP)
+    rc, data, out, err = run(tmp_path, "split-loop")
+    assert rc == 1
+    assert data is not None and "contiguous" in data["error"].lower()
+    # Pre-emit: no segment files were written.
+    compiled = tmp_path / "split-loop" / ".compiled"
+    assert not list(compiled.glob("seg-*.js")) if compiled.exists() else True
+
+
+# --- S-INFER: union-edge cycle + ref-implied ordering in compile ---
+
+REF_CYCLE = """\
+version: 1
+name: ref-cycle
+nodes:
+  - id: a
+    agent: ag
+    prompt: use ${b.output.x}
+  - id: b
+    agent: ag
+    prompt: use ${a.output.y}
+"""
+
+
+def test_ref_only_cycle_dies_in_compile(tmp_path):
+    make_flow(tmp_path, "ref-cycle", REF_CYCLE)
+    rc, data, out, err = run(tmp_path, "ref-cycle")
+    assert rc == 1
+    assert data is not None and "cycle" in data["error"].lower()
+
+
+REF_ORDER = """\
+version: 1
+name: ref-order
+nodes:
+  - id: b
+    agent: ag
+    prompt: use ${a.output.x}
+  - id: a
+    agent: ag
+    prompt: plan
+"""
+
+
+def test_inferred_edge_orders_segment(tmp_path):
+    # `b` is defined before `a` but reads ${a.output.x} (no explicit depends_on).
+    # The inferred edge a->b must order `a` before `b` in the single segment.
+    d = make_flow(tmp_path, "ref-order", REF_ORDER)
+    rc, data, out, err = run(tmp_path, "ref-order")
+    assert rc == 0, err
+    assert data["sequence"] == ["segment[a,b]"]
+    m = json.loads((d / ".compiled" / "manifest.json").read_text())
+    assert m["steps"][0]["nodes"] == ["a", "b"]
