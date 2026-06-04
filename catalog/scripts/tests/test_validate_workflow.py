@@ -262,3 +262,59 @@ gates:
 """
     rc, data, _ = run(write_wf(tmp_path, body))
     assert rc == 0 and data["pass"] is True
+
+
+# --- P1.2/P1.3: profile-driven node/gate verbs (add/patch/remove) through validate ---
+
+def _overlay(tmp_path, text):
+    p = tmp_path / "over.yaml"
+    p.write_text(text)
+    return p
+
+
+def test_node_verb_add_and_patch_passes(tmp_path):
+    wf = write_wf(tmp_path, VALID)
+    over = _overlay(tmp_path, """\
+nodes:
+  patch:
+    - id: b
+      prompt: patched ${a.output.x}
+  add:
+    - id: c
+      agent: some-agent
+      depends_on: [b]
+      prompt: use ${b.output.y}
+""")
+    rc, data, _ = run(wf, over)
+    assert rc == 0 and data["pass"] is True
+
+
+def test_node_verb_remove_with_dangling_ref_blocks(tmp_path):
+    wf = write_wf(tmp_path, VALID)  # b depends on a and reads ${a.output.x}
+    over = _overlay(tmp_path, "nodes:\n  remove: [a]\n")
+    rc, data, _ = run(wf, over)
+    assert rc == 1 and data["pass"] is False
+    assert any("unknown node 'a'" in i["message"] for i in data["issues"])
+
+
+def test_node_verb_missing_patch_id_clean_error(tmp_path):
+    wf = write_wf(tmp_path, VALID)
+    over = _overlay(tmp_path, "nodes:\n  patch:\n    - id: ghost\n      prompt: nope\n")
+    rc, data, err = run(wf, over)
+    assert rc == 1 and data["pass"] is False
+    assert any("list-verb error" in i["message"] for i in data["issues"])
+    assert "Traceback" not in err
+
+
+def test_gate_verb_patch_via_profile_passes(tmp_path):
+    body = VALID + """\
+gates:
+  - id: g1
+    after: a
+    type: human_approval
+    prompt: approve?
+"""
+    wf = write_wf(tmp_path, body)
+    over = _overlay(tmp_path, "gates:\n  patch:\n    - id: g1\n      prompt: PATCHED approve?\n")
+    rc, data, _ = run(wf, over)
+    assert rc == 0 and data["pass"] is True

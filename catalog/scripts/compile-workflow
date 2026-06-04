@@ -402,20 +402,23 @@ def main():
     profiles_dir = def_dir / "profiles"
     base_path = profiles_dir / "base.yaml"
     profile_used = "base"
-    if base_path.exists():
-        base_cfg = yaml.safe_load(base_path.read_text()) or {}
-        # base.yaml carries only overlay fields (version etc.); merge onto def.
-        wf = deep_merge(wf, {k: v for k, v in base_cfg.items() if k != "version"})
-    default_profile = (wf.get("profile") or {}).get("default")
-    effective = args.profile or default_profile
-    if effective and effective != "base":
-        overlay_path = profiles_dir / f"{effective}.yaml"
-        if overlay_path.exists():
-            overlay = yaml.safe_load(overlay_path.read_text()) or {}
-            wf = deep_merge(wf, {k: v for k, v in overlay.items() if k != "version"})
-            profile_used = effective
-        else:
-            die(f"profile '{effective}' not found at {overlay_path}", 1)
+    try:
+        if base_path.exists():
+            base_cfg = yaml.safe_load(base_path.read_text()) or {}
+            # base.yaml carries only overlay fields (version etc.); merge onto def.
+            wf = deep_merge(wf, {k: v for k, v in base_cfg.items() if k != "version"})
+        default_profile = (wf.get("profile") or {}).get("default")
+        effective = args.profile or default_profile
+        if effective and effective != "base":
+            overlay_path = profiles_dir / f"{effective}.yaml"
+            if overlay_path.exists():
+                overlay = yaml.safe_load(overlay_path.read_text()) or {}
+                wf = deep_merge(wf, {k: v for k, v in overlay.items() if k != "version"})
+                profile_used = effective
+            else:
+                die(f"profile '{effective}' not found at {overlay_path}", 1)
+    except ValueError as e:
+        die(f"profile list-verb error: {e}", 1)
 
     for ov in args.override:
         if "=" not in ov:

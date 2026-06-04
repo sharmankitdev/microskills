@@ -322,3 +322,51 @@ def test_autonomous_profile_softens_gate():
     assert rc == 0, err
     assert data["segments"] == 2
     assert "gate" in data["sequence"]
+
+
+# --- P1.2: profile-driven node verbs (add/patch/remove) through compile ---
+
+def test_node_verb_add_via_profile_compiles(tmp_path):
+    base = (
+        "version: 1\n"
+        "nodes:\n"
+        "  add:\n"
+        "    - id: c\n"
+        "      agent: ag\n"
+        "      depends_on: [b]\n"
+        "      prompt: use ${b.output.y}\n"
+    )
+    make_flow(tmp_path, "verb-add", LINEAR.replace("name: linear-flow", "name: verb-add"), base=base)
+    rc, data, out, err = run(tmp_path, "verb-add")
+    assert rc == 0, err
+    assert "c" in str(data["sequence"])
+
+
+def test_node_verb_patch_via_profile_takes_effect(tmp_path):
+    base = (
+        "version: 1\n"
+        "nodes:\n"
+        "  patch:\n"
+        "    - id: b\n"
+        "      prompt: PATCHED_PROMPT ${a.output.x}\n"
+    )
+    d = make_flow(tmp_path, "verb-patch", LINEAR.replace("name: linear-flow", "name: verb-patch"), base=base)
+    rc, data, out, err = run(tmp_path, "verb-patch")
+    assert rc == 0, err
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert "PATCHED_PROMPT" in seg
+
+
+def test_node_verb_error_emits_clean_json(tmp_path):
+    base = (
+        "version: 1\n"
+        "nodes:\n"
+        "  patch:\n"
+        "    - id: ghost\n"
+        "      prompt: nope\n"
+    )
+    make_flow(tmp_path, "verb-err", LINEAR.replace("name: linear-flow", "name: verb-err"), base=base)
+    rc, data, out, err = run(tmp_path, "verb-err")
+    assert rc == 1
+    assert data is not None and "list-verb error" in data["error"]
+    assert "Traceback" not in err

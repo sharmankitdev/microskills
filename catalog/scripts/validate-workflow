@@ -124,7 +124,12 @@ def main():
             continue
         if p.name != "base.yaml" and "profile" in overlay:
             add(issues, "block", "config", f"{p.name}: 'profile' block is base.yaml-only")
-        merged = deep_merge(merged, overlay)
+        try:
+            merged = deep_merge(merged, overlay)
+        except ValueError as e:
+            add(issues, "block", "config", f"{p.name}: list-verb error: {e}")
+            print(json.dumps({"pass": False, "issues": issues}, indent=2))
+            sys.exit(1)
 
     merged = strip_nulls(merged)
 
