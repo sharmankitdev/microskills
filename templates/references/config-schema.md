@@ -184,7 +184,9 @@ When `default` is set (in base.yaml only) the resolver rewrites the Inputs table
 
 ## `steps`
 
-Override numbered steps from `MICROSKILL.md`. Keys must match the regex `^[0-9]+$` (step numbers as YAML strings). Each entry is a **closed** object exposing exactly two axes.
+Customize the `MICROSKILL.md` `## Steps` section. Two distinct mechanisms live under `steps`, both keyed by the step's **ORIGINAL** number.
+
+**(a) Annotate a step in place** — numeric-string keys (`^[0-9]+$`) carrying a **closed** `{optional, mandate_tool}` object.
 
 | Path | Type | Required | Default | Constraint |
 |---|---|---|---|---|
@@ -199,7 +201,30 @@ steps:
     mandate_tool: WebSearch
 ```
 
-When `mandate_tool` is set and the step cannot be performed with that tool, the runtime blocks rather than substituting another. (Microskills do not currently support inserting new steps via config — keep the skill atomic.)
+When `mandate_tool` is set and the step cannot be performed with that tool, the runtime blocks rather than substituting another.
+
+**(b) Restructure the Steps markdown** — the reserved keys `remove` / `patch` / `add` drop, rewrite, or insert steps. These are **markdown-line directives**, *not* the `deep_merge` list-verb engine used for workflow `nodes`/`gates` (see `DAG-RULES.md §11`). They are applied **REMOVE → PATCH → ADD**, after which the surviving + added steps are **renumbered contiguously**.
+
+| Path | Type | Required | Default | Constraint |
+|---|---|---|---|---|
+| `steps.remove` | array<int≥1> | no | — | ORIGINAL step numbers to elide; unique; a number naming no step is an **error** |
+| `steps.patch."<n>"` | object | no | — | replace step *n*'s body in place (position kept); key `^[0-9]+$`; closed |
+| `steps.patch."<n>".text` | string | no | — | new step body (everything after the renumbered `N. ` prefix); single linear path only |
+| `steps.add[]` | array | no | — | insert new steps; applied after remove+patch, in declared order |
+| `steps.add[].after` | int≥0 | yes | — | ORIGINAL step to insert after; `0` prepends before the first surviving step; a non-`0` value naming no step is an **error** |
+| `steps.add[].text` | string | yes | — | new step body; single linear path only |
+
+```yaml
+steps:
+  remove: [2]                                            # drop original step 2
+  patch:
+    "4": { text: "Validate the payload against the schema." }
+  add:
+    - { after: 0, text: "Read the input contract." }     # prepend
+    - { after: 5, text: "Emit the result JSON." }        # insert after original step 5
+```
+
+**Atomicity is preserved.** A patched/added `text` that introduces branching language (`if`/`else`/`for each`/`retry`/`when…then`) is **rejected at resolve time** — the same vocabulary `validate-microskill` enforces, shared via `catalog/scripts/microskill_steps.py` so the two cannot drift. More than 10 merged steps stays an advisory **warning**, not a block. A gate anchored after a *removed* step falls back to the trailing `## Gates (resolved)` block — it is not silently dropped.
 
 ## `gates`
 
@@ -330,15 +355,18 @@ Two layers run before the skill starts work:
 | Unknown field at any level (typo, stale key) | grammar | block |
 | `inputs.<name>.inject_from` declares 0 or >1 source keys | grammar | block |
 | `inputs.<name>.allowed_values` empty | grammar | block |
-| `steps."<n>"` key is non-numeric | grammar | block |
+| `steps` key is neither `^[0-9]+$` nor `add`/`patch`/`remove` | grammar | block |
 | `gates.<id>` id is the literal `add` or fails regex | grammar | block |
 | `gates.add[].type == human_approval` without `prompt` | grammar | block |
 | `context.snippets[]` missing `name` or `text` | grammar | block |
-| `profiles/base.yaml` not found | load | block (exit 2) |
+| `profiles/base.yaml` not found | load | resolves with an **empty overlay** (no error) — `base` alone applies |
 | Top-level `profile` block in a non-base overlay | semantic | block (exit 1) |
 | Unknown `inputs.<name>` (no such input declared in `MICROSKILL.md`) | semantic | warn |
 | `inputs.<name>.required: true` for `<name>` not in `MICROSKILL.md` Inputs table | semantic | warn — input NOT added to `required_inputs` ledger |
-| Unknown step number in `steps` (skill has no such step) | semantic | warn |
+| Unknown step number in `steps` annotate form (skill has no such step) | semantic | warn |
+| `steps.remove`/`steps.patch`/`steps.add[].after` names a non-existent step | resolve | block (clean JSON error; `validate-microskill` surfaces it earlier as a warn) |
+| A `steps` `add`/`patch` `text` contains branching language (`if`/`for each`/…) | resolve | block (clean JSON error) |
+| >10 merged steps after `steps` add/remove | resolve | warn (advisory) |
 | Unknown gate id in `gates` (non-`add`; skill has no such gate) | semantic | warn |
 | `gates.add[].id` collides with an existing gate id | semantic | block |
 | `inputs.<name>.inject_from` source unresolvable at runtime | runtime | block — surface gap |

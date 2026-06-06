@@ -328,6 +328,91 @@ def test_autonomous_profile_softens_gate():
     assert "gate" in data["sequence"]
 
 
+def _gate_checkpoint(defs_root, name):
+    man = json.loads((defs_root / name / ".compiled" / "manifest.json").read_text())
+    return next(s["gate"] for s in man["steps"] if s.get("checkpoint_type") == "gate")
+
+
+def test_gates_patch_verb_equals_full_restatement(tmp_path):
+    # Migrating the autonomous profiles from full-gate restatement to
+    # gates:{patch:[...]} must be byte-identical: patching severity+prompt by id
+    # resolves to the SAME gate (after/type/options inherited from the base) as
+    # restating the whole gate, and leaves the segment bytes untouched.
+    wf = (
+        "version: 1\n"
+        "name: gate-flow\n"
+        "nodes:\n"
+        "  - id: a\n"
+        "    agent: ag\n"
+        "    prompt: do a\n"
+        "gates:\n"
+        "  - id: g\n"
+        "    after: a\n"
+        "    type: human_approval\n"
+        "    severity: hard\n"
+        "    prompt: Original prompt.\n"
+        "    options: [approve, revise, abandon]\n"
+    )
+    d = tmp_path / "gate-flow"
+    (d / "profiles").mkdir(parents=True)
+    (d / "WORKFLOW.yaml").write_text(wf)
+    (d / "profiles" / "base.yaml").write_text("version: 1\n")
+    # (a) full restatement of the gate, flipping severity + prompt
+    (d / "profiles" / "restate.yaml").write_text(
+        "version: 1\n"
+        "gates:\n"
+        "  - id: g\n"
+        "    after: a\n"
+        "    type: human_approval\n"
+        "    severity: warn\n"
+        "    prompt: >\n"
+        "      (autonomous) Soft prompt.\n"
+        "    options: [approve, revise, abandon]\n"
+    )
+    # (b) the same change expressed as a patch verb keyed by gate id
+    (d / "profiles" / "patchverb.yaml").write_text(
+        "version: 1\n"
+        "gates:\n"
+        "  patch:\n"
+        "    - id: g\n"
+        "      severity: warn\n"
+        "      prompt: >\n"
+        "        (autonomous) Soft prompt.\n"
+    )
+
+    def compiled(profile):
+        rc, data, out, err = run(tmp_path, "gate-flow", "--profile", profile)
+        assert rc == 0, err
+        seg = (d / ".compiled" / "seg-1.js").read_text()
+        return _gate_checkpoint(tmp_path, "gate-flow"), seg
+
+    g_restate, seg_restate = compiled("restate")
+    g_patch, seg_patch = compiled("patchverb")
+    assert g_patch == g_restate            # resolved gate is identical
+    assert seg_patch == seg_restate        # segment bytes untouched
+    assert g_patch["severity"] == "warn"
+    assert g_patch["after"] == "a"         # inherited from base (proves merge, not replace)
+    assert g_patch["type"] == "human_approval"
+    assert g_patch["options"] == ["approve", "revise", "abandon"]
+
+
+def test_real_autonomous_gate_patch_applies():
+    # The shipped autonomous profiles soften approve_plan via gates:{patch:[...]}.
+    # Verify the patch merged by id on the REAL defs: severity→warn + the autonomous
+    # prompt land, while after/type/options are inherited from the base gate.
+    for name, domain in [("microskill-create", "microskill"), ("workflow-create", "workflow")]:
+        rc, data, out, err = run(REAL_DEFS, name, "--profile", "autonomous")
+        assert rc == 0, err
+        gate = _gate_checkpoint(REAL_DEFS, name)
+        assert gate["id"] == "approve_plan"
+        assert gate["severity"] == "warn"
+        assert gate["prompt"].startswith("(autonomous)")
+        assert f"created {domain} afterward" in gate["prompt"]
+        assert gate["after"] == "plan"
+        assert gate["type"] == "human_approval"
+        assert gate["options"] == ["approve", "revise", "abandon"]
+
+
 # --- P1.2: profile-driven node verbs (add/patch/remove) through compile ---
 
 def test_node_verb_add_via_profile_compiles(tmp_path):
