@@ -16,6 +16,19 @@ microskills:
     source: plugin
   - name: analyze-monolith-orchestrator
     source: plugin
+  # domain: software-engineering (code-review) — atomic microskills composed by the
+  # review-changes workflow. Forward-compat breadcrumb for a future tag/domain system
+  # (schemas are closed grammars today, so this grouping rides in a comment).
+  - name: summarize-diff
+    source: plugin
+  - name: verify-finding
+    source: plugin
+  - name: synthesize-review
+    source: plugin
+  - name: collect-findings
+    source: plugin
+  - name: review-dimension
+    source: plugin
 workflows:
   - name: microskill-create
     source: plugin
@@ -24,4 +37,7 @@ workflows:
   - name: build-workflow-from-plan
     source: plugin
   - name: decompose-monolith-orchestrator
+    source: plugin
+  # domain: software-engineering (code-review) — flagship pipeline over the review microskills.
+  - name: review-changes
     source: plugin

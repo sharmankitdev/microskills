@@ -1,0 +1,167 @@
+version: 1
+name: review-changes
+description: Review a unified git diff end to end — summarize, review across correctness/security/performance, collect, adversarially verify, and synthesize a prioritized report, with an approval gate that can post it to a PR/MR.
+
+# Caller-supplied inputs (referenced as ${workflow.inputs.<name>}).
+inputs:
+  diff:
+    type: string
+    required: true
+    description: The unified git diff to review end to end (e.g. the output of `git diff`).
+  context:
+    type: string
+    required: false
+    description: Optional free-text grounding material (PR/change description, spec excerpt) forwarded to summarize-diff to ground the intent overview.
+  post_target:
+    type: string
+    required: false
+    description: Optional PR/MR identifier the post node targets when the human chooses to post the synthesized report.
+
+# Advisory only — documents the reused microskills; no runtime effect (no workflow: nodes here).
+imports:
+  - microskills/summarize-diff
+  - microskills/review-dimension
+  - microskills/collect-findings
+  - microskills/verify-finding
+  - microskills/synthesize-review
+
+# Single background segment (summarize -> 3 sibling dimension reviews -> collect ->
+# verify fan-out -> synthesize), then a human-approval gate, then an orchestrator post
+# checkpoint guarded on the human's choice. No loop. No orchestrator node sits between
+# segment-1 nodes, so the whole review pipeline compiles into one autonomous segment.
+nodes:
+  # Seg 1: summarize the diff into a structured, file-grouped summary that grounds every
+  # downstream review. Whole summary object is reused as change_summary by each dimension
+  # review and by the synthesis.
+  - id: summarize
+    use: summarize-diff
+    depends_on: []
+    inputs:
+      diff: ${workflow.inputs.diff}
+      context: ${workflow.inputs.context}
+    output_schema:
+      type: object
+      required: [summary, files, risk_surface, stats]
+      properties:
+        summary: { type: string }
+        files: { type: array }
+        risk_surface: { type: string }
+        stats: { type: object }
+
+  # Seg 1: correctness review. SIBLING node (not a for_each) because customize.profile is a
+  # static literal, not a per-item variable. The base profile IS the correctness profile —
+  # review-dimension/profiles/base.yaml ships dimension=correctness plus the correctness rubric.
+  - id: review_correctness
+    use: review-dimension
+    customize: { profile: base }
+    depends_on: [summarize]
+    inputs:
+      diff: ${workflow.inputs.diff}
+      change_summary: ${summarize.output}
+
+  # Seg 1: security review. SIBLING node applying the security profile overlay
+  # (dimension=security + security rubric, opus model).
+  - id: review_security
+    use: review-dimension
+    customize: { profile: security }
+    depends_on: [summarize]
+    inputs:
+      diff: ${workflow.inputs.diff}
+      change_summary: ${summarize.output}
+
+  # Seg 1: performance review. SIBLING node applying the performance profile overlay
+  # (dimension=performance + performance rubric).
+  - id: review_performance
+    use: review-dimension
+    customize: { profile: performance }
+    depends_on: [summarize]
+    inputs:
+      diff: ${workflow.inputs.diff}
+      change_summary: ${summarize.output}
+
+  # Seg 1: fan the three sibling dimension results into one combined, dimension-stamped,
+  # globally-identified, deduplicated list. Each dimension node's whole {dimension, findings}
+  # output feeds the matching collect-findings input; style is omitted (optional).
+  - id: collect
+    use: collect-findings
+    depends_on: [review_correctness, review_security, review_performance]
+    inputs:
+      correctness: ${review_correctness.output}
+      security: ${review_security.output}
+      performance: ${review_performance.output}
+    output_schema:
+      type: object
+      required: [findings, count]
+      properties:
+        findings: { type: array }
+        count: { type: integer }
+
+  # Seg 1: adversarially verify each collected finding against the diff. Fan-out via for_each
+  # over the collected findings, bounded by max_parallel; lands in a background segment so the
+  # batch cap is honored. The per-item verdicts are consumed downstream as the whole array via
+  # ${verify.items}.
+  - id: verify
+    use: verify-finding
+    for_each: ${collect.output.findings}
+    as: finding
+    max_parallel: 4
+    depends_on: [collect]
+    inputs:
+      finding: ${finding}
+      diff: ${workflow.inputs.diff}
+
+  # Seg 1: synthesize the verified findings into one prioritized report. Consumes the
+  # summarize-diff summary, the collected findings, and the per-finding verify-finding verdicts
+  # (the whole fan-out array via ${verify.items}). This node's result is the workflow output.
+  - id: synthesize
+    use: synthesize-review
+    depends_on: [summarize, collect, verify]
+    inputs:
+      change_summary: ${summarize.output}
+      findings: ${collect.output.findings}
+      verifications: ${verify.items}
+    output_schema:
+      type: object
+      required: [verdict, blocker_count, summary, report_markdown, findings]
+      properties:
+        verdict: { type: string }
+        blocker_count: { type: integer }
+        summary: { type: string }
+        report_markdown: { type: string }
+        findings: { type: array }
+
+  # Checkpoint (orchestrator): post the synthesized report to the PR/MR. Runs in the main loop
+  # only (filesystem/CLI side effect + possible AskUserQuestion). Guarded on the gate choice via
+  # ${review_report_gate.output.choice} (a gate-id ref — accepted by validate, implies no edge),
+  # so it runs only when the human chose `post`. Orchestrator nodes thread data through the
+  # prompt, not an inputs map.
+  - id: post
+    delegation: orchestrator
+    when: ${review_report_gate.output.choice == 'post'}
+    depends_on: [synthesize]
+    prompt: >
+      The human approved posting the synthesized code review. Post the report markdown
+      (${synthesize.output.report_markdown}) to the PR/MR identified by
+      ${workflow.inputs.post_target} using the gh CLI (e.g.
+      `gh pr comment ${workflow.inputs.post_target} --body-file -`) or, if gh is
+      unavailable, the equivalent git CLI / forge command. If ${workflow.inputs.post_target}
+      is empty, AskUserQuestion for the target before posting. Report the resulting
+      comment URL.
+
+# Human-approval gate after synthesize: segment boundary. The dispatcher renders the synthesize
+# output (verdict, blocker count, report_markdown) above this prompt; the human picks one option.
+# `post` continues to the post node; `save_only` returns the report without posting; `abandon` stops.
+gates:
+  - id: review_report_gate
+    after: synthesize
+    type: human_approval
+    severity: hard
+    prompt: >
+      Review the synthesized code review shown above (overall verdict, blocker count, and the
+      severity-grouped markdown report). Choose post to comment it on the PR/MR target, save_only
+      to keep the report without posting, or abandon to stop.
+    options: [post, save_only, abandon]
+
+# The workflow output is the synthesized review.
+output:
+  from: synthesize
