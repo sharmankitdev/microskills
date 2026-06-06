@@ -1,0 +1,30 @@
+version: 1
+
+# Security dimension overlay for review-dimension. Overrides only the active
+# dimension, its rubric snippet, and the model. `output_schema`, `inputs`, and
+# the MICROSKILL.md body are inherited from base — the SAME body serves this
+# dimension, differing only by the configured dimension var and rubric.
+vars:
+  dimension: security
+
+# Replaces base's correctness rubric wholesale (a plain list replaces, not
+# merges). The body's {{dimension}} scan runs against this rubric.
+context:
+  snippets:
+    - name: security-rubric
+      text: >-
+        Security rubric: flag only defects that introduce a security weakness —
+        injection (SQL, command, template, XSS) from unsanitized input; missing
+        or broken authentication and authorization checks; hardcoded secrets,
+        credentials, or keys; unsafe deserialization of untrusted data; path
+        traversal and unsafe file access; server-side request forgery; missing
+        input validation on trust boundaries; weak or misused cryptography and
+        insecure randomness; sensitive data exposed in responses, logs, or error
+        messages; missing access controls and insecure direct object references;
+        CSRF on state-changing endpoints; unsafe shell, eval, or dynamic code
+        execution. Do not raise correctness, performance, or style-only concerns
+        under this rubric.
+
+# Security review warrants the strongest model — demonstrates the runtime axis.
+runtime:
+  model: opus

@@ -1430,3 +1430,198 @@ def test_no_vars_byte_identical(tmp_path):
     segs1 = {p.name: p.read_text() for p in (d / ".compiled").glob("seg-*.js")}
     segs2 = {p.name: p.read_text() for p in (d2 / ".compiled").glob("seg-*.js")}
     assert segs1 == segs2
+
+
+# --- INDEPENDENT-SIBLING PARALLELISM (dependency-rank fan-out within a segment) ---
+# Background nodes that share a dependency rank (no edge between them) are mutually
+# independent. The compiler now emits each such rank as a single parallel([...]) batch
+# with destructuring, instead of one serial `await` per sibling. Single-node ranks stay
+# byte-identical to the old serial emission. Loop-body segments are NOT parallelized.
+
+SIBLINGS = """\
+version: 1
+name: sib-flow
+nodes:
+  - id: a
+    agent: ag
+    prompt: do a
+  - id: b
+    agent: ag
+    depends_on: [a]
+    prompt: use ${a.output.x}
+  - id: c
+    agent: ag
+    depends_on: [a]
+    prompt: also use ${a.output.x}
+  - id: d
+    agent: ag
+    depends_on: [b, c]
+    prompt: combine ${b.output.y} and ${c.output.z}
+"""
+
+
+def test_independent_siblings_emit_single_parallel_batch(tmp_path):
+    # b and c both depend only on a (no edge between them) → same rank → one
+    # parallel([...]) with destructuring, NOT two serial `const n_x = await`.
+    d = make_flow(tmp_path, "sib-flow", SIBLINGS)
+    rc, data, out, err = run(tmp_path, "sib-flow")
+    assert rc == 0, err
+    assert data["sequence"] == ["segment[a,b,c,d]"]
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert "const [n_b, n_c] = await parallel([" in seg   # rank emitted as a batch
+    assert "() => runAgent" in seg                         # siblings are thunks
+    assert "const n_b = await" not in seg                  # b is not a serial await
+    assert "const n_c = await" not in seg                  # c is not a serial await
+    # the single-node ranks around the batch stay serial awaits
+    assert "const n_a = await runAgent" in seg
+    assert "const n_d = await runAgent" in seg
+
+
+def test_serial_chain_stays_byte_identical(tmp_path):
+    # A pure dependency chain a -> b has only single-node ranks, so it must compile
+    # to sequential awaits with NO parallel([...]) wrapper (byte-stable behavior).
+    d = make_flow(tmp_path, "linear-flow", LINEAR)
+    rc, data, out, err = run(tmp_path, "linear-flow")
+    assert rc == 0, err
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert "const n_a = await runAgent" in seg
+    assert "const n_b = await runAgent" in seg
+    assert "parallel(" not in seg            # no sibling batch, no parallel helper
+
+
+def test_sibling_parallelism_is_deterministic(tmp_path):
+    # Same def compiles byte-identically across recompiles and across worlds.
+    d = make_flow(tmp_path, "sib-flow", SIBLINGS)
+    run(tmp_path, "sib-flow")
+    first = (d / ".compiled" / "seg-1.js").read_text()
+    run(tmp_path, "sib-flow")
+    second = (d / ".compiled" / "seg-1.js").read_text()
+    assert first == second
+    d2 = make_flow(tmp_path / "b", "sib-flow", SIBLINGS)
+    run(tmp_path / "b", "sib-flow")
+    assert (d2 / ".compiled" / "seg-1.js").read_text() == first
+
+
+SIBLINGS_FE = """\
+version: 1
+name: sibfe-flow
+inputs:
+  items:
+    type: array
+    required: true
+nodes:
+  - id: a
+    agent: ag
+    prompt: do a
+  - id: b
+    agent: ag
+    depends_on: [a]
+    prompt: use ${a.output.x}
+  - id: c
+    agent: ag
+    for_each: ${workflow.inputs.items}
+    as: item
+    depends_on: [a]
+    prompt: scan ${item}
+"""
+
+
+def test_for_each_sibling_nests_inside_rank_batch(tmp_path):
+    # A for_each sibling in a multi-node rank keeps its own inner fan-out: its thunk
+    # is `() => parallel(...)` (no await) nested inside the rank's outer parallel([...]).
+    d = make_flow(tmp_path, "sibfe-flow", SIBLINGS_FE)
+    rc, data, out, err = run(tmp_path, "sibfe-flow")
+    assert rc == 0, err
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert "const [n_b, n_c] = await parallel([" in seg
+    assert "() => parallel(((_args.wf_items) || []).map((item) => () => runAgent" in seg
+
+
+SIBLINGS_WHEN = """\
+version: 1
+name: sibwhen-flow
+nodes:
+  - id: a
+    agent: ag
+    prompt: do a
+    output_schema:
+      type: object
+      properties:
+        ok: { type: boolean }
+        bad: { type: boolean }
+  - id: b
+    agent: ag
+    when: ${a.output.ok}
+    depends_on: [a]
+    prompt: ok path
+  - id: c
+    agent: ag
+    when: ${a.output.bad}
+    depends_on: [a]
+    prompt: bad path
+"""
+
+
+def test_when_guarded_siblings_parallelize_with_ternary_thunks(tmp_path):
+    # Opposite-when siblings share a rank → one parallel([...]) of ternary thunks
+    # `() => (cond) ? runAgent(...) : null`; exactly one resolves non-null.
+    d = make_flow(tmp_path, "sibwhen-flow", SIBLINGS_WHEN)
+    rc, data, out, err = run(tmp_path, "sibwhen-flow")
+    assert rc == 0, err
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert "const [n_b, n_c] = await parallel([" in seg
+    assert "() => (n_a.ok) ?" in seg
+    assert ": null" in seg
+
+
+LOOP_SIBLINGS = """\
+version: 1
+name: loopsib-flow
+nodes:
+  - id: p
+    agent: ag
+    prompt: plan
+  - id: x
+    agent: ag
+    depends_on: [p]
+    prompt: x
+  - id: y
+    agent: ag
+    depends_on: [p]
+    prompt: y
+gates:
+  - id: g
+    after: p
+    type: human_approval
+    prompt: ok?
+loop:
+  while: ${!y.output.pass}
+  max_iters: 2
+  body: [x, y]
+  carry:
+    last: ${y.output}
+"""
+
+
+def test_loop_body_siblings_stay_serial(tmp_path):
+    # SCOPE BOUNDARY: independent siblings inside a loop body are NOT parallelized —
+    # the do/while scaffold stays a sequential body (v1 only fans out non-loop segments).
+    d = make_flow(tmp_path, "loopsib-flow", LOOP_SIBLINGS)
+    rc, data, out, err = run(tmp_path, "loopsib-flow")
+    assert rc == 0, err
+    seg2 = (d / ".compiled" / "seg-2.js").read_text()   # loop segment, after the gate
+    assert "do {" in seg2 and "} while (" in seg2
+    assert "n_x = await runAgent" in seg2               # sequential body assignment
+    assert "n_y = await runAgent" in seg2
+    assert "await parallel([" not in seg2               # no sibling batch in the loop
+
+
+def test_review_changes_dimension_reviews_parallelize(tmp_path):
+    # ACCEPTANCE: review-changes' three dimension reviews all depend only on
+    # `summarize`, so they share a rank and compile into a single parallel([...]).
+    rc, data, out, err = run(REAL_DEFS, "review-changes")
+    assert rc == 0, err
+    seg = (REAL_DEFS / "review-changes" / ".compiled" / "seg-1.js").read_text()
+    assert ("const [n_review_correctness, n_review_security, n_review_performance] "
+            "= await parallel([") in seg
+    assert "const n_review_security = await" not in seg   # not a serial sibling

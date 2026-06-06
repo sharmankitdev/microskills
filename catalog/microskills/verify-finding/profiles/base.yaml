@@ -1,0 +1,15 @@
+version: 1
+inputs:
+  finding:
+    required: true
+  diff:
+    required: true
+output_schema:
+  type: object
+  required: [finding_id, verdict, rationale, adjusted_severity, false_positive]
+  properties:
+    finding_id: { type: string }
+    verdict: { type: string, enum: [confirmed, refuted, needs_human] }
+    rationale: { type: string }
+    adjusted_severity: { type: [string, "null"] }
+    false_positive: { type: boolean }

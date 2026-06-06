@@ -1,0 +1,33 @@
+version: 1
+
+# Every input (correctness, security, performance, style) is optional with a
+# null default, so no inputs.<name>.required and no inputs.<name>.default lines
+# are emitted. This is a pure in-memory fan-in transformation that writes
+# nothing to disk and runs no domain agent, so — matching the sibling fan-in
+# microskills (synthesize-review, verify-finding, summarize-diff) — no runtime
+# section is declared.
+output_schema:
+  type: object
+  required: [findings, count]
+  properties:
+    findings:
+      type: array
+      items:
+        type: object
+        # id + severity are required so the downstream join (synthesize-review
+        # joins verifications to findings by id) and severity ranking are
+        # guaranteed by contract, not merely preserved by concatenation.
+        required: [global_id, dimension, id, severity]
+        properties:
+          global_id: { type: integer }
+          dimension: { type: string }
+          id: { type: string }
+          severity: { type: string }
+          file: { type: string }
+          line: { type: integer }
+          title: { type: string }
+          explanation: { type: string }
+          fix: { type: string }
+          confidence: { type: string }
+    count:
+      type: integer
