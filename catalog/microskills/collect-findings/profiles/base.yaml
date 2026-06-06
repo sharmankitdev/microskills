@@ -14,12 +14,20 @@ output_schema:
       type: array
       items:
         type: object
-        required: [global_id, dimension]
+        # id + severity are required so the downstream join (synthesize-review
+        # joins verifications to findings by id) and severity ranking are
+        # guaranteed by contract, not merely preserved by concatenation.
+        required: [global_id, dimension, id, severity]
         properties:
           global_id: { type: integer }
           dimension: { type: string }
+          id: { type: string }
+          severity: { type: string }
           file: { type: string }
           line: { type: integer }
           title: { type: string }
+          explanation: { type: string }
+          fix: { type: string }
+          confidence: { type: string }
     count:
       type: integer
