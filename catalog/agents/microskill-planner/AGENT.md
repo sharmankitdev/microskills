@@ -15,7 +15,7 @@ You know microskills intimately:
 
 - Decide first, then draft. The first question is always "does this fit one microskill?" If not, surface a `scope_advisory` and stop drafting steps that will not be used.
 - Defaults are explicit, not implicit. If the requirement leaves a knob open, state what you chose and why in the inputs table — do not punt the question.
-- Names are load-bearing. Pick a verb-led kebab-case name that tells the caller exactly what the microskill does (e.g. `pr-title-from-diff`, not `pr-utility`).
+- Names are load-bearing. Pick a verb-led (or `<noun>-<verb>`) kebab-case name that says exactly what the microskill does — the WHAT — while stripping the caller, pipeline position, and any profile-swappable domain — the WHO/WHERE. Precise, not vague; reusable, not coupled. Three-way test: `pr-utility` (vague — reject), `pr-title-for-changelog-step` (coupled to a caller/step — reject), `pr-title-from-diff` (precise + reusable — keep). When a domain varies but the action does not, push it into a profile and keep the name generic (`task-plan`, domain via profile — not `plan-for-microskill-create`); keep a domain-coupled name only when no profile could retarget it (`validate-microskill`).
 - Be exhaustive about failure modes the caller will hit, terse about edge cases that will not.
 - The description is the trigger. It must end with what the microskill produces, so callers know when to invoke it.
 - The output contract is part of the design. When the result is structured data a caller or workflow node consumes, declare `output_schema` so the skill composes; omit it only for purely human-facing prose.

@@ -275,14 +275,15 @@ nodes:
 
 def test_real_workflow_create_compiles():
     # The implement/evaluate loop moved out into build-workflow-from-plan, so
-    # workflow-create is now a single background segment (plan) followed by the
-    # provision/advise orchestrator checkpoints and the `build` nested-workflow
-    # checkpoint (a first-class workflow: node invoking the shared build half).
+    # workflow-create is now a single background segment (plan) followed by three
+    # checkpoints: `provision` (nested workflow: microskill-create, autonomous
+    # profile, for_each over missing microskills), `advise` (orchestrator node),
+    # and `build` (nested workflow: build-workflow-from-plan).
     rc, data, out, err = run(REAL_DEFS, "workflow-create")
     assert rc == 0, err
     assert data["segments"] == 1
     assert data["sequence"] == [
-        "segment[plan]", "gate", "orchestrator_node", "orchestrator_node",
+        "segment[plan]", "gate", "nested_workflow", "orchestrator_node",
         "nested_workflow"]
 
 
@@ -295,6 +296,77 @@ def test_real_build_workflow_from_plan_compiles():
     assert data["segments"] == 1
     assert data["sequence"] == [
         "segment[implement,evaluate]", "orchestrator_node"]
+
+
+# --- Nested-workflow profile passthrough -------------------------------------
+
+NESTED_CHILD = """\
+version: 1
+name: child-flow
+nodes:
+  - id: c
+    agent: ag
+    prompt: child do
+output:
+  from: c
+"""
+
+NESTED_PARENT = """\
+version: 1
+name: parent-flow
+imports:
+  - child-flow
+nodes:
+  - id: a
+    agent: ag
+    prompt: do a
+  - id: call
+    workflow: child-flow
+    depends_on: [a]
+    customize: { profile: autonomous }
+    inputs:
+      x: ${a.output.x}
+"""
+
+NESTED_PARENT_PLAIN = """\
+version: 1
+name: parent-plain
+imports:
+  - child-flow
+nodes:
+  - id: a
+    agent: ag
+    prompt: do a
+  - id: call
+    workflow: child-flow
+    depends_on: [a]
+    inputs:
+      x: ${a.output.x}
+"""
+
+
+def _nested_step(defs_root, name):
+    man = json.loads((defs_root / name / ".compiled" / "manifest.json").read_text())
+    return next(s for s in man["steps"] if s.get("checkpoint_type") == "nested_workflow")
+
+
+def test_nested_workflow_carries_profile(tmp_path):
+    # A workflow: node with customize.profile stamps that profile into the
+    # nested_workflow checkpoint so the dispatcher compiles the child with it.
+    make_flow(tmp_path, "child-flow", NESTED_CHILD)
+    make_flow(tmp_path, "parent-flow", NESTED_PARENT)
+    rc, data, out, err = run(tmp_path, "parent-flow")
+    assert rc == 0, err
+    assert _nested_step(tmp_path, "parent-flow")["profile"] == "autonomous"
+
+
+def test_nested_workflow_omits_profile_when_no_customize(tmp_path):
+    # No customize → no profile key → checkpoint byte-identical to the old shape.
+    make_flow(tmp_path, "child-flow", NESTED_CHILD)
+    make_flow(tmp_path, "parent-plain", NESTED_PARENT_PLAIN)
+    rc, data, out, err = run(tmp_path, "parent-plain")
+    assert rc == 0, err
+    assert "profile" not in _nested_step(tmp_path, "parent-plain")
 
 
 def test_real_flow_segments_and_advisory_branch():

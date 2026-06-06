@@ -141,7 +141,7 @@ gates:
     after: plan
     type: human_approval
     severity: hard
-    prompt: Review the plan. Approve to implement, revise to re-plan, or abandon.
+    prompt: Review the plan — including whether the name is a reusable capability (not coupled to a caller, step, or a domain a profile could carry). Approve to implement, revise to re-plan, or abandon.
     options: [approve, revise, abandon]
 
 # Guarded loop: repeat implement→evaluate until the evaluator passes or the cap.

@@ -460,6 +460,65 @@ def test_real_decompose_nested_validates_with_defs_root():
     assert data["pass"] is True, [i for i in data["issues"] if i["severity"] == "block"]
 
 
+# --- nested-workflow customize.profile resolution (needs --defs-root) ---
+
+def _nested_defs(tmp_path):
+    """A defs-root with a child 'kid' (base + autonomous profiles) ready to import."""
+    root = tmp_path / "defs"
+    kid = root / "kid"
+    (kid / "profiles").mkdir(parents=True)
+    (kid / "WORKFLOW.yaml").write_text(
+        "version: 1\nname: kid\n"
+        "inputs:\n  q:\n    type: string\n    required: true\n"
+        "nodes:\n  - id: c\n    agent: ag\n    prompt: do ${workflow.inputs.q}\n"
+        "output:\n  from: c\n")
+    (kid / "profiles" / "base.yaml").write_text("version: 1\n")
+    (kid / "profiles" / "autonomous.yaml").write_text("version: 1\n")
+    return root
+
+
+_NESTED_PARENT = """\
+version: 1
+name: parent
+imports:
+  - kid
+nodes:
+  - id: a
+    agent: ag
+    prompt: do a
+  - id: call
+    workflow: kid
+    depends_on: [a]
+    customize: {{ profile: {prof} }}
+    inputs:
+      q: ${{a.output.x}}
+"""
+
+
+def _write_parent(root, prof):
+    p = root / "parent"
+    (p / "profiles").mkdir(parents=True)
+    (p / "WORKFLOW.yaml").write_text(_NESTED_PARENT.format(prof=prof))
+    (p / "profiles" / "base.yaml").write_text("version: 1\n")
+    return p
+
+
+def test_nested_profile_resolves_passes(tmp_path):
+    root = _nested_defs(tmp_path)
+    p = _write_parent(root, "autonomous")
+    rc, data, _ = run(p / "WORKFLOW.yaml", p / "profiles" / "base.yaml", "--defs-root", root)
+    assert data["pass"] is True, [i for i in data["issues"] if i["severity"] == "block"]
+
+
+def test_nested_profile_missing_blocks(tmp_path):
+    root = _nested_defs(tmp_path)
+    p = _write_parent(root, "ghost")
+    rc, data, _ = run(p / "WORKFLOW.yaml", p / "profiles" / "base.yaml", "--defs-root", root)
+    assert data["pass"] is False
+    assert any("ghost" in i["message"]
+               for i in data["issues"] if i["severity"] == "block")
+
+
 # --- gate-0: gate-id uniqueness + gate/node-id disjointness ---
 
 def test_duplicate_gate_id_blocks(tmp_path):

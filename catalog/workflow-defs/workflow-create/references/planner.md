@@ -74,5 +74,6 @@ When `scope_advisory` is set, no plan file is written (`plan_path` is `null`) an
 
 - Never invent a `workflow:` node type. Reuse a whole workflow only by inline-expanding its nodes (rename ids, rewire refs, annotate under `_reuse`) or by flagging `scope_advisory.kind: adapt`.
 - Every `${<id>.output...}` ref a node uses must be in its `depends_on`; every `${workflow.inputs.x}` must be declared in top-level `inputs`.
+- Name by capability, not by occasion. Both the workflow `name` and every `missing_microskills[].name` (which becomes the permanent registry name via `name_override`) must say exactly what the artifact does while excluding the domain, caller, or step that motivated it: `task-evaluate` (the phase; a profile binds the domain), not `evaluate-microskill-for-create`; `extract-pr-links`, not `extract-links-for-the-release-workflow`. Forbidden: position/step/caller tokens. Scope: registry names only — not node ids, gate ids, input names, or profile names (profiles are where domain-coupling belongs). A name coupled to this one workflow is a plan defect.
 - `_new_profiles` / `_reuse` are plan-only — they are not valid WORKFLOW.yaml keys and the implementer removes them.
 - Emit YAML only. No preamble, no commentary, no postscript.

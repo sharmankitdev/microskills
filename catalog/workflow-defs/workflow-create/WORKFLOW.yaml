@@ -32,6 +32,7 @@ inputs:
 imports:
   - microskills/task-plan
   - build-workflow-from-plan
+  - microskill-create
 
 # Node definition order is load-bearing: orchestrator nodes (provision, advise)
 # come BEFORE the loop body so they don't split the implement/evaluate segment.
@@ -62,24 +63,27 @@ nodes:
               name: { type: string }
               requirement: { type: string }
 
-  # Checkpoint (orchestrator): create the microskills the planner flagged as
+  # Checkpoint (nested workflow): create the microskills the planner flagged as
   # missing, one per item, by invoking microskill-create with the autonomous
-  # (gates-warn) profile. Runs in the main loop — the only place a node may invoke
-  # a nested workflow. Guarded so the advisory path skips it.
+  # (gates-warn) profile — passed structurally via customize.profile, so no human
+  # pause. First-class workflow: node (mirrors `build` below): runs in the main loop
+  # — the only place a node may invoke a nested workflow. for_each fans out one child
+  # run per missing microskill; each vendors into harness/microskills/<name>/, upserts
+  # harness.yaml, and runs sync-harness so later nodes can reference it. microskill-create
+  # is a leaf (no nested workflow: node) so depth stays ≤ 1. Guarded so the advisory
+  # path skips it.
   - id: provision
-    delegation: orchestrator
+    workflow: microskill-create
     when: ${plan.output.scope_advisory == null}
     for_each: ${plan.output.missing_microskills}
     as: ms_spec
     depends_on: [plan]
-    prompt: >
-      Provision a missing microskill. Invoke the microskill-create workflow
-      with the `autonomous` profile (no human pause) supplying requirement =
-      ${ms_spec.requirement} and name = ${ms_spec.name}. That flow vendors the
-      microskill into harness/microskills/${ms_spec.name}/, upserts harness.yaml, and
-      runs sync-harness — installing it at .claude/microskills/${ms_spec.name}/ so later
-      nodes can reference it with use: ${ms_spec.name}. If creation fails, stop and
-      surface the error — do not fabricate the microskill.
+    customize: { profile: autonomous }
+    inputs:
+      requirement: ${ms_spec.requirement}
+      name: ${ms_spec.name}
+      harness_root: ${workflow.inputs.harness_root}
+      harness_yaml: ${workflow.inputs.harness_yaml}
 
   # Checkpoint (orchestrator): when the planner returns a scope_advisory instead
   # of a plan, surface it and stop. Defined before the loop body.
@@ -127,7 +131,7 @@ gates:
     after: plan
     type: human_approval
     severity: hard
-    prompt: Review the plan (node graph, reuse/profile decisions, microskills to be created). Approve to build, revise to re-plan, or abandon.
+    prompt: Review the plan (node graph, reuse/profile decisions, microskills to be created — check each name is a reusable capability, not coupled to this workflow/step). Approve to build, revise to re-plan, or abandon.
     options: [approve, revise, abandon]
 
 # The implement ↔ evaluate retry loop now lives inside build-workflow-from-plan, which the
