@@ -1,0 +1,48 @@
+version: 1
+
+# `diff` is Required=yes in the MICROSKILL.md table, so the resolver needs
+# inputs.diff.required: true to gather it at runtime (derived from
+# plan.inputs.diff.required). `context` is optional with a null default, so it
+# needs no entry. Neither input declares a non-null default, so no
+# inputs.<name>.default lines are emitted.
+inputs:
+  diff:
+    required: true
+
+output_schema:
+  type: object
+  required: [summary, files, risk_surface, stats]
+  properties:
+    summary:
+      type: string
+    files:
+      type: array
+      items:
+        type: object
+        required: [path, change_kind, hunks, insertions, deletions, language]
+        properties:
+          path:
+            type: string
+          change_kind:
+            type: string
+            enum: [added, modified, deleted, renamed]
+          hunks:
+            type: integer
+          insertions:
+            type: integer
+          deletions:
+            type: integer
+          language:
+            type: string
+    risk_surface:
+      type: string
+    stats:
+      type: object
+      required: [files_changed, insertions, deletions]
+      properties:
+        files_changed:
+          type: integer
+        insertions:
+          type: integer
+        deletions:
+          type: integer

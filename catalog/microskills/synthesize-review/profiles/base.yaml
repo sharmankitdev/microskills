@@ -1,0 +1,33 @@
+version: 1
+inputs:
+  change_summary:
+    required: true
+  findings:
+    required: true
+  verifications:
+    required: true
+output_schema:
+  type: object
+  required:
+    - verdict
+    - blocker_count
+    - summary
+    - report_markdown
+    - findings
+  properties:
+    verdict:
+      type: string
+      enum:
+        - approve
+        - comment
+        - request_changes
+    blocker_count:
+      type: integer
+    summary:
+      type: string
+    report_markdown:
+      type: string
+    findings:
+      type: array
+      items:
+        type: object

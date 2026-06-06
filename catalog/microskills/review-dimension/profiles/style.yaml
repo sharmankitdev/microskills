@@ -1,0 +1,25 @@
+version: 1
+
+# Style dimension overlay for review-dimension. Overrides only the active
+# dimension, its rubric snippet, and the model; `output_schema`, `inputs`, and
+# the body are inherited from base.
+vars:
+  dimension: style
+
+context:
+  snippets:
+    - name: style-rubric
+      text: >-
+        Style rubric: flag only readability, maintainability, and convention
+        issues — unclear, misleading, or inconsistent naming; dead, unreachable,
+        or commented-out code; formatting and idioms inconsistent with the
+        surrounding code; overly long or deeply nested functions that should be
+        decomposed; magic numbers and unexplained constants; missing comments
+        where intent is non-obvious, or stale comments that contradict the code;
+        copy-paste duplication that should be factored; needlessly convoluted
+        control flow. Do not raise correctness, security, or performance-only
+        concerns under this rubric.
+
+# Style review is cheap and high-volume — demonstrates dropping to a fast model.
+runtime:
+  model: haiku

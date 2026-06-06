@@ -1,0 +1,57 @@
+version: 1
+
+# The active quality dimension. Substituted as {{dimension}} throughout the
+# MICROSKILL.md body (steps + output), so the dimension flows into the rendered
+# prose, the output `dimension` field, and the dimension-prefixed finding id.
+# Default = correctness; a per-dimension profile overlay (security / performance
+# / style) overrides this for each fan-out branch.
+vars:
+  dimension: correctness
+
+# `diff` is Required=yes in the MICROSKILL.md table, so the resolver needs
+# inputs.diff.required: true to gather it at runtime (derived from
+# plan.inputs.diff.required). `change_summary` is optional with a null default,
+# so it needs no entry. Neither input declares a non-null default, so no
+# inputs.<name>.default lines are emitted.
+inputs:
+  diff:
+    required: true
+
+# The active dimension's rubric, supplied as reference context so the body has a
+# concrete rubric to scan against. Base ships the correctness rubric to match
+# the default dimension; without it the default run would halt at the body's own
+# "Missing rubric context" failure mode. A per-dimension profile overlay
+# replaces this snippet with that dimension's rubric.
+context:
+  snippets:
+    - name: correctness-rubric
+      text: >-
+        Correctness rubric (default dimension): flag only defects that make the
+        code produce wrong results or behave incorrectly — logic and algorithm
+        errors; off-by-one and boundary mistakes; null / undefined /
+        uninitialized handling; missing or incorrect error and exception
+        handling; unhandled edge cases and invalid inputs; race conditions and
+        concurrency hazards; incorrect API, library, or type-contract usage;
+        broken invariants, state corruption, and resource leaks; control-flow
+        mistakes such as wrong conditionals or missing returns / breaks. Do not
+        raise style, performance, or security-only concerns under this rubric.
+
+output_schema:
+  type: object
+  required: [dimension, findings]
+  properties:
+    dimension: { type: string }
+    findings:
+      type: array
+      items:
+        type: object
+        required: [id, severity, file, title, explanation, confidence]
+        properties:
+          id: { type: string }
+          severity: { type: string, enum: [blocker, major, minor, nit] }
+          file: { type: string }
+          line: { type: integer }
+          title: { type: string }
+          explanation: { type: string }
+          fix: { type: string }
+          confidence: { type: string, enum: [high, medium, low] }

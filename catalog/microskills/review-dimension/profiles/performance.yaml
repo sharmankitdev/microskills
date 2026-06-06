@@ -1,0 +1,22 @@
+version: 1
+
+# Performance dimension overlay for review-dimension. Overrides only the active
+# dimension and its rubric snippet; `output_schema`, `inputs`, the body, and the
+# default model are inherited from base.
+vars:
+  dimension: performance
+
+context:
+  snippets:
+    - name: performance-rubric
+      text: >-
+        Performance rubric: flag only defects that waste time, memory, or other
+        resources — algorithmic blowups such as nested loops or quadratic scans
+        over large inputs; N+1 query patterns and per-iteration database or
+        network calls that should be batched; repeated recomputation of values
+        that could be hoisted or memoized; unbounded memory growth and missing
+        pagination or streaming over large data; blocking or synchronous I/O on a
+        hot path that should be async or batched; redundant allocations, copies,
+        or serializations in tight loops; missing obviously beneficial caching;
+        loading or holding far more data than the operation needs. Do not raise
+        correctness, security, or style-only concerns under this rubric.
