@@ -372,6 +372,13 @@ Run one instance per item in a collection. `as` names the per-item loop variable
 - **`for_each` is not allowed inside a `loop.body`** — fan-out inside a loop is a **block**
   (`fan-out inside a loop body is unsupported`).
 
+> `for_each` fans out **one node over a collection**. To run **distinct nodes** concurrently you don't
+> need it — just make them independent siblings (same segment, no edge between them, e.g. all depending
+> on the same upstream node). The compiler runs same-rank siblings in parallel automatically (§12,
+> *Intra-segment parallelism*). Reach for sibling nodes when the parallel branches differ structurally
+> (different microskill, or the same microskill under a different `customize.profile` — which
+> `for_each` can't vary per item); reach for `for_each` when it's the same call over N data items.
+
 ---
 
 ## 7. Edges, ordering, cycles
@@ -631,6 +638,43 @@ build-workflow-from-plan: segment[implement,evaluate]  orchestrator_node(finaliz
 workflow-create:          segment[plan]  gate  nested_workflow(provision)  orchestrator_node(advise)  nested_workflow(build)
 ```
 
+### Intra-segment parallelism — independent-sibling ranks
+
+**Within a (non-loop) segment the compiler runs independent siblings concurrently, not serially.**
+After segmentation it partitions the segment's nodes into **dependency ranks**: `rank(n) = 0` if `n`
+has no in-segment dependency, else `1 + max(rank of its in-segment deps)`. Nodes that share a rank
+have **no edge between them** (§7) — they are mutually independent — so the compiler emits the whole
+rank as **one `parallel([...])` batch** with array-destructuring, instead of one `await` per node:
+
+```js
+// rank with 3 independent siblings (each keeps its own profile / for_each / when):
+const [n_review_correctness, n_review_security, n_review_performance] = await parallel([
+  () => runMicroskill("review-dimension", { profile: "base", ... }),
+  () => runMicroskill("review-dimension", { profile: "security", ... }),
+  () => runMicroskill("review-dimension", { profile: "performance", ... }),
+])
+```
+
+This is what makes the `review-changes` correctness/security/performance reviews — three sibling
+`use:` nodes that all `depends_on: [summarize]` — run **at the same time** even though each carries a
+different `customize.profile` (a static literal that `for_each` can't vary per item, which is exactly
+why they're siblings and not a fan-out). Rules and guarantees:
+
+- A **single-node rank** is emitted exactly as before — `phase(<id>)` + an awaited assignment — so a
+  pure dependency chain (every node depends on the previous) is **byte-identical** to the pre-feature
+  serial emit. Only segments that actually contain independent siblings change shape.
+- **Determinism holds.** Ranks come from the shared deterministic topo order (definition-order
+  tie-break, §7), and within-rank order follows it, so the destructured var order — and the whole
+  emitted batch — is byte-stable across recompiles.
+- A sibling that is itself a `for_each` keeps its **own** inner fan-out: its thunk is `() =>
+  parallel(...)` / `() => parallelChunked(...)` nested inside the rank's outer `parallel([...])`. A
+  `when`-guarded sibling becomes a ternary thunk `() => (cond) ? <call> : null` (the rank's
+  `parallel()` tolerates the `null`).
+- **Loop-body segments are NOT rank-parallelized** — the `do/while` body stays sequential (the loop
+  scaffold owns its ordering). Independent siblings only fan out inside ordinary (non-loop) segments.
+- This is purely an *emit* optimization: it never moves a node across a segment boundary, never
+  changes the `sequence` / partition, and so leaves `manifest.json` (and `manifest_hash`) untouched.
+
 ### Runtime threading (what the dispatcher does)
 
 For each manifest step in order:
@@ -763,6 +807,36 @@ nodes:
     prompt: Use ${a.output.result} to do the second thing.
 output: { from: b }
 ```
+> `a` and `b` form a chain (`b` depends on `a`) → two single-node ranks → sequential awaits.
+
+**Independent siblings — one segment, fan-in → `segment[root,left,right,join]`:** `left` and `right`
+both depend only on `root` (no edge between them), so they share a rank and the compiler emits them as
+**one `parallel([...])` batch** — concurrent, not serial (§12, *Intra-segment parallelism*). `join`
+fans them back in.
+```yaml
+version: 1
+name: siblings-flow
+nodes:
+  - id: root
+    agent: worker
+    prompt: Produce the shared input.
+  - id: left
+    agent: worker
+    depends_on: [root]
+    prompt: Analyze ${root.output.data} one way.
+  - id: right
+    agent: worker
+    depends_on: [root]
+    prompt: Analyze ${root.output.data} another way.
+  - id: join
+    agent: worker
+    depends_on: [left, right]
+    prompt: Combine ${left.output.r} and ${right.output.r}.
+output: { from: join }
+```
+> Ranks: `root`=0, `left`/`right`=1 (emitted as `const [n_left, n_right] = await parallel([...])`),
+> `join`=2. Use sibling nodes (not `for_each`) when the parallel branches are structurally different —
+> e.g. different agents, or one microskill under different `customize.profile`s.
 
 **Gated two-segment → `segment[plan]` · gate · `segment[build]`:**
 ```yaml

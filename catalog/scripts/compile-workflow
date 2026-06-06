@@ -301,6 +301,28 @@ def topo_sort(nodes):
     return order
 
 
+def rank_partition(seg_nodes):
+    """Group a (non-loop) segment's nodes into dependency RANKS for sibling
+    parallelism. rank(n) = 0 if n has no in-segment dep, else 1 + max(rank of its
+    in-segment deps). Nodes sharing a rank have no edge between them → they are
+    mutually independent and safe to run concurrently. `seg_nodes` arrives in the
+    shared deterministic topo order (definition-order tie-break), so each node's
+    deps are already ranked when we reach it and within-rank order is deterministic.
+    Returns a list of layers (each a list of node ids) in ascending rank order;
+    a layer of size ≥2 is an independent-sibling batch."""
+    ids = [n["id"] for n in seg_nodes]
+    idset = set(ids)
+    edges = union_edges(seg_nodes)  # deps restricted to seg_nodes' own ids
+    rank = {}
+    for nid in ids:                 # topo order ⇒ every dep already has a rank
+        deps = edges.get(nid, set()) & idset
+        rank[nid] = 0 if not deps else 1 + max(rank[d] for d in deps)
+    layers = {}
+    for nid in ids:                 # preserve topo order within each rank
+        layers.setdefault(rank[nid], []).append(nid)
+    return [layers[k] for k in sorted(layers)]
+
+
 def resolve_microskill_directives(use_name, customize, defs_root):
     """Run resolve-microskill to read a use: node's allowed_tools + gates AND its
     fully-resolved (profile-merged, strip_nulls'd) output_schema. Returns a dict
@@ -444,12 +466,15 @@ def strip_ref_wrapper(expr):
     return (expr or "").strip().lstrip("$").strip("{}")
 
 
-def node_call_js(node, seg_var_ids, indent="  ", declare=True, track_ran=False):
+def node_call_js(node, seg_var_ids, indent="  ", declare=True, track_ran=False, thunk=False):
     """Emit the assignment JS for one background node.
 
     declare=False assigns to a pre-declared var (used inside loop bodies).
     track_ran=True (a guarded loop body) sets `__ran` and uses an if/else form
     for `when`, so a fully-skipped iteration can break out of the loop.
+    thunk=True returns a bare `() => <promise|null>` (no await, no var, no phase)
+    for use inside a parallel([...]) sibling-rank batch — the enclosing parallel()
+    awaits it. Mutually exclusive with track_ran (loop bodies stay serial).
     `when` → conditional skip (node yields null). `for_each` → parallel fan-out
     over a collection, with `as` naming the per-item var."""
     nid = node["id"]
@@ -489,6 +514,8 @@ def node_call_js(node, seg_var_ids, indent="  ", declare=True, track_ran=False):
     # max_parallel: K bounds the fan-out to batches of K via parallelChunked (built
     # only on the host parallel() global). WITHOUT max_parallel the emission is the
     # unbounded parallel() exactly as before (byte-identical).
+    # `bare` is the un-awaited node expression (a promise). `expr` re-wraps it with
+    # await for the serial statement forms — byte-identical to the pre-thunk emit.
     fe = node.get("for_each")
     if fe:
         coll = translate_ref(strip_ref_wrapper(fe), seg_var_ids)
@@ -496,14 +523,23 @@ def node_call_js(node, seg_var_ids, indent="  ", declare=True, track_ran=False):
         thunks = f"(({coll}) || []).map(({as_var}) => () => {raw})"
         mp = node.get("max_parallel")
         if mp is not None:
-            expr = f"await parallelChunked({thunks}, {int(mp)})"
+            bare = f"parallelChunked({thunks}, {int(mp)})"
         else:
-            expr = f"await parallel({thunks})"
+            bare = f"parallel({thunks})"
     else:
-        expr = f"await {raw}"
+        bare = raw
+    expr = f"await {bare}"
 
     when = node.get("when")
     cond = translate_ref(strip_ref_wrapper(when), seg_var_ids) if when else None
+
+    if thunk:
+        # Bare thunk for a parallel([...]) rank: no await (the rank's parallel()
+        # awaits), no var, no phase. `when` becomes a ternary that yields null when
+        # skipped (parallel() tolerates a null element).
+        if cond is not None:
+            return f"() => ({cond}) ? {bare} : null"
+        return f"() => {bare}"
 
     if track_ran:
         if cond is not None:
@@ -617,10 +653,24 @@ def emit_segment_js(seg_nodes, wf, loop, seg_index):
                 f"log(`{name}: ran ${{__iter}} iteration(s)`)\n"
                 f"return {ret}\n")
     else:
+        # Emit by dependency rank. A single-node rank stays byte-identical to the old
+        # serial emit (phase() + an awaited assignment). A rank of independent siblings
+        # (≥2 nodes, no edge between them) is emitted as ONE parallel([...]) batch with
+        # destructuring — concurrent instead of serial. Per-node progress phase is still
+        # carried by each call's `phase` arg (and meta.phases), so the inline phase()
+        # marker is only needed for the serial single-node form.
+        node_by_id = {n["id"]: n for n in seg_nodes}
         calls = ""
-        for n in seg_nodes:
-            calls += f"phase({json.dumps(n['id'])})\n"
-            calls += node_call_js(n, seg_var_ids, indent="").lstrip()
+        for layer in rank_partition(seg_nodes):
+            if len(layer) == 1:
+                n = node_by_id[layer[0]]
+                calls += f"phase({json.dumps(n['id'])})\n"
+                calls += node_call_js(n, seg_var_ids, indent="").lstrip()
+            else:
+                thunks = ",\n  ".join(
+                    node_call_js(node_by_id[nid], seg_var_ids, thunk=True) for nid in layer)
+                vars_js = ", ".join(jsvar(nid) for nid in layer)
+                calls += f"const [{vars_js}] = await parallel([\n  {thunks},\n])\n"
         ret = "{ " + ", ".join(f"{json.dumps(i)}: {jsvar(i)}" for i in seg_ids) + " }"
         body = calls + f"\nreturn {ret}\n"
 

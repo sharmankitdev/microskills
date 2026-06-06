@@ -29,6 +29,9 @@ imports:
 # verify fan-out -> synthesize), then a human-approval gate, then an orchestrator post
 # checkpoint guarded on the human's choice. No loop. No orchestrator node sits between
 # segment-1 nodes, so the whole review pipeline compiles into one autonomous segment.
+# The 3 dimension reviews all depend only on `summarize`, so they share a dependency
+# rank and the compiler emits them as ONE concurrent parallel([...]) batch — they run
+# at the same time, not serially (see DAG-RULES.md §12, Intra-segment parallelism).
 nodes:
   # Seg 1: summarize the diff into a structured, file-grouped summary that grounds every
   # downstream review. Whole summary object is reused as change_summary by each dimension
@@ -49,8 +52,10 @@ nodes:
         stats: { type: object }
 
   # Seg 1: correctness review. SIBLING node (not a for_each) because customize.profile is a
-  # static literal, not a per-item variable. The base profile IS the correctness profile —
-  # review-dimension/profiles/base.yaml ships dimension=correctness plus the correctness rubric.
+  # static literal, not a per-item variable — yet sibling reviews still run CONCURRENTLY:
+  # all three share a dependency rank and compile into one parallel([...]) batch. The base
+  # profile IS the correctness profile — review-dimension/profiles/base.yaml ships
+  # dimension=correctness plus the correctness rubric.
   - id: review_correctness
     use: review-dimension
     customize: { profile: base }
