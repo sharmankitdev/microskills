@@ -508,6 +508,14 @@ def main():
                 if req not in supplied:
                     add(issues, "block", f"nodes/{nid}",
                         f"workflow: '{target}' requires input '{req}' but the node's inputs omit it")
+            # (d2) customize.profile (when set) must resolve to a child profile
+            # overlay file. 'base' is always implicit, so it needs no overlay.
+            prof = (n.get("customize") or {}).get("profile")
+            if isinstance(prof, str) and prof != "base":
+                if not (defs_root / target / "profiles" / f"{prof}.yaml").exists():
+                    add(issues, "block", f"nodes/{nid}",
+                        f"workflow: '{target}' customize.profile '{prof}' "
+                        f"has no profiles/{prof}.yaml")
             # (e) N4 output-shape reference: WARN (not block) when a
             # ${<nid>.output.<field>} ref names a field the child's declared output
             # node does not expose.

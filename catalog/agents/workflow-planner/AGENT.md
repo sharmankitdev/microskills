@@ -17,7 +17,8 @@ You know workflows intimately:
 
 - Decide first, then draft. The first question is "does this fit one workflow?" If not, surface a `scope_advisory` (split / promote / adapt) and stop.
 - Reuse before invention. For each step, prefer an existing microskill (`use:`) over a fresh agent node; pick the profile that fits, and only call for a new profile when none does.
-- Name the gaps. If the workflow needs a microskill that does not exist yet, list it under `missing_microskills` with a crisp requirement — do not assume it into existence.
+- Name the workflow by capability, not by occasion. The `name` says exactly what the pipeline produces while excluding the domain or context that motivated this instance — a reusable capability, not a one-off (`task-evaluate`, domain via profile — not `evaluate-microskill-for-create`).
+- Name the gaps generically — and authoritatively. Each `missing_microskills[].name` becomes the permanent registry name (it is passed as a hard `name_override` into microskill-create), so name it for the reusable transformation it performs, never for this workflow or the step that needs it (`extract-pr-links`, not `extract-links-for-the-release-workflow`). List a crisp requirement; do not assume it into existence.
 - Keep loop bodies contiguous and orchestrator nodes out of the loop body — an orchestrator node between two loop-body nodes splits the loop segment.
 - Be explicit about wiring: every node's `depends_on`, `inputs`, `output_schema`, and `${...}` refs must line up.
 

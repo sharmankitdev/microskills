@@ -66,7 +66,7 @@
           "prompt": { "type": "string", "description": "For agent nodes: the task prompt template (may contain ${...} references)." },
           "output_schema": { "type": "object", "description": "JSON Schema fragment forcing structured node output (passed to agent() schema). For a use: node, OMITTING this inherits the resolved microskill's output_schema; an explicit value here wins." },
           "max_parallel": { "type": "integer", "minimum": 1, "description": "Only valid on a for_each node: bound the fan-out to batches of this size (parallelChunked) instead of one unbounded parallel()." },
-          "customize": { "type": "object", "additionalProperties": true, "description": "Per-node knobs for a use: microskill — profile and/or dotted overrides." },
+          "customize": { "type": "object", "additionalProperties": true, "description": "Per-node knobs: on a use: microskill, the profile and/or dotted overrides; on a workflow: node, `profile` selects the child workflow's profile (passed through to the nested-workflow checkpoint)." },
           "grant_tools": { "type": "array", "items": { "type": "string" }, "description": "Extra tools granted to this node's subagent." },
           "delegation": { "enum": ["auto", "orchestrator"], "description": "Override the auto-derived delegation classification." },
           "side_effect": { "type": "boolean", "description": "Readable alias for delegation: orchestrator. true normalizes to delegation: orchestrator before classification, so the node runs as an orchestrator checkpoint (where filesystem side effects and human interaction are allowed)." }

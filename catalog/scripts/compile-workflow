@@ -781,6 +781,12 @@ def main():
                 chk = {"kind": "checkpoint", "checkpoint_type": "nested_workflow", "node": nid,
                        "workflow": node["workflow"], "inputs": node.get("inputs") or {},
                        "depends_on": node.get("depends_on") or []}
+                # Profile passthrough: customize.profile on a workflow: node selects
+                # the child's profile (the dispatcher compiles the child with it).
+                # Absent → no key → checkpoint stays byte-identical to the old shape.
+                prof = (node.get("customize") or {}).get("profile")
+                if prof:
+                    chk["profile"] = prof
             else:
                 chk = {"kind": "checkpoint", "checkpoint_type": "orchestrator_node", "node": nid,
                        "prompt": node.get("prompt", ""), "depends_on": node.get("depends_on") or []}

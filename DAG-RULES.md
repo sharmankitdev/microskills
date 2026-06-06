@@ -270,10 +270,17 @@ dispatcher. It carries `inputs` / `depends_on` / `when` / `for_each` + `as` like
 `inputs` values stay as raw `${...}` refs in the manifest and the dispatcher resolves them against
 workflow inputs + upstream results when it re-enters the `workflow` skill for the child.
 
+**Profile passthrough.** A `customize: { profile: <name> }` on the node selects **the child
+workflow's** profile: the compiler stamps `profile: <name>` into the checkpoint and the dispatcher
+compiles the child with `--profile <name>` (absent → child compiles with its default, and the
+checkpoint stays byte-identical). This is how `provision` runs `microskill-create` with the
+`autonomous` profile so the child's plan gate never pauses for a human.
+
 With `validate-workflow --defs-root <dir>`, the child contract is checked against `imports` **and**
 the child's `WORKFLOW.yaml`: the target must be in `imports` (else block), must resolve to a child
 `WORKFLOW.yaml` (else block), every `required` child input must be supplied by this node's `inputs`
-(else block), and `${<this-node>.output.<field>}` refs are cross-checked against the child's declared
+(else block), a `customize.profile` (when set) must resolve to a child `profiles/<name>.yaml` (else
+block), and `${<this-node>.output.<field>}` refs are cross-checked against the child's declared
 output node (mismatch → **warn**). **Nesting depth is 1**: a child that itself contains a `workflow:`
 node is blocked, and an import cycle across the reachable import graph is blocked. Without
 `--defs-root` these checks are skipped (backward-compatible single-file validation).
@@ -295,7 +302,7 @@ node is blocked, and an import cycle across the reachable import graph is blocke
 | `when` | all | Conditional guard (see §6). |
 | `for_each` + `as` | all | Fan-out over a collection (see §6). |
 | `max_parallel` | for_each only | Bound the fan-out to batches of K (`parallelChunked`) instead of one unbounded `parallel()`. **Only valid on a `for_each` node** — on a non-fan-out node it is a block. |
-| `customize` | (a) | `{profile: <name>}` selects the microskill's profile. **See the footgun in §13.** |
+| `customize` | (a)(d) | On a `use:` node, `{profile: <name>}` selects the microskill's profile; on a `workflow:` node, it selects the **child workflow's** profile (passed through to the nested-workflow checkpoint). **See the footgun in §13.** |
 | `grant_tools` | (a)(b) | **Declared but inert** — the compiler does not consume it. See §13. |
 
 ---
@@ -335,13 +342,13 @@ Run one instance per item in a collection. `as` names the per-item loop variable
 `${<as>}`.
 
 ```yaml
-- id: provision
+- id: notify-owners
   delegation: orchestrator
-  for_each: ${plan.output.missing_microskills}   # a collection
-  as: ms_spec                                     # binds each item
+  for_each: ${plan.output.changed_files}   # a collection
+  as: file                                 # binds each item
   depends_on: [plan]
   prompt: >
-    Provision a microskill: requirement = ${ms_spec.requirement}, name = ${ms_spec.name}.
+    Notify the owner of ${file.path} that it changed.
 ```
 
 - `for_each` **requires** `as`, and `as` must be a safe identifier `^[a-z][a-z0-9_]*$` (it becomes a
@@ -558,7 +565,9 @@ wins. Inheritance is a default-for-*absent* only: a microskill profile that *del
 (`output_schema: null`) resolves to none, so a deleted schema is never resurrected.
 
 **Node-level `customize`:** on a `use:` node, `customize: { profile: <name> }` selects *which profile
-of that microskill* the node runs. That's the **only** `customize` key the compiler reads (see §13).
+of that microskill* the node runs; on a `workflow:` node, it selects *which profile of the child
+workflow* the dispatcher compiles (§5d). `profile` is the **only** `customize` key the compiler reads
+(see §13).
 
 Example — the `autonomous` profile of `microskill-create` softens the approval gate from `hard` to
 `warn`: the structure stays (2 segments, the gate checkpoint still exists) but the run never pauses

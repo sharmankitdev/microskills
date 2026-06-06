@@ -150,10 +150,12 @@ collecting an array into `results[node]`). Then:
    `value` against `inputs`/`results` (same rules as an orchestrator node). The resolved map is the
    child's input set.
 2. **Re-enter this same `workflow` skill for `step.workflow`** — compile
-   `.claude/workflow-defs/${step.workflow}/WORKFLOW.yaml` and run its manifest, supplying the resolved
-   map as the child's gathered `inputs` (skip the interactive input-gathering step — the inputs are
-   already provided by the parent). The compiler guaranteed depth ≤ 1, so the child contains no
-   further nested call; recursion is bounded.
+   `.claude/workflow-defs/${step.workflow}/WORKFLOW.yaml`, passing **`--profile ${step.profile}` when the
+   checkpoint carries a `profile`** (a `customize: {profile}` on the `workflow:` node — e.g. `provision`
+   runs `microskill-create` with the `autonomous` profile so its plan gate never pauses; omit the flag
+   when absent), and run its manifest, supplying the resolved map as the child's gathered `inputs`
+   (skip the interactive input-gathering step — the inputs are already provided by the parent). The
+   compiler guaranteed depth ≤ 1, so the child contains no further nested call; recursion is bounded.
 3. **Store the child's result** — its `manifest.output.from` node output — into `results[node]`, and
    emit a short recap (reuse the child's own wrap-up; don't replay its segments).
 4. If the child fails or its evaluator never passes, **stop and surface the error** — do not claim
