@@ -14,10 +14,14 @@ microskills:
     source: plugin
   - name: validate-microskill
     source: plugin
+  - name: analyze-monolith-orchestrator
+    source: plugin
 workflows:
   - name: microskill-create
     source: plugin
   - name: workflow-create
     source: plugin
   - name: build-workflow-from-plan
+    source: plugin
+  - name: decompose-monolith-orchestrator
     source: plugin
