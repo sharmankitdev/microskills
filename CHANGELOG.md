@@ -1,3 +1,9 @@
+## [0.6.0](https://github.com/sharmankitdev/microskills/compare/v0.5.0...v0.6.0) (2026-06-06)
+
+### Features
+
+* **workflow:** add code-review pipeline with intra-segment sibling parallelism ([#9](https://github.com/sharmankitdev/microskills/issues/9)) ([e3dd79a](https://github.com/sharmankitdev/microskills/commit/e3dd79a21960754287872c45286bc417d8823496))
+
 ## [0.5.0](https://github.com/sharmankitdev/microskills/compare/v0.4.1...v0.5.0) (2026-06-06)
 
 ### Features
