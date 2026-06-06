@@ -1,3 +1,9 @@
+## [0.5.0](https://github.com/sharmankitdev/microskills/compare/v0.4.1...v0.5.0) (2026-06-06)
+
+### Features
+
+* **workflow:** nested-workflow profile passthrough + capability-named planner output ([#7](https://github.com/sharmankitdev/microskills/issues/7)) ([47694dd](https://github.com/sharmankitdev/microskills/commit/47694dd4aec49fb001375bf6767d364dd36416e5))
+
 ## [0.4.1](https://github.com/sharmankitdev/microskills/compare/v0.4.0...v0.4.1) (2026-06-06)
 
 ## [0.4.0](https://github.com/sharmankitdev/microskills/compare/v0.3.0...v0.4.0) (2026-06-04)
