@@ -2,8 +2,9 @@
 # of another workflow (e.g. decompose-monolith-orchestrator's `provision` node
 # building a missing nested workflow), where no human is present to approve the plan.
 #
-# It re-specifies the gates list (deep-merge replaces top-level lists) to soften
-# the approve_plan gate from `hard` to `warn`. A human_approval gate ALWAYS flushes
+# It `patch`es the approve_plan gate by id (gates:{patch:[...]}) to soften its
+# severity from `hard` to `warn` and swap in an autonomous prompt — after/type/options
+# are inherited from the base gate, not restated. A human_approval gate ALWAYS flushes
 # the segment (compile-workflow), so the `build` orchestrator node stays after its own
 # boundary; but on `warn` the dispatcher emits the prompt and continues WITHOUT pausing.
 # Net effect: same compiled shape, no human pause.
@@ -14,11 +15,9 @@
 version: 1
 
 gates:
-  - id: approve_plan
-    after: plan
-    type: human_approval
-    severity: warn
-    prompt: >
-      (autonomous) Plan generated. Running without human approval — review the
-      created workflow afterward.
-    options: [approve, revise, abandon]
+  patch:
+    - id: approve_plan
+      severity: warn
+      prompt: >
+        (autonomous) Plan generated. Running without human approval — review the
+        created workflow afterward.
