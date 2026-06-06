@@ -73,8 +73,12 @@ Validate and compile from the project root:
 
 ## 3. Top-level keys
 
-The grammar is **closed** — `additionalProperties: false` everywhere. An unknown key fails schema
-validation. Only `name` + `nodes` are required; everything else is optional.
+The **structural** grammar is **closed** — `additionalProperties: false` on the root and on every
+node, gate, `loop`, `output`, `profile`, and inputs-spec object — so an unknown *structural* key fails
+schema validation. Three spots are intentionally **open**: a node's `customize` (`additionalProperties:
+true`, to carry `profile` plus dotted overrides), a node's `output_schema` (an arbitrary embedded
+JSON-Schema fragment), and the map-typed `vars` / `inputs` / `node.inputs` / `loop.carry` (arbitrary
+entry *names* with typed values). Only `name` + `nodes` are required; everything else is optional.
 
 | Key | Required | Purpose |
 |---|---|---|
@@ -102,7 +106,7 @@ nodes:
     agent: planner
     prompt: Plan with {{model}}.        # {{model}} → opus before schema validation
 loop:
-  max_iters: 3                          # (a {{cap}} token anywhere would resolve to 3)
+  max_iters: 3                          # literal int — a {{cap}} token resolves to the STRING "3" (vars coerce to string, below), which would FAIL this integer field at schema validation
 ```
 
 A `{{key}}` token **anywhere** in the merged doc (values *and* dict keys) is textually replaced from
@@ -357,10 +361,13 @@ Run one instance per item in a collection. `as` names the per-item loop variable
 - In a background segment, `for_each` compiles to `await parallel((collection || []).map((<as>) => () => ...))`
   — **fan-out runs in parallel**. An empty/absent collection → empty result.
 - **`max_parallel: K`** (for_each only) caps the fan-out to fixed-size batches of K via a
-  `parallelChunked` helper (emitted into the segment only when a `max_parallel` node is present), each
-  batch awaited in turn — output order is preserved, identical to the unbounded `parallel()`. Without
-  it, the emission is byte-identical to before. `max_parallel` on a node with no `for_each` is a
-  **block** in both validate and compile.
+  `parallelChunked` helper (emitted into the segment only when a `max_parallel` for_each node is
+  present), each batch awaited in turn — output order is preserved, identical to the unbounded
+  `parallel()`. Without it, the emission is byte-identical to before. `max_parallel` on a node with no
+  `for_each` is a **block** in both validate and compile. **Caveat:** `max_parallel` is only honored on
+  a for_each node that lands in a **background segment**. On an *orchestrator* for_each node (e.g. the
+  `notify-owners` example above) the compiler forwards only `when`/`for_each`/`as` to the checkpoint and
+  silently drops `max_parallel`, and the dispatcher applies no batch cap — validation does not block it.
 - The whole fan-out result array is consumable downstream via **`${<id>.items}`** (§4).
 - **`for_each` is not allowed inside a `loop.body`** — fan-out inside a loop is a **block**
   (`fan-out inside a loop body is unsupported`).
@@ -406,8 +413,11 @@ gates:
 
 **What makes a gate split a segment:** a gate of `type: human_approval` **or** `severity: hard`
 (hard is the default) flushes the current background segment and becomes an orchestrator checkpoint.
-A `severity: warn` gate does **not** pause — the dispatcher renders the output, emits the prompt, and
-continues.
+A `severity: warn` gate of `type: human_approval` does **not** pause — the dispatcher renders the
+output, emits the prompt, and continues. (A `warn` gate of `type: verification`/`tool_check` is a
+different story: the compiler emits a gate checkpoint only when `type: human_approval` **or** `severity:
+hard`, so a non-`human_approval` `warn` gate produces **no** checkpoint at all — it is dropped at compile
+time and the dispatcher never renders it.)
 
 | Field | Rule |
 |---|---|
@@ -474,7 +484,8 @@ loop:
   contiguity check, so both forms are validated identically.
 - `body` lists the node ids that repeat. Each must be a known node; a `for_each` node in the body is
   a **block**.
-- The body compiles to a JS `do { ... } while ((<while>) && __iter < max)` inside **one segment**.
+- The body compiles to a JS `do { ... } while ((<while>) && __iter < __max)` inside **one segment**
+  (the compiler emits `let __iter = 0` / `const __max = <max_iters>`).
 - `carry` threads state across iterations: each var inits from `_args.carry_<v>` (`null` on the first
   round) and is reassigned at the end of each iteration. Body nodes read it via `${loop.carry.<v>}`.
 - The loop returns a `__rounds` count (the iteration count) so the dispatcher can recap "loop done in
@@ -552,7 +563,13 @@ nodes:
   remove: [advise]                                 # drop a node by id
 ```
 
-`patch` deep-merges into the matching-id item; `add` appends new items; `remove` drops by id. A
+The verbs always apply in a fixed order — **remove → patch → add** (not the listing order above):
+`remove` drops base entries by id first, then `patch` deep-merges *into* the surviving matching-id item
+**preserving its position**, then `add` appends new items to the end in declared order. Because removes
+run before adds, `remove: [x]` + `add: [{id: x, …}]` cleanly **replaces** entry `x` (and you can't
+`patch` an id you `add` in the same overlay — adds run last). A `patch`/`remove` naming an absent id, or
+an `add` whose id still exists after the removes (a collision), is a list-verb error — a fatal message at
+compile, a `block` issue at validate. A
 `remove` that **orphans a reference** — leaving a dangling `depends_on`, ref, `gate.after`,
 `output.from`, or `loop.body` entry — is caught at validate (as the corresponding unknown-node block).
 *(Microskills have the analogous `steps.add/patch/remove` on their step list — the microskill-side
@@ -611,7 +628,7 @@ Example compiled sequences (from the real workflows):
 microskill-create:        segment[plan]  gate  orchestrator_node(advise)
                           segment[implement,evaluate]  orchestrator_node(finalize)
 build-workflow-from-plan: segment[implement,evaluate]  orchestrator_node(finalize)
-workflow-create:          segment[plan]  gate  orchestrator_node ×3 (provision, advise, build)
+workflow-create:          segment[plan]  gate  nested_workflow(provision)  orchestrator_node(advise)  nested_workflow(build)
 ```
 
 ### Runtime threading (what the dispatcher does)
@@ -632,8 +649,11 @@ For each manifest step in order:
 - **`checkpoint` / nested_workflow** (a `workflow:` node) → honor `when`/`for_each` as above, resolve
   the step's `inputs` refs against `inputs`/`results`, then **re-enter the same `workflow` skill** for
   the child (compile + run its manifest, feeding the resolved inputs and skipping interactive input
-  gathering). Depth ≤ 1 is compiler-guaranteed, so recursion is bounded. Store the child's
-  `output.from` result into `results[node]`.
+  gathering). **If the node carried `customize: { profile: <name> }`, compile the child with `--profile
+  <name>` (profile passthrough — e.g. `provision` compiles `microskill-create` with the `autonomous`
+  profile so the child's plan gate never pauses); absent → the child compiles with its own default.**
+  Depth ≤ 1 is compiler-guaranteed, so recursion is bounded. Store the child's `output.from` result
+  into `results[node]`.
 
 At the end, report `results[manifest.output.from]`.
 
@@ -680,10 +700,12 @@ stored node outputs no longer line up) or an absent file → start fresh at step
   applied via `--profile` — that path is real.)*
 - **⚠️ `grant_tools` is inert.** It's in the schema but the compiler never consumes it. Don't rely on
   it to grant tools — bake tool permissions into the microskill/agent profile.
-- **No `AskUserQuestion` in a background segment.** A `use:`/`agent:` node that needs to ask a human
-  must be reclassified to orchestrator (it auto-classifies that way if its microskill's
-  `allowed_tools` includes `AskUserQuestion` or it carries a hard gate). Asking inside a segment =
-  silent fabrication.
+- **No `AskUserQuestion` in a background segment.** A node that needs to ask a human must end up an
+  orchestrator checkpoint. A `use:` node *auto*-classifies that way when its resolved microskill's
+  `allowed_tools` includes `AskUserQuestion` or that microskill declares a hard gate. An `agent:` node
+  does **not** auto-classify on tools — it is unconditionally background unless you set `delegation:
+  orchestrator` explicitly (a hard/`human_approval` gate anchored `after:` it also forces a checkpoint).
+  Asking inside a segment = silent fabrication.
 - **Nested workflows are checkpoints, never background.** Use the first-class `workflow:` node (§5d)
   — it always classifies as an orchestrator checkpoint. Background subagents have no orchestration
   context and can't re-enter the dispatcher. (You can still drive a nested workflow from a plain
@@ -858,8 +880,11 @@ nodes:
     for_each: ${plan.output.units}  # one child run per unit
     as: unit
     depends_on: [plan]              # ref-implied too; restated here for clarity
-    inputs:
-      plan_path: ${unit}            # raw refs — the dispatcher resolves them at run time
+    inputs:                         # ALL of the child's required inputs must be present, or
+      plan_path: ${unit}            #   validate-workflow --defs-root BLOCKS. build-workflow-from-plan
+      name: ${unit}                 #   requires plan_path/name/requirement/staging_dir (all required).
+      requirement: ${workflow.inputs.requirement}
+      staging_dir: ${unit}          # raw refs — the dispatcher resolves them at run time
 gates:
   - id: approve_plan
     after: plan
