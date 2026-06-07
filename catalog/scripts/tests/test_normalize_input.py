@@ -1,9 +1,11 @@
 """
 Tests for catalog/scripts/normalize-input — the tested implementation of the dispatcher's
-large/multi-shape input-by-reference normalization (string | file | directory -> one file).
+multi-shape input-by-reference normalization (file | directory PATH -> one canonical file).
 
-Invokes the script as a subprocess (the path the dispatcher uses via Bash) and asserts on
-stdout JSON + on-disk state. Hermetic: everything under tmp_path.
+normalize-input takes PATHS only — never untrusted content on argv (a literal-string
+materialize value is written to a file by the dispatcher via the Write tool, then its path
+is passed here). Invokes the script as a subprocess and asserts on stdout JSON + on-disk
+state. Hermetic: everything under tmp_path.
 """
 import json
 import subprocess
@@ -22,38 +24,9 @@ def run(value, out):
     return proc.returncode, data, proc.stdout, proc.stderr
 
 
-def run_stdin(value, out):
-    # The robust string path: the literal value arrives on stdin, never via argv (which
-    # has a hard ARG_MAX — a large literal string would raise 'Argument list too long').
-    proc = subprocess.run(
-        [sys.executable, str(SCRIPT), "--stdin", "--out", str(out)],
-        input=value, capture_output=True, text=True)
-    data = json.loads(proc.stdout) if proc.stdout.strip().startswith("{") else None
-    return proc.returncode, data, proc.stdout, proc.stderr
-
-
-def test_string_via_stdin_is_written_to_file(tmp_path):
-    # The provision case: a literal requirement STRING (on stdin) -> a canonical file.
-    out = tmp_path / "run-inputs" / "requirement_path"
-    rc, data, _o, err = run_stdin("a requirement: lint commit messages", out)
-    assert rc == 0, err
-    assert data["shape"] == "string"
-    assert data["path"] == str(out.resolve())
-    assert out.read_text() == "a requirement: lint commit messages"
-    assert data["warning"] is None
-
-
-def test_small_string_via_value_convenience(tmp_path):
-    # A small literal string is also accepted via --value (CLI convenience).
-    out = tmp_path / "req.txt"
-    rc, data, _o, err = run("small inline requirement", out)
-    assert rc == 0, err
-    assert data["shape"] == "string"
-    assert out.read_text() == "small inline requirement"
-
-
 def test_file_is_passed_through_not_copied(tmp_path):
-    # A real file -> its own absolute path, contents untouched, no copy to --out.
+    # A real file (e.g. a diff the caller wrote, or a string the dispatcher Write-tool'd to
+    # a file) -> its own absolute path, contents untouched, no copy to --out.
     src = tmp_path / "diff.patch"
     src.write_text("diff --git a/x b/x\n")
     out = tmp_path / "run-inputs" / "diff_path"
@@ -62,6 +35,17 @@ def test_file_is_passed_through_not_copied(tmp_path):
     assert data["shape"] == "file"
     assert data["path"] == str(src.resolve())
     assert not out.exists()  # pass-through, nothing written to --out
+    assert data["warning"] is None
+
+
+def test_missing_path_is_an_error_not_a_string(tmp_path):
+    # A value that is not an existing path is a hard error — never silently treated as a
+    # literal string (closes the shape-sniffing ambiguity). The dispatcher passes only paths.
+    out = tmp_path / "out"
+    rc, data, _o, err = run("a requirement: lint commit messages", out)
+    assert rc == 1
+    assert "does not exist" in (data or {}).get("error", "")
+    assert not out.exists()
 
 
 def test_directory_concatenates_sorted_with_headers(tmp_path):
@@ -74,7 +58,6 @@ def test_directory_concatenates_sorted_with_headers(tmp_path):
     rc, data, _o, err = run(d, out)
     assert rc == 0, err
     assert data["shape"] == "dir"
-    # byte-stable relative-path order (codepoint == C locale for ASCII), per-file headers
     assert out.read_text() == (
         "=== a.md ===\nAye\n"
         "=== b.md ===\nBee\n"
@@ -93,18 +76,21 @@ def test_directory_concat_is_byte_deterministic(tmp_path):
     assert out1.read_text() == out2.read_text()  # same inputs -> byte-identical
 
 
-def test_size_guard_warns_over_threshold_via_stdin(tmp_path):
-    # A large literal string flows through stdin (NOT argv — argv would raise
-    # 'Argument list too long' on Linux), and the >256KB guard warns.
-    out = tmp_path / "big.txt"
-    rc, data, _o, err = run_stdin("x" * (256 * 1024 + 1), out)
+def test_directory_out_inside_source_is_not_self_included(tmp_path):
+    # If --out lives inside the source dir and pre-exists, it must NOT be enumerated by the
+    # walk (would corrupt byte-determinism by appending prior output to itself).
+    d = tmp_path / "specs"
+    d.mkdir()
+    (d / "a.txt").write_text("A")
+    (d / "b.txt").write_text("B")
+    out = d / "out.txt"
+    out.write_text("STALE")  # pre-exists inside the source dir
+    rc, data, _o, err = run(d, out)
     assert rc == 0, err
-    assert data["bytes"] > 256 * 1024
-    assert data["warning"] is not None and "distillation" in data["warning"]
+    assert out.read_text() == "=== a.txt ===\nA\n=== b.txt ===\nB\n"  # out.txt excluded
 
 
 def test_size_guard_warns_on_large_file(tmp_path):
-    # The realistic large-input shape: a big file (pass-through) trips the same guard.
     big = tmp_path / "huge.diff"
     big.write_text("y" * (256 * 1024 + 10))
     out = tmp_path / "ignored"
@@ -114,8 +100,9 @@ def test_size_guard_warns_on_large_file(tmp_path):
     assert data["warning"] is not None and "distillation" in data["warning"]
 
 
-def test_small_input_no_warning(tmp_path):
-    out = tmp_path / "small.txt"
-    rc, data, _o, err = run_stdin("tiny", out)
+def test_small_file_no_warning(tmp_path):
+    src = tmp_path / "small.txt"
+    src.write_text("tiny")
+    rc, data, _o, err = run(src, tmp_path / "out")
     assert rc == 0, err
     assert data["warning"] is None
