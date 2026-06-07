@@ -1,7 +1,8 @@
 version: 1
 
-# Every input (correctness, security, performance, style) is optional with a
-# null default, so no inputs.<name>.required and no inputs.<name>.default lines
+# Every input (correctness, security, performance, style, documentation,
+# test_coverage) is optional with a null default, so no inputs.<name>.required
+# and no inputs.<name>.default lines
 # are emitted. This is a pure in-memory fan-in transformation that writes
 # nothing to disk and runs no domain agent, so — matching the sibling fan-in
 # microskills (synthesize-review, verify-finding, summarize-diff) — no runtime

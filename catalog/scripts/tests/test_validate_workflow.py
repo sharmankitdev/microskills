@@ -1242,3 +1242,39 @@ def test_no_vars_validate_unchanged(tmp_path):
     rc, data, _ = run(write_wf(tmp_path, VALID))
     assert rc == 0 and data["pass"] is True
     assert data["issues"] == []
+
+
+PHASE_GROUP = """\
+version: 1
+name: pg-flow
+nodes:
+  - id: a
+    agent: some-agent
+    prompt: do a
+  - id: rb
+    agent: some-agent
+    phase_group: review
+    depends_on: [a]
+    prompt: use ${a.output.x}
+  - id: rc
+    agent: some-agent
+    phase_group: review
+    depends_on: [a]
+    prompt: also ${a.output.x}
+"""
+
+
+def test_phase_group_validates_clean(tmp_path):
+    # phase_group is an accepted optional node field (schema) with no DAG effect.
+    rc, data, _ = run(write_wf(tmp_path, PHASE_GROUP))
+    assert rc == 0 and data["pass"] is True
+    assert data["issues"] == []
+
+
+def test_phase_group_id_collision_warns(tmp_path):
+    # A phase_group equal to a node id warns (boxes would merge) but does not block.
+    body = PHASE_GROUP.replace("phase_group: review", "phase_group: a")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 0 and data["pass"] is True
+    assert any(i["severity"] == "warn" and "collides with node id" in i["message"]
+               for i in data["issues"])

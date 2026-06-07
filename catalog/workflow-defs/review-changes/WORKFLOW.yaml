@@ -12,10 +12,6 @@ inputs:
     type: string
     required: false
     description: Optional free-text grounding material (PR/change description, spec excerpt) forwarded to summarize-diff to ground the intent overview.
-  post_target:
-    type: string
-    required: false
-    description: Optional PR/MR identifier the post node targets when the human chooses to post the synthesized report.
 
 # Advisory only — documents the reused microskills; no runtime effect (no workflow: nodes here).
 imports:
@@ -25,13 +21,19 @@ imports:
   - microskills/verify-finding
   - microskills/synthesize-review
 
-# Single background segment (summarize -> 3 sibling dimension reviews -> collect ->
-# verify fan-out -> synthesize), then a human-approval gate, then an orchestrator post
-# checkpoint guarded on the human's choice. No loop. No orchestrator node sits between
-# segment-1 nodes, so the whole review pipeline compiles into one autonomous segment.
-# The 3 dimension reviews all depend only on `summarize`, so they share a dependency
-# rank and the compiler emits them as ONE concurrent parallel([...]) batch — they run
-# at the same time, not serially (see DAG-RULES.md §12, Intra-segment parallelism).
+# This is a REUSABLE COMPONENT: it produces the review and ENDS at `synthesize`. The
+# terminal human action (decide what to do with the report, post it to a PR/MR) is a
+# SEPARATE concern owned by whatever workflow incorporates this one — see the "caller owns
+# the terminal decision" skeleton in DAG-RULES.md §14. Invoked on its own, the dispatcher's
+# Finish step presents the synthesized report to the user.
+#
+# Compiles to ONE autonomous background segment, ZERO checkpoints (summarize -> 3 sibling
+# dimension reviews -> collect -> verify fan-out -> synthesize): no gate, no orchestrator
+# node, no loop, so it composes cleanly when nested. The 3 dimension reviews all depend only
+# on `summarize`, so they share a dependency rank and the compiler emits them as ONE
+# concurrent parallel([...]) batch — they run at the same time, not serially (see
+# DAG-RULES.md §12, Intra-segment parallelism). They share `phase_group: review`, so they
+# render under one "review" group in the /workflows window.
 nodes:
   # Seg 1: summarize the diff into a structured, file-grouped summary that grounds every
   # downstream review. Whole summary object is reused as change_summary by each dimension
@@ -59,6 +61,7 @@ nodes:
   - id: review_correctness
     use: review-dimension
     customize: { profile: base }
+    phase_group: review
     depends_on: [summarize]
     inputs:
       diff: ${workflow.inputs.diff}
@@ -69,6 +72,7 @@ nodes:
   - id: review_security
     use: review-dimension
     customize: { profile: security }
+    phase_group: review
     depends_on: [summarize]
     inputs:
       diff: ${workflow.inputs.diff}
@@ -79,6 +83,7 @@ nodes:
   - id: review_performance
     use: review-dimension
     customize: { profile: performance }
+    phase_group: review
     depends_on: [summarize]
     inputs:
       diff: ${workflow.inputs.diff}
@@ -135,38 +140,8 @@ nodes:
         report_markdown: { type: string }
         findings: { type: array }
 
-  # Checkpoint (orchestrator): post the synthesized report to the PR/MR. Runs in the main loop
-  # only (filesystem/CLI side effect + possible AskUserQuestion). Guarded on the gate choice via
-  # ${review_report_gate.output.choice} (a gate-id ref — accepted by validate, implies no edge),
-  # so it runs only when the human chose `post`. Orchestrator nodes thread data through the
-  # prompt, not an inputs map.
-  - id: post
-    delegation: orchestrator
-    when: ${review_report_gate.output.choice == 'post'}
-    depends_on: [synthesize]
-    prompt: >
-      The human approved posting the synthesized code review. Post the report markdown
-      (${synthesize.output.report_markdown}) to the PR/MR identified by
-      ${workflow.inputs.post_target} using the gh CLI (e.g.
-      `gh pr comment ${workflow.inputs.post_target} --body-file -`) or, if gh is
-      unavailable, the equivalent git CLI / forge command. If ${workflow.inputs.post_target}
-      is empty, AskUserQuestion for the target before posting. Report the resulting
-      comment URL.
-
-# Human-approval gate after synthesize: segment boundary. The dispatcher renders the synthesize
-# output (verdict, blocker count, report_markdown) above this prompt; the human picks one option.
-# `post` continues to the post node; `save_only` returns the report without posting; `abandon` stops.
-gates:
-  - id: review_report_gate
-    after: synthesize
-    type: human_approval
-    severity: hard
-    prompt: >
-      Review the synthesized code review shown above (overall verdict, blocker count, and the
-      severity-grouped markdown report). Choose post to comment it on the PR/MR target, save_only
-      to keep the report without posting, or abandon to stop.
-    options: [post, save_only, abandon]
-
-# The workflow output is the synthesized review.
+# The workflow output IS the synthesized review. Its verdict / blocker_count / report_markdown /
+# findings form the output contract a caller consumes — the caller decides whether to post it,
+# loop on it, or present it. This component never posts or pauses for a human itself.
 output:
   from: synthesize

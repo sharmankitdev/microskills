@@ -251,6 +251,15 @@ def main():
     gate_id_set = {g.get("id") for g in (merged.get("gates") or [])
                    if isinstance(g, dict) and g.get("id")}
 
+    # phase_group is a cosmetic /workflows progress-group label (emit-only). A
+    # phase_group equal to a node id would merge that group's box with the node's own
+    # box — deterministic but surprising; warn, never block.
+    for nid, n in node_by_id.items():
+        pg = n.get("phase_group")
+        if pg and pg in id_set:
+            add(issues, "warn", f"nodes/{nid}",
+                f"phase_group '{pg}' collides with node id '{pg}'; their /workflows progress boxes will merge")
+
     # --- Per-node shape + ref-completeness ---
     for nid, n in node_by_id.items():
         has_use = bool(n.get("use"))
