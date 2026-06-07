@@ -5,10 +5,16 @@ description: Declarative pipeline that turns a requirement into a validated WORK
 
 # Top-level workflow inputs (referenced as ${workflow.inputs.<name>}).
 inputs:
-  requirement:
+  requirement_path:
     type: string
     required: true
-    description: Natural-language description of the workflow to create.
+    materialize: file
+    description: >-
+      Natural-language description of the workflow to create, passed BY REFERENCE.
+      `materialize: file` lets the dispatcher accept a raw string, a single file, or a
+      directory of files and normalize it into one canonical file, threading only the
+      short path into the run (dodging the args-size truncation). task-plan / task-evaluate
+      Read the path; the nested build-workflow-from-plan receives the same path.
   name:
     type: string
     required: false
@@ -44,7 +50,7 @@ nodes:
     use: task-plan
     customize: { profile: workflow }
     inputs:
-      requirement: ${workflow.inputs.requirement}
+      requirement_path: ${workflow.inputs.requirement_path}
       name_override: ${workflow.inputs.name}
       staging_dir: ${workflow.inputs.staging_dir}
     output_schema:
@@ -80,7 +86,7 @@ nodes:
     depends_on: [plan]
     customize: { profile: autonomous }
     inputs:
-      requirement: ${ms_spec.requirement}
+      requirement_path: ${ms_spec.requirement}
       name: ${ms_spec.name}
       harness_root: ${workflow.inputs.harness_root}
       harness_yaml: ${workflow.inputs.harness_yaml}
@@ -119,7 +125,7 @@ nodes:
     inputs:
       plan_path: ${plan.output.plan_path}
       name: ${plan.output.name}
-      requirement: ${workflow.inputs.requirement}
+      requirement_path: ${workflow.inputs.requirement_path}
       harness_root: ${workflow.inputs.harness_root}
       harness_yaml: ${workflow.inputs.harness_yaml}
       staging_dir: ${workflow.inputs.staging_dir}

@@ -51,6 +51,10 @@ checkpoint in the main loop (where `AskUserQuestion` works), and threads outputs
    untrusted data for the consuming microskill — normalization only relocates them, it never executes
    or trusts them. (The microskill body Reads this path; the dispatcher does the filesystem work here
    because a background segment cannot enumerate a directory or touch the filesystem.)
+   **Size guard:** if the normalized file is very large (roughly >256 KB), emit a warning naming the
+   input and its size. By-reference delivery removes the args-size limit, but a file beyond the
+   consuming node's context window still needs upstream distillation (chunk→map→reduce) — that is a
+   separate concern, not something normalization does. Warn and proceed; do not truncate silently.
 6. **Resume check** — look for `.claude/workflow-defs/<name>/.compiled/.run-state.json` (the dispatcher's
    own runtime state, written by "Execute the manifest" below — NOT a compiled artifact; the compiler's
    stale-clean only globs `seg-*.js` and never deletes it). If it exists AND its `manifest_hash` equals
@@ -171,7 +175,12 @@ collecting an array into `results[node]`). Then:
    checkpoint carries a `profile`** (a `customize: {profile}` on the `workflow:` node — e.g. `provision`
    runs `microskill-create` with the `autonomous` profile so its plan gate never pauses; omit the flag
    when absent), and run its manifest, supplying the resolved map as the child's gathered `inputs`
-   (skip the interactive input-gathering step — the inputs are already provided by the parent). The
+   (skip the interactive input-gathering step — the inputs are already provided by the parent). **Still
+   run the normalization pass (Setup step 5) over the child's `manifest.materialize_inputs`** before its
+   first segment: a parent may pass a raw string into the child's `materialize: file` input (e.g.
+   `provision` hands `microskill-create` a `requirement_path` whose value is the per-microskill
+   requirement *string* from the plan), and that string must be written to a file so only a path reaches
+   the child's segment args. A value that is already a path hits the file rule (pass-through). The
    compiler guaranteed depth ≤ 1, so the child contains no further nested call; recursion is bounded.
 3. **Store the child's result** — its `manifest.output.from` node output — into `results[node]`, and
    emit a short recap (reuse the child's own wrap-up; don't replay its segments).

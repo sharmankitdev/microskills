@@ -1786,3 +1786,13 @@ def test_materialize_inputs_empty_when_none(tmp_path):
     rc, data, out, err = run("plain-skill", skill_root=tmp_path)
     assert rc == 0, err
     assert data["materialize_inputs"] == []
+
+
+def test_real_task_plan_requirement_is_by_reference():
+    # The shared task-plan microskill carries the requirement BY REFERENCE:
+    # requirement_path is required + materialized; the old inline requirement is gone.
+    rc, data, out, err = run("task-plan", skill_root=REAL_MICROSKILLS_ROOT)
+    assert rc == 0, err
+    assert "requirement_path" in data["required_inputs"]
+    assert "requirement" not in data["required_inputs"]
+    assert data["materialize_inputs"] == ["requirement_path"]

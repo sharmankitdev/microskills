@@ -20,10 +20,15 @@ inputs:
     type: string
     required: true
     description: Target workflow name (kebab-case) the implementer staged under <staging_dir>/<name>/.
-  requirement:
+  requirement_path:
     type: string
     required: true
-    description: The originating requirement — the evaluator's semantic ground truth.
+    materialize: file
+    description: >-
+      The originating requirement — the evaluator's semantic ground truth — passed BY
+      REFERENCE. `materialize: file` lets the dispatcher normalize a raw string, a single
+      file, or a directory into one canonical file and thread only the short path; a
+      caller passing an already-normalized path hits the file rule (pass-through). task-evaluate Reads it.
   harness_root:
     type: string
     required: false
@@ -67,7 +72,7 @@ nodes:
     depends_on: [implement]
     inputs:
       staging_paths: ${implement.output.staging_paths}
-      requirement: ${workflow.inputs.requirement}
+      requirement_path: ${workflow.inputs.requirement_path}
       plan_path: ${workflow.inputs.plan_path}
       name: ${workflow.inputs.name}
       staging_base: ${workflow.inputs.staging_dir}
