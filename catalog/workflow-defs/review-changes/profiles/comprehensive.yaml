@@ -19,7 +19,7 @@ nodes:
       phase_group: review
       depends_on: [summarize]
       inputs:
-        diff: ${workflow.inputs.diff}
+        diff_path: ${workflow.inputs.diff_path}
         change_summary: ${summarize.output}
     - id: review_documentation
       use: review-dimension
@@ -27,7 +27,7 @@ nodes:
       phase_group: review
       depends_on: [summarize]
       inputs:
-        diff: ${workflow.inputs.diff}
+        diff_path: ${workflow.inputs.diff_path}
         change_summary: ${summarize.output}
     - id: review_test_coverage
       use: review-dimension
@@ -35,7 +35,7 @@ nodes:
       phase_group: review
       depends_on: [summarize]
       inputs:
-        diff: ${workflow.inputs.diff}
+        diff_path: ${workflow.inputs.diff_path}
         change_summary: ${summarize.output}
         threshold: ${workflow.inputs.min_coverage}
   patch:
