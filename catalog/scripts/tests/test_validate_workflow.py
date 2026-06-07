@@ -1272,9 +1272,26 @@ def test_phase_group_validates_clean(tmp_path):
 
 
 def test_phase_group_id_collision_warns(tmp_path):
-    # A phase_group equal to a node id warns (boxes would merge) but does not block.
+    # A phase_group equal to ANOTHER node's id warns (boxes would merge) but does not block.
     body = PHASE_GROUP.replace("phase_group: review", "phase_group: a")
     rc, data, _ = run(write_wf(tmp_path, body))
     assert rc == 0 and data["pass"] is True
     assert any(i["severity"] == "warn" and "collides with node id" in i["message"]
                for i in data["issues"])
+
+
+def test_phase_group_equal_to_own_id_does_not_warn(tmp_path):
+    # A node whose phase_group equals its OWN id is a no-op (its default group already
+    # IS its id) — nothing merges, so it must NOT warn (no false positive).
+    body = """\
+version: 1
+name: pg-self
+nodes:
+  - id: a
+    agent: some-agent
+    phase_group: a
+    prompt: do a
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 0 and data["pass"] is True
+    assert not any("collides with node id" in i["message"] for i in data["issues"])
