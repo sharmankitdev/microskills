@@ -1625,3 +1625,156 @@ def test_review_changes_dimension_reviews_parallelize(tmp_path):
     assert ("const [n_review_correctness, n_review_security, n_review_performance] "
             "= await parallel([") in seg
     assert "const n_review_security = await" not in seg   # not a serial sibling
+
+
+# --- phase_group: cosmetic /workflows grouping (emit-only, manifest_hash-safe) ---
+SIBLINGS_PG = """\
+version: 1
+name: sibpg-flow
+nodes:
+  - id: a
+    agent: ag
+    prompt: do a
+  - id: rb
+    agent: ag
+    phase_group: review
+    depends_on: [a]
+    prompt: use ${a.output.x}
+  - id: rc
+    agent: ag
+    phase_group: review
+    depends_on: [a]
+    prompt: also ${a.output.x}
+  - id: rd
+    agent: ag
+    phase_group: review
+    depends_on: [a]
+    prompt: more ${a.output.x}
+"""
+
+
+def test_phase_group_dedupes_meta_phases(tmp_path):
+    # The three phase_group: review siblings collapse to ONE meta.phases title.
+    d = make_flow(tmp_path, "sibpg-flow", SIBLINGS_PG)
+    rc, data, out, err = run(tmp_path, "sibpg-flow")
+    assert rc == 0, err
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert seg.count('{ title: "review" }') == 1     # deduped to one group
+    assert '{ title: "a" }' in seg                    # the upstream node keeps its own
+    assert '{ title: "rb" }' not in seg               # individual ids collapsed away
+    assert '{ title: "rc" }' not in seg
+
+
+def test_phase_group_baked_into_each_call(tmp_path):
+    # Each sibling's runAgent carries phase:"review" (the per-call opt is what the
+    # /workflows engine groups by inside a parallel batch).
+    d = make_flow(tmp_path, "sibpg-flow", SIBLINGS_PG)
+    run(tmp_path, "sibpg-flow")
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert '"review", "node:rb")' in seg
+    assert '"review", "node:rc")' in seg
+    assert '"review", "node:rd")' in seg
+
+
+def test_phase_group_multi_node_rank_no_marker(tmp_path):
+    # A multi-node rank emits NO inline phase() marker (race-prone inside parallel);
+    # grouping rides the per-call opt. The single-node `a` rank still gets its marker.
+    d = make_flow(tmp_path, "sibpg-flow", SIBLINGS_PG)
+    run(tmp_path, "sibpg-flow")
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert 'phase("review")' not in seg              # no marker before the batch
+    assert 'phase("a")' in seg                        # single-node rank keeps its marker
+    assert "const [n_rb, n_rc, n_rd] = await parallel([" in seg
+
+
+def test_phase_group_manifest_hash_unchanged(tmp_path):
+    # phase_group lives only in seg bytes, never the manifest → manifest_hash is
+    # identical with vs without it (the determinism guarantee), while seg bytes differ.
+    # Mutate the SAME def in place so the (absolute, path-embedding) manifest is held
+    # constant except for phase_group.
+    d = make_flow(tmp_path, "sibpg-flow", SIBLINGS_PG)
+    rc1, data1, *_ = run(tmp_path, "sibpg-flow", "--explain")
+    seg_pg = (d / ".compiled" / "seg-1.js").read_text()
+    (d / "WORKFLOW.yaml").write_text(SIBLINGS_PG.replace("    phase_group: review\n", ""))
+    rc2, data2, *_ = run(tmp_path, "sibpg-flow", "--explain")
+    assert rc1 == 0 and rc2 == 0
+    assert data1["manifest_hash"] == data2["manifest_hash"]      # manifest untouched
+    seg_no = (d / ".compiled" / "seg-1.js").read_text()
+    assert seg_pg != seg_no                                       # emit bytes differ
+
+
+def test_phase_group_byte_deterministic(tmp_path):
+    d = make_flow(tmp_path, "sibpg-flow", SIBLINGS_PG)
+    run(tmp_path, "sibpg-flow")
+    first = (d / ".compiled" / "seg-1.js").read_text()
+    run(tmp_path, "sibpg-flow")
+    assert (d / ".compiled" / "seg-1.js").read_text() == first
+    d2 = make_flow(tmp_path / "b", "sibpg-flow", SIBLINGS_PG)
+    run(tmp_path / "b", "sibpg-flow")
+    assert (d2 / ".compiled" / "seg-1.js").read_text() == first
+
+
+SINGLE_PG = """\
+version: 1
+name: singlepg-flow
+nodes:
+  - id: a
+    agent: ag
+    phase_group: foo
+    prompt: do a
+  - id: b
+    agent: ag
+    depends_on: [a]
+    prompt: use ${a.output.x}
+"""
+
+
+def test_single_node_phase_group_marker(tmp_path):
+    # A lone (single-node-rank) node with a phase_group emits phase("<group>") and
+    # surfaces the group in meta.phases.
+    d = make_flow(tmp_path, "singlepg-flow", SINGLE_PG)
+    rc, data, out, err = run(tmp_path, "singlepg-flow")
+    assert rc == 0, err
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert 'phase("foo")' in seg
+    assert 'phase("a")' not in seg
+    assert '{ title: "foo" }' in seg
+    assert '"foo", "node:a")' in seg                  # per-call opt also carries the group
+
+
+# --- review-changes: pure-pipeline strip + lite / comprehensive profiles (real def) ---
+def test_review_changes_base_is_pure_pipeline(tmp_path):
+    # After the strip, base review-changes is ONE background segment with ZERO
+    # checkpoints (no gate, no post) — it ends at synthesize and composes clean when nested.
+    rc, data, out, err = run(REAL_DEFS, "review-changes")
+    assert rc == 0, err
+    assert data["segments"] == 1 and data["checkpoints"] == 0
+    assert data["sequence"] == [
+        "segment[summarize,review_correctness,review_security,"
+        "review_performance,collect,verify,synthesize]"]
+
+
+def test_review_changes_lite_profile_is_correctness_only(tmp_path):
+    # lite removes the security + performance dimension nodes and unwires collect.
+    rc, data, out, err = run(REAL_DEFS, "review-changes", "--profile", "lite")
+    assert rc == 0, err
+    assert data["segments"] == 1 and data["checkpoints"] == 0
+    seq = data["sequence"][0]
+    assert "review_correctness" in seq
+    assert "review_security" not in seq and "review_performance" not in seq
+
+
+def test_review_changes_comprehensive_profile_six_dimensions(tmp_path):
+    # comprehensive adds style/documentation/test_coverage — six dimensions under ONE
+    # "review" group — plus the configurable min_coverage input (default 80).
+    rc, data, out, err = run(REAL_DEFS, "review-changes", "--profile", "comprehensive", "--explain")
+    assert rc == 0, err
+    seg = (REAL_DEFS / "review-changes" / ".compiled" / "seg-1.js").read_text()
+    assert ("const [n_review_correctness, n_review_security, n_review_performance, "
+            "n_review_style, n_review_documentation, n_review_test_coverage] "
+            "= await parallel([") in seg
+    assert seg.count('{ title: "review" }') == 1          # all six collapse to one group
+    assert 'phase("review")' not in seg                    # per-call opt, no racey marker
+    assert '"threshold": _args.wf_min_coverage' in seg     # coverage threshold threaded in
+    man = json.loads((REAL_DEFS / "review-changes" / ".compiled" / "manifest.json").read_text())
+    assert man["input_defaults"].get("min_coverage") == 80

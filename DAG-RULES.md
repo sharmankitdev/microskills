@@ -675,6 +675,21 @@ why they're siblings and not a fan-out). Rules and guarantees:
 - This is purely an *emit* optimization: it never moves a node across a segment boundary, never
   changes the `sequence` / partition, and so leaves `manifest.json` (and `manifest_hash`) untouched.
 
+### Progress grouping — `phase_group`
+
+Each node renders under a `/workflows` progress group named by its **id** by default. An optional node
+field **`phase_group: <label>`** overrides that: every node sharing a `phase_group` renders under one group
+box. The label is the per-call `phase` opt baked into the node's `runMicroskill`/`runAgent` call, and
+`meta.phases` de-dupes to one entry per distinct group. For an independent-sibling rank whose members all
+share a `phase_group` (e.g. `review-changes`'s three dimension reviews carry `phase_group: review`), that
+per-call opt is what groups them — the compiler emits **no** inline `phase()` marker for a multi-node rank
+(the global `phase()` marker races inside a `parallel([...])` batch); a single-node rank keeps its
+`phase(<group>)` marker.
+
+`phase_group` is **emit-only**: it changes the segment's phase markers / `meta.phases`, never the manifest,
+so it leaves `manifest.json` and `manifest_hash` untouched (recompiling with vs without it yields the same
+hash). A `phase_group` whose value equals a node id is a **warn** (the two boxes would merge), never a block.
+
 ### Runtime threading (what the dispatcher does)
 
 For each manifest step in order:
@@ -969,6 +984,51 @@ output: { from: build }
 ```
 > `build` carries `for_each`/`as` like any node; with `validate-workflow --defs-root <dir>` the child's
 > required inputs are checked against this node's `inputs`, and depth>1 / import cycles are blocked.
+
+**Caller owns the terminal decision — nest a pure review component, then branch on its verdict →
+`nested_workflow(review)` · orchestrator(review_decision) · orchestrator(post):** a reusable review
+component (e.g. `review-changes`) deliberately **ends at its synthesis node** — it *produces* the review and
+never asks a human or posts. A caller that wants to *act* on the result owns that policy: nest the review,
+then an orchestrator node renders the report and asks the human **verdict-appropriate** options, and a
+declarative `post` node fires on the recorded choice.
+```yaml
+name: pr-review
+imports: [review-changes]
+inputs:
+  diff: { type: string, required: true }
+  post_target: { type: string, required: false }
+nodes:
+  - id: review                          # nested pure-pipeline review — a checkpoint, ends at synthesize
+    workflow: review-changes
+    inputs:
+      diff: ${workflow.inputs.diff}     # block style — ${...} can't sit in a { } flow map
+  - id: review_decision                 # orchestrator: prompt IS ${...}-resolved + can AskUserQuestion
+    delegation: orchestrator
+    depends_on: [review]
+    prompt: >
+      Render the review report (${review.output.report_markdown}); verdict
+      ${review.output.verdict}, ${review.output.blocker_count} blocker(s). Then AskUserQuestion with
+      options that fit the verdict — request_changes -> "Show blockers to fix" / "Post anyway" /
+      "Don't post"; approve|comment -> "Post to PR" / "Don't post". For "Show blockers to fix", list
+      the blocker findings from ${review.output.findings} and stop. Return ONLY
+      {"choice":"<the selected label, verbatim>"}.
+  - id: post                            # declarative side-effect, guarded on the recorded choice
+    delegation: orchestrator
+    when: ${review_decision.output.choice == 'Post to PR' || review_decision.output.choice == 'Post anyway'}
+    depends_on: [review, review_decision]
+    prompt: >
+      Post ${review.output.report_markdown} to ${workflow.inputs.post_target} via the gh CLI.
+output: { from: review }
+```
+> **Why an orchestrator node, not a gate:** a gate can't vary its prompt/options by an upstream verdict —
+> gate `prompt`/`options` are static and never `${...}`-resolved (§8). An orchestrator node's prompt IS
+> resolved and it can call `AskUserQuestion`, so verdict-conditional prompting lives there. **Soft
+> contract:** an orchestrator checkpoint has no `output_schema`, so the `{choice}` shape and the
+> option-label ↔ `when`-literal coupling are enforced by prompt discipline, not validation — keep the
+> AskUserQuestion labels and the `when` strings a single hand-maintained set (a typo silently dead-ends a
+> branch). **Caveat:** a `workflow:` node is *always* a checkpoint, so a declarative `loop:` can't wrap the
+> nested review (loop-contiguity, §9) — a fix→re-run cycle is orchestrator/human-driven (re-invoke on a
+> fresh diff), not an engine loop.
 
 ---
 

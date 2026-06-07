@@ -1,0 +1,21 @@
+version: 1
+
+# Documentation dimension overlay for review-dimension. Overrides only the active
+# dimension and its rubric snippet; output_schema, inputs, the body, and the default
+# model are inherited from base.
+vars:
+  dimension: documentation
+
+context:
+  snippets:
+    - name: documentation-rubric
+      text: >-
+        Documentation rubric: flag only defects in the documentation that ships
+        with the change — public functions, classes, or modules added or changed
+        without docstrings, or with docstrings that no longer match the signature
+        or behavior; outdated or contradictory inline comments left beside changed
+        code; README, changelog, or usage docs that drift from the new behavior;
+        new configuration, flags, or environment variables left undocumented;
+        public API or breaking changes with no migration note; examples or code
+        samples that no longer reflect the current API. Do not raise correctness,
+        security, performance, or style-only concerns under this rubric.

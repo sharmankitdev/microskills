@@ -480,7 +480,9 @@ def node_call_js(node, seg_var_ids, indent="  ", declare=True, track_ran=False, 
     nid = node["id"]
     var = jsvar(nid)
     kw = "const " if declare else ""
-    phase = nid
+    # A node's progress group is its phase_group (if set) else its id; nodes sharing
+    # a phase_group render under one /workflows box. Emit-only — never in the manifest.
+    phase = node.get("phase_group") or nid
     # An EXPLICIT node-level output_schema always wins; otherwise a use: node
     # inherits the microskill's resolved schema stashed on _exec_schema by classify().
     # (_exec_schema is None when no microskill schema survived profile resolution.)
@@ -607,7 +609,16 @@ def emit_segment_js(seg_nodes, wf, loop, seg_index):
         for expr in ((loop or {}).get("carry") or {}).values():
             needs.scan(expr, seg_var_ids)
 
-    phases = ", ".join(f'{{ title: {json.dumps(i)} }}' for i in seg_ids)
+    # meta.phases: one entry per distinct progress group, in byte-stable topo order.
+    # A node's group is its phase_group (if set) else its id; nodes sharing a
+    # phase_group collapse to a single title (first-occurrence dedup).
+    _seen_ph, _phase_titles = set(), []
+    for _n in seg_nodes:
+        _p = _n.get("phase_group") or _n["id"]
+        if _p not in _seen_ph:
+            _seen_ph.add(_p)
+            _phase_titles.append(_p)
+    phases = ", ".join(f'{{ title: {json.dumps(t)} }}' for t in _phase_titles)
     name = f'{wf["name"]}__seg{seg_index}'
     head = (f"export const meta = {{\n"
             f"  name: {json.dumps(name)},\n"
@@ -664,7 +675,7 @@ def emit_segment_js(seg_nodes, wf, loop, seg_index):
         for layer in rank_partition(seg_nodes):
             if len(layer) == 1:
                 n = node_by_id[layer[0]]
-                calls += f"phase({json.dumps(n['id'])})\n"
+                calls += f"phase({json.dumps(n.get('phase_group') or n['id'])})\n"
                 calls += node_call_js(n, seg_var_ids, indent="").lstrip()
             else:
                 thunks = ",\n  ".join(
