@@ -49,8 +49,12 @@ checkpoint in the main loop (where `AskUserQuestion` works), and threads outputs
      case) → use the **Write tool** (NOT Bash) to write `v` verbatim to `<compiled_dir>/run-inputs/<name>`;
      the content is a structured tool parameter, never a shell argument. That file's path is `<path>`.
    - **`v` is a filesystem path the caller supplied** (a file or directory) → that path is `<path>`
-     (short and caller-chosen; pass it double-quoted).
-   Then run `.claude/scripts/normalize-input --value "<path>" --out "<compiled_dir>/run-inputs/<name>.cat"`
+     (short and caller-chosen).
+   Pass `<path>` to Bash in **single quotes** (`'<path>'`) — single quotes suppress `$(...)`, backtick,
+   and `$var` expansion that double quotes do NOT — and first **reject any path containing a shell
+   metacharacter** (`$`, backtick, `"`, `'`, `\`, or a newline): refuse it rather than interpolate, so
+   even a trusted-but-odd path can never expand. (Dispatcher-written run-inputs paths never contain these.)
+   Then run `.claude/scripts/normalize-input --value '<path>' --out '<compiled_dir>/run-inputs/<name>.cat'`
    via Bash (it `mkdir -p`s as needed). It receives only PATHS, never content: a **directory** → a
    byte-stable concatenation (codepoint-sorted relpaths under `=== <relpath> ===` headers, self-excluding
    `--out`); a **file** → its absolute path (pass-through, no copy). Parse the JSON `{path, shape, bytes,

@@ -17,8 +17,9 @@ resulting PATH is passed here. This is what closes the command-injection vector:
 Shapes (both are paths):
   - directory -> concatenate every file under it, in byte-stable relative-path order
     (codepoint sort == C locale for ASCII), each under a `=== <relpath> ===` header, then
-    its contents, then a trailing newline. Written to --out. (The --out file is excluded
-    from the walk so a destination inside the source dir cannot self-include.)
+    its contents, then a trailing newline. Written to --out. Symlinked files and subdirs
+    are skipped (never followed outside the tree), and --out is excluded by inode identity
+    so a destination inside the source dir cannot self-include.
   - file      -> pass through: return the file's own absolute path (no copy).
 
 The file CONTENTS remain untrusted data for the consuming microskill — this only relocates
@@ -36,13 +37,26 @@ WARN_BYTES = 256 * 1024  # by-reference fixes delivery, not a file beyond the no
 def normalize(value, out):
     out = os.path.abspath(out)
     if os.path.isdir(value):
-        out_real = os.path.realpath(out)
-        rels = sorted(
-            os.path.relpath(os.path.join(dp, fn), value)
-            for dp, _dns, fns in os.walk(value)
-            for fn in fns
-            if os.path.realpath(os.path.join(dp, fn)) != out_real  # never self-include --out
-        )
+        # Identify --out once by (st_dev, st_ino) so it is excluded from the walk even if it
+        # lives inside the source dir — one stat, no per-file realpath. os.walk(followlinks=
+        # False, the default) already skips symlinked SUBDIRS; we also skip symlinked FILES
+        # so a `secret -> /etc/passwd` link in the caller dir is never followed via open().
+        out_id = None
+        if os.path.exists(out):
+            st = os.stat(out)
+            out_id = (st.st_dev, st.st_ino)
+        rels = []
+        for dp, _dns, fns in os.walk(value):
+            for fn in fns:
+                full = os.path.join(dp, fn)
+                if os.path.islink(full):
+                    continue  # never follow a symlinked file (it could target outside the dir)
+                if out_id is not None:
+                    st = os.stat(full)
+                    if (st.st_dev, st.st_ino) == out_id:
+                        continue  # exclude --out itself
+                rels.append(os.path.relpath(full, value))
+        rels.sort()
         os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
         with open(out, "w", encoding="utf-8") as o:
             for rel in rels:

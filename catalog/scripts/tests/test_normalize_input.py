@@ -90,6 +90,22 @@ def test_directory_out_inside_source_is_not_self_included(tmp_path):
     assert out.read_text() == "=== a.txt ===\nA\n=== b.txt ===\nB\n"  # out.txt excluded
 
 
+def test_directory_skips_symlinked_files(tmp_path):
+    # A symlinked file in the source dir must NOT be followed (it could target /etc/passwd
+    # or anything outside the tree). Only the real file is concatenated.
+    secret = tmp_path / "outside.txt"
+    secret.write_text("SECRET-OUTSIDE")
+    d = tmp_path / "specs"
+    d.mkdir()
+    (d / "real.txt").write_text("real")
+    (d / "leak").symlink_to(secret)  # symlinked FILE pointing outside the dir
+    out = tmp_path / "cat.txt"
+    rc, data, _o, err = run(d, out)
+    assert rc == 0, err
+    assert out.read_text() == "=== real.txt ===\nreal\n"  # leak excluded
+    assert "SECRET-OUTSIDE" not in out.read_text()
+
+
 def test_size_guard_warns_on_large_file(tmp_path):
     big = tmp_path / "huge.diff"
     big.write_text("y" * (256 * 1024 + 10))
