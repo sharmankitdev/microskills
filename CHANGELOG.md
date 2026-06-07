@@ -1,3 +1,9 @@
+## [0.8.0](https://github.com/sharmankitdev/microskills/compare/v0.7.0...v0.8.0) (2026-06-07)
+
+### Features
+
+* **workflow:** pass large inputs by reference via materialize:file ([#12](https://github.com/sharmankitdev/microskills/issues/12)) ([00488c9](https://github.com/sharmankitdev/microskills/commit/00488c9bf6aec0f4d7221258bbccc1f9b6c7106b))
+
 ## [0.7.0](https://github.com/sharmankitdev/microskills/compare/v0.6.0...v0.7.0) (2026-06-07)
 
 ### Features
