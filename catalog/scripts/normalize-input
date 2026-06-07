@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+"""normalize-input — turn a large / multi-shape input (a literal string, a single file,
+or a directory of files) into ONE canonical file and print its absolute path as JSON.
+
+The workflow/microskill dispatchers call this for every `materialize: file` input so the
+normalization LOGIC — deterministic directory concatenation, string materialization, and
+the size guard — is tested code rather than dispatcher prose. In particular the
+string->file path (e.g. workflow-create's `provision` handing nested microskill-create a
+requirement STRING) is exercised by this script's tests, not left to an unenforced
+invariant. See catalog/skills/{workflow,microskill}/SKILL.md.
+
+Shape detection runs on the VALUE:
+  - directory -> concatenate every file under it, in byte-stable relative-path order
+    (codepoint sort == C locale for ASCII), each preceded by a `=== <relpath> ===`
+    header line then its contents then a trailing newline. Written to --out.
+  - file      -> pass through: return the file's own absolute path (no copy).
+  - else      -> treat the value as a literal string; write it verbatim to --out.
+
+The value's CONTENTS remain untrusted data for the consuming microskill — this only
+relocates them, never executes or trusts them. Output JSON: {path, shape, bytes, warning}.
+"""
+import argparse
+import json
+import os
+import sys
+
+WARN_BYTES = 256 * 1024  # by-reference fixes delivery, not a file beyond the node's context window
+
+
+def normalize(value, out):
+    out = os.path.abspath(out)
+    if os.path.isdir(value):
+        shape = "dir"
+        rels = sorted(
+            os.path.relpath(os.path.join(dp, fn), value)
+            for dp, _dns, fns in os.walk(value)
+            for fn in fns
+        )
+        os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+        with open(out, "w", encoding="utf-8") as o:
+            for rel in rels:
+                o.write(f"=== {rel} ===\n")
+                with open(os.path.join(value, rel), "r", encoding="utf-8", errors="replace") as f:
+                    o.write(f.read())
+                o.write("\n")
+        path = out
+    elif os.path.isfile(value):
+        shape = "file"
+        path = os.path.abspath(value)  # pass-through, no copy
+    else:
+        shape = "string"
+        os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+        with open(out, "w", encoding="utf-8") as o:
+            o.write(value)
+        path = out
+
+    nbytes = os.path.getsize(path)
+    warning = None
+    if nbytes > WARN_BYTES:
+        warning = (
+            f"normalized input '{path}' is {nbytes} bytes (> {WARN_BYTES}); by-reference "
+            f"delivery avoids the args-size truncation, but a file beyond the consuming "
+            f"node's context window needs upstream distillation (chunk->map->reduce) — a "
+            f"separate concern this does not handle"
+        )
+    return {"path": path, "shape": shape, "bytes": nbytes, "warning": warning}
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Normalize a string|file|directory input to one canonical file.")
+    ap.add_argument("--value", required=True,
+                    help="the gathered input value: a directory path, a file path, or a literal string")
+    ap.add_argument("--out", required=True,
+                    help="output file path to write when the value is a directory or a literal string")
+    args = ap.parse_args()
+    try:
+        result = normalize(args.value, args.out)
+    except OSError as e:
+        print(json.dumps({"error": str(e)}))
+        sys.exit(1)
+    print(json.dumps(result))
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

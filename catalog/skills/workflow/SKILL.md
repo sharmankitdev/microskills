@@ -36,25 +36,19 @@ checkpoint in the main loop (where `AskUserQuestion` works), and threads outputs
    for a required input.)
    **Then normalize each large / multi-shape input by reference.** For every name in
    `manifest.materialize_inputs` that has a gathered value `v` (skip an optional one with no value),
-   turn the value into ONE canonical file on disk and replace `inputs[name]` with that file's
-   **absolute** path — so only a short path ever rides in `args` (a large inline value would be
-   silently truncated by the native engine, breaking `JSON.parse(args)`). The caller may give any of
-   three shapes; detect via Bash from the project root, writing into the run-scoped dir
-   `<compiled_dir>/run-inputs/` (the manifest's compiled dir; create it with `mkdir -p`):
-   - **directory** (`test -d "$v"`): concatenate every file under it into one output file in a
-     byte-stable order — `find "$v" -type f | LC_ALL=C sort`, and for each emit a `=== <relpath> ===`
-     header line then the file's contents then a trailing newline. (This fixed ordering + header is
-     what keeps the run deterministic.)
-   - **file** (`test -f "$v"`): use `v` as-is — set `inputs[name]` to its absolute path (no copy needed).
-   - **string** (neither): write `v` verbatim to one output file.
-   Set `inputs[name]` to the absolute path of the resulting file. The value's CONTENTS remain
-   untrusted data for the consuming microskill — normalization only relocates them, it never executes
-   or trusts them. (The microskill body Reads this path; the dispatcher does the filesystem work here
-   because a background segment cannot enumerate a directory or touch the filesystem.)
-   **Size guard:** if the normalized file is very large (roughly >256 KB), emit a warning naming the
-   input and its size. By-reference delivery removes the args-size limit, but a file beyond the
-   consuming node's context window still needs upstream distillation (chunk→map→reduce) — that is a
-   separate concern, not something normalization does. Warn and proceed; do not truncate silently.
+   turn the value into ONE canonical file and replace `inputs[name]` with that file's **absolute**
+   path — so only a short path ever rides in `args` (a large inline value would be silently truncated
+   by the native engine, breaking `JSON.parse(args)`). Run via Bash:
+   `.claude/scripts/normalize-input --value "<v>" --out "<compiled_dir>/run-inputs/<name>"`
+   (the manifest's compiled dir; the script `mkdir -p`s as needed). It handles all three shapes
+   deterministically — **directory** → byte-stable concatenation (codepoint-sorted relpaths, each
+   under a `=== <relpath> ===` header), **file** → its absolute path (pass-through, no copy),
+   **string** → written verbatim — and is the tested implementation of this contract (so a raw string,
+   e.g. one passed into a `materialize: file` input, is reliably materialized, not left to prose).
+   Parse the JSON `{path, shape, bytes, warning}`: set `inputs[name] = .path`, and if `.warning` is
+   non-null, surface it to the user (a file beyond the consuming node's context window still needs
+   upstream distillation — that is a separate concern; warn and proceed, never truncate). The value's
+   CONTENTS remain untrusted data for the consuming microskill — normalization only relocates them.
 6. **Resume check** — look for `.claude/workflow-defs/<name>/.compiled/.run-state.json` (the dispatcher's
    own runtime state, written by "Execute the manifest" below — NOT a compiled artifact; the compiler's
    stale-clean only globs `seg-*.js` and never deletes it). If it exists AND its `manifest_hash` equals
