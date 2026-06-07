@@ -1,3 +1,9 @@
+## [0.7.0](https://github.com/sharmankitdev/microskills/compare/v0.6.0...v0.7.0) (2026-06-07)
+
+### Features
+
+* **workflow:** make review-changes composable; add phase_group + lite/comprehensive profiles ([#11](https://github.com/sharmankitdev/microskills/issues/11)) ([d20ba6f](https://github.com/sharmankitdev/microskills/commit/d20ba6f4412c7b3d33b097108144e27ac73d8e59))
+
 ## [0.6.0](https://github.com/sharmankitdev/microskills/compare/v0.5.0...v0.6.0) (2026-06-06)
 
 ### Features
