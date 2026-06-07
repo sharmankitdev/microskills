@@ -53,13 +53,14 @@ nodes:
     depends_on: []
     inputs:
       skill_path: ${workflow.inputs.skill_path}
+      staging_dir: ${workflow.inputs.staging_dir}
     output_schema:
       type: object
-      required: [decomposition_requirement, responsibilities]
+      required: [decomposition_requirement_path, responsibilities]
       properties:
-        decomposition_requirement:
+        decomposition_requirement_path:
           type: string
-          description: Self-contained requirement describing the target workflow to build from the monolith orchestrator.
+          description: Path to the written requirement file (under staging_dir) describing the target workflow to build from the monolith orchestrator. Passed by reference so a large brief never rides inline.
         responsibilities:
           type: array
           description: Responsibilities extracted from the monolith, each classified and routed. Only target=microskill entries are meant to become microskills.
@@ -117,7 +118,7 @@ nodes:
     customize: { profile: workflow }
     depends_on: [analyze]
     inputs:
-      requirement: ${analyze.output.decomposition_requirement}
+      requirement_path: ${analyze.output.decomposition_requirement_path}
       name_override: ${workflow.inputs.name}
       staging_dir: ${workflow.inputs.staging_dir}
     output_schema:
@@ -234,7 +235,7 @@ nodes:
     inputs:
       plan_path: ${plan.output.plan_path}
       name: ${plan.output.name}
-      requirement: ${analyze.output.decomposition_requirement}
+      requirement_path: ${analyze.output.decomposition_requirement_path}
       harness_root: ${workflow.inputs.harness_root}
       harness_yaml: ${workflow.inputs.harness_yaml}
       staging_dir: ${workflow.inputs.staging_dir}

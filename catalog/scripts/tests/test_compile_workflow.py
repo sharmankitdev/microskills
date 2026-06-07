@@ -1838,3 +1838,31 @@ def test_review_changes_threads_diff_path_by_reference(tmp_path):
     assert "diff_path" in man["required_inputs"]
     assert "diff" not in man["required_inputs"]
     assert man["materialize_inputs"] == ["diff_path"]
+
+
+# --- wave 2: requirement_path by reference across the create pipelines (real defs) ---
+def test_create_pipelines_requirement_by_reference(tmp_path):
+    # microskill-create / workflow-create / build-workflow-from-plan all carry the
+    # requirement BY REFERENCE: manifest required_inputs has requirement_path (not the
+    # old inline requirement) and materialize_inputs lists it.
+    for wf in ("microskill-create", "workflow-create", "build-workflow-from-plan"):
+        rc, data, out, err = run(REAL_DEFS, wf)
+        assert rc == 0, f"{wf}: {err}"
+        man = json.loads((REAL_DEFS / wf / ".compiled" / "manifest.json").read_text())
+        assert "requirement_path" in man["required_inputs"], wf
+        assert "requirement" not in man["required_inputs"], wf
+        assert "requirement_path" in man["materialize_inputs"], wf
+
+
+def test_decompose_analyze_writes_requirement_path_plan_reads_it(tmp_path):
+    # decompose's analyze→plan is one background segment (mechanism b): analyze must
+    # PRODUCE the requirement as a file path (decomposition_requirement_path) and plan
+    # must thread that path into task-plan's requirement_path — so only a short path
+    # rides inline, never the full requirement text.
+    rc, data, out, err = run(REAL_DEFS, "decompose-monolith-orchestrator")
+    assert rc == 0, err
+    assert data["sequence"][0] == "segment[analyze,plan]"
+    seg = (REAL_DEFS / "decompose-monolith-orchestrator" / ".compiled" / "seg-1.js").read_text()
+    assert "decomposition_requirement_path" in seg
+    assert '"requirement_path"' in seg            # plan node consumes the path
+    assert "decomposition_requirement" not in seg.replace("decomposition_requirement_path", "")

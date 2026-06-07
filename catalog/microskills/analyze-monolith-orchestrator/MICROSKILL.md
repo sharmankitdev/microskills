@@ -1,7 +1,7 @@
 ---
 name: analyze-monolith-orchestrator
 base: true
-description: Use when you have a monolith orchestrator SKILL.md — a fat skill bundling many responsibilities and inline steps — and need to decompose it for the microskills pattern. Reads the file at skill_path and produces a structured decomposition brief that classifies each responsibility by control-flow shape, routes only the genuinely atomic ones to microskills (as pure single-action cores), hoists cross-cutting orchestration to the workflow layer, flags required sub-agents, and emits a single planner-ready decomposition_requirement string.
+description: Use when you have a monolith orchestrator SKILL.md — a fat skill bundling many responsibilities and inline steps — and need to decompose it for the microskills pattern. Reads the file at skill_path and produces a structured decomposition brief that classifies each responsibility by control-flow shape, routes only the genuinely atomic ones to microskills (as pure single-action cores), hoists cross-cutting orchestration to the workflow layer, flags required sub-agents, and writes a single planner-ready decomposition requirement to a file under staging_dir, returning its path (decomposition_requirement_path) so a large brief never rides inline.
 ---
 
 # Analyze Monolith Orchestrator
@@ -15,6 +15,7 @@ Given skill_path to a monolith orchestrator SKILL.md, read it and produce a deco
 | Name | Required | Type | Description | Default |
 |---|---|---|---|---|
 | skill_path | yes | string | Filesystem path to the monolith orchestrator SKILL.md to decompose. | — |
+| staging_dir | yes | string | Absolute path to the sandbox dir where the composed decomposition requirement file is written. | — |
 
 ## Steps
 
@@ -27,14 +28,14 @@ Given skill_path to a monolith orchestrator SKILL.md, read it and produce a deco
 7. **Hoist cross-cutting concerns** — Record under hoisted_concerns the orchestration to push to the workflow layer: single re-attempt policy, report-and-ask-the-user handoff, tool-failure fallback, partial-entry self-hydration, and mode selection — each naming its owning node, loop, or gate.
 8. **Detect agent dependencies** — Record under agent_dependencies every sub-agent the monolith names, the responsibility that uses it, and whether it exists under .claude/agents/.
 9. **Resolve nested-workflow needs** — Set exists on every nested_workflow target — true where the monolith invokes an already-available skill, command, or workflow; false where the sub-pipeline is described inline with no standalone unit. Give every false-exists target a workflow-create requirement, and give every nested_workflow target an invoke_target naming the unit the parent's orchestrator node runs.
-10. **Synthesize and return** — Write decomposition_requirement instructing the planner to define a microskill solely from every atomic_core (a pure single-action unit carrying no re-attempt, human pause, fallback, mode fork, or self-hydration), realize every non-atomic responsibility as its assigned construct, realize every nested_workflow target as an orchestrator node that invokes its invoke_target at runtime (never a use: import, never inline-expansion; a missing nested workflow is built via workflow-create before its node), place every hoisted concern on its owning node/loop/gate, provision or port every missing agent_dependency before its node, and preserve the original ordering and human checkpoints; then return the full decomposition brief as JSON.
+10. **Synthesize, write & return** — Compose the decomposition requirement instructing the planner to define a microskill solely from every atomic_core (a pure single-action unit carrying no re-attempt, human pause, fallback, mode fork, or self-hydration), realize every non-atomic responsibility as its assigned construct, realize every nested_workflow target as an orchestrator node that invokes its invoke_target at runtime (never a use: import, never inline-expansion; a missing nested workflow is built via workflow-create before its node), place every hoisted concern on its owning node/loop/gate, provision or port every missing agent_dependency before its node, and preserve the original ordering and human checkpoints. Ensure staging_dir exists, write that composed requirement to `<staging_dir>/decomposition_requirement.md`, then return the full decomposition brief as JSON with decomposition_requirement_path set to that written path.
 
 ## Output
 
-A single JSON object emitted as the skill's result (no prose), conforming to output_schema: decomposition_requirement (planner-ready string), responsibilities (each with name, purpose, shape, target, atomic_core, hoisted_concerns), control_flow, data_flow, agent_dependencies, and nested_workflows (each with name, requirement, exists, invoke_target). Only responsibilities with target=microskill are meant to become microskills; the rest are workflow constructs, and nested_workflow targets become orchestrator-node invokes — built via workflow-create when exists is false, invoked as-is when true.
+A single JSON object emitted as the skill's result (no prose), conforming to output_schema: decomposition_requirement_path (path to the planner-ready requirement file written under staging_dir), responsibilities (each with name, purpose, shape, target, atomic_core, hoisted_concerns), control_flow, data_flow, agent_dependencies, and nested_workflows (each with name, requirement, exists, invoke_target). Only responsibilities with target=microskill are meant to become microskills; the rest are workflow constructs, and nested_workflow targets become orchestrator-node invokes — built via workflow-create when exists is false, invoked as-is when true.
 
 ## Failure modes
 
-- **skill_path missing** — skill_path is missing or blank; stop, name the input, do not proceed.
+- **skill_path missing** — skill_path or staging_dir is missing or blank; stop, name the input, do not proceed.
 - **skill_path unreadable** — skill_path does not exist or is not readable; stop, quote the path, do not proceed.
 - **No decomposable structure** — file read but contains no discernible responsibilities or steps; stop, report that no decomposable structure was found, do not fabricate responsibilities.

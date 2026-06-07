@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+"""normalize-input — turn a multi-shape input PATH (a single file, or a directory of
+files) into ONE canonical file and print its absolute path as JSON.
+
+The workflow/microskill dispatchers call this for every `materialize: file` input so the
+normalization LOGIC — deterministic directory concatenation and the size guard — is tested
+code rather than dispatcher prose.
+
+SECURITY — paths only, never content. `--value` is always a filesystem PATH the caller
+already holds; this script never receives untrusted file/string CONTENT on its argv. A
+literal-string materialize value (e.g. workflow-create's `provision` handing nested
+microskill-create a requirement STRING, or an inline diff) is materialized to a file by the
+dispatcher using the Write tool — its bytes never appear in a shell command — and only the
+resulting PATH is passed here. This is what closes the command-injection vector: untrusted
+`$(...)`, backticks, `$var`, or a stray `"` in the content can never reach a shell.
+
+Shapes (both are paths):
+  - directory -> concatenate every file under it, in byte-stable relative-path order
+    (codepoint sort == C locale for ASCII), each under a `=== <relpath> ===` header, then
+    its contents, then a trailing newline. Written to --out. Symlinked files and subdirs
+    are skipped (never followed outside the tree), and --out is excluded by inode identity
+    so a destination inside the source dir cannot self-include.
+  - file      -> pass through: return the file's own absolute path (no copy).
+
+The file CONTENTS remain untrusted data for the consuming microskill — this only relocates
+them, never executes or trusts them. Output JSON: {path, shape, bytes, warning}.
+"""
+import argparse
+import json
+import os
+import shutil
+import sys
+
+WARN_BYTES = 256 * 1024  # by-reference fixes delivery, not a file beyond the node's context window
+
+
+def normalize(value, out):
+    out = os.path.abspath(out)
+    if os.path.isdir(value):
+        # Identify --out once by (st_dev, st_ino) so it is excluded from the walk even if it
+        # lives inside the source dir — one stat, no per-file realpath. os.walk(followlinks=
+        # False, the default) already skips symlinked SUBDIRS; we also skip symlinked FILES
+        # so a `secret -> /etc/passwd` link in the caller dir is never followed via open().
+        out_id = None
+        if os.path.exists(out):
+            st = os.stat(out)
+            out_id = (st.st_dev, st.st_ino)
+        rels = []
+        for dp, _dns, fns in os.walk(value):
+            for fn in fns:
+                full = os.path.join(dp, fn)
+                if os.path.islink(full):
+                    continue  # never follow a symlinked file (it could target outside the dir)
+                if out_id is not None:
+                    st = os.stat(full)
+                    if (st.st_dev, st.st_ino) == out_id:
+                        continue  # exclude --out itself
+                rels.append(os.path.relpath(full, value))
+        rels.sort()
+        os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+        with open(out, "w", encoding="utf-8") as o:
+            for rel in rels:
+                o.write(f"=== {rel} ===\n")
+                with open(os.path.join(value, rel), "r", encoding="utf-8", errors="replace") as f:
+                    shutil.copyfileobj(f, o)
+                o.write("\n")
+        return _result(out, "dir")
+    if os.path.isfile(value):
+        return _result(os.path.abspath(value), "file")  # pass-through, no copy
+    return {"error": f"--value path does not exist (expected a file or directory): {value}"}
+
+
+def _result(path, shape):
+    nbytes = os.path.getsize(path)
+    warning = None
+    if nbytes > WARN_BYTES:
+        warning = (
+            f"normalized input '{path}' is {nbytes} bytes (> {WARN_BYTES}); by-reference "
+            f"delivery avoids the args-size truncation, but a file beyond the consuming "
+            f"node's context window needs upstream distillation (chunk->map->reduce) — a "
+            f"separate concern this does not handle"
+        )
+    return {"path": path, "shape": shape, "bytes": nbytes, "warning": warning}
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Normalize a file|directory input PATH to one canonical file.")
+    ap.add_argument("--value", required=True,
+                    help="a filesystem PATH: a directory (concatenated) or a file (passed through). "
+                         "Never untrusted content — a literal string is materialized to a file by the "
+                         "dispatcher (Write tool) and its path is passed here.")
+    ap.add_argument("--out", required=True,
+                    help="output file path to write the concatenation to when --value is a directory")
+    args = ap.parse_args()
+    try:
+        result = normalize(args.value, args.out)
+    except OSError as e:
+        print(json.dumps({"error": str(e)}))
+        sys.exit(1)
+    print(json.dumps(result))
+    sys.exit(1 if result.get("error") else 0)
+
+
+if __name__ == "__main__":
+    main()

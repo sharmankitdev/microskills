@@ -1,21 +1,27 @@
 version: 1
 
+# skill_path + staging_dir are both required: the body Reads the monolith at skill_path
+# and Writes the composed requirement under staging_dir, returning its path. No
+# allowed_tools confinement — the skill Reads and Writes, so it stays tool-unrestricted.
 inputs:
   skill_path:
+    required: true
+  staging_dir:
     required: true
 
 output_schema:
   type: object
-  required: [decomposition_requirement, responsibilities]
+  required: [decomposition_requirement_path, responsibilities]
   properties:
-    decomposition_requirement:
+    decomposition_requirement_path:
       type: string
       description: >
-        Self-contained natural-language requirement a workflow planner can consume to
-        rebuild the monolith as a microskill DAG. Instructs the planner to define a
-        microskill only for each atomic_core, realize non-atomic responsibilities as
-        workflow constructs, place hoisted concerns on the wrapping node/loop/gate, and
-        provision missing agent_dependencies.
+        Path to the written requirement file (under staging_dir) holding a self-contained
+        natural-language requirement a workflow planner can consume to rebuild the monolith
+        as a microskill DAG. Passed BY REFERENCE so a large brief never rides inline. The
+        requirement instructs the planner to define a microskill only for each atomic_core,
+        realize non-atomic responsibilities as workflow constructs, place hoisted concerns
+        on the wrapping node/loop/gate, and provision missing agent_dependencies.
     responsibilities:
       type: array
       description: >

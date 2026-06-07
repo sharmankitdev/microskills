@@ -5,10 +5,16 @@ description: Create a microskill from a requirement — plan → human approval 
 
 # Top-level workflow inputs (referenced as ${workflow.inputs.<name>}).
 inputs:
-  requirement:
+  requirement_path:
     type: string
     required: true
-    description: Natural-language description of the microskill to create.
+    materialize: file
+    description: >-
+      Natural-language description of the microskill to create, passed BY REFERENCE.
+      `materialize: file` lets the dispatcher accept a raw string, a single file, or a
+      directory of files and normalize it into one canonical file, threading only the
+      short path into the run (dodging the args-size truncation). task-plan / task-evaluate
+      Read the path.
   name:
     type: string
     required: false
@@ -42,7 +48,7 @@ nodes:
     use: task-plan
     customize: { profile: microskill }
     inputs:
-      requirement: ${workflow.inputs.requirement}
+      requirement_path: ${workflow.inputs.requirement_path}
       name_override: ${workflow.inputs.name}
       staging_dir: ${workflow.inputs.staging_dir}
     output_schema:
@@ -92,7 +98,7 @@ nodes:
     depends_on: [implement, plan]
     inputs:
       staging_paths: ${implement.output.staging_paths}
-      requirement: ${workflow.inputs.requirement}
+      requirement_path: ${workflow.inputs.requirement_path}
       plan_path: ${plan.output.plan_path}
     output_schema:
       type: object

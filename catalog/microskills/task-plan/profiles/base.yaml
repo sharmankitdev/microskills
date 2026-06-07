@@ -5,9 +5,15 @@ version: 1
 vars:
   contract_doc: .claude/workflow-defs/microskill-create/references/planner.md
 
+# `requirement_path` carries the requirement BY REFERENCE: `materialize: file` tells
+# the dispatcher to normalize the caller's string/file/dir into one canonical file and
+# supply only the short path (the body Reads it), dodging the args-size truncation. No
+# allowed_tools confinement here — the planner Reads the contract/requirement AND Writes
+# the plan file, so it must stay tool-unrestricted.
 inputs:
-  requirement:
+  requirement_path:
     required: true
+    materialize: file
   staging_dir:
     required: true
 
