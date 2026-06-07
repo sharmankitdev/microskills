@@ -38,9 +38,11 @@ checkpoint in the main loop (where `AskUserQuestion` works), and threads outputs
    `manifest.materialize_inputs` that has a gathered value `v` (skip an optional one with no value),
    turn the value into ONE canonical file and replace `inputs[name]` with that file's **absolute**
    path — so only a short path ever rides in `args` (a large inline value would be silently truncated
-   by the native engine, breaking `JSON.parse(args)`). Run via Bash:
-   `.claude/scripts/normalize-input --value "<v>" --out "<compiled_dir>/run-inputs/<name>"`
-   (the manifest's compiled dir; the script `mkdir -p`s as needed). It handles all three shapes
+   by the native engine, breaking `JSON.parse(args)`). Run `.claude/scripts/normalize-input` via Bash
+   with `--out "<compiled_dir>/run-inputs/<name>"` (the manifest's compiled dir; the script `mkdir -p`s
+   as needed): when `<v>` is an existing path (dir or file) pass `--value "<v>"`; when it is a literal
+   string pipe it via stdin instead (`printf '%s' "<v>" | .claude/scripts/normalize-input --stdin --out …`)
+   so a large literal value never hits the argv size limit. It handles all three shapes
    deterministically — **directory** → byte-stable concatenation (codepoint-sorted relpaths, each
    under a `=== <relpath> ===` header), **file** → its absolute path (pass-through, no copy),
    **string** → written verbatim — and is the tested implementation of this contract (so a raw string,

@@ -22,15 +22,34 @@ def run(value, out):
     return proc.returncode, data, proc.stdout, proc.stderr
 
 
-def test_string_is_written_to_file(tmp_path):
-    # The provision case: a literal requirement STRING -> a canonical file the body Reads.
+def run_stdin(value, out):
+    # The robust string path: the literal value arrives on stdin, never via argv (which
+    # has a hard ARG_MAX — a large literal string would raise 'Argument list too long').
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPT), "--stdin", "--out", str(out)],
+        input=value, capture_output=True, text=True)
+    data = json.loads(proc.stdout) if proc.stdout.strip().startswith("{") else None
+    return proc.returncode, data, proc.stdout, proc.stderr
+
+
+def test_string_via_stdin_is_written_to_file(tmp_path):
+    # The provision case: a literal requirement STRING (on stdin) -> a canonical file.
     out = tmp_path / "run-inputs" / "requirement_path"
-    rc, data, _o, err = run("a requirement: lint commit messages", out)
+    rc, data, _o, err = run_stdin("a requirement: lint commit messages", out)
     assert rc == 0, err
     assert data["shape"] == "string"
     assert data["path"] == str(out.resolve())
     assert out.read_text() == "a requirement: lint commit messages"
     assert data["warning"] is None
+
+
+def test_small_string_via_value_convenience(tmp_path):
+    # A small literal string is also accepted via --value (CLI convenience).
+    out = tmp_path / "req.txt"
+    rc, data, _o, err = run("small inline requirement", out)
+    assert rc == 0, err
+    assert data["shape"] == "string"
+    assert out.read_text() == "small inline requirement"
 
 
 def test_file_is_passed_through_not_copied(tmp_path):
@@ -74,16 +93,29 @@ def test_directory_concat_is_byte_deterministic(tmp_path):
     assert out1.read_text() == out2.read_text()  # same inputs -> byte-identical
 
 
-def test_size_guard_warns_over_threshold(tmp_path):
+def test_size_guard_warns_over_threshold_via_stdin(tmp_path):
+    # A large literal string flows through stdin (NOT argv — argv would raise
+    # 'Argument list too long' on Linux), and the >256KB guard warns.
     out = tmp_path / "big.txt"
-    rc, data, _o, err = run("x" * (256 * 1024 + 1), out)
+    rc, data, _o, err = run_stdin("x" * (256 * 1024 + 1), out)
     assert rc == 0, err
     assert data["bytes"] > 256 * 1024
     assert data["warning"] is not None and "distillation" in data["warning"]
 
 
+def test_size_guard_warns_on_large_file(tmp_path):
+    # The realistic large-input shape: a big file (pass-through) trips the same guard.
+    big = tmp_path / "huge.diff"
+    big.write_text("y" * (256 * 1024 + 10))
+    out = tmp_path / "ignored"
+    rc, data, _o, err = run(big, out)
+    assert rc == 0, err
+    assert data["shape"] == "file"
+    assert data["warning"] is not None and "distillation" in data["warning"]
+
+
 def test_small_input_no_warning(tmp_path):
     out = tmp_path / "small.txt"
-    rc, data, _o, err = run("tiny", out)
+    rc, data, _o, err = run_stdin("tiny", out)
     assert rc == 0, err
     assert data["warning"] is None
