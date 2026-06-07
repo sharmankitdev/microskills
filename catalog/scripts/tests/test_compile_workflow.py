@@ -1778,3 +1778,63 @@ def test_review_changes_comprehensive_profile_six_dimensions(tmp_path):
     assert '"threshold": _args.wf_min_coverage' in seg     # coverage threshold threaded in
     man = json.loads((REAL_DEFS / "review-changes" / ".compiled" / "manifest.json").read_text())
     assert man["input_defaults"].get("min_coverage") == 80
+
+
+# --- materialize: file — large/multi-shape input passed by reference ---
+MATERIALIZE = """\
+version: 1
+name: mat-flow
+inputs:
+  big_path:
+    type: string
+    required: true
+    materialize: file
+  also_path:
+    type: string
+    required: false
+    materialize: file
+  small:
+    type: string
+    required: false
+nodes:
+  - id: a
+    agent: ag
+    prompt: use ${workflow.inputs.big_path} and ${workflow.inputs.also_path} and ${workflow.inputs.small}
+"""
+
+
+def test_manifest_emits_materialize_inputs(tmp_path):
+    # Inputs declared `materialize: file` are listed (sorted) in the manifest's
+    # materialize_inputs; a plain input is NOT — so the dispatcher knows which
+    # gathered values to normalize to a temp file before threading the path.
+    d = make_flow(tmp_path, "mat-flow", MATERIALIZE)
+    rc, data, out, err = run(tmp_path, "mat-flow")
+    assert rc == 0, err
+    man = json.loads((d / ".compiled" / "manifest.json").read_text())
+    assert man["materialize_inputs"] == ["also_path", "big_path"]   # sorted
+    assert "small" not in man["materialize_inputs"]
+
+
+def test_manifest_materialize_inputs_empty_when_none(tmp_path):
+    # A workflow with no materialize inputs still carries the key (empty list),
+    # so the dispatcher can iterate unconditionally.
+    d = make_flow(tmp_path, "linear-flow", LINEAR)
+    rc, data, out, err = run(tmp_path, "linear-flow")
+    assert rc == 0, err
+    man = json.loads((d / ".compiled" / "manifest.json").read_text())
+    assert man["materialize_inputs"] == []
+
+
+def test_review_changes_threads_diff_path_by_reference(tmp_path):
+    # After the diff_path migration, the compiled review-changes segment threads
+    # ONLY the short path (_args.wf_diff_path) into every diff consumer — never the
+    # inline _args.wf_diff — and the manifest marks diff_path materialize:file.
+    rc, data, out, err = run(REAL_DEFS, "review-changes", "--explain")
+    assert rc == 0, err
+    seg = (REAL_DEFS / "review-changes" / ".compiled" / "seg-1.js").read_text()
+    assert "_args.wf_diff_path" in seg
+    assert "_args.wf_diff" not in seg.replace("_args.wf_diff_path", "")  # no bare wf_diff
+    man = json.loads((REAL_DEFS / "review-changes" / ".compiled" / "manifest.json").read_text())
+    assert "diff_path" in man["required_inputs"]
+    assert "diff" not in man["required_inputs"]
+    assert man["materialize_inputs"] == ["diff_path"]

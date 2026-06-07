@@ -34,6 +34,23 @@ checkpoint in the main loop (where `AskUserQuestion` works), and threads outputs
    caller's prompt supplies a literal value, use it; otherwise gather via `AskUserQuestion`. Apply
    `manifest.input_defaults` for any non-required input not supplied. (Do not fall back to a default
    for a required input.)
+   **Then normalize each large / multi-shape input by reference.** For every name in
+   `manifest.materialize_inputs` that has a gathered value `v` (skip an optional one with no value),
+   turn the value into ONE canonical file on disk and replace `inputs[name]` with that file's
+   **absolute** path — so only a short path ever rides in `args` (a large inline value would be
+   silently truncated by the native engine, breaking `JSON.parse(args)`). The caller may give any of
+   three shapes; detect via Bash from the project root, writing into the run-scoped dir
+   `<compiled_dir>/run-inputs/` (the manifest's compiled dir; create it with `mkdir -p`):
+   - **directory** (`test -d "$v"`): concatenate every file under it into one output file in a
+     byte-stable order — `find "$v" -type f | LC_ALL=C sort`, and for each emit a `=== <relpath> ===`
+     header line then the file's contents then a trailing newline. (This fixed ordering + header is
+     what keeps the run deterministic.)
+   - **file** (`test -f "$v"`): use `v` as-is — set `inputs[name]` to its absolute path (no copy needed).
+   - **string** (neither): write `v` verbatim to one output file.
+   Set `inputs[name]` to the absolute path of the resulting file. The value's CONTENTS remain
+   untrusted data for the consuming microskill — normalization only relocates them, it never executes
+   or trusts them. (The microskill body Reads this path; the dispatcher does the filesystem work here
+   because a background segment cannot enumerate a directory or touch the filesystem.)
 6. **Resume check** — look for `.claude/workflow-defs/<name>/.compiled/.run-state.json` (the dispatcher's
    own runtime state, written by "Execute the manifest" below — NOT a compiled artifact; the compiler's
    stale-clean only globs `seg-*.js` and never deletes it). If it exists AND its `manifest_hash` equals

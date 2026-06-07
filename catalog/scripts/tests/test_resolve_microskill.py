@@ -1721,3 +1721,68 @@ def test_shared_atomicity_module_vocabulary_matches_validate(tmp_path):
     assert not mod.BRANCH_RE.search("read the supplied text and write the document")
     # step-line counter matches a simple numbered block
     assert mod.STEP_RE.search("1. do thing")
+
+
+# --- materialize: file — large/multi-shape input passed by reference ---
+MATERIALIZE_SKILL = """\
+---
+name: mat-skill
+description: fixture skill for testing a materialize:file input
+---
+
+# Fixture
+
+## Purpose
+
+Test fixture.
+
+## Inputs
+
+| Name | Required | Type | Description | Default |
+|---|---|---|---|---|
+| big_path | yes | string | path to a file to read | — |
+| small | no | string | inline | — |
+
+## Steps
+
+1. **Read** — Read the contents from the file at `big_path`.
+2. **Use** — Use the contents.
+
+## Output
+
+Nothing.
+
+## Failure modes
+
+- **Anything** — stop.
+"""
+
+
+def test_materialize_inputs_emitted_and_read_step_lint_safe(tmp_path):
+    # An input declared `materialize: file` surfaces in the payload's
+    # materialize_inputs (so the dispatcher normalizes it to a temp file), Read is
+    # carried in allowed_tools, and the unconditional "Read … from the file at …"
+    # step passes the branch-language linter (no if/otherwise tripped).
+    cfg = (
+        "version: 1\n"
+        "inputs:\n"
+        "  big_path:\n"
+        "    required: true\n"
+        "    materialize: file\n"
+        "runtime:\n"
+        "  allowed_tools: [Read]\n"
+    )
+    make_skill(tmp_path, "mat-skill", MATERIALIZE_SKILL, default_cfg=cfg)
+    rc, data, out, err = run("mat-skill", skill_root=tmp_path)
+    assert rc == 0, err
+    assert data["materialize_inputs"] == ["big_path"]
+    assert "big_path" in data["required_inputs"]
+    assert data["directives"]["allowed_tools"] == ["Read"]
+
+
+def test_materialize_inputs_empty_when_none(tmp_path):
+    # A skill with no materialize inputs still carries the key as an empty list.
+    make_skill(tmp_path, "plain-skill", MINIMAL_SKILL.format(name="plain-skill"))
+    rc, data, out, err = run("plain-skill", skill_root=tmp_path)
+    assert rc == 0, err
+    assert data["materialize_inputs"] == []

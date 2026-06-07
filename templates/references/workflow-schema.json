@@ -37,7 +37,8 @@
           "type": { "type": "string" },
           "required": { "type": "boolean" },
           "description": { "type": "string" },
-          "default": {}
+          "default": {},
+          "materialize": { "type": "string", "enum": ["file"], "description": "Marks this as a large / multi-shape input passed BY REFERENCE. The dispatcher normalizes the caller-supplied value — a raw string, a single file path, or a directory of files — into ONE canonical file on disk and threads only that short path into the segment args (the consuming microskill body reads it). Avoids the native-engine args-size truncation that drops large inline values. The input name should end in `_path`. Only `file` is defined today (room for `dir` later)." }
         }
       }
     },

@@ -907,6 +907,14 @@ def main():
     input_defaults = {
         name: spec["default"] for name, spec in (wf.get("inputs") or {}).items()
         if isinstance(spec, dict) and "default" in spec}
+    # Inputs declared `materialize: file` are large / multi-shape payloads passed BY
+    # REFERENCE: the dispatcher normalizes the caller-supplied string/file/dir into one
+    # canonical file and threads only the short path (so a large value never rides inline
+    # and trips the native-engine args-size truncation). Names only — the dispatcher does
+    # the filesystem work in the main loop.
+    materialize_inputs = sorted(
+        name for name, spec in (wf.get("inputs") or {}).items()
+        if isinstance(spec, dict) and spec.get("materialize"))
 
     manifest = {
         "name": wf["name"],
@@ -914,6 +922,7 @@ def main():
         "description": wf.get("description", ""),
         "required_inputs": required_inputs,
         "input_defaults": input_defaults,
+        "materialize_inputs": materialize_inputs,
         "output": wf.get("output"),
         "steps": manifest_steps,
     }

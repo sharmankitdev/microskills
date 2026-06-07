@@ -65,6 +65,11 @@
           "default": {
             "type": "string",
             "description": "Default value shown in the rendered Inputs table Default column. String only. The resolver substitutes this into the MICROSKILL.md `—` cell at render time. Allowed only in profiles/base.yaml — overlays may not redeclare it (semantic, not schema-enforced)."
+          },
+          "materialize": {
+            "type": "string",
+            "enum": ["file"],
+            "description": "Marks this as a large / multi-shape input passed BY REFERENCE. When the microskill is invoked directly, the dispatcher normalizes the caller-supplied value — a raw string, a single file path, or a directory of files — into ONE canonical file on disk and supplies only that short path (the body reads it). Avoids args-size truncation of large inline values. The input name should end in `_path`. Only `file` is defined today."
           }
         }
       }
