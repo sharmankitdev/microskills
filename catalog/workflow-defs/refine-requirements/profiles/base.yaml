@@ -1,0 +1,4 @@
+version: 1
+
+# Default profile for refine-requirements. Empty overlay — the workflow compiles from WORKFLOW.yaml
+# alone. Present as the documented tuning seam (e.g. max_iterations default, or future gate severity).
