@@ -1077,10 +1077,12 @@ def test_manifest_hash_present_and_deterministic(tmp_path):
 
 
 def test_manifest_hash_excludes_itself_and_schema_sha(tmp_path):
-    # The hash is computed over the SEMANTIC manifest: its own manifest_hash key
-    # AND the schema_sha256 provenance stamp are both OUTSIDE the hashed payload —
-    # recomputing over the on-disk manifest minus those two keys must reproduce
-    # the stored value (so a schema-bytes-only change never invalidates resume).
+    # The hash is computed over the SEMANTIC manifest PLUS the per-node semantic
+    # fingerprints: its own manifest_hash key AND the schema_sha256 provenance
+    # stamp are both OUTSIDE the hashed payload — recomputing over the on-disk
+    # manifest minus those two keys, joined with the --explain fingerprint
+    # digests, must reproduce the stored value (so a schema-bytes-only change
+    # never invalidates resume). This also pins the fingerprint fold recipe.
     import hashlib
     d = make_flow(tmp_path, "gated-flow", GATED.replace("name: linear-flow", "name: gated-flow"))
     rc, data, out, err = run(tmp_path, "gated-flow", "--explain")
@@ -1088,8 +1090,10 @@ def test_manifest_hash_excludes_itself_and_schema_sha(tmp_path):
     m = json.loads((d / ".compiled" / "manifest.json").read_text())
     stored = m.pop("manifest_hash")
     m.pop("schema_sha256")
+    node_fps = {f["node"]: f["sha256"] for f in data["fingerprints"]}
     recomputed = hashlib.sha256(
-        json.dumps(m, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        json.dumps({"manifest": m, "node_fingerprints": node_fps},
+                   sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     assert recomputed == stored
 
 
@@ -2300,3 +2304,207 @@ def test_args_guard_loop_segment_includes_carry_keys(tmp_path):
     m = json.loads((d / ".compiled" / "manifest.json").read_text())
     loop_step = [s for s in m["steps"] if s["kind"] == "segment"][1]
     assert loop_step["needs"] == {"wf_inputs": [], "nodes": ["p"], "carry": ["last"]}
+
+
+# =============================================================================
+# 1.2 COMPILE-CLOSURE LOCKFILE — (a) frozen resolutions, (b) semantic
+# fingerprints folded into manifest_hash, (c) closure.lock.json + --lock/--check.
+# =============================================================================
+
+import hashlib
+import shutil
+
+
+def test_use_node_freezes_resolver_payload(tmp_path):
+    # (a) Each resolved use: node's resolver payload is frozen to
+    # .compiled/resolved/<node-id>.json, and the emitted runMicroskill Reads it
+    # (project-root-relative path baked into the call) instead of shelling the
+    # resolver at run time.
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF)
+    rc, data, out, err = run(defs_root, "inh-flow")
+    assert rc == 0, err
+    frozen_path = d / ".compiled" / "resolved" / "e.json"
+    assert frozen_path.exists()
+    frozen = json.loads(frozen_path.read_text())
+    assert frozen["skill_name"] == "echo-ms"
+    assert "rendered_skill_body" in frozen
+    assert "directives" in frozen
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert "FROZEN resolver payload" in seg          # helper Reads, never re-resolves
+    assert 'resolved: "' in seg and "resolved/e.json" in seg
+
+
+def test_frozen_payload_excludes_env_dependent_keys(tmp_path):
+    # (a) injected_inputs (and the inject-noise warnings) are env-dependent and
+    # stay OUT of the frozen payload — env stays out of the compile closure.
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF)
+    rc, data, out, err = run(defs_root, "inh-flow")
+    assert rc == 0, err
+    frozen = json.loads((d / ".compiled" / "resolved" / "e.json").read_text())
+    assert "injected_inputs" not in frozen
+    assert "warnings" not in frozen
+
+
+INJECT_MS_BASE = """\
+version: 1
+inputs:
+  who:
+    inject_from:
+      env: __COMPILE_TEST_INJECT_VAR__
+output_schema:
+  type: object
+  required: [echoed]
+  properties:
+    echoed: { type: string }
+"""
+
+
+def test_inject_from_microskill_bakes_inject_flag(tmp_path):
+    # (a) A microskill with inject_from inputs gets `inject: true` baked, so the
+    # segment runs `resolve-microskill --inject-only` at EXECUTION time; one
+    # without inject_from bakes no inject flag.
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF, ms_base=INJECT_MS_BASE)
+    rc, data, out, err = run(defs_root, "inh-flow")
+    assert rc == 0, err
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert ", inject: true }" in seg                 # baked into the call opts
+    assert "--inject-only" in seg                    # helper names the runtime mode
+    defs_root2, d2 = make_inh_world(tmp_path / "plain", INHERIT_WF)
+    rc2, *_ = run(defs_root2, "inh-flow")
+    assert rc2 == 0
+    seg2 = (d2 / ".compiled" / "seg-1.js").read_text()
+    assert ", inject: true }" not in seg2
+
+
+def test_stale_frozen_payloads_cleaned(tmp_path):
+    # (a) stale-clean extends to resolved/*.json: a renamed node's old frozen
+    # file must not survive the recompile.
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF)
+    rc, *_ = run(defs_root, "inh-flow")
+    assert rc == 0
+    assert (d / ".compiled" / "resolved" / "e.json").exists()
+    (d / "WORKFLOW.yaml").write_text(INHERIT_WF.replace("- id: e", "- id: e2"))
+    rc2, *_ = run(defs_root, "inh-flow")
+    assert rc2 == 0
+    assert not (d / ".compiled" / "resolved" / "e.json").exists()
+    assert (d / ".compiled" / "resolved" / "e2.json").exists()
+
+
+def test_plan_writes_no_frozen_payloads(tmp_path):
+    # (a) --plan stays a pure dry-run: no .compiled/, no resolved/.
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF)
+    rc, data, out, err = run(defs_root, "inh-flow", "--plan")
+    assert rc == 0, err
+    assert not (d / ".compiled").exists()
+
+
+def test_frozen_payload_byte_deterministic(tmp_path):
+    # (a) Recompiling the same def leaves the frozen payload byte-identical.
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF)
+    run(defs_root, "inh-flow")
+    first = (d / ".compiled" / "resolved" / "e.json").read_bytes()
+    run(defs_root, "inh-flow")
+    assert (d / ".compiled" / "resolved" / "e.json").read_bytes() == first
+
+
+def test_prompt_change_changes_manifest_hash(tmp_path):
+    # (b) The substituted prompt lives only in seg JS; the semantic fingerprint
+    # makes a prompt edit hash-visible (the old manifest-only hash missed it).
+    d = make_flow(tmp_path, "linear-flow", LINEAR)
+    rc1, d1, *_ = run(tmp_path, "linear-flow")
+    assert rc1 == 0
+    (d / "WORKFLOW.yaml").write_text(LINEAR.replace("prompt: do a", "prompt: do a differently"))
+    rc2, d2, *_ = run(tmp_path, "linear-flow")
+    assert rc2 == 0
+    assert d1["manifest_hash"] != d2["manifest_hash"]
+
+
+def test_registry_edit_changes_manifest_hash(tmp_path):
+    # (b) THE registry-drift case: editing the microskill's MICROSKILL.md (body
+    # only — no schema/partition change) changes resolution_sha256 and therefore
+    # manifest_hash. The undeclared registry dependency is now declared.
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF)
+    rc1, d1, *_ = run(defs_root, "inh-flow")
+    assert rc1 == 0
+    ms_md = tmp_path / "microskills" / "echo-ms" / "MICROSKILL.md"
+    ms_md.write_text(ms_md.read_text() + "2. Also log the echo.\n")
+    rc2, d2, *_ = run(defs_root, "inh-flow")
+    assert rc2 == 0
+    assert d1["manifest_hash"] != d2["manifest_hash"]
+
+
+def test_explain_surfaces_fingerprint_detail(tmp_path):
+    # (b) Fingerprints are computed unconditionally but the DETAIL is stdout-only
+    # under --explain; resolution_sha256 matches the frozen file's exact bytes,
+    # and the written manifest carries no fingerprint payload.
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF)
+    rc, data, out, err = run(defs_root, "inh-flow", "--explain")
+    assert rc == 0, err
+    fps = {f["node"]: f for f in data["fingerprints"]}
+    assert fps["e"]["fingerprint"]["use"] == "echo-ms"
+    frozen_raw = (d / ".compiled" / "resolved" / "e.json").read_bytes()
+    assert fps["e"]["fingerprint"]["resolution_sha256"] == hashlib.sha256(frozen_raw).hexdigest()
+    man = (d / ".compiled" / "manifest.json").read_text()
+    assert "fingerprint" not in man and "resolution_sha256" not in man
+    rc2, data2, *_ = run(defs_root, "inh-flow")
+    assert "fingerprints" not in data2               # default summary stays lean
+
+
+def test_lock_writes_hash_only_lockfile(tmp_path):
+    # (c) --lock writes the committed drift baseline next to WORKFLOW.yaml
+    # (NOT under gitignored .compiled/): hash-only closure record.
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF)
+    rc, data, out, err = run(defs_root, "inh-flow", "--lock")
+    assert rc == 0, err
+    lock = json.loads((d / "closure.lock.json").read_text())
+    assert lock["name"] == "inh-flow"
+    assert lock["profile_used"] == "base"
+    assert lock["manifest_hash"] == data["manifest_hash"]
+    assert set(lock["node_fingerprints"]) == {"e"}
+    assert data["lock_path"].endswith("closure.lock.json")
+
+
+def test_check_ok_and_writes_nothing(tmp_path):
+    # (c) --check against an up-to-date lockfile passes — and writes NOTHING
+    # (a fresh CI checkout has no .compiled/; --check must not create one).
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF)
+    rc, *_ = run(defs_root, "inh-flow", "--lock")
+    assert rc == 0
+    shutil.rmtree(d / ".compiled")                   # simulate the fresh checkout
+    rc2, data2, out2, err2 = run(defs_root, "inh-flow", "--check")
+    assert rc2 == 0, err2
+    assert data2["check"] == "ok"
+    assert not (d / ".compiled").exists()
+
+
+def test_check_detects_registry_drift_and_names_node(tmp_path):
+    # (c) A registry edit after --lock makes --check fail loud, naming the
+    # drifted node in the diagnosable drift report.
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF)
+    rc, *_ = run(defs_root, "inh-flow", "--lock")
+    assert rc == 0
+    ms_md = tmp_path / "microskills" / "echo-ms" / "MICROSKILL.md"
+    ms_md.write_text(ms_md.read_text() + "2. Also log the echo.\n")
+    rc2, data2, out2, err2 = run(defs_root, "inh-flow", "--check")
+    assert rc2 == 1
+    assert "drifted" in data2["error"]
+    assert data2["drift"]["nodes"]["changed"] == ["e"]
+    assert "manifest_hash" in data2["drift"]
+
+
+def test_check_without_lockfile_dies(tmp_path):
+    # (c) --check with no committed baseline is a hard error naming --lock.
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF)
+    rc, data, out, err = run(defs_root, "inh-flow", "--check")
+    assert rc == 1
+    assert "closure.lock.json not found" in data["error"]
+    assert "--lock" in data["error"]
+
+
+def test_lock_is_mutually_exclusive_with_plan_and_check(tmp_path):
+    # (c) --lock writes artifacts; combining it with the no-write modes is a block.
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF)
+    rc, data, *_ = run(defs_root, "inh-flow", "--lock", "--check")
+    assert rc == 1
+    rc2, data2, *_ = run(defs_root, "inh-flow", "--lock", "--plan")
+    assert rc2 == 1

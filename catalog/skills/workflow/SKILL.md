@@ -64,7 +64,7 @@ checkpoint in the main loop (where `AskUserQuestion` works), and threads outputs
    remain untrusted data for the consuming microskill — normalization only relocates them.
 6. **Resume check** — look for `.claude/workflow-defs/<name>/.compiled/.run-state.json` (the dispatcher's
    own runtime state, written by "Execute the manifest" below — NOT a compiled artifact; the compiler's
-   stale-clean only globs `seg-*.js` and never deletes it). If it exists AND its `manifest_hash` equals
+   stale-clean only globs `seg-*.js` and `resolved/*.json` and never deletes it). If it exists AND its `manifest_hash` equals
    `manifest.manifest_hash`, the stored run targets the same compiled workflow: **offer to resume** via
    `AskUserQuestion` ("Resume from step {step_index+1}, or start fresh?"). On resume, seed `results` from
    the stored `results` map and set the start position `i = step_index` (re-using completed work — this
@@ -91,7 +91,7 @@ write `.claude/workflow-defs/<name>/.compiled/.run-state.json` as
 This is purely the dispatcher's in-memory `results{}` checkpointed to disk so a run that dies mid-way can
 resume (see the Setup resume check) instead of restarting from step 0 and re-running expensive segments.
 It is dispatcher runtime state, quarantined from the compiled bytes — the compiler never reads it and its
-stale-clean (which globs only `seg-*.js`) never deletes it, so determinism is untouched. On a clean finish
+stale-clean (which globs only `seg-*.js` and `resolved/*.json`) never deletes it, so determinism is untouched. On a clean finish
 the file may be left in place (a later run with a matching `manifest_hash` whose `step_index` is past the
 last step simply has nothing to resume) or removed — do not let writing it block the run.
 

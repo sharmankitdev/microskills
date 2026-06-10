@@ -14,6 +14,14 @@ Usage:
                                   [--override <dotted.path=value>]...
                                   [--skip-step <n>]...
                                   [--skill-root <dir>]
+                                  [--inject-only]
+
+`--inject-only` resolves the profile config, executes ONLY the env-dependent
+`inputs.<name>.inject_from` sources, and emits {skill_name, profile_used,
+profile_requested, warnings, injected_inputs} — no body rendering. It is the
+execution-time companion of compile-workflow's frozen resolver payloads
+(.compiled/resolved/<node-id>.json), which exclude injected_inputs so the
+compile closure stays env-independent.
 
 Stdout: JSON (see README / config-schema doc for the shape).
 Exit codes: 0 OK · 1 block · 2 environment / script error.
@@ -685,6 +693,11 @@ def main():
                     help="Skip an optional step by number. Repeatable.")
     ap.add_argument("--skill-root", default=str(DEFAULT_SKILL_ROOT),
                     help="Override skill-root directory.")
+    ap.add_argument("--inject-only", action="store_true",
+                    help="Resolve the profile config, execute ONLY the inject_from "
+                         "sources, and emit the injected_inputs (no body rendering). "
+                         "Execution-time companion of compile-workflow's frozen "
+                         "resolver payloads, which exclude env-dependent inject results.")
     args = ap.parse_args()
 
     skill_root = Path(args.skill_root).resolve()
@@ -817,6 +830,20 @@ def main():
             inject_failed = True
         else:
             injected_inputs[name] = val
+
+    # --inject-only: emit ONLY the env-dependent inject results and stop. The
+    # compile-time freeze (compile-workflow) excludes injected_inputs from the
+    # frozen resolver payload so the compile closure stays env-independent; this
+    # mode re-applies the inject_from sources at execution time. No body
+    # rendering — the frozen payload already carries rendered_skill_body.
+    if args.inject_only:
+        emit_and_exit({
+            "skill_name": args.skill,
+            "profile_used": profile_used,
+            "profile_requested": args.profile,
+            "warnings": warnings,
+            "injected_inputs": injected_inputs,
+        }, 1 if inject_failed else 0)
 
     skill_md = skill_dir / "MICROSKILL.md"
     if not skill_md.exists():

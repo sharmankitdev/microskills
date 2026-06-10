@@ -1,0 +1,13 @@
+{
+  "manifest_hash": "0ec9e842568c3007433b38d7786b2afd86a1179ff02e33ef77f39b7bf86ded03",
+  "name": "decompose-monolith-orchestrator",
+  "node_fingerprints": {
+    "advise": "d9894fd3c6038ee961e82ec1f64d38cf99ca64f78ddacfc370ed4d427412aab0",
+    "analyze": "9e68882ede0757a6aa93101fe12899a7b8827b226cf40eba3f310140cfba738b",
+    "build": "f3211102c50bb35327e00c68461714dd92df679fc1e10a6f8d56cf56a736387e",
+    "plan": "fdfb2784169a776592d13a6a0da084b62f73470ed8328dac8a00ea857b7a41b4",
+    "provision": "c9d6e27de40d017e3b54e86b1e3394c558f22156e9701b21fbb9323dae481d2d",
+    "report": "7cf991c528565fcb3d1d414e0e7cec464637e412eec7e3bcc9c75a753a64b25b"
+  },
+  "profile_used": "base"
+}

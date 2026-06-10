@@ -1796,3 +1796,46 @@ def test_real_task_plan_requirement_is_by_reference():
     assert "requirement_path" in data["required_inputs"]
     assert "requirement" not in data["required_inputs"]
     assert data["materialize_inputs"] == ["requirement_path"]
+
+
+# --- --inject-only: execution-time companion of compile-frozen payloads --------
+
+def test_inject_only_emits_only_injected_inputs(tmp_path):
+    # --inject-only resolves the profile config, executes the inject_from
+    # sources NOW, and emits {skill_name, profile_used, injected_inputs, ...}
+    # without rendering the body (the frozen payload already carries it).
+    body = MINIMAL_SKILL.format(name="injectonly-ok")
+    cfg = textwrap.dedent("""\
+        version: 1
+        inputs:
+          owner:
+            inject_from:
+              env: __RESOLVE_TEST_INJECT_ONLY__
+        """)
+    make_skill(tmp_path, "injectonly-ok", body, default_cfg=cfg)
+    env = {**os.environ, "__RESOLVE_TEST_INJECT_ONLY__": "Jane Smith"}
+    code, data, _, err = run("injectonly-ok", "--inject-only", skill_root=tmp_path, env=env)
+    assert code == 0, err
+    assert data["injected_inputs"] == {"owner": "Jane Smith"}
+    assert data["profile_used"] == "base"
+    assert "rendered_skill_body" not in data
+    assert "directives" not in data
+
+
+def test_inject_only_failure_blocks(tmp_path):
+    # An unset inject_from source still blocks (exit 1) with a warning, exactly
+    # like the full resolve path.
+    body = MINIMAL_SKILL.format(name="injectonly-fail")
+    cfg = textwrap.dedent("""\
+        version: 1
+        inputs:
+          owner:
+            inject_from:
+              env: __RESOLVE_TEST_NEVER_SET_ABC__
+        """)
+    make_skill(tmp_path, "injectonly-fail", body, default_cfg=cfg)
+    env = {k: v for k, v in os.environ.items() if k != "__RESOLVE_TEST_NEVER_SET_ABC__"}
+    code, data, _, err = run("injectonly-fail", "--inject-only", skill_root=tmp_path, env=env)
+    assert code == 1
+    assert data["injected_inputs"] == {}
+    assert any("__RESOLVE_TEST_NEVER_SET_ABC__" in w for w in data["warnings"])

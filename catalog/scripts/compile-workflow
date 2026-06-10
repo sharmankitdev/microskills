@@ -21,18 +21,34 @@ Pipeline:
      silently drop the do/while scaffold).
   4. Partition the topologically-sorted DAG into maximal background segments
      separated by orchestrator nodes/gates. loop.body stays inside one segment.
-  5. Emit one Workflow-JS per background segment + manifest.json to
+  5. Freeze each resolved use: node's resolver payload (minus the env-dependent
+     injected_inputs/warnings) to <def-dir>/.compiled/resolved/<node-id>.json —
+     the emitted runMicroskill READS that file at run time instead of
+     re-shelling the resolver against a possibly-drifted registry.
+  6. Emit one Workflow-JS per background segment + manifest.json to
      <def-dir>/.compiled/. Deterministic: same inputs → byte-identical output.
 
 Usage:
   compile-workflow <name> [--profile <p>] [--override a.b=c]... [--defs-root <dir>]
+                   [--plan] [--explain] [--lock] [--check]
 
 Stdout: JSON summary { name, profile_used, compiled_dir, manifest_path, segments,
 checkpoints, manifest_hash, sequence }. The written manifest always carries
 manifest_hash plus schema_sha256 (provenance of the validating schema, excluded
 from the hash), and stores segment script paths RELATIVE to the def dir so
-manifest bytes are portable across checkouts.
-Exit codes: 0 OK · 1 block (schema/DAG error) · 2 environment/script error.
+manifest bytes are portable across checkouts. manifest_hash folds in per-node
+SEMANTIC fingerprints (substituted prompt, inputs, effective schema, executor
+identity, when/for_each/as, frozen-resolution sha256 — phase_group excluded), so
+a registry edit or prompt change is hash-visible even though those bytes live
+only in seg JS.
+
+`--lock` additionally writes <def-dir>/closure.lock.json (hash-only: name,
+profile_used, manifest_hash, node_fingerprints) — the COMMITTED drift baseline.
+`--check` recompiles in memory (writes NOTHING) and dies with a drift report
+when the computed closure no longer matches the committed lockfile; this is the
+CI registry-drift gate (a fresh checkout has no .compiled/ baseline — the
+lockfile IS the baseline).
+Exit codes: 0 OK · 1 block (schema/DAG error/closure drift) · 2 environment/script error.
 """
 
 import argparse
@@ -334,7 +350,9 @@ def rank_partition(seg_nodes):
 def resolve_microskill_directives(use_name, customize, defs_root):
     """Run resolve-microskill to read a use: node's allowed_tools + gates AND its
     fully-resolved (profile-merged, strip_nulls'd) output_schema. Returns a dict
-    {"directives": <dict|None>, "output_schema": <dict|None>, "error": <str|None>}.
+    {"directives": <dict|None>, "output_schema": <dict|None>,
+     "payload": <the FULL parsed resolver stdout|None>, "error": <str|None>}.
+    `payload` feeds the compile-closure freeze (.compiled/resolved/<node-id>.json).
     On any failure `directives` is None and `error` carries the diagnostic — the
     caller (classify) turns that into a HARD compile error (fail-loud: a typo'd
     use: target must never silently mutate the partition).
@@ -348,7 +366,7 @@ def resolve_microskill_directives(use_name, customize, defs_root):
         cmd += ["--profile", str(profile)]
     skill_root = Path(defs_root).parent / "microskills"
     cmd += ["--skill-root", str(skill_root)]
-    fail = {"directives": None, "output_schema": None, "error": None}
+    fail = {"directives": None, "output_schema": None, "payload": None, "error": None}
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, cwd=str(PROJECT_ROOT))
     except Exception as e:
@@ -371,6 +389,7 @@ def resolve_microskill_directives(use_name, customize, defs_root):
         return fail
     return {"directives": data.get("directives"),
             "output_schema": data.get("output_schema"),
+            "payload": data,
             "error": None}
 
 
@@ -431,6 +450,11 @@ def classify(node, gates_after, defs_root):
     # deleted the schema (output_schema: null) resolves to None here, so the
     # deleted schema is NOT resurrected — inheritance is a default-for-ABSENT only.
     node["_exec_schema"] = resolved["output_schema"]
+    # Stash the FULL resolver payload so the emit can FREEZE it to
+    # .compiled/resolved/<node-id>.json (the compile closure: the emitted
+    # runMicroskill Reads the frozen bytes at run time instead of re-shelling
+    # the resolver against a possibly-drifted registry).
+    node["_resolved_payload"] = resolved.get("payload")
     if directives is None:
         die(f"node '{nid}': use: '{node['use']}' failed to resolve "
             f"({resolved.get('error') or 'resolution failed'}). Fix the microskill "
@@ -566,6 +590,16 @@ def node_call_js(node, seg_var_ids, indent="  ", declare=True, track_ran=False, 
             exec_extra += f', agentType: {json.dumps(node["_exec_agent"])}'
         if node.get("_exec_model"):
             exec_extra += f', model: {json.dumps(node["_exec_model"])}'
+        # Frozen-resolution reference (compile closure): the project-root-relative
+        # path runMicroskill READS at run time — no runtime resolver shell-out, so
+        # a registry edit mid-run can never change the executed body.
+        if node.get("_resolved_path"):
+            exec_extra += f', resolved: {json.dumps(node["_resolved_path"])}'
+        # inject: true only when the resolved config carries inject_from inputs —
+        # the segment then runs `resolve-microskill --inject-only` at execution
+        # time (env-dependent values are excluded from the frozen payload).
+        if node.get("_inject"):
+            exec_extra += ', inject: true'
         raw = (f'runMicroskill({json.dumps(node["use"])}, {{ '
                f'profile: {json.dumps(profile)}, inputs: {inputs_js}, '
                f'schema: {schema_js}, phase: {json.dumps(phase)}{exec_extra} }})')
@@ -614,12 +648,20 @@ def node_call_js(node, seg_var_ids, indent="  ", declare=True, track_ran=False, 
 
 HELPERS_JS = r"""
 // --- node runtimes (identical to the proven spike templates) ---
-async function runMicroskill(name, { profile = 'base', inputs = {}, schema, phase, agentType, model } = {}) {
+// runMicroskill READS the compile-frozen resolver payload (resolved) instead of
+// shelling the resolver — the executed body is pinned at compile time, so a
+// registry edit mid-run can never change it. Only the env-dependent inject_from
+// values (inject: true) are resolved at execution time via --inject-only.
+async function runMicroskill(name, { profile = 'base', inputs = {}, schema, phase, agentType, model, resolved, inject } = {}) {
   const lines = Object.entries(inputs).map(([k, v]) => `- ${k}: ${JSON.stringify(v)}`).join('\n')
+  const injectLine = inject
+    ? `\n   First run via Bash from the project root: .claude/scripts/resolve-microskill ${name} --profile ${profile} --inject-only — parse its stdout JSON and treat injected_inputs as additional caller inputs.`
+    : ''
   return agent(
     `Execute the microskill "${name}".
-1. Run via Bash from the project root: .claude/scripts/resolve-microskill ${name} --profile ${profile}
-2. Parse stdout JSON. Execute rendered_skill_body, honoring directives.allowed_tools and gates.
+1. Read the FROZEN resolver payload at this project-root-relative path: ${resolved}
+   (frozen at compile time — do NOT shell the resolver for it). Parse it as JSON.
+2. Execute rendered_skill_body, honoring directives.allowed_tools and gates.${injectLine}
 3. Caller inputs:\n${lines}
 4. If a required input or decision is missing, FAIL with an error — do NOT invent an answer.
 5. Return ONLY the structured object matching the required schema. No prose.`,
@@ -788,10 +830,25 @@ def main():
                     help="Dry-run: compute and print the full plan but write NOTHING to "
                          ".compiled/ (no mkdir, no stale-clean, no seg files, no manifest).")
     ap.add_argument("--explain", action="store_true",
-                    help="Add per-node classification reasons and de-anonymize the "
-                         "sequence summary. Output-only — never changes the emitted "
-                         "bytes (manifest_hash is always emitted regardless).")
+                    help="Add per-node classification reasons, per-node semantic "
+                         "fingerprint detail, and de-anonymize the sequence summary. "
+                         "Output-only — never changes the emitted bytes "
+                         "(manifest_hash is always emitted regardless).")
+    ap.add_argument("--lock", action="store_true",
+                    help="Also write <def-dir>/closure.lock.json (hash-only closure "
+                         "baseline: name, profile_used, manifest_hash, "
+                         "node_fingerprints) — commit it as the CI drift baseline.")
+    ap.add_argument("--check", action="store_true",
+                    help="Recompile in memory (write NOTHING) and fail loud when the "
+                         "computed closure drifts from the committed "
+                         "closure.lock.json. The CI registry-drift gate.")
     args = ap.parse_args()
+
+    if args.lock and (args.plan or args.check):
+        die("--lock writes artifacts and cannot combine with --plan or --check", 1)
+    # --check is read-only by construction: like --plan it computes the full plan
+    # but writes nothing (CI must never dirty the checkout it is gating).
+    do_write = not (args.plan or args.check)
 
     defs_root = Path(args.defs_root).resolve()
     def_dir = defs_root / args.name
@@ -933,6 +990,39 @@ def main():
                     f"({b_reason}); a loop body must be entirely background — an "
                     f"orchestrator member silently drops the do/while scaffold", 1)
 
+    # --- compile closure: freeze each resolved use: node's resolver payload ---
+    # The resolver payload (rendered body, directives, config, schemas) is part
+    # of the compile's INPUT SET. Freezing it to .compiled/resolved/<node-id>.json
+    # (a) declares the registry dependency, (b) lets the emitted runMicroskill
+    # READ the frozen bytes at run time instead of re-shelling the resolver
+    # against a possibly-drifted registry, and (c) yields the resolution_sha256
+    # folded into the per-node semantic fingerprints below. Two env-dependent
+    # keys are EXCLUDED so the frozen bytes are a pure function of registry
+    # bytes + profile (env stays out of the compile closure):
+    #   - injected_inputs — inject_from values read from the compile machine's
+    #     env; a node whose resolved config carries inject_from inputs gets
+    #     `inject: true` baked instead, and the segment runs
+    #     `resolve-microskill --inject-only` at execution time;
+    #   - warnings — compile-time diagnostics (already surfaced on the resolver/
+    #     compile stdout) that can carry inject-failure noise from the compile env.
+    compiled_dir = def_dir / ".compiled"
+    resolved_dir = compiled_dir / "resolved"
+    frozen_payloads = {}
+    for nid in order:
+        node = node_by_id[nid]
+        payload = node.pop("_resolved_payload", None)
+        if payload is None:
+            continue
+        pruned = {k: v for k, v in payload.items()
+                  if k not in ("injected_inputs", "warnings")}
+        raw = json.dumps(pruned, indent=2) + "\n"
+        frozen_payloads[nid] = raw
+        node["_resolution_sha256"] = hashlib.sha256(raw.encode()).hexdigest()
+        node["_resolved_path"] = rel(resolved_dir / f"{nid}.json")
+        node["_inject"] = any(
+            isinstance(spec, dict) and spec.get("inject_from")
+            for spec in ((pruned.get("config") or {}).get("inputs") or {}).values())
+
     # --- partition into manifest steps ---
     steps = []
     seg = []
@@ -978,19 +1068,27 @@ def main():
     flush_segment()
 
     # --- emit segments ---
-    # ALL disk-mutating operations are guarded behind `not args.plan`. Under --plan
-    # we still compute the full plan (segment JS, needs, produces, manifest) so the
-    # summary is identical to a real compile, but write nothing: no mkdir, no
-    # stale-clean unlink, no seg files, no manifest.json. This mirrors the harness
-    # reconcile loops' --plan-by-default ergonomics.
-    compiled_dir = def_dir / ".compiled"
-    if not args.plan:
+    # ALL disk-mutating operations are guarded behind `do_write` (--plan and
+    # --check both write NOTHING). Under either flag we still compute the full
+    # plan (segment JS, needs, produces, frozen payloads, manifest) so the
+    # summary/check is identical to a real compile, but write nothing: no mkdir,
+    # no stale-clean unlink, no seg files, no resolved/*.json, no manifest.json.
+    # This mirrors the harness reconcile loops' --plan-by-default ergonomics.
+    if do_write:
         compiled_dir.mkdir(parents=True, exist_ok=True)
-        # clean stale segment files for determinism. (Note: only seg-*.js are
-        # globbed — manifest.json is overwritten below, and the dispatcher's
-        # .run-state.json is intentionally NOT touched.)
+        # clean stale segment files + frozen resolutions for determinism. (Note:
+        # only seg-*.js and resolved/*.json are globbed — manifest.json is
+        # overwritten below, and the dispatcher's .run-state.json is
+        # intentionally NOT touched.)
         for old in compiled_dir.glob("seg-*.js"):
             old.unlink()
+        if resolved_dir.is_dir():
+            for old in resolved_dir.glob("*.json"):
+                old.unlink()
+        if frozen_payloads:
+            resolved_dir.mkdir(parents=True, exist_ok=True)
+            for nid in sorted(frozen_payloads):
+                (resolved_dir / f"{nid}.json").write_text(frozen_payloads[nid])
 
     seg_index = 0
     manifest_steps = []
@@ -1000,7 +1098,7 @@ def main():
             seg_nodes = [node_by_id[i] for i in step["nodes"]]
             js, needs, produces = emit_segment_js(seg_nodes, wf, loop, seg_index)
             fname = f"seg-{seg_index}.js"
-            if not args.plan:
+            if do_write:
                 (compiled_dir / fname).write_text(js)
             manifest_steps.append({
                 "kind": "segment",
@@ -1044,17 +1142,57 @@ def main():
         "output": wf.get("output"),
         "steps": manifest_steps,
     }
+    # --- per-node SEMANTIC fingerprints (folded into manifest_hash) ---
+    # The manifest alone covers only the partition/needs/produces; the EXECUTED
+    # semantics — substituted prompt, baked inputs, effective schema, executor
+    # identity, the frozen registry resolution — live only in seg JS bytes.
+    # Fingerprint them per node so manifest_hash quantifies over the full
+    # declared input set: a registry edit, prompt change, or executor swap is
+    # hash-visible (and invalidates resume) even though the manifest dict is
+    # unchanged. phase_group is EXCLUDED by design (emit-only cosmetics — it
+    # must keep manifest_hash stable). Computed UNCONDITIONALLY; the per-node
+    # detail is surfaced only under --explain (stdout-only — the written bytes
+    # never fork on flags).
+    node_fingerprints = {}
+    fingerprint_detail = []
+    for nid in order:
+        node = node_by_id[nid]
+        fp = {
+            "use": node.get("use"),
+            "agent": node.get("agent"),
+            "profile": ((node.get("customize") or {}).get("profile", "base")
+                        if node.get("use") else None),
+            "prompt": node.get("prompt"),
+            "inputs": node.get("inputs") or {},
+            "schema": node.get("output_schema") or node.get("_exec_schema"),
+            "exec_agent": node.get("_exec_agent"),
+            "exec_model": node.get("_exec_model"),
+            "when": node.get("when"),
+            "for_each": node.get("for_each"),
+            "as": node.get("as"),
+            "resolution_sha256": node.get("_resolution_sha256"),
+        }
+        digest = hashlib.sha256(
+            json.dumps(fp, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        node_fingerprints[nid] = digest
+        fingerprint_detail.append({"node": nid, "sha256": digest, "fingerprint": fp})
+
     # Deterministic content hash over the canonical (sorted-key, compact) JSON of
-    # the SEMANTIC manifest. Two keys live OUTSIDE the hashed payload:
+    # the SEMANTIC manifest PLUS the per-node fingerprints above. Two keys live
+    # OUTSIDE the hashed payload:
     #   - manifest_hash itself (the hash can never depend on itself);
     #   - schema_sha256 — PROVENANCE ONLY. manifest_hash gates dispatcher resume
     #     (stored run-state is reusable only while partition/needs/produces still
     #     line up); a schema-bytes-only change moves no node output, so stamping
     #     it INSIDE the hash would needlessly invalidate resumable run-state.
-    # Same inputs → same hash; any change to the partition/needs/produces changes
-    # it. The dispatcher compares it against stored run-state before resuming.
+    # Same inputs → same hash; any change to the partition/needs/produces — or to
+    # any fingerprinted node semantic — changes it. The dispatcher compares it
+    # against stored run-state before resuming; --check compares it against the
+    # committed closure.lock.json.
     manifest_hash = hashlib.sha256(
-        json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+        json.dumps({"manifest": manifest, "node_fingerprints": node_fingerprints},
+                   sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
 
     manifest_path = compiled_dir / "manifest.json"
@@ -1067,8 +1205,51 @@ def main():
     out_manifest = dict(manifest)
     out_manifest["schema_sha256"] = schema_sha256
     out_manifest["manifest_hash"] = manifest_hash
-    if not args.plan:
+    if do_write:
         manifest_path.write_text(json.dumps(out_manifest, indent=2) + "\n")
+
+    # --- closure lockfile: the COMMITTED drift baseline ---
+    # .compiled/ is gitignored, so a fresh CI checkout has no compiled baseline —
+    # the committed closure.lock.json IS the baseline. Hash-only by design: it
+    # pins manifest_hash (which folds the per-node fingerprints, including each
+    # frozen resolution's sha256) plus the per-node fingerprint digests so a
+    # --check failure can name WHICH node drifted.
+    lock_path = def_dir / "closure.lock.json"
+    if args.lock:
+        lock_obj = {
+            "name": wf["name"],
+            "profile_used": profile_used,
+            "manifest_hash": manifest_hash,
+            "node_fingerprints": node_fingerprints,
+        }
+        lock_path.write_text(json.dumps(lock_obj, indent=2, sort_keys=True) + "\n")
+    if args.check:
+        if not lock_path.exists():
+            die(f"closure.lock.json not found: {rel(lock_path)} — generate it with "
+                f"`compile-workflow {wf['name']} --lock` and commit it", 1)
+        try:
+            locked = json.loads(lock_path.read_text())
+        except (OSError, json.JSONDecodeError) as e:
+            die(f"closure.lock.json unreadable: {e}", 1)
+        drift = {}
+        if locked.get("profile_used") != profile_used:
+            drift["profile_used"] = {"locked": locked.get("profile_used"),
+                                     "computed": profile_used}
+        if locked.get("manifest_hash") != manifest_hash:
+            drift["manifest_hash"] = {"locked": locked.get("manifest_hash"),
+                                      "computed": manifest_hash}
+        locked_fp = locked.get("node_fingerprints") or {}
+        changed = sorted(n for n in node_fingerprints
+                         if n in locked_fp and locked_fp[n] != node_fingerprints[n])
+        added = sorted(n for n in node_fingerprints if n not in locked_fp)
+        removed = sorted(n for n in locked_fp if n not in node_fingerprints)
+        if changed or added or removed:
+            drift["nodes"] = {"changed": changed, "added": added, "removed": removed}
+        if drift:
+            die(f"compile closure drifted from committed {rel(lock_path)} — the "
+                f"registry or workflow def changed without re-locking; review the "
+                f"delta, then run `compile-workflow {wf['name']} --lock` and commit "
+                f"the updated lockfile to accept it", 1, drift=drift)
 
     def seq_label(s):
         """A segment's bracketed node list, or a checkpoint label. WITHOUT --explain
@@ -1095,11 +1276,17 @@ def main():
         "manifest_hash": manifest_hash,
         "sequence": [seq_label(s) for s in manifest_steps],
     }
-    # --explain (and --plan, the dry-run preview) are additive: they only ADD keys.
+    # --explain (and --plan/--check/--lock, the dry-run/gate modes) are additive:
+    # they only ADD keys.
     if args.explain:
         summary["classification"] = classification
+        summary["fingerprints"] = fingerprint_detail
     if args.plan:
         summary["plan"] = True
+    if args.lock:
+        summary["lock_path"] = rel(lock_path)
+    if args.check:
+        summary["check"] = "ok"
     print(json.dumps(summary, indent=2))
     sys.exit(0)
 
