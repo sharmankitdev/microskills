@@ -262,11 +262,16 @@ agent.)
 It also **freezes the full resolver payload** (rendered body, directives, config, schemas) to
 `.compiled/resolved/<node-id>.json`, and the emitted `runMicroskill` **Reads that frozen file** at
 run time (project-root-relative path baked into the call) instead of re-shelling the resolver — a
-registry edit mid-run can never change the executed body. Two env-dependent keys are excluded so
-the frozen bytes are a pure function of registry bytes + profile: `injected_inputs` (a microskill
-with `inject_from` inputs gets `inject: true` baked, and the segment runs
-`resolve-microskill --inject-only` at execution time) and `warnings` (compile-time diagnostics).
-The stale-clean that precedes each compile globs `seg-*.js` **and** `resolved/*.json`.
+registry edit mid-run can never change the executed body. Env stays out of the compile closure end
+to end: compile-time resolution runs `resolve-microskill --skip-inject`, so `inject_from` sources
+are **never executed at compile time** (no env reads, no `command:` shell in the compile path) and
+the resolver's required-input ledger + rewritten Inputs table are computed from *declared*
+`inject_from` presence — the frozen bytes are a pure function of registry bytes + profile, with
+`injected_inputs` and `warnings` additionally excluded from the frozen payload. A microskill with
+`inject_from` inputs gets `inject: true` baked, and the segment runs
+`resolve-microskill --inject-only` at execution time (which fails loud if a source cannot be
+satisfied *there*). The stale-clean that precedes each compile globs `seg-*.js` **and**
+`resolved/*.json`.
 
 ### (b) `agent:` — invoke an agent directly with a prompt
 

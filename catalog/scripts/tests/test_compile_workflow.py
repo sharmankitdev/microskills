@@ -20,10 +20,10 @@ REAL_DEFS = REPO / ".claude" / "workflow-defs"
 _ENV = {**os.environ, "MICROSKILLS_TEMPLATES_ROOT": str(REPO / "templates")}
 
 
-def run(defs_root, name, *args):
+def run(defs_root, name, *args, env=None):
     proc = subprocess.run(
         [sys.executable, str(SCRIPT), name, "--defs-root", str(defs_root), *args],
-        capture_output=True, text=True, cwd=str(REPO), env=_ENV)
+        capture_output=True, text=True, cwd=str(REPO), env=env or _ENV)
     data = json.loads(proc.stdout) if proc.stdout.strip().startswith("{") else None
     return proc.returncode, data, proc.stdout, proc.stderr
 
@@ -747,13 +747,14 @@ output_schema:
 """
 
 
-def make_inh_world(tmp_path, wf_yaml, ms_base=ECHO_MS_BASE, extra_profiles=None):
+def make_inh_world(tmp_path, wf_yaml, ms_base=ECHO_MS_BASE, extra_profiles=None,
+                   ms_md=ECHO_MS_MD):
     """Build a hermetic world: <tmp>/workflow-defs/inh-flow + <tmp>/microskills/echo-ms.
     Returns (defs_root, def_dir)."""
     defs_root = tmp_path / "workflow-defs"
     ms_dir = tmp_path / "microskills" / "echo-ms" / "profiles"
     ms_dir.mkdir(parents=True)
-    (tmp_path / "microskills" / "echo-ms" / "MICROSKILL.md").write_text(ECHO_MS_MD)
+    (tmp_path / "microskills" / "echo-ms" / "MICROSKILL.md").write_text(ms_md)
     (ms_dir / "base.yaml").write_text(ms_base)
     for pname, ptext in (extra_profiles or {}).items():
         (ms_dir / f"{pname}.yaml").write_text(ptext)
@@ -2378,6 +2379,105 @@ def test_inject_from_microskill_bakes_inject_flag(tmp_path):
     assert rc2 == 0
     seg2 = (d2 / ".compiled" / "seg-1.js").read_text()
     assert ", inject: true }" not in seg2
+
+
+# A microskill whose REQUIRED input is inject-supplied, with the input declared
+# in the MICROSKILL.md Inputs table — the exact shape that used to leak inject
+# SUCCESS/FAILURE into the frozen payload (required_inputs flipped between []
+# and ['who'], and the Inputs table row between 'no … world' and 'yes … —').
+REQ_INJECT_MS_MD = """\
+---
+name: echo-ms
+description: echo microskill with a required inject-supplied input
+---
+
+# Echo
+
+## Inputs
+
+| Name | Required | Type | Description | Default |
+|---|---|---|---|---|
+| who | no | string | who to greet | world |
+
+## Steps
+
+1. Return the result.
+"""
+
+REQ_INJECT_MS_BASE = """\
+version: 1
+inputs:
+  who:
+    required: true
+    inject_from:
+      env: __COMPILE_TEST_REQ_INJECT_VAR__
+output_schema:
+  type: object
+  required: [echoed]
+  properties:
+    echoed: { type: string }
+"""
+
+
+def test_required_inject_compile_closure_is_env_independent(tmp_path):
+    # Invariant (e)/(a): the SAME def must compile to byte-identical frozen
+    # payloads and the same manifest_hash whether or not the compile machine's
+    # env satisfies a `required: true` + `inject_from` input. (Compile-time
+    # resolution passes --skip-inject, and the resolver's ledger keys off
+    # DECLARED inject_from presence — never inject success.)
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF,
+                                  ms_base=REQ_INJECT_MS_BASE,
+                                  ms_md=REQ_INJECT_MS_MD)
+    env_set = {**_ENV, "__COMPILE_TEST_REQ_INJECT_VAR__": "alice"}
+    env_unset = {k: v for k, v in _ENV.items()
+                 if k != "__COMPILE_TEST_REQ_INJECT_VAR__"}
+    rc1, d1, out1, err1 = run(defs_root, "inh-flow", env=env_set)
+    assert rc1 == 0, err1
+    frozen_set = (d / ".compiled" / "resolved" / "e.json").read_bytes()
+    hash_set = d1["manifest_hash"]
+    rc2, d2, out2, err2 = run(defs_root, "inh-flow", env=env_unset)
+    assert rc2 == 0, err2
+    frozen_unset = (d / ".compiled" / "resolved" / "e.json").read_bytes()
+    assert frozen_unset == frozen_set
+    assert d2["manifest_hash"] == hash_set
+    payload = json.loads(frozen_set)
+    # the declared-inject input is execution-time-supplied, never caller-gathered
+    assert payload["required_inputs"] == []
+    assert payload["profile_overrides_inputs"] == {}
+    # the Inputs table rides AS AUTHORED — no env-dependent required-flip rewrite
+    who_rows = [ln for ln in payload["rendered_skill_body"].splitlines()
+                if ln.startswith("| who ")]
+    assert len(who_rows) == 1
+    assert who_rows[0].split("|")[2].strip() == "no"
+    assert "world" in who_rows[0]
+
+
+def test_compile_never_executes_inject_sources(tmp_path):
+    # inject_from execution is an EXECUTION-TIME concern (--inject-only in the
+    # emitted segment); the compile path resolves with --skip-inject, so a
+    # `command:` source's side effect must never fire during classify/freeze.
+    sentinel = tmp_path / "inject-side-effect-ran.txt"
+    ms_base = f"""\
+version: 1
+inputs:
+  who:
+    inject_from:
+      command: "touch {sentinel} && echo alice"
+output_schema:
+  type: object
+  required: [echoed]
+  properties:
+    echoed: {{ type: string }}
+"""
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF, ms_base=ms_base)
+    rc, data, out, err = run(defs_root, "inh-flow")
+    assert rc == 0, err
+    assert not sentinel.exists()                     # the command never ran
+    # the execution-time path is still baked: inject: true + --inject-only
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert ", inject: true }" in seg
+    assert "--inject-only" in seg
+    assert "--skip-inject" not in seg                # compile-only flag, never baked
 
 
 def test_stale_frozen_payloads_cleaned(tmp_path):

@@ -1841,6 +1841,87 @@ def test_inject_only_failure_blocks(tmp_path):
     assert any("__RESOLVE_TEST_NEVER_SET_ABC__" in w for w in data["warnings"])
 
 
+# --- env-independent payload shape + --skip-inject (compile-time mode) ---------
+#
+# The required-input ledger (required_inputs / profile_overrides_inputs / the
+# rewritten Inputs table) is computed from DECLARED inject_from presence, never
+# from inject success — otherwise the emitted payload shape (and the
+# compile-closure freeze built on it) would depend on the resolving machine's
+# env. --skip-inject additionally never EXECUTES the sources at all, keeping
+# the compile path side-effect-free.
+
+def test_required_inject_ledger_is_env_independent(tmp_path):
+    body = REQUIRED_INPUTS_SKILL.format(name="ledger-inject-envdep")
+    cfg = textwrap.dedent("""\
+        version: 1
+        inputs:
+          owner:
+            required: true
+            inject_from:
+              env: __RESOLVE_REQ_INJECT_ENVDEP__
+        """)
+    make_skill(tmp_path, "ledger-inject-envdep", body, default_cfg=cfg)
+    env_set = {**os.environ, "__RESOLVE_REQ_INJECT_ENVDEP__": "alice"}
+    env_unset = {k: v for k, v in os.environ.items()
+                 if k != "__RESOLVE_REQ_INJECT_ENVDEP__"}
+    code_set, with_env, _, err = run("ledger-inject-envdep",
+                                     skill_root=tmp_path, env=env_set)
+    code_unset, without_env, *_ = run("ledger-inject-envdep",
+                                      skill_root=tmp_path, env=env_unset)
+    assert code_set == 0, err
+    assert code_unset == 1  # an unsatisfiable source still BLOCKS the full resolve
+    # the declared-inject input is never caller-gathered — in BOTH worlds
+    for payload in (with_env, without_env):
+        assert "owner" not in payload["required_inputs"]
+        assert "owner" not in payload["profile_overrides_inputs"]
+    # the entire payload minus the two declared env-dependent keys (exactly the
+    # keys compile-workflow prunes before freezing) is byte-equal across envs —
+    # including the rendered Inputs table (no required-flip rewrite of owner)
+    def frozen_view(p):
+        return {k: v for k, v in p.items() if k not in ("injected_inputs", "warnings")}
+    assert frozen_view(with_env) == frozen_view(without_env)
+    owner_rows = [ln for ln in without_env["rendered_skill_body"].splitlines()
+                  if ln.startswith("| owner ")]
+    assert len(owner_rows) == 1
+    assert owner_rows[0].split("|")[2].strip() == "no"  # as authored, not flipped
+
+
+def test_skip_inject_never_executes_sources(tmp_path):
+    # --skip-inject must not EXECUTE the source — a command: source's side
+    # effect cannot fire — and an unsatisfiable source cannot block (exit 0).
+    sentinel = tmp_path / "side-effect-ran.txt"
+    body = REQUIRED_INPUTS_SKILL.format(name="skipinject-cmd")
+    cfg = textwrap.dedent(f"""\
+        version: 1
+        inputs:
+          owner:
+            required: true
+            inject_from:
+              command: "touch {sentinel} && echo alice"
+        """)
+    make_skill(tmp_path, "skipinject-cmd", body, default_cfg=cfg)
+    code, data, _, err = run("skipinject-cmd", "--skip-inject", skill_root=tmp_path)
+    assert code == 0, err
+    assert not sentinel.exists()                  # the command never ran
+    assert data["injected_inputs"] == {}
+    assert "owner" not in data["required_inputs"]  # declared presence still rules
+    assert not any("owner" in w for w in data["warnings"])
+    # sanity: WITHOUT the flag the same source executes
+    code2, data2, *_ = run("skipinject-cmd", skill_root=tmp_path)
+    assert code2 == 0
+    assert sentinel.exists()
+    assert data2["injected_inputs"] == {"owner": "alice"}
+
+
+def test_skip_inject_and_inject_only_are_mutually_exclusive(tmp_path):
+    body = MINIMAL_SKILL.format(name="skipinject-both")
+    make_skill(tmp_path, "skipinject-both", body)
+    code, data, *_ = run("skipinject-both", "--skip-inject", "--inject-only",
+                         skill_root=tmp_path)
+    assert code == 2
+    assert "mutually exclusive" in data["error"]
+
+
 # =============================================================================
 # 3.2 — --override value parsing: the leading-'#' YAML-comment paper cut
 # =============================================================================

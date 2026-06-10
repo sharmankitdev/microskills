@@ -36,7 +36,7 @@
         "properties": {
           "required": {
             "type": "boolean",
-            "description": "When true, the resolver adds this input to the required_inputs ledger in the payload and rewrites the rendered Inputs table row to show required=yes with the default nullified. The Setup step then gates execution: if the caller did not supply a value in the invocation prompt, AskUserQuestion is used to gather it. The input's declared default in SKILL.md is treated as inert — it does not satisfy this requirement. If inject_from is also present and resolves successfully, the input is considered satisfied and is not added to required_inputs."
+            "description": "When true, the resolver adds this input to the required_inputs ledger in the payload and rewrites the rendered Inputs table row to show required=yes with the default nullified. The Setup step then gates execution: if the caller did not supply a value in the invocation prompt, AskUserQuestion is used to gather it. The input's declared default in SKILL.md is treated as inert — it does not satisfy this requirement. If inject_from is also DECLARED, the input is never added to required_inputs (and the table row is never rewritten) regardless of whether the source resolves on this machine: a declared-inject input is supplied by the execution environment (a failed source fails loud there — exit 1 / --inject-only), and keying the ledger off inject SUCCESS would make the payload — and compile-workflow's frozen closure built on it — env-dependent."
           },
           "allowed_values": {
             "type": "array",
@@ -48,7 +48,7 @@
           "inject_from": {
             "type": "object",
             "additionalProperties": false,
-            "description": "Auto-inject value from an external source. Exactly one source key.",
+            "description": "Auto-inject value from an external source. Exactly one source key. Sources EXECUTE at execution time only (the full resolve, or `--inject-only` inside a compiled segment); compile-time resolution passes `--skip-inject` so the compile path never runs them and the compile closure stays env-independent.",
             "properties": {
               "git_config": { "type": "string", "minLength": 1, "description": "Runs `git config <key>`. Empty result -> unresolved." },
               "env":        { "type": "string", "minLength": 1, "description": "Reads environment variable. Empty/unset -> unresolved." },

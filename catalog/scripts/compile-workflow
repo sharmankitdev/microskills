@@ -913,12 +913,25 @@ def resolve_microskill_directives(use_name, customize, defs_root):
         cmd += ["--override", pair]
     skill_root = Path(defs_root).parent / "microskills"
     cmd += ["--skill-root", str(skill_root)]
+    # COMPILE-TIME resolution never EXECUTES inject_from sources (env reads,
+    # git config, arbitrary `command:` shell are execution-time concerns —
+    # the baked `--inject-only` call applies them in the segment). This keeps
+    # the compile path side-effect-free AND the frozen payload a pure function
+    # of registry bytes + profile: the resolver computes its required-input
+    # ledger and Inputs-table rewrite from DECLARED inject_from presence, so
+    # the same def compiles byte-identically whether or not the compile
+    # machine's env could satisfy the sources.
+    cmd += ["--skip-inject"]
     fail = {"directives": None, "output_schema": None, "payload": None, "error": None}
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, cwd=str(PROJECT_ROOT))
     except Exception as e:
         fail["error"] = f"resolver invocation failed: {e}"
         return fail
+    # rc 1 is accepted only to read the resolver's structured diagnostics:
+    # under --skip-inject a rc-1 payload never carries directives (inject
+    # failure — the one rc-1-with-full-payload case — cannot occur at compile
+    # time), so it always dies at the directives-None check below.
     if proc.returncode not in (0, 1):
         try:
             msg = (json.loads(proc.stdout) or {}).get("error")
@@ -1839,15 +1852,19 @@ def main():
     # (a) declares the registry dependency, (b) lets the emitted runMicroskill
     # READ the frozen bytes at run time instead of re-shelling the resolver
     # against a possibly-drifted registry, and (c) yields the resolution_sha256
-    # folded into the per-node semantic fingerprints below. Two env-dependent
-    # keys are EXCLUDED so the frozen bytes are a pure function of registry
-    # bytes + profile (env stays out of the compile closure):
-    #   - injected_inputs — inject_from values read from the compile machine's
-    #     env; a node whose resolved config carries inject_from inputs gets
-    #     `inject: true` baked instead, and the segment runs
-    #     `resolve-microskill --inject-only` at execution time;
+    # folded into the per-node semantic fingerprints below. Env stays out of
+    # the compile closure end to end: the classify-time resolver subprocess
+    # runs with --skip-inject (inject_from sources are never EXECUTED at
+    # compile time — no side effects, no env-dependent success/failure shape
+    # in required_inputs / profile_overrides_inputs / the rewritten Inputs
+    # table; a node whose resolved config carries inject_from inputs gets
+    # `inject: true` baked instead, and the segment runs
+    # `resolve-microskill --inject-only` at execution time), and two keys are
+    # additionally EXCLUDED from the frozen bytes:
+    #   - injected_inputs — {} under --skip-inject, but excluded anyway so a
+    #     hand-run full resolution can never fork the frozen shape;
     #   - warnings — compile-time diagnostics (already surfaced on the resolver/
-    #     compile stdout) that can carry inject-failure noise from the compile env.
+    #     compile stdout).
     compiled_dir = def_dir / ".compiled"
     resolved_dir = compiled_dir / "resolved"
     frozen_payloads = {}
