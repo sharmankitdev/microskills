@@ -742,6 +742,108 @@ def auto_wire_node_inputs(node, target_inputs, workflow_inputs):
     return wired, required_wired
 
 
+def load_child_doc(defs_root, name):
+    """PURE child read: load <defs-root>/<name>/WORKFLOW.yaml as a dict.
+    Never touches the child's .compiled/manifest.json (compile/validate must stay
+    byte-identical-deterministic w.r.t. a single source — the WORKFLOW.yaml).
+    Returns (doc, error_message): doc is None when the file is missing/unparseable.
+    SHARED with validate-workflow (one reader so the two tools can never disagree
+    on what a resolvable child is)."""
+    wf = Path(defs_root) / name / "WORKFLOW.yaml"
+    if not wf.exists():
+        return None, f"does not resolve to {wf}"
+    try:
+        return (yaml.safe_load(wf.read_text()) or {}), None
+    except yaml.YAMLError as e:
+        return None, f"child '{name}' WORKFLOW.yaml parse error: {e}"
+
+
+def workflow_node_targets(doc):
+    """The child-workflow names referenced by this doc's workflow: nodes (in order).
+    SHARED with validate-workflow."""
+    out = []
+    for n in (doc.get("nodes") or []):
+        if isinstance(n, dict) and n.get("workflow"):
+            out.append(n["workflow"])
+    return out
+
+
+def nested_workflow_depth_cycle_errors(defs_root, merged):
+    """SHARED nested-workflow static governance used by BOTH compile (hard die
+    pre-emit) and validate (--defs-root blocks) — the dispatcher's bounded-
+    recursion contract ("the child contains no further nested call") rests on
+    it, so it cannot live only in an optional validation pass:
+
+      (a) DEPTH=1 — a workflow: node's child that itself contains a workflow:
+          node is a grandchild nesting; the dispatcher has no re-entrancy
+          guard for it.
+      (b) IMPORT-CYCLE — 3-color DFS over the IMPORT graph reachable from the
+          merged doc (a GRAY back-edge is a cycle). Adjacency = a doc's
+          workflow: targets restricted to its OWN imports allowlist.
+
+    Only resolvable, allowlisted children are walked: a missing or
+    un-allowlisted target is skipped here (validate reports those through its
+    own allowlist/resolution blocks; compile leaves allowlist enforcement to
+    validate — the CI gate runs validate --defs-root over every catalog def).
+    Returns [(location, message), ...] in deterministic order."""
+    errors = []
+    wf_nodes = [(n.get("id"), n) for n in (merged.get("nodes") or [])
+                if isinstance(n, dict) and n.get("workflow")]
+    if not wf_nodes:
+        return errors
+    imports_set = {imp for imp in (merged.get("imports") or [])
+                   if isinstance(imp, str)}
+    child_cache = {}
+
+    def child_doc(name):
+        if name not in child_cache:
+            child_cache[name] = load_child_doc(defs_root, name)
+        return child_cache[name]
+
+    for nid, n in wf_nodes:
+        target = n["workflow"]
+        if target not in imports_set:
+            continue
+        doc, _err = child_doc(target)
+        if doc is None:
+            continue
+        gtargets = workflow_node_targets(doc)
+        if gtargets:
+            errors.append((
+                f"nodes/{nid}",
+                f"workflow: '{target}' itself contains a nested workflow: node "
+                f"({', '.join(sorted(set(gtargets)))}); nesting depth > 1 is "
+                f"not allowed"))
+
+    root_name = merged.get("name")
+    IWHITE, IGRAY, IBLACK = 0, 1, 2
+    icolor = {}
+
+    def doc_imports(doc):
+        return {imp for imp in (doc.get("imports") or []) if isinstance(imp, str)}
+
+    def ivisit(name, doc, stack):
+        icolor[name] = IGRAY
+        allow = doc_imports(doc)
+        for tgt in workflow_node_targets(doc):
+            if tgt not in allow:
+                continue  # un-allowlisted: validate's own block, never walked
+            if icolor.get(tgt) == IGRAY:
+                errors.append((
+                    "imports",
+                    f"workflow import cycle: {' -> '.join(stack + [name, tgt])}"))
+                continue
+            if icolor.get(tgt, IWHITE) == IWHITE:
+                cdoc, _ = child_doc(tgt)
+                if cdoc is not None:
+                    ivisit(tgt, cdoc, stack + [name])
+        icolor[name] = IBLACK
+
+    if root_name:
+        ivisit(root_name, merged, [])
+    return errors
+
+
 def node_io(node):
     """Per-node IO contract recorded on the manifest step it is produced by
     (consumed by check-step-io, the dispatcher's post-step validator):
@@ -1654,6 +1756,20 @@ def main():
         if gh_errs:
             gid, gmsg = gh_errs[0]
             die(f"gate '{gid}': {gmsg}", 1)
+
+    # --- FAIL-LOUD: nested-workflow depth<=1 + import-cycle (shared helper) ---
+    # The dispatcher's bounded-recursion contract ("the child contains no
+    # further nested call") is guaranteed by the COMPILER, not only by an
+    # optional validate --defs-root pass: the shared
+    # nested_workflow_depth_cycle_errors helper walks the import graph
+    # reachable from this def and dies on a depth-2 nesting or an import
+    # cycle before any emit. The die carries ALL findings (a cycle world
+    # usually also trips the depth check — report both, name everything).
+    nw_errs = nested_workflow_depth_cycle_errors(defs_root, wf)
+    if nw_errs:
+        die("nested-workflow depth/import-cycle check failed", 1,
+            nested_workflow_errors=[
+                {"location": loc, "message": msg} for loc, msg in nw_errs])
 
     nodes = wf.get("nodes") or []
 

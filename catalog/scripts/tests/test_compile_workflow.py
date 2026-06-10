@@ -670,6 +670,58 @@ def test_split_loop_body_dies_before_emit(tmp_path):
     assert not list(compiled.glob("seg-*.js")) if compiled.exists() else True
 
 
+# --- Nested-workflow depth<=1 + import-cycle enforced in COMPILE too ---
+# The dispatcher's bounded-recursion contract ("the child contains no further
+# nested call") must be guaranteed by the compiler itself, not only by an
+# optional validate --defs-root pass — same shared helper, hard die pre-emit.
+
+def _nesting_def(defs_root, name, imports, node_yaml):
+    make_flow(defs_root, name, f"""\
+version: 1
+name: {name}
+imports: [{imports}]
+nodes:
+{node_yaml}
+""")
+
+
+def test_depth_two_nesting_dies_in_compile(tmp_path):
+    _nesting_def(tmp_path, "grand-flow", "",
+                 "  - id: g\n    agent: ag\n    prompt: leaf work\n")
+    _nesting_def(tmp_path, "child-flow", "grand-flow",
+                 "  - id: call\n    workflow: grand-flow\n    inputs: {}\n")
+    _nesting_def(tmp_path, "parent-flow", "child-flow",
+                 "  - id: build\n    workflow: child-flow\n    inputs: {}\n")
+    rc, data, out, err = run(tmp_path, "parent-flow")
+    assert rc == 1, out + err
+    msgs = json.dumps(data)
+    assert "depth" in msgs, msgs
+    compiled = tmp_path / "parent-flow" / ".compiled"
+    assert not list(compiled.glob("seg-*.js")) if compiled.exists() else True
+
+
+def test_import_cycle_dies_in_compile(tmp_path):
+    # a -> b -> a over the import graph: hard compile error, never an emit.
+    _nesting_def(tmp_path, "a-flow", "b-flow",
+                 "  - id: call\n    workflow: b-flow\n    inputs: {}\n")
+    _nesting_def(tmp_path, "b-flow", "a-flow",
+                 "  - id: call\n    workflow: a-flow\n    inputs: {}\n")
+    rc, data, out, err = run(tmp_path, "a-flow")
+    assert rc == 1, out + err
+    msgs = json.dumps(data)
+    assert "cycle" in msgs, msgs
+
+
+def test_depth_one_nesting_still_compiles(tmp_path):
+    _nesting_def(tmp_path, "child-flow", "",
+                 "  - id: c\n    agent: ag\n    prompt: leaf work\n")
+    _nesting_def(tmp_path, "parent-flow", "child-flow",
+                 "  - id: build\n    workflow: child-flow\n    inputs: {}\n")
+    rc, data, out, err = run(tmp_path, "parent-flow")
+    assert rc == 0, out + err
+    assert data["checkpoints"] == 1
+
+
 # --- Reserved wf_ node-id prefix (workflow-input args namespace) ---
 
 WF_PREFIX = """\

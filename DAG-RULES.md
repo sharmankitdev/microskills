@@ -342,8 +342,11 @@ the child's `WORKFLOW.yaml`: the target must be in `imports` (else block), must 
 (else block), a `customize.profile` (when set) must resolve to a child `profiles/<name>.yaml` (else
 block), and `${<this-node>.output.<field>}` refs are cross-checked against the child's declared
 output node (mismatch → **warn**). **Nesting depth is 1**: a child that itself contains a `workflow:`
-node is blocked, and an import cycle across the reachable import graph is blocked. Without
-`--defs-root` these checks are skipped (backward-compatible single-file validation).
+node is blocked, and an import cycle across the reachable import graph is blocked — and both of
+these are **also a hard `compile-workflow` die** (one shared helper, so the two tools can never
+disagree): the dispatcher's bounded-recursion contract does not depend on the optional validate
+pass. Without `--defs-root` the validate-side checks are skipped (backward-compatible single-file
+validation); the compile-side die always runs.
 
 ### `wire: auto` — declared pass-through forwarding
 
@@ -1415,7 +1418,8 @@ profiles. This is a documented boundary, not a fixed one.
   `delegation: orchestrator` node's `prompt`, but `workflow:` gets you the import-allowlist + child-
   contract checks.)
 - **`workflow:` targets must be in `imports`.** A `workflow:` node whose target isn't allowlisted in
-  `imports` is a validate block (with `--defs-root`); nesting depth > 1 and import cycles are blocked.
+  `imports` is a validate block (with `--defs-root`); nesting depth > 1 and import cycles are blocked
+  in validate **and** hard-die in compile (shared helper — §5d).
 - **`output_schema` replaces, never merges.** A profile that overrides `output_schema` must restate
   the *whole* schema — base fields do not leak in. (A `use:` node that *omits* its own schema inherits
   the microskill's — §11.)

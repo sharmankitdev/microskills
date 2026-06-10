@@ -467,8 +467,11 @@ never in a segment.
    first segment: a parent may pass a raw string into the child's `materialize: file` input (e.g.
    `provision` hands `microskill-create` a `requirement_path` whose value is the per-microskill
    requirement *string* from the plan), and that string must be written to a file so only a path reaches
-   the child's segment args. A value that is already a path hits the file rule (pass-through). The
-   compiler guaranteed depth ≤ 1, so the child contains no further nested call; recursion is bounded.
+   the child's segment args. A value that is already a path hits the file rule (pass-through).
+   Depth ≤ 1 is enforced at compile time — `compile-workflow` hard-dies on a child that itself
+   contains a `workflow:` node (and on an import cycle), and `validate-workflow --defs-root` blocks
+   the same findings via the same shared helper — so the child contains no further nested call;
+   recursion is bounded.
 3. **Store the child's result** — its `manifest.output.from` node output — into `results[node]`, and
    emit a short recap (reuse the child's own wrap-up; don't replay its segments).
 4. If the child fails or its evaluator never passes, **stop and surface the error** — do not claim

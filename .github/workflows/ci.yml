@@ -43,5 +43,16 @@ jobs:
             [ -f "$d/WORKFLOW.yaml" ] || continue
             catalog/scripts/compile-workflow "$(basename "$d")" --defs-root catalog/workflow-defs --check
           done
+      # Full-registry static validation: every catalog def must pass
+      # validate-workflow WITH --defs-root (imports allowlist, nested-target
+      # resolution, depth=1 + import-cycle, required-child-input, fork lints) —
+      # the --check gate above only pins the locked compile closure; this gate
+      # runs the registry-aware checks alongside it (exit 1 on any block).
+      - name: Validate catalog defs (full-registry)
+        run: |
+          for d in catalog/workflow-defs/*/; do
+            [ -f "$d/WORKFLOW.yaml" ] || continue
+            catalog/scripts/validate-workflow "$d/WORKFLOW.yaml" "$d/profiles/base.yaml" --defs-root catalog/workflow-defs
+          done
       - name: Run tests
         run: python -m pytest catalog/scripts/tests/ scripts/tests/ hooks/tests/ -v

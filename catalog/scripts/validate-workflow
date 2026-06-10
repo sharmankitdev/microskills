@@ -103,6 +103,9 @@ gate_headless_errors = _cw.gate_headless_errors
 spill_placement_errors = _cw.spill_placement_errors
 spill_schema_errors = _cw.spill_schema_errors
 spill_guard_ref_errors = _cw.spill_guard_ref_errors
+load_child_doc = _cw.load_child_doc
+workflow_node_targets = _cw.workflow_node_targets
+nested_workflow_depth_cycle_errors = _cw.nested_workflow_depth_cycle_errors
 NODE_OUTPUT_FIELD_RE = _cw.NODE_OUTPUT_FIELD_RE
 NODE_ITEMS_RE = _cw.NODE_ITEMS_RE
 
@@ -149,29 +152,6 @@ def refs_in(obj):
     out = []
     for s in collect_strings(obj):
         out.extend(REF_RE.findall(s))
-    return out
-
-
-def load_child_doc(defs_root, name):
-    """PURE child read: load <defs-root>/<name>/WORKFLOW.yaml as a dict.
-    Never touches the child's .compiled/manifest.json (compile/validate must stay
-    byte-identical-deterministic w.r.t. a single source — the WORKFLOW.yaml).
-    Returns (doc, error_message): doc is None when the file is missing/unparseable."""
-    wf = Path(defs_root) / name / "WORKFLOW.yaml"
-    if not wf.exists():
-        return None, f"does not resolve to {wf}"
-    try:
-        return (yaml.safe_load(wf.read_text()) or {}), None
-    except yaml.YAMLError as e:
-        return None, f"child '{name}' WORKFLOW.yaml parse error: {e}"
-
-
-def workflow_node_targets(doc):
-    """The child-workflow names referenced by this doc's workflow: nodes (in order)."""
-    out = []
-    for n in (doc.get("nodes") or []):
-        if isinstance(n, dict) and n.get("workflow"):
-            out.append(n["workflow"])
     return out
 
 
@@ -1124,13 +1104,9 @@ def main():
                 add(issues, "block", f"nodes/{nid}",
                     f"workflow: '{target}' {err}")
                 continue
-            # (c) DEPTH=1: a child that itself contains a workflow: node is a
-            # grandchild nesting — hard-blocked (no dispatcher re-entrancy guard).
-            gtargets = workflow_node_targets(doc)
-            if gtargets:
-                add(issues, "block", f"nodes/{nid}",
-                    f"workflow: '{target}' itself contains a nested workflow: node "
-                    f"({', '.join(sorted(set(gtargets)))}); nesting depth > 1 is not allowed")
+            # (c) DEPTH=1 now runs via the SHARED
+            # nested_workflow_depth_cycle_errors helper below (compile dies on
+            # the same findings — the two tools can never disagree).
             # (d) N4 child contract (PURE, from child WORKFLOW.yaml): every
             # required child input must be supplied by this node's inputs.
             supplied = set((n.get("inputs") or {}).keys())
@@ -1171,34 +1147,12 @@ def main():
                                     f"references ${{{nid}.output.{fld}}} but child workflow "
                                     f"'{target}' output does not declare field '{fld}'")
 
-        # (f) Import-cycle DFS over the IMPORT graph reachable from this workflow.
-        # 3-color: a GRAY back-edge is a cycle. Adjacency = a doc's workflow: targets
-        # restricted to its own imports allowlist (only resolvable children).
-        root_name = merged.get("name")
-        IWHITE, IGRAY, IBLACK = 0, 1, 2
-        icolor = {}
-
-        def doc_imports(doc):
-            return {imp for imp in (doc.get("imports") or []) if isinstance(imp, str)}
-
-        def ivisit(name, doc, stack):
-            icolor[name] = IGRAY
-            allow = doc_imports(doc)
-            for tgt in workflow_node_targets(doc):
-                if tgt not in allow:
-                    continue  # already reported as not-in-imports for the root
-                if icolor.get(tgt) == IGRAY:
-                    add(issues, "block", "imports",
-                        f"workflow import cycle: {' -> '.join(stack + [name, tgt])}")
-                    continue
-                if icolor.get(tgt, IWHITE) == IWHITE:
-                    cdoc, _ = child_doc(tgt)
-                    if cdoc is not None:
-                        ivisit(tgt, cdoc, stack + [name])
-            icolor[name] = IBLACK
-
-        if root_name:
-            ivisit(root_name, merged, [])
+        # (c)+(f) DEPTH=1 + import-cycle DFS: the SHARED helper compile-workflow
+        # also hard-dies on (same adjacency — each doc's workflow: targets
+        # restricted to its own imports allowlist; un-allowlisted/unresolvable
+        # targets are reported by the blocks above, never walked).
+        for nw_loc, nw_msg in nested_workflow_depth_cycle_errors(defs_root, merged):
+            add(issues, "block", nw_loc, nw_msg)
 
     passed = not any(i["severity"] == "block" for i in issues)
     print(json.dumps({"pass": passed, "issues": issues}, indent=2))
