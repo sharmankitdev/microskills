@@ -1016,13 +1016,14 @@ def test_default_compile_byte_identical_to_explain_compiled_bytes(tmp_path):
     assert plain == expl
 
 
-def test_default_summary_byte_identical_no_manifest_hash(tmp_path):
-    # With neither flag the stdout summary stays exactly as today: no
-    # manifest_hash key, no classification reasons, bare sequence labels.
+def test_default_summary_has_hash_but_no_explain_extras(tmp_path):
+    # SINGLE MANIFEST SHAPE: manifest_hash is core (always in the summary — the
+    # dispatcher's resume gate needs it on every compile); classification reasons
+    # and de-anonymized sequence labels remain --explain-only extras.
     make_flow(tmp_path, "gated-flow", GATED.replace("name: linear-flow", "name: gated-flow"))
     rc, data, out, err = run(tmp_path, "gated-flow")
     assert rc == 0, err
-    assert "manifest_hash" not in data
+    assert "manifest_hash" in data
     assert "classification" not in data
     assert data["sequence"] == ["segment[a]", "gate", "segment[b]"]
 
@@ -1075,16 +1076,18 @@ def test_manifest_hash_present_and_deterministic(tmp_path):
     assert data2["manifest_hash"] == h1
 
 
-def test_manifest_hash_excludes_itself(tmp_path):
-    # The hash is computed over the manifest WITHOUT its own manifest_hash key —
-    # recomputing the hash over the on-disk manifest (sans manifest_hash) must
-    # reproduce the stored value.
+def test_manifest_hash_excludes_itself_and_schema_sha(tmp_path):
+    # The hash is computed over the SEMANTIC manifest: its own manifest_hash key
+    # AND the schema_sha256 provenance stamp are both OUTSIDE the hashed payload —
+    # recomputing over the on-disk manifest minus those two keys must reproduce
+    # the stored value (so a schema-bytes-only change never invalidates resume).
     import hashlib
     d = make_flow(tmp_path, "gated-flow", GATED.replace("name: linear-flow", "name: gated-flow"))
     rc, data, out, err = run(tmp_path, "gated-flow", "--explain")
     assert rc == 0, err
     m = json.loads((d / ".compiled" / "manifest.json").read_text())
     stored = m.pop("manifest_hash")
+    m.pop("schema_sha256")
     recomputed = hashlib.sha256(
         json.dumps(m, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     assert recomputed == stored
@@ -1107,10 +1110,11 @@ def test_manifest_hash_changes_when_workflow_changes(tmp_path):
     assert data1["manifest_hash"] != data2["manifest_hash"]
 
 
-def test_plan_can_emit_manifest_hash_without_writing(tmp_path):
-    # --plan --explain prints the manifest_hash but still writes nothing.
+def test_plan_emits_manifest_hash_without_writing(tmp_path):
+    # --plan prints the manifest_hash (always surfaced now — no --explain needed)
+    # but still writes nothing.
     make_flow(tmp_path, "gated-flow", GATED.replace("name: linear-flow", "name: gated-flow"))
-    rc, data, out, err = run(tmp_path, "gated-flow", "--plan", "--explain")
+    rc, data, out, err = run(tmp_path, "gated-flow", "--plan")
     assert rc == 0, err
     assert "manifest_hash" in data
     assert not (tmp_path / "gated-flow" / ".compiled").exists()
@@ -1334,9 +1338,9 @@ def test_items_ref_cross_segment_resolves_to_args(tmp_path):
 def test_no_items_ref_byte_identical(tmp_path):
     # DETERMINISM: a workflow that uses no .items ref compiles byte-identically.
     # Recompiling the SAME def is byte-identical (manifest included), and the
-    # emitted segment JS is identical across two independent worlds (only the
-    # manifest's absolute `script` path is path-dependent, so seg-*.js is the
-    # path-free determinism surface).
+    # WHOLE .compiled/ output is identical across two independent worlds — the
+    # manifest stores script paths relative to the def dir, so nothing in the
+    # output is path-dependent (portable single-shape manifest).
     d = make_flow(tmp_path, "fe-flow", FE_PLAIN)
     run(tmp_path, "fe-flow")
     first = {p.name: p.read_text() for p in (d / ".compiled").iterdir()}
@@ -1345,9 +1349,9 @@ def test_no_items_ref_byte_identical(tmp_path):
     assert first == second
     d2 = make_flow(tmp_path / "b", "fe-flow", FE_PLAIN)
     run(tmp_path / "b", "fe-flow")
-    segs1 = {p.name: p.read_text() for p in (d / ".compiled").glob("seg-*.js")}
-    segs2 = {p.name: p.read_text() for p in (d2 / ".compiled").glob("seg-*.js")}
-    assert segs1 == segs2
+    all1 = {p.name: p.read_text() for p in (d / ".compiled").iterdir()}
+    all2 = {p.name: p.read_text() for p in (d2 / ".compiled").iterdir()}
+    assert all1 == all2
 
 
 # --- PHASE 5b FEATURE B: intra-def vars (double-brace {{key}} pre-pass) ---
@@ -2108,3 +2112,73 @@ def test_loop_body_interactive_use_member_dies(tmp_path):
     assert rc == 1
     assert "loop.body node 'ev'" in data["error"]
     assert "AskUserQuestion" in data["error"]
+
+
+# --- PORTABLE SINGLE-SHAPE MANIFEST (rank: portable-single-shape-manifest) ---
+# Manifest step script paths are stored relative to the def dir; manifest_hash is
+# always emitted (no default-vs---explain byte fork); schema_sha256 records the
+# provenance of the validating schema OUTSIDE the hash.
+
+
+def test_manifest_script_path_relative_to_def_dir(tmp_path):
+    d = make_flow(tmp_path, "gated-flow", GATED.replace("name: linear-flow", "name: gated-flow"))
+    rc, data, out, err = run(tmp_path, "gated-flow")
+    assert rc == 0, err
+    m = json.loads((d / ".compiled" / "manifest.json").read_text())
+    segs = [s for s in m["steps"] if s["kind"] == "segment"]
+    assert [s["script"] for s in segs] == [".compiled/seg-1.js", ".compiled/seg-2.js"]
+    # The relative path actually resolves against the def dir.
+    for s in segs:
+        assert (d / s["script"]).is_file()
+
+
+def test_manifest_always_carries_hash_and_schema_sha(tmp_path):
+    # A DEFAULT compile (no --explain) writes manifest_hash + schema_sha256 —
+    # single manifest shape, no opt-in fork.
+    d = make_flow(tmp_path, "linear-flow", LINEAR)
+    rc, data, out, err = run(tmp_path, "linear-flow")
+    assert rc == 0, err
+    m = json.loads((d / ".compiled" / "manifest.json").read_text())
+    assert isinstance(m.get("manifest_hash"), str) and len(m["manifest_hash"]) == 64
+    assert isinstance(m.get("schema_sha256"), str) and len(m["schema_sha256"]) == 64
+    assert data["manifest_hash"] == m["manifest_hash"]    # summary matches manifest
+
+
+def test_default_and_explain_manifests_byte_identical(tmp_path):
+    # The on-disk .compiled/ bytes no longer fork on --explain.
+    import hashlib
+    d1 = make_flow(tmp_path / "a", "gated-flow", GATED.replace("name: linear-flow", "name: gated-flow"))
+    run(tmp_path / "a", "gated-flow")
+    d2 = make_flow(tmp_path / "b", "gated-flow", GATED.replace("name: linear-flow", "name: gated-flow"))
+    run(tmp_path / "b", "gated-flow", "--explain")
+    plain = {p.name: p.read_text() for p in (d1 / ".compiled").iterdir()}
+    expl = {p.name: p.read_text() for p in (d2 / ".compiled").iterdir()}
+    assert plain == expl
+
+
+def test_schema_sha256_matches_validating_schema_bytes(tmp_path):
+    # schema_sha256 is the sha256 of the exact workflow-schema.json bytes used
+    # for validation (pinned here via MICROSKILLS_TEMPLATES_ROOT).
+    import hashlib
+    d = make_flow(tmp_path, "linear-flow", LINEAR)
+    rc, data, out, err = run(tmp_path, "linear-flow")
+    assert rc == 0, err
+    m = json.loads((d / ".compiled" / "manifest.json").read_text())
+    schema_path = REPO / "templates" / "references" / "workflow-schema.json"
+    assert m["schema_sha256"] == hashlib.sha256(schema_path.read_bytes()).hexdigest()
+
+
+def test_manifest_bytes_portable_across_checkouts(tmp_path):
+    # The SAME def compiled from two different absolute roots produces
+    # byte-identical manifest.json — and therefore the same manifest_hash —
+    # so a repo move/clone no longer invalidates resume by path alone.
+    d1 = make_flow(tmp_path / "checkout-one", "linear-flow", LINEAR)
+    rc1, data1, _, e1 = run(tmp_path / "checkout-one", "linear-flow")
+    assert rc1 == 0, e1
+    d2 = make_flow(tmp_path / "checkout-two", "linear-flow", LINEAR)
+    rc2, data2, _, e2 = run(tmp_path / "checkout-two", "linear-flow")
+    assert rc2 == 0, e2
+    m1 = (d1 / ".compiled" / "manifest.json").read_text()
+    m2 = (d2 / ".compiled" / "manifest.json").read_text()
+    assert m1 == m2
+    assert data1["manifest_hash"] == data2["manifest_hash"]

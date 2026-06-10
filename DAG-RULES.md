@@ -716,7 +716,9 @@ For each manifest step in order:
 
 - **`segment`** → build `args`: `wf_<x>` for each needed workflow input, `<id>` for each needed
   upstream node output, `carry_<v> = null` for loop carries. Invoke the Workflow engine with the
-  segment's `scriptPath` + `args`. The segment returns an object keyed by its `produces` node ids;
+  segment's `scriptPath` + `args` — the manifest stores `script` **relative to the def dir**
+  (`.compiled/seg-N.js`), so the dispatcher resolves it against `.claude/workflow-defs/<name>/`.
+  The segment returns an object keyed by its `produces` node ids;
   store each into `results`. (A loop segment also returns `__rounds`.)
 - **`checkpoint` / gate** → render `results[gate.after]` as readable markdown (never raw JSON), then
   `AskUserQuestion` with the gate's prompt + options. Approve → continue; revise → re-run the
@@ -742,13 +744,29 @@ At the end, report `results[manifest.output.from]`.
   `produces`, manifest, summary) but **write nothing** — no `mkdir`, no stale-clean, no `seg-*.js`, no
   `manifest.json`. The printed summary is identical to a real compile (plus `plan: true`). Mirrors the
   harness reconcile loops' `--plan`-by-default ergonomics. (The dispatcher never passes `--plan`.)
-- **`compile-workflow … --explain`** — **output-only**, never changes emitted bytes. Adds: per-node
-  `classification` (id → class + reason), a **de-anonymized** `sequence` (checkpoints labelled
-  `gate:<id>` / `orchestrator_node:<id>` / `nested_workflow:<id>` instead of the bare lossy type), and
-  the **`manifest_hash`** — both in the summary *and* written into `manifest.json` (the only thing that
-  changes the written bytes vs a default compile). `manifest_hash` is a SHA-256 over the canonical
-  (sorted-key, compact) manifest *excluding its own hash field*; any change to the partition / needs /
-  produces changes it.
+- **`compile-workflow … --explain`** — **output-only**, never changes any written bytes (the on-disk
+  `.compiled/` output is byte-identical with or without it — a **single manifest shape**). Adds to
+  the stdout summary: per-node `classification` (id → class + reason) and a **de-anonymized**
+  `sequence` (checkpoints labelled `gate:<id>` / `orchestrator_node:<id>` / `nested_workflow:<id>`
+  instead of the bare lossy type).
+
+### Manifest provenance — `manifest_hash` and `schema_sha256` (always emitted)
+
+Every compile writes two provenance keys into `manifest.json` (and surfaces `manifest_hash` in the
+stdout summary):
+
+- **`manifest_hash`** — a SHA-256 over the canonical (sorted-key, compact) manifest *excluding both
+  provenance keys*; any change to the partition / needs / produces changes it. Because segment
+  `script` paths are stored relative to the def dir, the manifest — and this hash — is **portable
+  across checkouts** (a repo move/clone alone no longer invalidates resume).
+- **`schema_sha256`** — the SHA-256 of the exact `workflow-schema.json` bytes the compile validated
+  against (the templates-root fallback means different environments can hold different schema
+  copies). It is **outside** `manifest_hash` by design: it is provenance only, and a
+  schema-bytes-only change moves no node output, so it must not invalidate resumable run-state.
+
+*Migration note:* introducing the relative `script` paths + always-on provenance keys changed
+manifest bytes once; the dispatcher's run-state `manifest_hash` gate absorbs it (pre-change
+run-state is simply ignored and the run starts fresh).
 
 ### Dispatcher resume (`.run-state.json`)
 
@@ -756,7 +774,8 @@ After each step the dispatcher checkpoints its `results{}` to
 `.compiled/.run-state.json` as `{manifest_hash, step_index, results}`. This is **dispatcher runtime
 state, not a compiled artifact** — the compiler never reads it, and its stale-clean globs only
 `seg-*.js`, so it is never deleted (determinism untouched). On the next run the dispatcher compiles
-with `--explain`, then if `.run-state.json` exists **and its `manifest_hash` matches** the freshly
+(every compile emits `manifest_hash`), then if `.run-state.json` exists **and its `manifest_hash`
+matches** the freshly
 compiled manifest, it offers to **resume** from the stored `step_index` (re-using completed work — e.g.
 an expensive opus planner segment). A **mismatched** hash (the workflow was recompiled / changed, so
 stored node outputs no longer line up) or an absent file → start fresh at step 0.

@@ -24,10 +24,11 @@ checkpoint in the main loop (where `AskUserQuestion` works), and threads outputs
    token from a shim). If no `.claude/workflow-defs/<name>/WORKFLOW.yaml` exists, stop and report.
 2. **Profile / overrides** — detect `<profile>` (slash position 2 or `"with <profile> profile"`) and
    any `override workflow-config: <field>=<value>` clauses.
-3. **Compile** — run via Bash: `.claude/scripts/compile-workflow <name> --explain [--profile "<profile>"]
-   [--override <k>=<v> ...]`. Pass `--explain` so the compile summary and the written manifest carry
-   `manifest_hash` (the resume check in step 6 needs it). Non-zero exit → stop and surface the JSON
-   `error` / `schema_errors`. (Never pass `--plan` here — that is a dry-run that writes nothing.)
+3. **Compile** — run via Bash: `.claude/scripts/compile-workflow <name> [--profile "<profile>"]
+   [--override <k>=<v> ...]`. The compile summary and the written manifest always carry
+   `manifest_hash` (the resume check in step 6 needs it); `--explain` is optional diagnostics only.
+   Non-zero exit → stop and surface the JSON `error` / `schema_errors`. (Never pass `--plan` here —
+   that is a dry-run that writes nothing.)
 4. **Read the manifest** — read the `manifest_path` from the compile summary
    (`.claude/workflow-defs/<name>/.compiled/manifest.json`). Note `manifest.manifest_hash`.
 5. **Gather inputs** — initialize `inputs = {}`. For each name in `manifest.required_inputs`: if the
@@ -100,8 +101,10 @@ last step simply has nothing to resume) or removed — do not let writing it blo
    - for each `id` in `step.needs.nodes` → `args[id] = results[id]` (the upstream node's output)
    - for each `v` in `step.needs.carry` → `args["carry_" + v] = null` (loops carry state internally
      across their own iterations; the seed is null)
-2. Invoke the **Workflow tool** with `scriptPath = step.script` (the manifest stores an absolute path)
-   and `args = <the object above>`. The segment runs autonomously in the background on the native engine.
+2. Invoke the **Workflow tool** with `scriptPath` = `step.script` **resolved against the def dir**:
+   the manifest stores it relative to the def dir (e.g. `.compiled/seg-1.js` — portable across
+   checkouts), so the path to pass is `.claude/workflow-defs/<name>/<step.script>`. Pass
+   `args = <the object above>`. The segment runs autonomously in the background on the native engine.
 3. When it completes, its return value is an object keyed by the node ids in `step.produces`. Store
    each into `results` (e.g. `results.plan = <returned>.plan`).
 4. **Emit a recap** (2-4 lines, human-readable, no raw JSON) of what the segment produced, before the

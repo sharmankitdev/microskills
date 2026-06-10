@@ -27,7 +27,11 @@ Pipeline:
 Usage:
   compile-workflow <name> [--profile <p>] [--override a.b=c]... [--defs-root <dir>]
 
-Stdout: JSON summary { name, profile_used, compiled_dir, manifest_path, segments, checkpoints }.
+Stdout: JSON summary { name, profile_used, compiled_dir, manifest_path, segments,
+checkpoints, manifest_hash, sequence }. The written manifest always carries
+manifest_hash plus schema_sha256 (provenance of the validating schema, excluded
+from the hash), and stores segment script paths RELATIVE to the def dir so
+manifest bytes are portable across checkouts.
 Exit codes: 0 OK · 1 block (schema/DAG error) · 2 environment/script error.
 """
 
@@ -764,9 +768,9 @@ def main():
                     help="Dry-run: compute and print the full plan but write NOTHING to "
                          ".compiled/ (no mkdir, no stale-clean, no seg files, no manifest).")
     ap.add_argument("--explain", action="store_true",
-                    help="Add per-node classification reasons, de-anonymize the sequence "
-                         "summary, and surface manifest_hash. Output-only — never changes "
-                         "the emitted segment bytes.")
+                    help="Add per-node classification reasons and de-anonymize the "
+                         "sequence summary. Output-only — never changes the emitted "
+                         "bytes (manifest_hash is always emitted regardless).")
     args = ap.parse_args()
 
     defs_root = Path(args.defs_root).resolve()
@@ -824,7 +828,12 @@ def main():
 
     if not SCHEMA_PATH.exists():
         die(f"workflow schema not found: {SCHEMA_PATH}", 1)
-    schema = json.loads(SCHEMA_PATH.read_text())
+    schema_bytes = SCHEMA_PATH.read_bytes()
+    # Provenance of the VALIDATING schema (the four-way _templates_root fallback
+    # means different environments may validate against different bytes). Recorded
+    # in the manifest, OUTSIDE manifest_hash — see the hash comment below.
+    schema_sha256 = hashlib.sha256(schema_bytes).hexdigest()
+    schema = json.loads(schema_bytes)
     errs = sorted(Draft202012Validator(schema).iter_errors(wf), key=lambda e: list(e.path))
     if errs:
         msgs = ["schema " + ("/".join(str(x) for x in e.path) or "<root>") + ": " + e.message for e in errs]
@@ -976,7 +985,12 @@ def main():
             manifest_steps.append({
                 "kind": "segment",
                 "index": seg_index,
-                "script": str(compiled_dir / fname),
+                # Stored RELATIVE to the def dir (portable single-shape manifest):
+                # manifest bytes — and manifest_hash — are now identical across
+                # checkouts, and a repo move no longer breaks resume. The
+                # dispatcher resolves it against the def dir
+                # (.claude/workflow-defs/<name>/<script>).
+                "script": f".compiled/{fname}",
                 "nodes": step["nodes"],
                 "is_loop": bool(loop) and set(step["nodes"]) == set((loop or {}).get("body") or []),
                 "needs": needs,
@@ -1011,21 +1025,28 @@ def main():
         "steps": manifest_steps,
     }
     # Deterministic content hash over the canonical (sorted-key, compact) JSON of
-    # the manifest — computed over the manifest WITHOUT its own manifest_hash key,
-    # so the hash can never depend on itself. Same inputs → same hash; any change
-    # to the partition/needs/produces changes it. (rank14's dispatcher consumes it
-    # to decide whether stored run-state matches the just-compiled workflow.)
+    # the SEMANTIC manifest. Two keys live OUTSIDE the hashed payload:
+    #   - manifest_hash itself (the hash can never depend on itself);
+    #   - schema_sha256 — PROVENANCE ONLY. manifest_hash gates dispatcher resume
+    #     (stored run-state is reusable only while partition/needs/produces still
+    #     line up); a schema-bytes-only change moves no node output, so stamping
+    #     it INSIDE the hash would needlessly invalidate resumable run-state.
+    # Same inputs → same hash; any change to the partition/needs/produces changes
+    # it. The dispatcher compares it against stored run-state before resuming.
     manifest_hash = hashlib.sha256(
         json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
 
     manifest_path = compiled_dir / "manifest.json"
-    # manifest_hash is additive/opt-in: included in the WRITTEN manifest only under
-    # --explain, so a default compile's .compiled/ bytes stay byte-identical to
-    # before. The dispatcher obtains it via --explain.
+    # SINGLE MANIFEST SHAPE: schema_sha256 and manifest_hash are ALWAYS written —
+    # a default compile and an --explain compile produce byte-identical .compiled/
+    # output (--explain only enriches the stdout summary). Migration note: adding
+    # these keys + the relative script path changes manifest bytes once; the
+    # dispatcher's run-state manifest_hash gate absorbs it (stale state is
+    # ignored, runs start fresh).
     out_manifest = dict(manifest)
-    if args.explain:
-        out_manifest["manifest_hash"] = manifest_hash
+    out_manifest["schema_sha256"] = schema_sha256
+    out_manifest["manifest_hash"] = manifest_hash
     if not args.plan:
         manifest_path.write_text(json.dumps(out_manifest, indent=2) + "\n")
 
@@ -1049,12 +1070,13 @@ def main():
         "manifest_path": rel(manifest_path),
         "segments": sum(1 for s in manifest_steps if s["kind"] == "segment"),
         "checkpoints": sum(1 for s in manifest_steps if s["kind"] == "checkpoint"),
+        # Always surfaced (single manifest shape): the dispatcher's resume gate
+        # needs it on every compile, not only under --explain.
+        "manifest_hash": manifest_hash,
         "sequence": [seq_label(s) for s in manifest_steps],
     }
     # --explain (and --plan, the dry-run preview) are additive: they only ADD keys.
-    # With neither flag the summary is byte-identical to before.
     if args.explain:
-        summary["manifest_hash"] = manifest_hash
         summary["classification"] = classification
     if args.plan:
         summary["plan"] = True
