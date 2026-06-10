@@ -1295,3 +1295,156 @@ nodes:
     rc, data, _ = run(write_wf(tmp_path, body))
     assert rc == 0 and data["pass"] is True
     assert not any("collides with node id" in i["message"] for i in data["issues"])
+
+
+# --- FAIL-LOUD CLASSIFICATION (validate-side static checks) ---
+# Mirrors compile-workflow's hard die paths: use:-target existence (behind
+# --defs-root), delegation: auto contradictions, and the statically-detectable
+# orchestrator loop-body members.
+
+USE_MS_MD = """\
+---
+name: real-ms
+description: minimal microskill for use:-existence tests
+---
+
+# real-ms
+
+## Purpose
+
+Do the thing.
+
+## Steps
+
+1. Return the result.
+"""
+
+USE_WF = """\
+version: 1
+name: use-flow
+nodes:
+  - id: u
+    use: real-ms
+"""
+
+
+def make_use_world(tmp_path, wf_body, with_ms=True):
+    """<tmp>/workflow-defs/use-flow + (optionally) <tmp>/microskills/real-ms —
+    the sibling-skill-root layout compile derives from --defs-root."""
+    defs_root = tmp_path / "workflow-defs"
+    if with_ms:
+        mdir = tmp_path / "microskills" / "real-ms" / "profiles"
+        mdir.mkdir(parents=True)
+        (tmp_path / "microskills" / "real-ms" / "MICROSKILL.md").write_text(USE_MS_MD)
+        (mdir / "base.yaml").write_text("version: 1\n")
+    return make_def(defs_root, "use-flow", wf_body), defs_root
+
+
+def test_use_target_present_passes_with_defs_root(tmp_path):
+    wf, defs_root = make_use_world(tmp_path, USE_WF, with_ms=True)
+    rc, data, _ = run_defs(defs_root, wf)
+    assert rc == 0, data
+    assert data["pass"] is True
+
+
+def test_use_target_missing_blocks_with_defs_root(tmp_path):
+    # The target microskill does not exist under the sibling microskills/ root →
+    # block (compile fails loud on the same condition).
+    wf, defs_root = make_use_world(tmp_path, USE_WF, with_ms=False)
+    rc, data, _ = run_defs(defs_root, wf)
+    assert rc == 1 and data["pass"] is False
+    assert any("use: 'real-ms' does not resolve" in i["message"] for i in data["issues"])
+
+
+def test_use_target_missing_without_defs_root_passes(tmp_path):
+    # Without --defs-root the existence check is skipped — hermetic single-file
+    # validation stays backward-compatible.
+    wf, _ = make_use_world(tmp_path, USE_WF, with_ms=False)
+    rc, data, _ = run(wf)
+    assert rc == 0, data
+    assert data["pass"] is True
+
+
+def test_use_target_missing_orchestrator_escape_hatch_passes(tmp_path):
+    # Explicit delegation: orchestrator skips resolution in compile, so the
+    # existence check skips it too.
+    body = USE_WF + "    delegation: orchestrator\n    prompt: by hand\n"
+    wf, defs_root = make_use_world(tmp_path, body, with_ms=False)
+    rc, data, _ = run_defs(defs_root, wf)
+    assert rc == 0, data
+    assert data["pass"] is True
+
+
+def test_delegation_auto_on_workflow_node_blocks(tmp_path):
+    make_def(tmp_path, "child-flow", CHILD)
+    body = PARENT.replace("    workflow: child-flow\n",
+                          "    workflow: child-flow\n    delegation: auto\n")
+    parent = make_def(tmp_path, "parent-flow", body)
+    rc, data, _ = run_defs(tmp_path, parent)
+    assert rc == 1 and data["pass"] is False
+    assert any("delegation: auto on a workflow: node" in i["message"]
+               for i in data["issues"])
+
+
+def test_side_effect_with_delegation_auto_blocks(tmp_path):
+    body = """\
+version: 1
+name: contra-flow
+nodes:
+  - id: s
+    agent: ag
+    prompt: do it
+    side_effect: true
+    delegation: auto
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    assert any("contradicts delegation: auto" in i["message"] for i in data["issues"])
+
+
+LOOP_ORCH_BODY = """\
+version: 1
+name: loop-orch-flow
+nodes:
+  - id: p
+    agent: ag
+    prompt: plan
+  - id: impl
+    delegation: orchestrator
+    depends_on: [p]
+    prompt: impl by hand
+  - id: ev
+    agent: ag
+    depends_on: [impl]
+    prompt: ev
+loop:
+  while: ${!ev.output.pass}
+  max_iters: 2
+  body: [impl, ev]
+"""
+
+
+def test_loop_body_explicit_orchestrator_member_blocks(tmp_path):
+    # Statically-detectable subset of compile's loop-body fail-loud: an explicit
+    # delegation: orchestrator member blocks (no resolution needed).
+    rc, data, _ = run(write_wf(tmp_path, LOOP_ORCH_BODY))
+    assert rc == 1 and data["pass"] is False
+    assert any(i["location"] == "loop/body" and "do/while" in i["message"]
+               for i in data["issues"])
+
+
+def test_loop_body_side_effect_member_blocks(tmp_path):
+    body = LOOP_ORCH_BODY.replace("    delegation: orchestrator\n",
+                                  "    agent: ag\n    side_effect: true\n")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    assert any(i["location"] == "loop/body" and "orchestrator" in i["message"]
+               for i in data["issues"])
+
+
+def test_loop_body_background_members_pass(tmp_path):
+    # Control: an all-background body (use/agent, no orchestrator markers) passes.
+    body = LOOP_ORCH_BODY.replace("    delegation: orchestrator\n", "    agent: ag\n")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 0, data
+    assert data["pass"] is True

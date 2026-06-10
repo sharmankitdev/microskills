@@ -8,13 +8,17 @@ Pipeline:
      overrides, strip nulls (helpers reused from resolve-microskill).
   2. Validate the merged doc against workflow-schema.json.
   3. Classify each node background|orchestrator per the delegation governance:
-     - explicit `delegation` wins;
+     - explicit `delegation` wins (but `delegation: auto` on a use: node still
+       runs resolution, and dies if the resolved microskill is interactive);
      - a node with neither use nor agent is an orchestrator-native step;
      - a `use:` microskill whose resolved allowed_tools contains AskUserQuestion,
-       or that carries a hard gate, is orchestrator (fail-safe: resolution
-       failure → orchestrator);
+       or that carries a hard gate, is orchestrator (FAIL-LOUD: resolution
+       failure is a hard compile error — escape hatch: explicit
+       `delegation: orchestrator`);
      - agent nodes are background (autonomous) unless a gate/override says otherwise;
      - a hard / human_approval gate anchored `after: X` is an orchestrator checkpoint.
+     An orchestrator-classified loop.body member is a hard error (it would
+     silently drop the do/while scaffold).
   4. Partition the topologically-sorted DAG into maximal background segments
      separated by orchestrator nodes/gates. loop.body stays inside one segment.
   5. Emit one Workflow-JS per background segment + manifest.json to
@@ -326,9 +330,10 @@ def rank_partition(seg_nodes):
 def resolve_microskill_directives(use_name, customize, defs_root):
     """Run resolve-microskill to read a use: node's allowed_tools + gates AND its
     fully-resolved (profile-merged, strip_nulls'd) output_schema. Returns a dict
-    {"directives": <dict|None>, "output_schema": <dict|None>}. Fail-safe: on any
-    failure return {"directives": None, "output_schema": None} (caller treats a
-    None directives as orchestrator).
+    {"directives": <dict|None>, "output_schema": <dict|None>, "error": <str|None>}.
+    On any failure `directives` is None and `error` carries the diagnostic — the
+    caller (classify) turns that into a HARD compile error (fail-loud: a typo'd
+    use: target must never silently mutate the partition).
 
     skill-root is derived as the sibling `microskills/` of the defs root so a
     hermetic tmp world resolves its own microskills; for the real runtime this is
@@ -339,43 +344,78 @@ def resolve_microskill_directives(use_name, customize, defs_root):
         cmd += ["--profile", str(profile)]
     skill_root = Path(defs_root).parent / "microskills"
     cmd += ["--skill-root", str(skill_root)]
-    fail = {"directives": None, "output_schema": None}
+    fail = {"directives": None, "output_schema": None, "error": None}
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, cwd=str(PROJECT_ROOT))
-    except Exception:
+    except Exception as e:
+        fail["error"] = f"resolver invocation failed: {e}"
         return fail
     if proc.returncode not in (0, 1):
+        try:
+            msg = (json.loads(proc.stdout) or {}).get("error")
+        except Exception:
+            msg = None
+        fail["error"] = msg or f"resolver exited {proc.returncode}"
         return fail
     try:
         data = json.loads(proc.stdout)
     except Exception:
+        fail["error"] = "resolver produced unparseable output"
+        return fail
+    if data.get("directives") is None:
+        fail["error"] = data.get("error") or "resolver returned no directives"
         return fail
     return {"directives": data.get("directives"),
-            "output_schema": data.get("output_schema")}
+            "output_schema": data.get("output_schema"),
+            "error": None}
 
 
 def classify(node, gates_after, defs_root):
     """Return (class, reason) where class is 'orchestrator' or 'background' and
     reason is a short human string explaining WHY. The reason is surfaced only
     under --explain; the class drives partitioning exactly as before. (side_effect
-    is already normalized to delegation: orchestrator before this is called.)"""
+    is already normalized to delegation: orchestrator before this is called.)
+
+    FAIL-LOUD governance — no silent partition mutation:
+    - a use: node whose microskill fails to resolve is a HARD compile error
+      (the old fail-safe silently became an orchestrator checkpoint that DROPPED
+      the use: field). Escape hatch: explicit `delegation: orchestrator` — it
+      returns before resolution, so the author owns the checkpoint.
+    - `delegation: auto` on a use: node still RUNS resolution (the emit needs the
+      stashed _exec_* executor identity and the inherited schema) and DIES when
+      the resolved microskill exposes AskUserQuestion or carries a hard gate —
+      auto can keep a clean microskill in a background segment, never force an
+      interactive one there.
+    - `delegation: auto` on a workflow: node or an orchestrator-native step
+      (neither use nor agent) is a HARD error: neither can run in a segment."""
+    nid = node.get("id", "?")
     deleg = node.get("delegation")
     if deleg == "orchestrator":
         return "orchestrator", "explicit delegation:orchestrator"
-    if deleg == "auto":
-        return "background", "explicit delegation:auto"
     # A nested-workflow node is always an orchestrator checkpoint (background
     # segments can't re-enter the dispatcher). Classify it BEFORE use/agent so it
-    # never reaches microskill resolution.
+    # never reaches microskill resolution. delegation: auto cannot override this.
     if node.get("workflow"):
+        if deleg == "auto":
+            die(f"node '{nid}': delegation: auto on a workflow: node is invalid — "
+                f"a nested workflow always runs as an orchestrator checkpoint "
+                f"(background segments cannot re-enter the dispatcher)", 1)
         return "orchestrator", f"nested workflow: {node['workflow']}"
     has_use = bool(node.get("use"))
     has_agent = bool(node.get("agent"))
     if not has_use and not has_agent:
+        if deleg == "auto":
+            die(f"node '{nid}': delegation: auto on a node with neither use nor "
+                f"agent is invalid — an orchestrator-native step has no "
+                f"background executor", 1)
         return "orchestrator", "orchestrator-native step (neither use nor agent)"
     if has_agent:
+        if deleg == "auto":
+            return "background", "explicit delegation:auto"
         return "background", "agent node -> background (autonomous)"
-    # use: microskill — inspect resolved directives (fail-safe → orchestrator)
+    # use: microskill — ALWAYS resolve (even under delegation: auto): the emit
+    # needs the executor identity, and an interactive microskill must never end
+    # up inside a background segment.
     resolved = resolve_microskill_directives(node["use"], node.get("customize"), defs_root)
     directives = resolved["directives"]
     # Stash the executor identity so node_call_js can bake it into the runMicroskill
@@ -388,12 +428,27 @@ def classify(node, gates_after, defs_root):
     # deleted schema is NOT resurrected — inheritance is a default-for-ABSENT only.
     node["_exec_schema"] = resolved["output_schema"]
     if directives is None:
-        return "orchestrator", f"use: {node['use']} resolution failed (fail-safe -> orchestrator)"
+        die(f"node '{nid}': use: '{node['use']}' failed to resolve "
+            f"({resolved.get('error') or 'resolution failed'}). Fix the microskill "
+            f"name/registry, or mark the node `delegation: orchestrator` explicitly "
+            f"if an orchestrator checkpoint is intended.", 1)
     if "AskUserQuestion" in (directives.get("allowed_tools") or []):
+        if deleg == "auto":
+            die(f"node '{nid}': delegation: auto would force use: '{node['use']}' "
+                f"into a background segment, but its resolved allowed_tools "
+                f"exposes AskUserQuestion — a background subagent cannot ask a "
+                f"human and will silently fabricate. Remove delegation: auto.", 1)
         return "orchestrator", f"use: {node['use']} exposes AskUserQuestion"
     for g in directives.get("gates") or []:
         if g.get("severity", "hard") == "hard":
+            if deleg == "auto":
+                die(f"node '{nid}': delegation: auto would force use: '{node['use']}' "
+                    f"into a background segment, but it carries hard gate "
+                    f"'{g.get('id', '?')}' — a background segment cannot pause for "
+                    f"approval. Remove delegation: auto.", 1)
             return "orchestrator", f"use: {node['use']} carries a hard gate forces checkpoint"
+    if deleg == "auto":
+        return "background", "explicit delegation:auto"
     return "background", f"use: {node['use']} -> background (autonomous)"
 
 
@@ -779,9 +834,15 @@ def main():
 
     # side_effect: true is a readable alias for delegation: orchestrator. Normalize
     # it BEFORE classify so the node classifies as an orchestrator checkpoint. An
-    # explicit delegation already present wins (side_effect only sets the default).
+    # explicit delegation: orchestrator already present is a no-op; an explicit
+    # delegation: auto CONTRADICTS the alias (the side-effect node would silently
+    # run in a background segment) — fail loud instead of letting one win.
     for n in nodes:
         if isinstance(n, dict) and n.pop("side_effect", None) is True:
+            if n.get("delegation") == "auto":
+                die(f"node '{n.get('id', '?')}': side_effect: true contradicts "
+                    f"delegation: auto — a side-effect node must run as an "
+                    f"orchestrator checkpoint; remove one of the two fields", 1)
             n.setdefault("delegation", "orchestrator")
 
     node_by_id = {n["id"]: n for n in nodes}
@@ -815,12 +876,37 @@ def main():
     if contig_err:
         die(contig_err, 1)
 
+    # --- classify every node ONCE, in topological order ---
+    # classify() stashes _exec_* on use: nodes (consumed by the emit) and DIES on
+    # the fail-loud governance violations (unresolvable use:, delegation: auto on
+    # an interactive microskill), so it runs BEFORE the loop-body check, the
+    # partition, and any disk write. The per-node record (node id → class +
+    # reason) is surfaced only under --explain; it never affects emitted bytes.
+    classes = {}
+    classification = []
+    for nid in order:
+        klass, reason = classify(node_by_id[nid], gates_after, defs_root)
+        classes[nid] = klass
+        classification.append({"node": nid, "class": klass, "reason": reason})
+
+    # --- FAIL-LOUD: no orchestrator-classified loop.body member ---
+    # The partition below flushes the open segment at every orchestrator node, so
+    # an orchestrator-classified body member would split the body across steps;
+    # the is_loop check (set(segment) == body) would then never match and the
+    # do/while scaffold would be SILENTLY dropped (loop runs exactly once). Die
+    # before any emit. (loop_contiguity_error cannot catch this: the member is IN
+    # the body, so the window contains no interleaved out-of-body node.)
+    if loop:
+        for b in (loop.get("body") or []):
+            if classes.get(b) == "orchestrator":
+                b_reason = next((c["reason"] for c in classification if c["node"] == b), "")
+                die(f"loop.body node '{b}' classifies as an orchestrator checkpoint "
+                    f"({b_reason}); a loop body must be entirely background — an "
+                    f"orchestrator member silently drops the do/while scaffold", 1)
+
     # --- partition into manifest steps ---
     steps = []
     seg = []
-    # Per-node classification record (node id → reason), in topological order.
-    # Surfaced only under --explain; never affects partitioning or emitted bytes.
-    classification = []
 
     def flush_segment():
         nonlocal seg
@@ -830,9 +916,7 @@ def main():
 
     for nid in order:
         node = node_by_id[nid]
-        klass, reason = classify(node, gates_after, defs_root)
-        classification.append({"node": nid, "class": klass, "reason": reason})
-        if klass == "orchestrator":
+        if classes[nid] == "orchestrator":
             flush_segment()
             if node.get("workflow"):
                 # Nested-workflow checkpoint: the dispatcher re-enters the workflow

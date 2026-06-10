@@ -297,8 +297,8 @@ node is blocked, and an import cycle across the reachable import graph is blocke
 | `use` | (a) | Bare microskill name. Mutually exclusive with `agent`/`workflow`. |
 | `agent` | (b) | Agent type. Mutually exclusive with `use`/`workflow`. |
 | `workflow` | (d) | Bare child-workflow name (kebab-case). Mutually exclusive with `use`/`agent`; must be in `imports`. Always an orchestrator checkpoint. |
-| `delegation` | all | `orchestrator` forces a checkpoint; `auto` forces background. Overrides the auto-classification. |
-| `side_effect` | all | `true` is a **readable alias for `delegation: orchestrator`** — normalized to it before classification (an explicit `delegation` already present wins). Use it to mark a node that does filesystem side effects / human interaction. |
+| `delegation` | all | `orchestrator` forces a checkpoint; `auto` forces background **for a node that can actually run there**: a `use:` node still resolves first (the executor identity must be stashed) and the compile **dies** if the resolved microskill exposes `AskUserQuestion` or carries a hard gate; `auto` on a `workflow:` node or an orchestrator-native step is a hard error (§12). |
+| `side_effect` | all | `true` is a **readable alias for `delegation: orchestrator`** — normalized to it before classification (an explicit `delegation: orchestrator` is a no-op; pairing it with `delegation: auto` is a **hard error** in both compile and validate). Use it to mark a node that does filesystem side effects / human interaction. |
 | `depends_on` | all | Upstream node ids → DAG edges. Unioned with ref-implied edges (§7). |
 | `inputs` | (a)(b)(d) | Map of input field → `${...}` expression (or literal). Wires data in. |
 | `prompt` | (b)(c) | Task prompt template. May contain `${...}`. (For `use:` nodes the body comes from the microskill.) |
@@ -512,6 +512,13 @@ compiler emits it when it sees a `when` in the body.
 > non-last body node — fails before any emit. (Previously it compiled to a silently-broken loop.)
 > **Keep `loop.body` nodes contiguous in the topological order**, and place orchestrator nodes / gates
 > *before* or *after* the loop body — never inside it.
+>
+> Contiguity is necessary but not sufficient: a body **member** that itself classifies as an
+> orchestrator checkpoint (explicit `delegation: orchestrator` / `side_effect: true`, a `workflow:`
+> node, an orchestrator-native step, or a `use:` microskill that resolves to `AskUserQuestion` / a
+> hard gate) passes the window check yet would equally drop the scaffold — the compiler now **dies**
+> on it after classification, and validate blocks the statically-detectable subset. **Every
+> `loop.body` member must be background.**
 
 ---
 
@@ -606,16 +613,29 @@ for a human.
 The compiler classifies each node (`side_effect: true` is normalized to `delegation: orchestrator`
 *before* this runs):
 
-1. `delegation: orchestrator` → **orchestrator** (explicit wins). `delegation: auto` → **background**.
+1. `delegation: orchestrator` → **orchestrator** (explicit wins; on a `use:` node this also skips
+   resolution — the escape hatch for an unresolvable target). `delegation: auto` → **background**,
+   but it is *not* a bypass: a `use:` node still resolves (rule 5 below, executor identity included),
+   and `auto` on a `workflow:` node or an orchestrator-native step is a **hard compile error**.
 2. `workflow:` → **orchestrator** (a nested-workflow checkpoint) — classified before any use/agent
    inspection.
 3. Neither `use` nor `agent` (nor `workflow`) → **orchestrator** (an orchestrator-native step).
 4. `agent:` → **background**.
 5. `use:` → resolve the microskill's directives and inspect:
-   - resolution **fails** → orchestrator (fail-safe);
-   - resolved `allowed_tools` contains **`AskUserQuestion`** → orchestrator;
-   - resolved directives carry a **hard-severity gate** → orchestrator;
+   - resolution **fails** → **hard compile error** (formerly a silent fail-safe-to-orchestrator that
+     *dropped the `use:` field entirely*; mark the node `delegation: orchestrator` explicitly if a
+     checkpoint is what you meant);
+   - resolved `allowed_tools` contains **`AskUserQuestion`** → orchestrator (**hard error** under
+     `delegation: auto` — a background subagent cannot ask a human);
+   - resolved directives carry a **hard-severity gate** → orchestrator (**hard error** under
+     `delegation: auto` — a background segment cannot pause for approval);
    - otherwise → **background**.
+
+After classification the compiler also dies if any **`loop.body` member classified orchestrator** —
+the partition would split the body across steps and silently drop the do/while scaffold (§9).
+`validate-workflow` blocks the statically-detectable subset (explicit `delegation: orchestrator` /
+`side_effect: true`, a `workflow:` node, or an orchestrator-native step in the body) and — with
+`--defs-root` — blocks a `use:` target that does not exist under the sibling `microskills/` root.
 
 Under `--explain` the compiler surfaces a per-node **classification reason** (the short string behind
 each decision, e.g. `use: task-plan -> background (autonomous)`, `nested workflow: build-…`) so you
@@ -747,7 +767,17 @@ stored node outputs no longer line up) or an absent file → start fresh at step
 
 - **⚠️ Loop contiguity (§9) is now ENFORCED, not silent.** An orchestrator node or hard gate between
   two `loop.body` nodes used to compile to a silently-broken loop; it is now a **block** in both
-  validate and compile. Keep body nodes contiguous.
+  validate and compile. Keep body nodes contiguous — and **every body member must classify
+  background**: an orchestrator-classified member (explicit delegation/side_effect, a `workflow:`
+  node, or a `use:` microskill resolving to `AskUserQuestion`/a hard gate) is a hard compile error.
+- **⚠️ A typo'd `use:` target is a hard compile error.** It used to silently classify as an
+  orchestrator checkpoint that *dropped the `use:` field entirely*. Fix the name/registry, or mark
+  the node `delegation: orchestrator` explicitly if a checkpoint is intended (validate also blocks an
+  unresolvable target when given `--defs-root`).
+- **⚠️ `delegation: auto` is not a bypass.** A `use:` node under `auto` still resolves (the executor
+  identity is stashed and baked), and the compile **dies** if the resolved microskill exposes
+  `AskUserQuestion` or carries a hard gate. `auto` on a `workflow:` node, on an orchestrator-native
+  step, or combined with `side_effect: true` is a hard error.
 - **⚠️ Gate / node id collisions are blocked.** Gate ids share the `${id...}` ref namespace with node
   ids, so a gate id must be unique among gates **and** disjoint from every node id — a collision is a
   validate block.

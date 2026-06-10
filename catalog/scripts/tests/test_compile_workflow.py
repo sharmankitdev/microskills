@@ -1866,3 +1866,245 @@ def test_decompose_analyze_writes_requirement_path_plan_reads_it(tmp_path):
     assert "decomposition_requirement_path" in seg
     assert '"requirement_path"' in seg            # plan node consumes the path
     assert "decomposition_requirement" not in seg.replace("decomposition_requirement_path", "")
+
+
+# --- FAIL-LOUD CLASSIFICATION (rank: fail-loud-classification) ---
+# The three silent partition-mutation holes are now hard die paths:
+#   (i)  use:-resolution failure (was: silent orchestrator that DROPPED use:)
+#   (ii) delegation: auto skipping resolution (was: stripped _exec_* identity and
+#        could force an interactive microskill into a background segment)
+#   (iii) an orchestrator-classified loop.body member (was: silently dropped
+#        do/while scaffold — loop ran once).
+
+CLS_MS_MD = """\
+---
+name: {name}
+description: minimal microskill for classification tests
+---
+
+# {name}
+
+## Purpose
+
+Do the thing.
+
+## Steps
+
+1. Return the result.
+"""
+
+ASK_MS_BASE = """\
+version: 1
+runtime:
+  allowed_tools: [Read, AskUserQuestion]
+"""
+
+GATED_MS_BASE = """\
+version: 1
+gates:
+  add:
+    - id: confirm-it
+      after: step-1
+      type: human_approval
+      prompt: ok?
+"""
+
+EXEC_MS_BASE = """\
+version: 1
+runtime:
+  agent: echo-runner
+  model: haiku
+output_schema:
+  type: object
+  required: [echoed]
+  properties:
+    echoed: { type: string }
+"""
+
+
+def make_cls_world(tmp_path, wf_yaml, ms=None):
+    """Hermetic world: <tmp>/workflow-defs/cls-flow + <tmp>/microskills/<name> for
+    each entry in `ms` ({name: base_yaml}). Returns (defs_root, def_dir)."""
+    defs_root = tmp_path / "workflow-defs"
+    for name, base in (ms or {}).items():
+        mdir = tmp_path / "microskills" / name / "profiles"
+        mdir.mkdir(parents=True)
+        (tmp_path / "microskills" / name / "MICROSKILL.md").write_text(
+            CLS_MS_MD.format(name=name))
+        (mdir / "base.yaml").write_text(base)
+    d = defs_root / "cls-flow"
+    (d / "profiles").mkdir(parents=True)
+    (d / "WORKFLOW.yaml").write_text(wf_yaml)
+    (d / "profiles" / "base.yaml").write_text("version: 1\n")
+    return defs_root, d
+
+
+def test_use_resolution_failure_is_hard_error(tmp_path):
+    # (i) A typo'd use: target is a HARD compile error naming the node, the
+    # target, and the delegation: orchestrator escape hatch — and nothing is
+    # written (die happens before any mkdir/emit).
+    wf = "version: 1\nname: cls-flow\nnodes:\n  - id: u\n    use: no-such-ms\n"
+    defs_root, d = make_cls_world(tmp_path, wf)
+    rc, data, out, err = run(defs_root, "cls-flow")
+    assert rc == 1
+    assert "no-such-ms" in data["error"]
+    assert "failed to resolve" in data["error"]
+    assert "delegation: orchestrator" in data["error"]    # escape hatch named
+    assert not (d / ".compiled").exists()                 # died before any write
+
+
+def test_use_resolution_failure_escape_hatch_orchestrator(tmp_path):
+    # (i) Explicit delegation: orchestrator skips resolution entirely — the node
+    # compiles as an orchestrator checkpoint (the author owns the drop of use:).
+    wf = ("version: 1\nname: cls-flow\nnodes:\n"
+          "  - id: u\n    use: no-such-ms\n    delegation: orchestrator\n"
+          "    prompt: do it by hand\n")
+    defs_root, d = make_cls_world(tmp_path, wf)
+    rc, data, out, err = run(defs_root, "cls-flow")
+    assert rc == 0, err
+    assert data["sequence"] == ["orchestrator_node"]
+
+
+def test_use_askuserquestion_classifies_orchestrator(tmp_path):
+    # Classifier branch: resolved allowed_tools exposing AskUserQuestion →
+    # orchestrator checkpoint (not background, not an error).
+    wf = "version: 1\nname: cls-flow\nnodes:\n  - id: u\n    use: ask-ms\n"
+    defs_root, d = make_cls_world(tmp_path, wf, ms={"ask-ms": ASK_MS_BASE})
+    rc, data, out, err = run(defs_root, "cls-flow", "--explain")
+    assert rc == 0, err
+    assert data["sequence"] == ["orchestrator_node:u"]
+    by_node = {c["node"]: c for c in data["classification"]}
+    assert by_node["u"]["class"] == "orchestrator"
+    assert "AskUserQuestion" in by_node["u"]["reason"]
+
+
+def test_use_hard_gate_classifies_orchestrator(tmp_path):
+    # Classifier branch: a resolved hard-severity gate → orchestrator checkpoint.
+    wf = "version: 1\nname: cls-flow\nnodes:\n  - id: u\n    use: gated-ms\n"
+    defs_root, d = make_cls_world(tmp_path, wf, ms={"gated-ms": GATED_MS_BASE})
+    rc, data, out, err = run(defs_root, "cls-flow", "--explain")
+    assert rc == 0, err
+    assert data["sequence"] == ["orchestrator_node:u"]
+    by_node = {c["node"]: c for c in data["classification"]}
+    assert by_node["u"]["class"] == "orchestrator"
+    assert "hard gate" in by_node["u"]["reason"]
+
+
+def test_delegation_auto_resolves_and_bakes_executor_identity(tmp_path):
+    # (ii) delegation: auto no longer skips resolution: the executor identity
+    # (runtime.agent / runtime.model) and the inherited output_schema are stashed
+    # and baked into the emitted runMicroskill call.
+    wf = ("version: 1\nname: cls-flow\nnodes:\n"
+          "  - id: u\n    use: exec-ms\n    delegation: auto\n")
+    defs_root, d = make_cls_world(tmp_path, wf, ms={"exec-ms": EXEC_MS_BASE})
+    rc, data, out, err = run(defs_root, "cls-flow")
+    assert rc == 0, err
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert 'agentType: "echo-runner"' in seg
+    assert 'model: "haiku"' in seg
+    assert '"echoed"' in seg                  # inherited schema baked in
+    assert "schema: null" not in seg
+
+
+def test_delegation_auto_dies_on_askuserquestion(tmp_path):
+    # (ii) auto cannot force an interactive microskill into a background segment.
+    wf = ("version: 1\nname: cls-flow\nnodes:\n"
+          "  - id: u\n    use: ask-ms\n    delegation: auto\n")
+    defs_root, d = make_cls_world(tmp_path, wf, ms={"ask-ms": ASK_MS_BASE})
+    rc, data, out, err = run(defs_root, "cls-flow")
+    assert rc == 1
+    assert "AskUserQuestion" in data["error"]
+    assert not (d / ".compiled").exists()
+
+
+def test_delegation_auto_dies_on_hard_gate(tmp_path):
+    # (ii) auto cannot force a hard-gated microskill into a background segment.
+    wf = ("version: 1\nname: cls-flow\nnodes:\n"
+          "  - id: u\n    use: gated-ms\n    delegation: auto\n")
+    defs_root, d = make_cls_world(tmp_path, wf, ms={"gated-ms": GATED_MS_BASE})
+    rc, data, out, err = run(defs_root, "cls-flow")
+    assert rc == 1
+    assert "hard gate" in data["error"]
+    assert "confirm-it" in data["error"]
+
+
+def test_delegation_auto_dies_on_resolution_failure(tmp_path):
+    # (i)+(ii) auto is NOT an escape hatch for an unresolvable use: target — the
+    # segment would need the resolved identity, so it dies like the default path.
+    wf = ("version: 1\nname: cls-flow\nnodes:\n"
+          "  - id: u\n    use: no-such-ms\n    delegation: auto\n")
+    defs_root, d = make_cls_world(tmp_path, wf)
+    rc, data, out, err = run(defs_root, "cls-flow")
+    assert rc == 1
+    assert "failed to resolve" in data["error"]
+
+
+def test_delegation_auto_on_workflow_node_dies(tmp_path):
+    # (ii) a nested workflow can never run inside a background segment.
+    wf = ("version: 1\nname: cls-flow\nimports: [child-flow]\nnodes:\n"
+          "  - id: w\n    workflow: child-flow\n    delegation: auto\n")
+    defs_root, d = make_cls_world(tmp_path, wf)
+    rc, data, out, err = run(defs_root, "cls-flow")
+    assert rc == 1
+    assert "workflow:" in data["error"]
+    assert "orchestrator checkpoint" in data["error"]
+
+
+def test_side_effect_contradicting_delegation_auto_dies(tmp_path):
+    # side_effect: true is an alias for delegation: orchestrator; pairing it with
+    # delegation: auto is a contradiction — fail loud instead of letting one win.
+    wf = ("version: 1\nname: cls-flow\nnodes:\n"
+          "  - id: s\n    agent: ag\n    prompt: do it\n"
+          "    side_effect: true\n    delegation: auto\n")
+    defs_root, d = make_cls_world(tmp_path, wf)
+    rc, data, out, err = run(defs_root, "cls-flow")
+    assert rc == 1
+    assert "contradicts" in data["error"]
+
+
+LOOP_BODY_ORCH = """\
+version: 1
+name: cls-flow
+nodes:
+  - id: p
+    agent: ag
+    prompt: plan
+  - id: impl
+    delegation: orchestrator
+    depends_on: [p]
+    prompt: impl by hand
+  - id: ev
+    agent: ag
+    depends_on: [impl]
+    prompt: ev
+loop:
+  while: ${!ev.output.pass}
+  max_iters: 2
+  body: [impl, ev]
+"""
+
+
+def test_loop_body_orchestrator_member_dies(tmp_path):
+    # (iii) an orchestrator-classified body member used to pass contiguity and
+    # silently drop the do/while scaffold (loop ran once). Now a hard error.
+    defs_root, d = make_cls_world(tmp_path, LOOP_BODY_ORCH)
+    rc, data, out, err = run(defs_root, "cls-flow")
+    assert rc == 1
+    assert "loop.body node 'impl'" in data["error"]
+    assert "do/while" in data["error"]
+    assert not (d / ".compiled").exists()
+
+
+def test_loop_body_interactive_use_member_dies(tmp_path):
+    # (iii) the resolution-driven case: a body member whose microskill exposes
+    # AskUserQuestion classifies orchestrator → same hard error (this subset is
+    # NOT statically detectable in validate-workflow; only compile catches it).
+    wf = ("version: 1\nname: cls-flow\nnodes:\n"
+          "  - id: impl\n    agent: ag\n    prompt: impl\n"
+          "  - id: ev\n    use: ask-ms\n    depends_on: [impl]\n"
+          "loop:\n  while: ${!ev.output.pass}\n  max_iters: 2\n  body: [impl, ev]\n")
+    defs_root, d = make_cls_world(tmp_path, wf, ms={"ask-ms": ASK_MS_BASE})
+    rc, data, out, err = run(defs_root, "cls-flow")
+    assert rc == 1
+    assert "loop.body node 'ev'" in data["error"]
+    assert "AskUserQuestion" in data["error"]

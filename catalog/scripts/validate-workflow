@@ -283,6 +283,19 @@ def main():
             add(issues, "block", f"nodes/{nid}",
                 "node has neither 'use' nor 'agent'; only allowed for an orchestrator-native step (delegation: orchestrator)")
 
+        # FAIL-LOUD delegation contradictions (mirror compile's hard die):
+        # delegation: auto cannot force a workflow: node into a background segment
+        # (segments cannot re-enter the dispatcher), and side_effect: true (alias
+        # for delegation: orchestrator) contradicts delegation: auto outright.
+        if n.get("delegation") == "auto" and has_wf:
+            add(issues, "block", f"nodes/{nid}",
+                "delegation: auto on a workflow: node is invalid — a nested workflow "
+                "always runs as an orchestrator checkpoint")
+        if n.get("delegation") == "auto" and n.get("side_effect") is True:
+            add(issues, "block", f"nodes/{nid}",
+                "side_effect: true contradicts delegation: auto — a side-effect node "
+                "must run as an orchestrator checkpoint; remove one of the two fields")
+
         depends = n.get("depends_on") or []
         for d in depends:
             if d not in id_set:
@@ -446,9 +459,26 @@ def main():
         for b in loop.get("body") or []:
             if b not in id_set:
                 add(issues, "block", "loop/body", f"references unknown node '{b}'")
-            elif node_by_id.get(b, {}).get("for_each"):
+                continue
+            bn = node_by_id.get(b, {})
+            if bn.get("for_each"):
                 add(issues, "block", "loop/body",
                     f"node '{b}' uses for_each; fan-out inside a loop body is unsupported")
+            # FAIL-LOUD (statically-detectable subset; mirrors compile's hard die):
+            # an orchestrator-classified body member splits the body across steps
+            # and silently drops the do/while scaffold. Block the cases visible
+            # without microskill resolution: explicit delegation: orchestrator /
+            # side_effect: true, a workflow: node, and an orchestrator-native step
+            # (neither use nor agent). A use: node that auto-classifies orchestrator
+            # via resolution (AskUserQuestion / hard gate) is caught by compile.
+            if (bn.get("delegation") == "orchestrator" or bn.get("side_effect") is True
+                    or bn.get("workflow")
+                    or not (bn.get("use") or bn.get("agent") or bn.get("workflow"))):
+                add(issues, "block", "loop/body",
+                    f"node '{b}' is an orchestrator checkpoint (explicit "
+                    f"delegation/side_effect, a workflow: node, or no use/agent); a "
+                    f"loop body must be entirely background — an orchestrator member "
+                    f"breaks the do/while scaffold")
         if "max_iters" not in loop:
             add(issues, "block", "loop", "missing required 'max_iters' cap")
         for inner in refs_in({"while": loop.get("while"), "carry": loop.get("carry")}):
@@ -475,6 +505,27 @@ def main():
     out = merged.get("output")
     if isinstance(out, dict) and out.get("from") and out["from"] not in id_set:
         add(issues, "block", "output", f"'from' references unknown node '{out['from']}'")
+
+    # --- use: target existence — only with --defs-root ---
+    # Mirrors compile-workflow's fail-loud classification: an unresolvable use:
+    # target is a HARD compile error, so surface it at validate time too. The
+    # skill root is derived exactly as compile derives it — the sibling
+    # `microskills/` of the defs root. The explicit delegation: orchestrator
+    # escape hatch (incl. its side_effect alias) skips resolution in compile, so
+    # it skips the existence check here as well. Absent --defs-root → skipped
+    # (hermetic single-file validation keeps passing).
+    if args.defs_root:
+        skill_root = Path(args.defs_root).resolve().parent / "microskills"
+        for nid, n in node_by_id.items():
+            use_name = n.get("use")
+            if not use_name or n.get("delegation") == "orchestrator" or n.get("side_effect") is True:
+                continue
+            ms_path = skill_root / str(use_name) / "MICROSKILL.md"
+            if not ms_path.exists():
+                add(issues, "block", f"nodes/{nid}",
+                    f"use: '{use_name}' does not resolve to {ms_path} (compile fails "
+                    f"loud on an unresolvable use: target; mark the node "
+                    f"delegation: orchestrator if a checkpoint is intended)")
 
     # --- Nested-workflow (workflow:) resolution — only with --defs-root ---
     # LOCKED: when --defs-root is ABSENT these checks are skipped, so existing
