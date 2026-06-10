@@ -3803,3 +3803,264 @@ def test_real_microskill_create_autonomous_profile_is_headless(tmp_path):
     assert gate["id"] == "approve_plan"
     assert gate["default"] == "approve"
     assert gate["severity"] == "hard"   # severity is NOT flipped any more
+
+
+# ---------------------------------------------------------------------------
+# spill_outputs — declared node-output-by-reference (output spill, 4.1b). The
+# compiler only RECORDS the declaration: a `spill` map on the PRODUCING
+# manifest step, OMITTED when absent (spill-free defs compile byte-identically
+# — segment JS never changes either way); the handoff writing + path
+# substitution is the dispatcher's run-step kernel. Hard blocks (shared with
+# validate-workflow): a spilled field referenced in a when/for_each guard or
+# the loop while/until (a path is not the value), spill on a for_each fan-out
+# producer, and a spilled field the effective output schema does not declare.
+
+
+SPILL_WF = """\
+version: 1
+name: spill-flow
+nodes:
+  - id: review
+    agent: ag
+    prompt: review it
+    output_schema:
+      type: object
+      required: [report, count]
+      properties:
+        report: { type: string }
+        count: { type: integer }
+    spill_outputs: [report]
+  - id: post
+    agent: ag
+    prompt: post ${review.output.report} (${review.output.count} findings)
+gates:
+  - id: g1
+    after: review
+    type: human_approval
+    prompt: ok?
+    options: [approve, abandon]
+"""
+
+SPILL_FREE_WF = SPILL_WF.replace("    spill_outputs: [report]\n", "")
+
+
+def test_spill_recorded_on_producing_segment_step_only(tmp_path):
+    d = make_flow(tmp_path, "spill-flow", SPILL_WF)
+    rc, data, out, err = run(tmp_path, "spill-flow")
+    assert rc == 0, err
+    m = json.loads((d / ".compiled" / "manifest.json").read_text())
+    seg1, gate, seg2 = m["steps"]
+    assert seg1["spill"] == {"review": ["report"]}   # the PRODUCING step
+    assert "spill" not in gate                       # gates are not producers
+    assert "spill" not in seg2                       # consumers carry nothing
+
+
+def test_spill_free_def_manifest_has_no_spill_key(tmp_path):
+    d = make_flow(tmp_path, "spill-flow", SPILL_FREE_WF)
+    rc, data, out, err = run(tmp_path, "spill-flow")
+    assert rc == 0, err
+    m = json.loads((d / ".compiled" / "manifest.json").read_text())
+    assert all("spill" not in s for s in m["steps"])
+
+
+def test_spill_never_changes_segment_js_but_is_hash_visible(tmp_path):
+    # Same def with and without spill_outputs: every emitted seg-*.js is
+    # byte-identical (spill is manifest metadata + dispatcher runtime, never
+    # compiled JS — the S1 presence guard already passes a path string), while
+    # manifest_hash differs (the spill map is inside the hashed payload) and
+    # only the PRODUCING node's fingerprint moves.
+    da = make_flow(tmp_path / "with", "spill-flow", SPILL_WF)
+    db = make_flow(tmp_path / "without", "spill-flow", SPILL_FREE_WF)
+    rca, a, _, erra = run(tmp_path / "with", "spill-flow", "--explain")
+    rcb, b, _, errb = run(tmp_path / "without", "spill-flow", "--explain")
+    assert rca == 0 and rcb == 0, erra + errb
+    segs_a = {p.name: p.read_text() for p in (da / ".compiled").glob("seg-*.js")}
+    segs_b = {p.name: p.read_text() for p in (db / ".compiled").glob("seg-*.js")}
+    assert segs_a == segs_b
+    assert a["manifest_hash"] != b["manifest_hash"]
+    fp_a = {f["node"]: f for f in a["fingerprints"]}
+    fp_b = {f["node"]: f for f in b["fingerprints"]}
+    assert fp_a["review"]["sha256"] != fp_b["review"]["sha256"]
+    assert fp_a["review"]["fingerprint"]["spill_outputs"] == ["report"]
+    assert "spill_outputs" not in fp_b["review"]["fingerprint"]
+    assert fp_a["post"]["sha256"] == fp_b["post"]["sha256"]   # consumers untouched
+
+
+def test_spill_on_orchestrator_checkpoint_step(tmp_path):
+    wf = """\
+version: 1
+name: sp-orch
+nodes:
+  - id: a
+    agent: ag
+    prompt: do a
+  - id: fin
+    delegation: orchestrator
+    depends_on: [a]
+    prompt: finalize
+    output_schema:
+      type: object
+      required: [summary]
+      properties:
+        summary: { type: string }
+    spill_outputs: [summary]
+"""
+    d = make_flow(tmp_path, "sp-orch", wf)
+    rc, data, out, err = run(tmp_path, "sp-orch")
+    assert rc == 0, err
+    m = json.loads((d / ".compiled" / "manifest.json").read_text())
+    chk = next(s for s in m["steps"]
+               if s.get("checkpoint_type") == "orchestrator_node")
+    assert chk["spill"] == {"fin": ["summary"]}
+
+
+def test_spill_field_in_when_guard_is_a_hard_die(tmp_path):
+    wf = SPILL_WF.replace(
+        "    prompt: post ${review.output.report} (${review.output.count} findings)\n",
+        "    when: ${review.output.report == 'ok'}\n"
+        "    prompt: post it\n")
+    make_flow(tmp_path, "spill-flow", wf)
+    rc, data, out, err = run(tmp_path, "spill-flow")
+    assert rc == 1
+    assert "spill_outputs" in data["error"] and "PATH" in data["error"]
+    assert "nodes/post/when" in data["error"]
+
+
+def test_spill_field_in_for_each_is_a_hard_die(tmp_path):
+    wf = """\
+version: 1
+name: sp-fe
+nodes:
+  - id: collect
+    agent: ag
+    prompt: collect
+    output_schema:
+      type: object
+      properties:
+        findings: { type: array }
+    spill_outputs: [findings]
+  - id: verify
+    agent: ag
+    for_each: ${collect.output.findings}
+    as: f
+    prompt: verify ${f}
+gates:
+  - id: g1
+    after: collect
+    type: human_approval
+    prompt: ok?
+"""
+    make_flow(tmp_path, "sp-fe", wf)
+    rc, data, out, err = run(tmp_path, "sp-fe")
+    assert rc == 1
+    assert "nodes/verify/for_each" in data["error"]
+    assert "spill_outputs" in data["error"]
+
+
+def test_spill_field_in_loop_while_is_a_hard_die(tmp_path):
+    wf = """\
+version: 1
+name: sp-loop
+nodes:
+  - id: impl
+    agent: ag
+    prompt: impl
+  - id: ev
+    agent: ag
+    depends_on: [impl]
+    prompt: ev
+    output_schema:
+      type: object
+      properties:
+        report: { type: string }
+    spill_outputs: [report]
+loop:
+  while: ${ev.output.report != 'done'}
+  max_iters: 2
+  body: [impl, ev]
+"""
+    make_flow(tmp_path, "sp-loop", wf)
+    rc, data, out, err = run(tmp_path, "sp-loop")
+    assert rc == 1
+    assert "loop/while" in data["error"] and "spill_outputs" in data["error"]
+
+
+def test_spill_on_for_each_fan_out_node_is_a_hard_die(tmp_path):
+    wf = """\
+version: 1
+name: sp-fan
+inputs:
+  items:
+    type: array
+    required: true
+nodes:
+  - id: scan
+    agent: ag
+    for_each: ${workflow.inputs.items}
+    as: item
+    prompt: scan ${item}
+    spill_outputs: [report]
+"""
+    make_flow(tmp_path, "sp-fan", wf)
+    rc, data, out, err = run(tmp_path, "sp-fan")
+    assert rc == 1
+    assert "ARRAY" in data["error"] and "spill_outputs" in data["error"]
+
+
+def test_spill_field_not_in_effective_schema_is_a_hard_die(tmp_path):
+    wf = SPILL_WF.replace("spill_outputs: [report]", "spill_outputs: [reprot]")
+    make_flow(tmp_path, "spill-flow", wf)
+    rc, data, out, err = run(tmp_path, "spill-flow")
+    assert rc == 1
+    assert "reprot" in data["error"] and "schema" in data["error"]
+
+
+def test_spill_schema_less_producer_is_any_and_passes(tmp_path):
+    # No effective output schema -> 'any': the field-coherence check never
+    # flags (mirrors the typed-ref field check), and the spill map records.
+    wf = SPILL_WF.replace("""\
+    output_schema:
+      type: object
+      required: [report, count]
+      properties:
+        report: { type: string }
+        count: { type: integer }
+""", "")
+    d = make_flow(tmp_path, "spill-flow", wf)
+    rc, data, out, err = run(tmp_path, "spill-flow")
+    assert rc == 0, err
+    m = json.loads((d / ".compiled" / "manifest.json").read_text())
+    assert m["steps"][0]["spill"] == {"review": ["report"]}
+
+
+def test_spill_same_segment_consumer_warns_on_stderr(tmp_path):
+    # No checkpoint between producer and consumer: the consumer reads the
+    # in-memory VALUE (no spill substitution happens in-segment) — warn,
+    # never silent, never a byte change.
+    wf = SPILL_WF.replace("""\
+gates:
+  - id: g1
+    after: review
+    type: human_approval
+    prompt: ok?
+    options: [approve, abandon]
+""", "")
+    d = make_flow(tmp_path, "spill-flow", wf)
+    rc, data, out, err = run(tmp_path, "spill-flow")
+    assert rc == 0
+    assert "SAME segment" in err and "review.output.report" in err
+    m = json.loads((d / ".compiled" / "manifest.json").read_text())
+    assert m["steps"][0]["spill"] == {"review": ["report"]}  # still recorded
+
+
+def test_spill_outputs_schema_rejects_empty_and_duplicates(tmp_path):
+    wf = SPILL_WF.replace("spill_outputs: [report]", "spill_outputs: []")
+    make_flow(tmp_path, "spill-flow", wf)
+    rc, data, *_ = run(tmp_path, "spill-flow")
+    assert rc == 1 and "schema_errors" in data
+    wf = SPILL_WF.replace("spill_outputs: [report]",
+                          "spill_outputs: [report, report]")
+    make_flow(tmp_path, "spill-flow2", wf.replace("name: spill-flow",
+                                                  "name: spill-flow2"))
+    rc, data, *_ = run(tmp_path, "spill-flow2")
+    assert rc == 1 and "schema_errors" in data

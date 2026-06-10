@@ -41,7 +41,11 @@ from the hash), and stores segment script paths RELATIVE to the def dir so
 manifest bytes are portable across checkouts. Every step that produces node
 results (segments + orchestrator/nested-workflow checkpoints) records a per-node
 "io": {schema, guarded, fan_out} contract — the dispatcher's post-step
-check-step-io validates stored results against it. manifest_hash folds in per-node
+check-step-io validates stored results against it — plus, ONLY when a produced
+node declares spill_outputs, a "spill" map (node id -> declared field list;
+omitted when absent, so spill-free manifests are byte-identical): the
+dispatcher's run-step kernel writes those fields to runs/<run-id>/handoff/ and
+threads their file paths instead of the values. manifest_hash folds in per-node
 SEMANTIC fingerprints (substituted prompt, inputs, effective schema, executor
 identity, when/for_each/as, frozen-resolution sha256 — phase_group excluded), so
 a registry edit or prompt change is hash-visible even though those bytes live
@@ -507,6 +511,97 @@ def loop_max_parallel_errors(nodes):
             out.append((n["id"],
                         "max_parallel is only valid on a for_each node; this node has no for_each"))
     return out
+
+
+# --- Output-by-reference: node-level spill_outputs, SHARED by compile and validate ---
+# A node's `spill_outputs: [field, ...]` declares output fields threaded BY
+# REFERENCE across checkpoint boundaries: the dispatcher's run-step kernel
+# writes each listed field's value to the per-run ledger
+# (runs/<run-id>/handoff/<node>.<field>) and substitutes the file's absolute
+# path before threading the result into a later segment's args (or a
+# checkpoint's resolved expressions) — the materialize:file / *_path
+# convention for NODE outputs. The compiler only RECORDS the declaration (a
+# `spill` map on the producing manifest step, omitted when absent so
+# spill-free defs compile byte-identically); the handoff files are dispatcher
+# runtime state the compiler never reads or writes.
+
+def spill_placement_errors(nodes):
+    """SHARED placement check (compile dies, validate blocks): spill_outputs on
+    a for_each fan-out node is unsupported — the node's stored result is an
+    ARRAY of per-item objects, so a flat <node>.<field> handoff substitution
+    has no single field to spill (per-item spill is not a v1 feature). Letting
+    it through would silently thread the full array inline — the exact hole
+    spill closes. Returns [(node_id, message), ...] in declaration order."""
+    out = []
+    for n in nodes:
+        if not isinstance(n, dict) or not n.get("id"):
+            continue
+        if n.get("spill_outputs") and n.get("for_each"):
+            out.append((n["id"],
+                        "spill_outputs is not supported on a for_each fan-out node — "
+                        "its result is an ARRAY of per-item objects, so there is no "
+                        "single <node>.<field> value to spill (per-item spill is not "
+                        "a v1 feature); aggregate the fan-out first and spill the "
+                        "aggregator's field instead"))
+    return out
+
+
+def spill_schema_errors(nid, spill, schema):
+    """SHARED spill_outputs/schema coherence check (compile dies, validate
+    blocks): when the producing node's EFFECTIVE output schema is an object
+    with declared properties, every spilled field must be one of them — a
+    typo'd field name would silently never spill (and the oversized value
+    would ride inline anyway). A schema-less / non-object producer is 'any'
+    and never flagged (mirrors the typed-ref field check). Returns [messages]."""
+    if not (isinstance(schema, dict) and schema.get("type") == "object"
+            and isinstance(schema.get("properties"), dict)):
+        return []
+    return [f"spill_outputs names field '{f}', but the node's effective output "
+            f"schema does not declare property '{f}' — the spill would silently "
+            f"never fire; fix the field name or the schema"
+            for f in spill if f not in schema["properties"]]
+
+
+def spill_guard_ref_errors(nodes, loop):
+    """SHARED HARD-BLOCK (compile dies, validate blocks): a field listed in a
+    producer's spill_outputs must never be referenced in a `when` / `for_each`
+    guard or the loop `while`/`until` — across a checkpoint the dispatcher
+    substitutes that field's value with its handoff FILE PATH, so the guard
+    would branch on (or fan out over) a path string. A PATH IS NOT THE VALUE:
+    a path is always truthy, never equals the value's literals, and is not an
+    array. Branch on a small unspilled field instead. Scans `until` as well as
+    `while` so the check is desugar-order-independent. Returns
+    [(location, message), ...] in declaration order."""
+    spill_map = {n["id"]: set(n["spill_outputs"]) for n in nodes
+                 if isinstance(n, dict) and n.get("id") and n.get("spill_outputs")}
+    errs = []
+    if not spill_map:
+        return errs
+
+    def scan(loc, text):
+        if not isinstance(text, str):
+            return
+        for inner in REF_RE.findall(text):
+            for prod, field in NODE_OUTPUT_FIELD_RE.findall(inner):
+                if field in spill_map.get(prod, ()):
+                    errs.append((loc,
+                                 f"references ${{{prod}.output.{field}}}, but "
+                                 f"'{field}' is listed in node '{prod}' "
+                                 f"spill_outputs — across a checkpoint the "
+                                 f"dispatcher threads that field as a handoff "
+                                 f"file PATH, not the value, so this guard "
+                                 f"would branch on a path string; branch on a "
+                                 f"small unspilled field instead"))
+
+    for n in nodes:
+        if not isinstance(n, dict) or not n.get("id"):
+            continue
+        scan(f"nodes/{n['id']}/when", n.get("when"))
+        scan(f"nodes/{n['id']}/for_each", n.get("for_each"))
+    if isinstance(loop, dict):
+        scan("loop/while", loop.get("while"))
+        scan("loop/until", loop.get("until"))
+    return errs
 
 
 # --- Declared gate policy (defaults + headless), SHARED by compile and validate ---
@@ -1657,6 +1752,34 @@ def main():
                     f"({b_reason}); a loop body must be entirely background — an "
                     f"orchestrator member silently drops the do/while scaffold", 1)
 
+    # --- spill_outputs: declared node-output-by-reference (shared checks) ---
+    # Placement (no for_each fan-out), schema coherence (every spilled field
+    # must exist in the node's EFFECTIVE output schema — explicit wins, else
+    # the resolved microskill schema stashed on _exec_schema by classify), and
+    # the HARD guard block: a spilled field referenced in a when / for_each
+    # guard or the loop while/until would branch on a handoff file PATH, not
+    # the value. Shared helpers with validate-workflow — the tools can never
+    # disagree. The compile itself only RECORDS the declaration (the `spill`
+    # map on the producing manifest step below); the dispatcher's run-step
+    # kernel does the runtime writing/substitution.
+    sp_errs = spill_placement_errors(nodes)
+    if sp_errs:
+        sp_nid, sp_msg = sp_errs[0]
+        die(f"node '{sp_nid}': {sp_msg}", 1)
+    for nid in order:
+        node = node_by_id[nid]
+        spill = node.get("spill_outputs")
+        if not spill:
+            continue
+        ss_errs = spill_schema_errors(
+            nid, spill, node.get("output_schema") or node.get("_exec_schema"))
+        if ss_errs:
+            die(f"node '{nid}': {ss_errs[0]}", 1)
+    sg_errs = spill_guard_ref_errors(nodes, loop)
+    if sg_errs:
+        sg_loc, sg_msg = sg_errs[0]
+        die(f"{sg_loc}: {sg_msg}", 1)
+
     # --- wire: auto — materialize declared pass-through forwards (pre-emit) ---
     # Opt-in per node (shared helpers with validate-workflow): every input the
     # node's TARGET declares (the resolved microskill profile config's inputs
@@ -1782,6 +1905,12 @@ def main():
             # output_schema is its RETURN CONTRACT (check-step-io validates the
             # stored result against it after the step) — no longer prose-only.
             chk["io"] = {nid: node_io(node)}
+            # Declared output-by-reference: recorded on the PRODUCING step,
+            # OMITTED when absent (spill-free defs stay byte-identical). The
+            # dispatcher's run-step kernel reads it when threading this node's
+            # result onward.
+            if node.get("spill_outputs"):
+                chk["spill"] = {nid: list(node["spill_outputs"])}
             steps.append(chk)
         else:
             seg.append(nid)
@@ -1790,6 +1919,34 @@ def main():
                 flush_segment()
                 steps.append({"kind": "checkpoint", "checkpoint_type": "gate", "gate": g})
     flush_segment()
+
+    # Spill substitution happens ONLY at the dispatcher's threading boundary, so
+    # a consumer in the SAME segment as the producer reads the in-memory VALUE
+    # (n_<id>.<field>), while a cross-checkpoint consumer of the same ref reads
+    # the handoff file PATH. That two-world meaning is deliberate (in-segment
+    # values never cross the args boundary, so they need no spill) but easy to
+    # misread — warn deterministically (stderr, never the emitted bytes) so it
+    # is never silent. (Guards were already hard-blocked above.)
+    for step in steps:
+        if step["kind"] != "segment":
+            continue
+        seg_set = set(step["nodes"])
+        for nid in step["nodes"]:
+            n = node_by_id[nid]
+            scoped = {k: n.get(k) for k in SCOPED_REF_FIELDS if k in n}
+            for s in collect_strings(scoped):
+                for inner in REF_RE.findall(s):
+                    for prod, field in NODE_OUTPUT_FIELD_RE.findall(inner):
+                        if (prod in seg_set and prod != nid and field in
+                                (node_by_id[prod].get("spill_outputs") or [])):
+                            sys.stderr.write(
+                                f"warning: node '{nid}': reads "
+                                f"${{{prod}.output.{field}}} in the SAME segment "
+                                f"as its producer — it receives the in-memory "
+                                f"VALUE there, while a cross-checkpoint consumer "
+                                f"of the same field receives the handoff file "
+                                f"path; make sure this consumer expects the "
+                                f"value\n")
 
     # --- emit segments ---
     # ALL disk-mutating operations are guarded behind `do_write` (--plan and
@@ -1824,7 +1981,7 @@ def main():
             fname = f"seg-{seg_index}.js"
             if do_write:
                 (compiled_dir / fname).write_text(js)
-            manifest_steps.append({
+            manifest_step = {
                 "kind": "segment",
                 "index": seg_index,
                 # Stored RELATIVE to the def dir (portable single-shape manifest):
@@ -1841,7 +1998,17 @@ def main():
                 # check-step-io validates the dispatcher-stored results against
                 # it between steps.
                 "io": {nid: node_io(node_by_id[nid]) for nid in step["nodes"]},
-            })
+            }
+            # Declared output-by-reference: the producing step's spill map
+            # (node id -> declared field list, topo order), OMITTED when no
+            # node in the segment declares spill_outputs — manifest bytes for
+            # spill-free defs are unchanged. Runtime consumption is run-step's.
+            seg_spill = {nid: list(node_by_id[nid]["spill_outputs"])
+                         for nid in step["nodes"]
+                         if node_by_id[nid].get("spill_outputs")}
+            if seg_spill:
+                manifest_step["spill"] = seg_spill
+            manifest_steps.append(manifest_step)
         else:
             manifest_steps.append(step)
 
@@ -1924,6 +2091,13 @@ def main():
         # them) stays byte-for-byte unchanged.
         if node.get("retry"):
             fp["retry"] = node.get("retry")
+        # spill_outputs changes what downstream consumers RECEIVE (a handoff
+        # path instead of the value) — fold it in, but only when PRESENT (same
+        # rationale as retry: spill-free fingerprints, and the lockfiles built
+        # on them, stay byte-for-byte unchanged), so a --check drift report can
+        # name the node that adopted spill.
+        if node.get("spill_outputs"):
+            fp["spill_outputs"] = node.get("spill_outputs")
         digest = hashlib.sha256(
             json.dumps(fp, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()

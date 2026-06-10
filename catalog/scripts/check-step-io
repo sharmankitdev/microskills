@@ -34,9 +34,13 @@ Per-node verdicts:
 Look-ahead size WARNING (exit 0, never an error): a produced value that a LATER
 segment's needs.nodes will thread back through args is measured (compact-JSON
 UTF-8 bytes); past --budget (default 32768 — headroom under the ~37KB native
-args truncation observed live) it WARNS, naming the producing node. ENFORCEMENT
-lives in the compiled segment's fail-loud args guard (throw on unparseable args /
-absent needed key) — this checker never duplicates it.
+args truncation observed live) it WARNS, naming the producing node. A field the
+producing step's recorded `spill` map declares is threaded BY REFERENCE
+(run-step substitutes a short handoff file path), so it is sized as a short
+placeholder, not its inline value — a declared spill silences the warning it
+exists to fix. ENFORCEMENT lives in the compiled segment's fail-loud args guard
+(throw on unparseable args / absent needed key) — this checker never duplicates
+it.
 
 PATHS-ONLY CONTRACT (injection doctrine). Flags carry the manifest path, the
 run-state path, and a step index — node output CONTENT never rides argv (where
@@ -224,11 +228,25 @@ def main():
         if later.get("kind") == "segment":
             threaded.update((later.get("needs") or {}).get("nodes") or [])
 
+    # This step's recorded spill map (compile records the producing node's
+    # declared spill_outputs here, omitted when absent): a spilled field is
+    # threaded BY REFERENCE — run-step substitutes a short handoff path — so
+    # the look-ahead sizes the view that will actually ride args (a short
+    # placeholder per spilled field), never the inline value.
+    step_spill = step.get("spill") if isinstance(step.get("spill"), dict) else {}
+
     checked, errors, warnings = [], [], []
     for nid in produced_ids(step):
         entry = check_node(nid, io.get(nid) or {}, results)
         if nid in results and nid in threaded:
-            size = compact_bytes(results[nid])
+            sized = results[nid]
+            sp_fields = step_spill.get(nid)
+            if sp_fields and isinstance(sized, dict):
+                sized = dict(sized)
+                for f in sp_fields:
+                    if sized.get(f) is not None:
+                        sized[f] = "<spilled: handoff path>"
+            size = compact_bytes(sized)
             entry["threaded_bytes"] = size
             if size > args.budget:
                 warnings.append(
@@ -236,8 +254,9 @@ def main():
                     f"(budget {args.budget}) — a later segment reads it through "
                     f"args, where the native engine truncates oversized "
                     f"payloads; the compiled args guard will fail loud there. "
-                    f"Consider writing this output to a file and threading the "
-                    f"path instead.")
+                    f"Declare the oversized field(s) in the producing node's "
+                    f"spill_outputs (threaded as handoff file paths) or move "
+                    f"the value by `materialize: file`.")
         checked.append(entry)
         errors.extend(entry.get("errors") or [])
 

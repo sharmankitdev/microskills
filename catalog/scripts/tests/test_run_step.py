@@ -551,3 +551,231 @@ def test_eval_template_missing_field_renders_undefined_like_segment(tmp_path):
                        "--run-state", str(st), "--step", "0")
     assert rc == 0
     assert data["prompt"] == "got undefined"
+
+
+# ================================================== spill (output-by-reference)
+# compile-workflow records a node's declared spill_outputs as a `spill` map on
+# the PRODUCING manifest step; run-step writes the listed fields to the per-run
+# ledger (<run_dir>/handoff/<node>.<field>) and substitutes their ABSOLUTE
+# paths in the THREADED VIEW only — the committed run-state keeps the values.
+
+
+def spill_producer_step(spill, nodes=None):
+    nodes = nodes if nodes is not None else list(spill)
+    return {"kind": "segment", "index": 1, "script": ".compiled/seg-1.js",
+            "nodes": nodes, "is_loop": False,
+            "needs": {"wf_inputs": [], "nodes": [], "carry": []},
+            "produces": nodes, "spill": spill}
+
+
+def test_args_spills_string_field_verbatim_and_substitutes_path(tmp_path):
+    blob = "x" * 4096
+    man, st = world(
+        tmp_path,
+        [spill_producer_step({"review": ["report"]}),
+         seg_step({"wf_inputs": [], "nodes": ["review"], "carry": []},
+                  script=".compiled/seg-2.js")],
+        results={"review": {"report": blob, "count": 3}})
+    rc, data, out, err = run("args", "--manifest", str(man),
+                             "--run-state", str(st), "--step", "1",
+                             "--budget", "1024")
+    assert rc == 0, out + err
+    hpath = str(tmp_path / "handoff" / "review.report")
+    assert data["args"]["review"]["report"] == hpath   # path, not the value
+    assert data["args"]["review"]["count"] == 3        # unspilled field: value
+    assert data["spilled"] == {"review": {"report": hpath}}
+    # the string field rides VERBATIM (the *_path convention — Read the text)
+    assert Path(hpath).read_text() == blob
+    # under budget: the big field now rides as a short path
+    assert data["args_bytes"] < 1024
+    # the committed run-state is NEVER mutated — stored results keep the value
+    assert json.loads(st.read_text())["results"]["review"]["report"] == blob
+
+
+def test_args_spills_non_string_field_as_canonical_json(tmp_path):
+    value = {"b": [2, 1], "a": {"k": True}}
+    man, st = world(
+        tmp_path,
+        [spill_producer_step({"collect": ["findings"]}),
+         seg_step({"wf_inputs": [], "nodes": ["collect"], "carry": []},
+                  script=".compiled/seg-2.js")],
+        results={"collect": {"findings": value}})
+    rc, data, *_ = run("args", "--manifest", str(man),
+                       "--run-state", str(st), "--step", "1")
+    assert rc == 0
+    hpath = data["args"]["collect"]["findings"]
+    assert Path(hpath).read_text() == json.dumps(value, indent=2,
+                                                 sort_keys=True) + "\n"
+
+
+def test_args_spilled_guarded_skip_null_still_passes_presence(tmp_path):
+    # The S1 args guard asserts key PRESENCE (null is legal). A spilled key
+    # normally arrives as a path STRING — which satisfies presence — but a
+    # guarded-skip producer stored null: the null must ride through untouched
+    # (key present, nothing spilled, no handoff side effects), exactly the
+    # presence-not-truthiness rule the compiled guard enforces.
+    man, st = world(
+        tmp_path,
+        [spill_producer_step({"advise": ["report"]}),
+         seg_step({"wf_inputs": [], "nodes": ["advise"], "carry": []},
+                  script=".compiled/seg-2.js")],
+        results={"advise": None})
+    rc, data, out, err = run("args", "--manifest", str(man),
+                             "--run-state", str(st), "--step", "1")
+    assert rc == 0, out + err
+    assert "advise" in data["args"] and data["args"]["advise"] is None
+    assert "spilled" not in data
+    assert not (tmp_path / "handoff").exists()
+
+
+def test_args_spill_absent_or_null_field_left_alone(tmp_path):
+    # An absent or null FIELD spills nothing (presence rules unchanged;
+    # schema conformance is check-step-io's job, never the kernel's).
+    man, st = world(
+        tmp_path,
+        [spill_producer_step({"review": ["report", "extra"]}),
+         seg_step({"wf_inputs": [], "nodes": ["review"], "carry": []},
+                  script=".compiled/seg-2.js")],
+        results={"review": {"count": 1, "extra": None}})
+    rc, data, *_ = run("args", "--manifest", str(man),
+                       "--run-state", str(st), "--step", "1")
+    assert rc == 0
+    assert data["args"]["review"] == {"count": 1, "extra": None}
+    assert "spilled" not in data
+    assert not (tmp_path / "handoff").exists()
+
+
+def test_args_spill_is_deterministic_and_idempotent(tmp_path):
+    man, st = world(
+        tmp_path,
+        [spill_producer_step({"review": ["report"]}),
+         seg_step({"wf_inputs": [], "nodes": ["review"], "carry": []},
+                  script=".compiled/seg-2.js")],
+        results={"review": {"report": "stable"}})
+    rc1, d1, *_ = run("args", "--manifest", str(man),
+                      "--run-state", str(st), "--step", "1")
+    first = Path(d1["args"]["review"]["report"]).read_bytes()
+    rc2, d2, *_ = run("args", "--manifest", str(man),
+                      "--run-state", str(st), "--step", "1")
+    assert rc1 == rc2 == 0
+    assert d1["args"] == d2["args"]
+    assert Path(d2["args"]["review"]["report"]).read_bytes() == first
+
+
+@needs_node
+def test_eval_substitutes_spilled_field_as_path_in_prompt(tmp_path):
+    # A checkpoint consumer sees the SAME threaded view a segment would: the
+    # spilled field resolves to the handoff path, an unspilled sibling to its
+    # value (one meaning everywhere downstream of the producer).
+    man, st = world(
+        tmp_path,
+        [spill_producer_step({"review": ["report"]}),
+         orch_step("post ${review.output.report} (${review.output.count})")],
+        results={"review": {"report": "y" * 2048, "count": 2}})
+    rc, data, out, err = run("eval", "--manifest", str(man),
+                             "--run-state", str(st), "--step", "1")
+    assert rc == 0, out + err
+    hpath = str(tmp_path / "handoff" / "review.report")
+    assert data["prompt"] == f"post {hpath} (2)"
+    assert data["spilled"] == {"review": {"report": hpath}}
+    assert Path(hpath).read_text() == "y" * 2048
+
+
+@needs_node
+def test_eval_nested_child_input_receives_spilled_path(tmp_path):
+    defs_root = tmp_path / "defs"
+    child_def(defs_root, "child-wf", "  report_path: { required: true }")
+    man, st = world(
+        tmp_path,
+        [spill_producer_step({"review": ["report"]}),
+         nested_step("child-wf", {"report_path": "${review.output.report}"})],
+        results={"review": {"report": "z" * 2048}})
+    rc, data, out, err = run("eval", "--manifest", str(man),
+                             "--run-state", str(st), "--step", "1",
+                             "--defs-root", str(defs_root))
+    assert rc == 0, out + err
+    hpath = str(tmp_path / "handoff" / "review.report")
+    assert data["child_inputs"] == {"report_path": hpath}
+
+
+@needs_node
+def test_eval_unneeded_spilled_node_is_not_written(tmp_path):
+    # Only nodes the step's expressions actually reference are spilled — an
+    # unrelated producer with a spill declaration leaves no handoff file.
+    man, st = world(
+        tmp_path,
+        [spill_producer_step({"review": ["report"]}),
+         orch_step("finalize ${plan.output.name}")],
+        results={"review": {"report": "big"}, "plan": {"name": "x"}})
+    rc, data, *_ = run("eval", "--manifest", str(man),
+                       "--run-state", str(st), "--step", "1")
+    assert rc == 0
+    assert data["prompt"] == "finalize x"
+    assert "spilled" not in data
+    assert not (tmp_path / "handoff").exists()
+
+
+def test_args_spill_integration_with_compiled_manifest(tmp_path):
+    # Shape integration (the test_check_step_io precedent): the spill map
+    # run-step consumes is the one compile-workflow ACTUALLY records on the
+    # producing step — compile a hermetic spill def, then build the consuming
+    # segment's args against the EMITTED manifest. Hand-built fixtures above
+    # cannot drift from this shape unnoticed.
+    defs_root = tmp_path / "defs"
+    d = defs_root / "sp-int"
+    (d / "profiles").mkdir(parents=True)
+    (d / "WORKFLOW.yaml").write_text("""\
+version: 1
+name: sp-int
+nodes:
+  - id: review
+    agent: ag
+    prompt: review it
+    output_schema:
+      type: object
+      required: [report, count]
+      properties:
+        report: { type: string }
+        count: { type: integer }
+    spill_outputs: [report]
+  - id: post
+    agent: ag
+    prompt: post ${review.output.report} (${review.output.count})
+gates:
+  - id: g1
+    after: review
+    type: human_approval
+    prompt: ok?
+""")
+    (d / "profiles" / "base.yaml").write_text("version: 1\n")
+    env = {**os.environ,
+           "MICROSKILLS_TEMPLATES_ROOT": str(REPO / "templates")}
+    proc = subprocess.run(
+        [sys.executable, str(REPO / "catalog" / "scripts" / "compile-workflow"),
+         "sp-int", "--defs-root", str(defs_root)],
+        capture_output=True, text=True, cwd=str(REPO), env=env)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    man = d / ".compiled" / "manifest.json"
+    manifest = json.loads(man.read_text())
+    # 0 = segment[review] (the producer, carrying spill), 1 = gate, 2 = segment[post]
+    assert manifest["steps"][0]["spill"] == {"review": ["report"]}
+    assert "spill" not in manifest["steps"][2]
+
+    run_dir = tmp_path / "runs" / "r1"
+    run_dir.mkdir(parents=True)
+    st = run_dir / "run-state.json"
+    st.write_text(json.dumps({
+        "manifest_hash": manifest["manifest_hash"], "step_index": 2,
+        "inputs": {}, "results": {"review": {"report": "R" * 4096, "count": 1}}}))
+    rc, data, out, err = run("args", "--manifest", str(man),
+                             "--run-state", str(st), "--step", "2",
+                             "--budget", "1024")
+    assert rc == 0, out + err
+    hpath = str(run_dir / "handoff" / "review.report")
+    assert data["args"]["review"]["report"] == hpath
+    assert data["args"]["review"]["count"] == 1
+    assert Path(hpath).read_text() == "R" * 4096
+    # the emitted consuming-segment guard still asserts only PRESENCE of the
+    # needed key — a path string satisfies it (S1 parity by construction)
+    seg2 = (d / manifest["steps"][2]["script"]).read_text()
+    assert '["review"]' in seg2 and "__missing" in seg2

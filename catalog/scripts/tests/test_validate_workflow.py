@@ -2382,3 +2382,197 @@ def test_present_gate_self_and_field_rules(tmp_path):
     rc2, data2, _ = run(write_wf(tmp_path, body2))
     assert rc2 == 1
     assert any("not yet recorded" in i["message"] for i in data2["issues"]), data2["issues"]
+
+
+# ---------------------------------------------------------------------------
+# spill_outputs — declared node-output-by-reference (shared helpers with
+# compile-workflow, so the two tools can never disagree): placement (no
+# for_each fan-out producer), schema coherence (spilled fields must exist in
+# the producer's EFFECTIVE output schema — inline wins, else the resolved
+# microskill schema), and the HARD-BLOCK on guards (when / for_each / loop
+# while/until) referencing a spilled field — across a checkpoint the
+# dispatcher threads it as a handoff file PATH, and a path is not the value.
+
+
+SPILL_VWF = """\
+version: 1
+name: spill-flow
+nodes:
+  - id: review
+    agent: some-agent
+    prompt: review it
+    output_schema:
+      type: object
+      required: [report, count]
+      properties:
+        report: { type: string }
+        count: { type: integer }
+    spill_outputs: [report]
+  - id: post
+    agent: some-agent
+    prompt: post ${review.output.report} (${review.output.count} findings)
+gates:
+  - id: g1
+    after: review
+    type: human_approval
+    prompt: ok?
+"""
+
+
+def test_spill_clean_def_passes(tmp_path):
+    rc, data, _ = run(write_wf(tmp_path, SPILL_VWF))
+    assert rc == 0, data
+    assert data["pass"] is True
+
+
+def test_spill_field_in_when_guard_blocks(tmp_path):
+    body = SPILL_VWF.replace(
+        "    prompt: post ${review.output.report} (${review.output.count} findings)\n",
+        "    when: ${review.output.report == 'ok'}\n"
+        "    prompt: post it\n")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert "nodes/post/when" in locs(data)
+    assert any("spill_outputs" in i["message"] and "PATH" in i["message"]
+               for i in data["issues"])
+
+
+def test_spill_unspilled_field_in_when_guard_passes(tmp_path):
+    # Branching on a small UNSPILLED field of the same producer is the
+    # documented pattern — never flagged.
+    body = SPILL_VWF.replace(
+        "    prompt: post ${review.output.report} (${review.output.count} findings)\n",
+        "    when: ${review.output.count > 0}\n"
+        "    prompt: post ${review.output.report}\n")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 0, data
+    assert data["pass"] is True
+
+
+def test_spill_field_in_for_each_blocks(tmp_path):
+    body = """\
+version: 1
+name: sp-fe
+nodes:
+  - id: collect
+    agent: some-agent
+    prompt: collect
+    output_schema:
+      type: object
+      properties:
+        findings: { type: array }
+    spill_outputs: [findings]
+  - id: verify
+    agent: some-agent
+    for_each: ${collect.output.findings}
+    as: f
+    prompt: verify ${f}
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert "nodes/verify/for_each" in locs(data)
+
+
+def test_spill_field_in_loop_until_blocks(tmp_path):
+    # The helper scans `until` as well as `while`, so the block is
+    # desugar-order-independent.
+    body = """\
+version: 1
+name: sp-loop
+nodes:
+  - id: impl
+    agent: some-agent
+    prompt: impl
+  - id: ev
+    agent: some-agent
+    depends_on: [impl]
+    prompt: ev
+    output_schema:
+      type: object
+      properties:
+        report: { type: string }
+    spill_outputs: [report]
+loop:
+  until: ${ev.output.report == 'done'}
+  max_iters: 2
+  body: [impl, ev]
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert "loop/until" in locs(data)
+
+
+def test_spill_on_for_each_fan_out_node_blocks(tmp_path):
+    body = """\
+version: 1
+name: sp-fan
+inputs:
+  items:
+    type: array
+    required: true
+nodes:
+  - id: scan
+    agent: some-agent
+    for_each: ${workflow.inputs.items}
+    as: item
+    prompt: scan ${item}
+    spill_outputs: [report]
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert "nodes/scan/spill_outputs" in locs(data)
+    assert any("ARRAY" in i["message"] for i in data["issues"])
+
+
+def test_spill_field_not_in_inline_schema_blocks(tmp_path):
+    body = SPILL_VWF.replace("spill_outputs: [report]",
+                             "spill_outputs: [reprot]")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert "nodes/review/spill_outputs" in locs(data)
+    assert any("reprot" in i["message"] for i in data["issues"])
+
+
+def test_spill_schema_less_producer_is_any_and_passes(tmp_path):
+    body = SPILL_VWF.replace("""\
+    output_schema:
+      type: object
+      required: [report, count]
+      properties:
+        report: { type: string }
+        count: { type: integer }
+""", "")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 0, data
+    assert data["pass"] is True
+
+
+SPILL_RESOLVED_WF = """\
+version: 1
+name: sch-flow
+nodes:
+  - id: u
+    use: schema-ms
+    spill_outputs: [%s]
+  - id: c
+    agent: ag
+    prompt: use ${u.output.echoed}
+"""
+
+
+def test_spill_field_checked_against_resolved_microskill_schema(tmp_path):
+    # Validator-side schema inheritance: a use: node with no inline schema
+    # falls back to the RESOLVED microskill output_schema for the spill
+    # coherence check — a spilled field the microskill never produces blocks.
+    wf, defs_root = make_schema_world(tmp_path, SPILL_RESOLVED_WF % "transcript")
+    rc, data, _ = run_defs(defs_root, wf)
+    assert rc == 1 and data["pass"] is False
+    assert "nodes/u/spill_outputs" in locs(data)
+    assert any("transcript" in i["message"] for i in data["issues"])
+
+
+def test_spill_field_in_resolved_microskill_schema_passes(tmp_path):
+    wf, defs_root = make_schema_world(tmp_path, SPILL_RESOLVED_WF % "echoed")
+    rc, data, _ = run_defs(defs_root, wf)
+    assert rc == 0, data
+    assert data["pass"] is True

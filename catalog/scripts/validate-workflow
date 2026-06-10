@@ -100,6 +100,9 @@ auto_wire_node_inputs = _cw.auto_wire_node_inputs
 gate_effective_options = _cw.gate_effective_options
 gate_policy_errors = _cw.gate_policy_errors
 gate_headless_errors = _cw.gate_headless_errors
+spill_placement_errors = _cw.spill_placement_errors
+spill_schema_errors = _cw.spill_schema_errors
+spill_guard_ref_errors = _cw.spill_guard_ref_errors
 NODE_OUTPUT_FIELD_RE = _cw.NODE_OUTPUT_FIELD_RE
 NODE_ITEMS_RE = _cw.NODE_ITEMS_RE
 
@@ -612,6 +615,34 @@ def main():
                 f"'as' must match ^[a-z][a-z0-9_]*$ (safe identifier), got '{as_var}'")
         if as_var and not has_for_each:
             add(issues, "warn", f"nodes/{nid}", "'as' declared without 'for_each'; it has no effect")
+
+    # --- spill_outputs: declared node-output-by-reference (shared checks) ---
+    # Mirrors compile EXACTLY (same shared helpers — the two tools can never
+    # disagree): (a) placement — spill_outputs on a for_each fan-out node is a
+    # block (the result is an ARRAY; no single <node>.<field> value to spill);
+    # (b) schema coherence — every spilled field must exist in the producer's
+    # EFFECTIVE output schema (inline wins, else the resolved microskill schema
+    # — validator-side inheritance; a schema-less producer is 'any', never
+    # flagged); (c) HARD-BLOCK — a spilled field referenced in a when /
+    # for_each guard or the loop while/until: across a checkpoint the
+    # dispatcher threads that field as a handoff file PATH, and a path is not
+    # the value (always truthy, never equal to the value's literals, not an
+    # array), so the guard would silently mis-branch every run.
+    spill_nodes = [n for n in nodes if isinstance(n, dict) and n.get("id")]
+    for sp_nid, sp_msg in spill_placement_errors(spill_nodes):
+        add(issues, "block", f"nodes/{sp_nid}/spill_outputs", sp_msg)
+    for nid, n in node_by_id.items():
+        spill = n.get("spill_outputs")
+        if not spill:
+            continue
+        eff_schema = n.get("output_schema")
+        if eff_schema is None:
+            eff_schema = resolved_schemas.get(nid)
+        for ss_msg in spill_schema_errors(nid, spill, eff_schema):
+            add(issues, "block", f"nodes/{nid}/spill_outputs", ss_msg)
+    sg_loop = merged.get("loop") if isinstance(merged.get("loop"), dict) else None
+    for sg_loc, sg_msg in spill_guard_ref_errors(spill_nodes, sg_loop):
+        add(issues, "block", sg_loc, sg_msg)
 
     # --- Branch-exclusivity lint (rank12, STRENGTHENED): bounded comparison analysis ---
     # Catches the malformed-fork footgun: sibling nodes (identical effective

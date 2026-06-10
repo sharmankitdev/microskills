@@ -386,3 +386,29 @@ def test_checker_against_compiled_manifest(tmp_path):
     rc, data, *_ = run_check(mp, state, 1)
     assert rc == 0
     assert by_node(data)["fin"]["result"] == "guarded_null"
+
+
+def test_oversized_spilled_field_does_not_warn(tmp_path):
+    # The producing step's recorded `spill` map means run-step threads the
+    # field as a short handoff path — the look-ahead sizes THAT view, so a
+    # declared spill silences the warning it exists to fix. An unspilled
+    # oversized sibling still warns.
+    spilled_step = dict(seg_step(
+        {"big": {"schema": None, "guarded": False, "fan_out": False}}))
+    spilled_step["spill"] = {"big": ["blob"]}
+    steps = [
+        spilled_step,
+        seg_step({"down": {"schema": None, "guarded": False, "fan_out": False}},
+                 needs_nodes=["big"]),
+    ]
+    mp, sp = world(tmp_path, steps, {"big": {"blob": "A" * 40000, "note": "ok"}})
+    rc, data, out, err = run_check(mp, sp, 0)
+    assert rc == 0, out
+    assert data["warnings"] == []
+    assert by_node(data)["big"]["threaded_bytes"] < 1000
+    # the spill view is sizing-only: an oversized UNSPILLED field still warns
+    mp2, sp2 = world(tmp_path, steps, {"big": {"blob": "A" * 40000,
+                                               "note": "B" * 40000}})
+    rc2, data2, *_ = run_check(mp2, sp2, 0)
+    assert rc2 == 0
+    assert any("big" in w for w in data2["warnings"])

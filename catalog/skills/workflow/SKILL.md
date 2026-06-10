@@ -284,7 +284,15 @@ so retention costs nothing at resume time). Do not let journaling block the run.
    truncates, run-step fails loud and never auto-spills (silently substituting a file path would
    corrupt the segment's `_args` derefs). Never hand-assemble, trim, or summarize args to sneak
    under the budget — an oversized payload means an upstream output must move to a file by
-   declaration (`materialize: file`), which is the author's fix, not yours.
+   declaration (`materialize: file` for a workflow input, `spill_outputs` on the producing node),
+   which is the author's fix, not yours.
+   **Declared spill rides automatically.** When a producing step's manifest carries a `spill` map
+   (the node declared `spill_outputs`), run-step has already written each listed field's value to
+   `<run_dir>/handoff/<node>.<field>` and substituted that file's **absolute path** into the
+   emitted `args` (the `spilled` key in its output names every substitution) — the by-reference
+   `*_path` convention; the downstream microskill reads the file. Pass the args verbatim as always:
+   never re-inline a handoff file's contents, and never edit the stored `results` (they keep the
+   full value — only the threaded view carries paths).
 2. Invoke the **Workflow tool** with `scriptPath` = `step.script` **resolved against the def dir**:
    the manifest stores it relative to the def dir (e.g. `.compiled/seg-1.js` — portable across
    checkouts), so the path to pass is `.claude/workflow-defs/<name>/<step.script>`. Pass
@@ -373,7 +381,10 @@ An orchestrator-native step (a node with neither `use` nor `agent`, or `delegati
 `.claude/scripts/run-step eval --manifest '.claude/workflow-defs/<name>/.compiled/manifest.json' --run-state '<run_dir>/run-state.json' --step <i>`
 It executes the step's `when` / `for_each` / `${...}` refs as the compiler's own translated JS
 (under node, context from the committed run-state) — **never evaluate an expression or substitute a
-`${...}` ref in your head**; the segment world runs these as real JS, and this is the same JS.
+`${...}` ref in your head**; the segment world runs these as real JS, and this is the same JS. A
+referenced field a producing step's `spill` map declares resolves to its **handoff file path**
+(run-step substitutes it — the same by-reference view a segment receives; its `spilled` key names
+each substitution): treat it as a path to Read, never re-inline the contents into the prompt.
 Parse its JSON and act on it:
 - `skipped: true` (a false `when`) → store `results[node] = null`, journal the step with
   `--outcome skipped`, and continue to the next step — do not execute the prompt.
@@ -410,8 +421,10 @@ never in a segment.
 1. **Evaluate and resolve in code** — run the same ONE Bash call as an orchestrator node:
    `.claude/scripts/run-step eval --manifest '.claude/workflow-defs/<name>/.compiled/manifest.json' --run-state '<run_dir>/run-state.json' --step <i>`
    For a nested step it additionally resolves the declared `inputs` map (a full `${ref}` value keeps
-   its type; an embedded ref string-interpolates) and **cross-checks the resolved map against the
-   child's required inputs pre-run** (base profile + the step's `profile` overlay applied). Parse
+   its type; an embedded ref string-interpolates; a field a producing step's `spill` map declares
+   resolves to its **handoff file path** — by-reference into the child, which a child
+   `materialize: file` input passes through as a path) and **cross-checks the resolved map against
+   the child's required inputs pre-run** (base profile + the step's `profile` overlay applied). Parse
    its JSON:
    - `skipped: true` (a false `when`) → store `results[node] = null`, journal with
      `--outcome skipped`, continue — never compile or enter the child.

@@ -384,6 +384,69 @@ A wired ref is `${workflow.inputs.*}`-only, so it can never add a dependency edg
 topological order; a wire that materializes the same pairs as the hand-written forwards leaves the
 compiled segments, `manifest_hash`, and the committed `closure.lock.json` **unchanged**.
 
+### `spill_outputs` — node output by reference
+
+`materialize: file` moves a large **workflow input** by reference; `spill_outputs` is its twin for
+**node outputs** crossing a checkpoint boundary. Node outputs thread between segments through the
+native engine's `args` string, which silently truncates around ~37KB — the compiled args guard then
+fails loud, but the fix must be declarative:
+
+```yaml
+- id: review
+  agent: reviewer
+  prompt: review the diff
+  output_schema:
+    type: object
+    required: [report, blocker_count]
+    properties:
+      report: { type: string }        # large markdown — spill it
+      blocker_count: { type: integer }
+  spill_outputs: [report]
+- id: post
+  use: post-review                    # its input is report_path — read by reference
+  inputs:
+    report_path: ${review.output.report}
+  when: ${review.output.blocker_count > 0}   # branch on a small UNSPILLED field
+```
+
+**Semantics.** The compiler only RECORDS the declaration: a `spill` map (`{<node-id>: [field, ...]}`)
+on the **producing manifest step**, omitted when absent — spill-free defs compile **byte-identically**
+and **segment JS never changes** either way. At run time the dispatcher's `run-step` kernel does the
+work: for every consumer downstream of a checkpoint boundary (a later segment's `args`, an
+orchestrator/nested checkpoint's resolved `${...}` refs), each spilled field's value is written to
+the per-run ledger at `runs/<run-id>/handoff/<node>.<field>` — a **string field verbatim** (the
+`*_path` convention: the consumer Reads the text), any other JSON value as canonical sorted-key
+JSON — and the field in the **threaded view** is replaced by that file's absolute path. The
+committed run-state keeps the full value (so `check-step-io` still validates values against
+schemas, gate `present:` paths still render the value, and re-runs re-derive the same bytes);
+**only the threaded view carries paths**. The S1 args guard is presence-based, so a spilled key
+(a path string) and a guarded-skip `null` both pass it unchanged.
+
+Rules (fail-loud, shared compile/validate helpers — the two tools can never disagree):
+
+- **Guards are HARD-BLOCKED** — a spilled field referenced in a `when` / `for_each` guard or the
+  loop `while`/`until` is a block in both tools: downstream it is a handoff file **path, not the
+  value** (always truthy, never equal to the value's literals, not an array), so the guard would
+  silently mis-branch every run. Branch on a small unspilled sibling field instead
+  (`blocker_count` above).
+- **No `for_each` fan-out producer** — a fan-out node's stored result is an ARRAY of per-item
+  objects; there is no single `<node>.<field>` value to spill (per-item spill is not a v1 feature).
+  Aggregate first, then spill the aggregator's field.
+- **Spilled fields must exist in the effective output schema** — explicit `output_schema` wins,
+  else the resolved microskill schema (validator-side inheritance); a typo'd field would silently
+  never spill. A schema-less producer is 'any' and never flagged.
+- **Same-segment consumers read the VALUE** — substitution happens only at the dispatcher's
+  threading boundary, so a consumer in the *same segment* as the producer receives the in-memory
+  value (`n_<id>.<field>`), not a path. That is deliberate (in-segment values never cross the args
+  boundary) but compile **warns** (stderr) on every same-segment read of a spilled field so the
+  two-world meaning is never silent — author the in-segment consumer to expect the value, and the
+  cross-checkpoint consumer to expect a `*_path`.
+
+`spill_outputs` is hash-visible: the producing step's `spill` map rides inside `manifest_hash`, and
+the node's semantic fingerprint folds `spill_outputs` **only when present** (the `retry` precedent)
+— spill-free fingerprints and committed lockfiles stay byte-for-byte unchanged, and a `--check`
+drift report can name the node that adopted spill.
+
 ### Full node field reference
 
 | Field | Applies to | Meaning |
@@ -402,6 +465,7 @@ compiled segments, `manifest_hash`, and the committed `closure.lock.json` **unch
 | `when` | all | Conditional guard (see §6). |
 | `for_each` + `as` | all | Fan-out over a collection (see §6). |
 | `max_parallel` | for_each only | Bound the fan-out to batches of K (`parallelChunked`) instead of one unbounded `parallel()`. **Only valid on a `for_each` node** — on a non-fan-out node it is a block. |
+| `spill_outputs` | (a)(b)(c)(d), not for_each | `[field, ...]` — declared output-by-reference (§5): each listed output field threads across checkpoint boundaries as a **handoff file path** (`runs/<run-id>/handoff/<node>.<field>`, written + substituted by `run-step`), never the inline value — the `materialize: file` twin for node outputs. Recorded as a `spill` map on the producing manifest step **only when present** (spill-free defs byte-identical; segment JS never changes). Blocks: a spilled field in a `when`/`for_each` guard or loop `while`/`until` (a path is not the value); a `for_each` producer (its result is an array); a field the effective schema does not declare. |
 | `customize` | (a)(d) | **Closed to `{profile?, overrides?}`.** On a `use:` node, `profile` selects the microskill's profile and `overrides` is a flat map of dotted resolver-config path → value (per-node `resolve-microskill --override` semantics — §11); on a `workflow:` node, `profile` selects the **child workflow's** profile (passed through to the nested-workflow checkpoint) and `overrides` is a **block**. |
 | `retry` | (a)(b) | `{max_attempts: N≥2}` — bounded retry for a **background** `use:`/`agent:` node (§12). A block/hard error anywhere else (a `workflow:`/orchestrator node never runs inside a compiled segment). |
 | `grant_tools` | (a)(b) | **Declared but inert** — the compiler does not consume it. See §13. |
@@ -1052,9 +1116,13 @@ For each manifest step in order:
   opens with a fail-loud guard that **throws** on unparseable args (the native engine truncates
   oversized payloads — a truncated JSON string must stop the run, not degrade to `{}` and let
   downstream nodes fabricate) and throws on any **absent** needed key (presence, not truthiness).
-  An args payload past the size budget (default 32 KiB) **fails loud pre-flight — never
-  auto-spilled** (silently substituting a file path would corrupt the segment's `_args` derefs;
-  moving a payload by reference is a declared feature, e.g. `materialize: file`). Invoke the
+  A field the producing step's `spill` map declares (the node's `spill_outputs` — §5) is
+  substituted with its **handoff file path** (`<run_dir>/handoff/<node>.<field>`, written by
+  run-step; the stored result keeps the value) before the size check, so a declared spill never
+  trips the budget. An args payload past the size budget (default 32 KiB) **fails loud pre-flight —
+  never auto-spilled** (silently substituting a file path would corrupt the segment's `_args`
+  derefs; moving a payload by reference is a DECLARED feature — `materialize: file` for a workflow
+  input, `spill_outputs` on the producing node). Invoke the
   Workflow engine with the segment's `scriptPath` + the emitted `args` verbatim — the manifest
   stores `script` **relative to the def dir** (`.compiled/seg-N.js`), so the dispatcher resolves it
   against `.claude/workflow-defs/<name>/`. The segment returns an object keyed by its `produces`
@@ -1071,7 +1139,9 @@ For each manifest step in order:
   `translate_ref`/`tmpl_literal` and **executes the translated JS under `node`** with the
   run-state-derived context on stdin — the one evaluation path, identical to the compiled-segment
   semantics (JS truthiness, `==` coercion, undefined propagation; a missing `node` binary fails
-  loud, and there is deliberately no Python re-implementation to drift). A false `when` skips
+  loud, and there is deliberately no Python re-implementation to drift). Spilled fields (§5)
+  resolve to their handoff paths here too — a checkpoint consumer sees the same threaded view a
+  segment would. A false `when` skips
   (store `null`) **without evaluating the fan-out** (the segment-ternary short-circuit); otherwise
   the dispatcher executes the returned fully-substituted `prompt` (one per `iterations` entry under
   `for_each`, collecting an array; empty collection → `[]`) in the main loop — this is where
@@ -1209,6 +1279,13 @@ chronological) via `run-journal init` and namespaces ALL of a run's state under
   committable nor offered for resume.
 - **`run-inputs/`** — per-run materialized inputs (`normalize-input` outputs), so one run's
   materialized diff can never be overwritten by the next run's.
+- **`handoff/`** — per-run spilled node outputs (`run-step` writes `<node>.<field>` for every
+  field a producing step's `spill` map declares — §5 `spill_outputs`; a string field verbatim,
+  anything else as canonical JSON), substituted as absolute paths into the threaded args/eval
+  view. Deterministic and idempotent (same recorded value → same bytes); the committed run-state
+  keeps the values, so a rerun's NEW run dir re-derives its own handoff files from the seeded
+  results. Like `run-inputs/`, downstream consumers may hold these paths — finished-run-dir
+  retention covers them.
 - **`journal.jsonl`** — an append-only machine-readable timeline written ONLY by the
   `run-journal` helper (paths-only contract: flags carry paths and short labels; the helper mints
   its own timestamps and computes byte sizes by *reading* the committed run-state — node outputs
@@ -1285,7 +1362,12 @@ profiles. This is a documented boundary, not a fixed one.
   `args` payloads (~37KB observed); the compiled guard **throws** on a JSON parse failure and on any
   absent needed key instead of degrading to `_args = {}` (which let downstream nodes read
   `undefined` and fabricate). Keep large values **by reference** (`materialize: file` inputs,
-  `*_path` conventions) so only short paths ride in `args`.
+  `spill_outputs` on producing nodes, `*_path` conventions) so only short paths ride in `args`.
+- **⚠️ A spilled field is a PATH everywhere downstream — never branch on it.** A field in
+  `spill_outputs` (§5) threads across checkpoints as its handoff file path; referencing it in a
+  `when`/`for_each` guard or loop `while`/`until` is a **block** in both tools (a path is always
+  truthy, never equals the value's literals, and is not an array). Same-segment consumers still
+  read the in-memory **value** — compile warns on that two-world read.
 - **⚠️ Gate / node id collisions are blocked.** Gate ids share the `${id...}` ref namespace with node
   ids, so a gate id must be unique among gates **and** disjoint from every node id — a collision is a
   validate block.
@@ -1604,6 +1686,10 @@ Before you compile, confirm:
 - [ ] `customize` carries only `profile`/`overrides`; `customize.overrides` and `retry` sit only on
       nodes where they can apply (`overrides`: resolving `use:` nodes; `retry`: background
       `use:`/`agent:` nodes). No reliance on `grant_tools` (still inert).
+- [ ] Any output field too large to ride `args` inline (~32 KiB compact JSON) is declared in the
+      producing node's `spill_outputs`; downstream consumers read it **by reference** (`*_path`
+      inputs); no guard (`when`/`for_each`/loop `while`/`until`) references a spilled field
+      (blocks — a path is not the value); no `spill_outputs` on a `for_each` producer.
 - [ ] Run `validate-workflow` (expect `pass: true`; add `--strict` to make an unresolvable `use:`
       block) then `compile-workflow` and eyeball the `sequence` in the summary — it should match the
       segments/checkpoints you intended (`--annotate` writes the same view to

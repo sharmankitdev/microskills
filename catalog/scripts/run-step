@@ -18,8 +18,9 @@ CODE, with the COMPILER'S OWN grammar (no second implementation to drift):
          FAILS LOUD, exit 1, and is never auto-spilled to a file: silently
          substituting a path would corrupt the segment's `_args` derefs,
          which expect the value itself. Moving an output by reference is a
-         DECLARED feature (`materialize: file` for workflow inputs; node
-         output spill is its own compiler feature), never a runtime improvisation.
+         DECLARED feature (`materialize: file` for workflow inputs;
+         `spill_outputs` on the producing node for node outputs — see
+         DECLARED SPILL below), never a runtime improvisation.
 
   eval   Evaluate a checkpoint step's declared `when` / `for_each` / `${...}`
          expressions. The expressions are translated by IMPORTING
@@ -38,6 +39,25 @@ CODE, with the COMPILER'S OWN grammar (no second implementation to drift):
          child's REQUIRED inputs pre-run (base.yaml + the step's profile
          overlay applied, mirroring the child compile) — a missing/null
          required input is a hard error BEFORE any segment of the child runs.
+
+DECLARED SPILL (output-by-reference). Both subcommands honor the manifest's
+recorded `spill` maps (compile-workflow records a node's declared
+`spill_outputs` on the PRODUCING step, omitted when absent): each listed
+field of that node's stored result is threaded BY REFERENCE — its value is
+written to the per-run ledger at runs/<run-id>/handoff/<node>.<field> (a
+string field VERBATIM, the *_path convention — the consumer Reads the text;
+any other JSON value as canonical sorted-key JSON + newline) and the field
+in the THREADED VIEW (`args` for a segment, the eval context / resolved
+child_inputs for a checkpoint) is replaced by that file's ABSOLUTE path. The
+committed run-state is NEVER mutated: stored results keep the full value
+(check-step-io validates values, not paths); only the threaded view carries
+paths. Presence rules are unchanged — a guarded-skip null result rides as
+null (nothing to spill; the compiled args guard checks presence, which a
+null satisfies), and an absent or null FIELD is left alone. The handoff dir
+is derived from --run-state (<run_dir>/run-state.json); writes are
+deterministic and idempotent (same value -> same bytes). Guards (when /
+for_each / loop while) referencing a spilled field are HARD-BLOCKED at
+compile/validate time — a path is not the value.
 
 RUN-STATE SHAPE. Both subcommands read the per-run resume checkpoint
 `runs/<run-id>/run-state.json` (see run-journal), which carries
@@ -215,6 +235,55 @@ def wf_input_value(name, inputs, manifest):
     return None, None
 
 
+# ----------------------------------------------------------------- spill
+
+def manifest_spill_map(manifest):
+    """{node_id: [field, ...]} unioned from every manifest step's `spill` map.
+    compile-workflow records a node's declared spill_outputs on the PRODUCING
+    step (omitted when absent — a node id appears in at most one producing
+    step), so the union is collision-free."""
+    out = {}
+    for step in manifest.get("steps") or []:
+        sp = step.get("spill")
+        if isinstance(sp, dict):
+            for nid, fields in sp.items():
+                if isinstance(fields, list):
+                    out[nid] = [f for f in fields if isinstance(f, str)]
+    return out
+
+
+def spill_node_result(nid, result, fields, handoff, spilled):
+    """The threaded VIEW of one node's stored result: each declared spilled
+    field's value is written to <handoff>/<nid>.<field> (a string VERBATIM —
+    the *_path convention; any other JSON value as canonical sorted-key JSON +
+    newline) and replaced by that file's absolute path. Returns a NEW dict —
+    the stored run-state result is never mutated. A non-dict result (a
+    guarded-skip null) passes through untouched, as does an absent or null
+    field (presence rules unchanged; schema conformance is check-step-io's
+    job). `spilled` collects {nid: {field: path}} for the output payload."""
+    if not isinstance(result, dict):
+        return result
+    out = dict(result)
+    for field in fields:
+        if out.get(field) is None:
+            continue
+        value = out[field]
+        path = handoff / f"{nid}.{field}"
+        data = value if isinstance(value, str) else (
+            json.dumps(value, indent=2, sort_keys=True) + "\n")
+        handoff.mkdir(parents=True, exist_ok=True)
+        path.write_text(data)
+        out[field] = str(path)
+        spilled.setdefault(nid, {})[field] = str(path)
+    return out
+
+
+def handoff_dir(run_state_path):
+    """The per-run handoff dir, derived from the committed run-state path
+    (<run_dir>/run-state.json -> <run_dir>/handoff)."""
+    return Path(run_state_path).resolve().parent / "handoff"
+
+
 # ----------------------------------------------------------------- args
 
 def cmd_args(a):
@@ -239,9 +308,19 @@ def cmd_args(a):
             errors.append(err)
         else:
             out_args[f"wf_{name}"] = value
+    spills = manifest_spill_map(manifest)
+    spilled = {}
     for nid in needs.get("nodes") or []:
         if nid in results:
-            out_args[nid] = results[nid]
+            value = results[nid]
+            # Declared output-by-reference: substitute the producing node's
+            # spilled fields with their handoff file paths BEFORE threading
+            # (a null guarded-skip result rides through untouched — presence,
+            # not truthiness, and there is nothing to spill).
+            if nid in spills:
+                value = spill_node_result(nid, value, spills[nid],
+                                          handoff_dir(a.run_state), spilled)
+            out_args[nid] = value
         else:
             errors.append(
                 f"no recorded result for node '{nid}' — every produced node "
@@ -254,6 +333,8 @@ def cmd_args(a):
 
     payload = {"step": a.step, "kind": "segment",
                "script": step.get("script"), "errors": errors}
+    if spilled:
+        payload["spilled"] = spilled
     if errors:
         emit(payload, 1)
 
@@ -272,8 +353,9 @@ def cmd_args(a):
             f"substituting a file path here would corrupt the segment's "
             f"_args derefs (they expect the value, not a path). Move the "
             f"oversized payload by DECLARATION instead — `materialize: file` "
-            f"for a workflow input, or write the producing node's output to "
-            f"a file and thread the path. Largest keys: {detail}"]
+            f"for a workflow input, or `spill_outputs: [<field>, ...]` on the "
+            f"producing node (the dispatcher then threads those fields as "
+            f"handoff file paths). Largest keys: {detail}"]
         emit(payload, 1)
     emit(payload, 0)
 
@@ -441,7 +523,23 @@ def cmd_eval(a):
             ctx[f"wf_{name}"] = value
     if payload["errors"]:
         emit(payload, 1)
-    ctx.update(results)
+    # Declared output-by-reference: a checkpoint consumer sees the SAME
+    # threaded view a segment would — every needed node with a recorded spill
+    # declaration has its spilled fields substituted with handoff file paths
+    # (one meaning everywhere downstream of the producer). Only the needed
+    # nodes are substituted (the generated program references nothing else);
+    # the stored run-state is never mutated.
+    spills = manifest_spill_map(manifest)
+    spilled = {}
+    results_view = dict(results)
+    for s_nid in sorted(needs.nodes - {as_var}):
+        if s_nid in spills and s_nid in results_view:
+            results_view[s_nid] = spill_node_result(
+                s_nid, results_view[s_nid], spills[s_nid],
+                handoff_dir(a.run_state), spilled)
+    if spilled:
+        payload["spilled"] = spilled
+    ctx.update(results_view)
 
     if shutil.which("node") is None:
         die("node not found on PATH — run-step evaluates checkpoint "
