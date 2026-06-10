@@ -159,17 +159,20 @@ nodes:
   # invokes no further nested workflow, so recursion stays bounded (depth = 1).
   # Guarded so the advisory path skips it. The explicit depends_on edge on
   # `provision` is PURE ORDERING (no ref carries it): the provisioned components
-  # must exist before the build starts.
+  # must exist before the build starts. wire: auto forwards the OPTIONAL harness
+  # plumbing the child declares (harness_root, harness_yaml) as
+  # ${workflow.inputs.<name>} pass-throughs; the child's REQUIRED inputs stay
+  # explicit — requirement_path is the analyze brief (NOT a same-named workflow
+  # input), and name/plan_path/staging_dir stay deliberate wires.
   - id: build
     workflow: build-workflow-from-plan
     when: ${plan.output.scope_advisory == null}
     depends_on: [provision]
+    wire: auto
     inputs:
       plan_path: ${plan.output.plan_path}
       name: ${plan.output.name}
       requirement_path: ${analyze.output.decomposition_requirement_path}
-      harness_root: ${workflow.inputs.harness_root}
-      harness_yaml: ${workflow.inputs.harness_yaml}
       staging_dir: ${workflow.inputs.staging_dir}
 
   # Summary print, split out of the old prose build node (a workflow: node returns the child's

@@ -506,6 +506,70 @@ def loop_max_parallel_errors(nodes):
     return out
 
 
+def wire_auto_placement_error(node):
+    """SHARED `wire: auto` placement check used by BOTH compile and validate.
+    The auto-wire set is computed from the TARGET's DECLARED inputs, so the
+    sugar is only meaningful where such a declaration exists AND resolution
+    actually runs: a use: microskill node (but not under the explicit
+    delegation: orchestrator escape hatch — that SKIPS resolution, so the
+    declared inputs are unknowable) or a workflow: node (the child
+    WORKFLOW.yaml declares its inputs). Anywhere else it would silently wire
+    nothing — fail loud instead (BLOCK, not fail-safe). Returns a message
+    string, or None when placement is legal (or the node carries no wire)."""
+    if node.get("wire") != "auto":
+        return None
+    if node.get("workflow"):
+        return None
+    if node.get("use"):
+        if node.get("delegation") == "orchestrator" or node.get("side_effect") is True:
+            return ("wire: auto cannot take effect under explicit "
+                    "delegation: orchestrator — that escape hatch skips microskill "
+                    "resolution, so the target's declared inputs are unknown; "
+                    "remove one of the two")
+        return None
+    return ("wire: auto is only valid on a use: microskill node or a workflow: "
+            "node — the auto-wire set comes from the target's DECLARED inputs, "
+            "which an agent:/orchestrator-native node does not have")
+
+
+def auto_wire_node_inputs(node, target_inputs, workflow_inputs):
+    """SHARED `wire: auto` materialization used by BOTH compile and validate
+    (one helper so the two tools can never disagree on the wired set).
+
+    For a node carrying `wire: auto`: every input name the TARGET declares
+    (`target_inputs` — the resolved microskill profile config's `inputs` map
+    for a use: node, the child WORKFLOW.yaml's declared `inputs` map for a
+    workflow: node) that the node does NOT explicitly supply, and that exactly
+    matches a declared workflow input name, materializes as
+    `inputs.<name>: ${workflow.inputs.<name>}` — byte-identical to the
+    hand-written pass-through forward. EXPLICIT ALWAYS WINS: a supplied key is
+    never touched. Wired pairs append AFTER the explicit pairs, in sorted name
+    order, so the authored entries keep their emitted order (and a wire-free
+    node's emit is byte-for-byte untouched).
+
+    Mutates node['inputs'] in place. Returns (wired, required_wired):
+    `wired` = the auto-wired names (sorted); `required_wired` ⊆ wired = those
+    the target declares required:true — the CALLER warns on these
+    (auto-satisfying a REQUIRED input is a real collision risk on generic
+    names like 'name', where the right value is often an upstream node output,
+    not the same-named workflow input)."""
+    if node.get("wire") != "auto":
+        return [], []
+    explicit = node.get("inputs") or {}
+    wired = sorted(
+        name for name in (target_inputs or {})
+        if name not in explicit and name in (workflow_inputs or {}))
+    required_wired = [
+        name for name in wired
+        if isinstance(target_inputs.get(name), dict)
+        and target_inputs[name].get("required")]
+    if wired:
+        inputs = node.setdefault("inputs", {})
+        for name in wired:
+            inputs[name] = "${workflow.inputs." + name + "}"
+    return wired, required_wired
+
+
 def rel(p):
     """Display path relative to project root when possible, else absolute."""
     try:
@@ -1196,7 +1260,8 @@ def main():
     ap.add_argument("--explain", action="store_true",
                     help="Add per-node classification reasons + executor identity "
                          "{profile, agent, model}, per-node semantic fingerprint "
-                         "detail, and de-anonymize the sequence summary. "
+                         "detail, every wire: auto-materialized input pair, and "
+                         "de-anonymize the sequence summary. "
                          "Output-only — never changes the emitted bytes "
                          "(manifest_hash is always emitted regardless).")
     ap.add_argument("--lock", action="store_true",
@@ -1459,6 +1524,59 @@ def main():
                 die(f"loop.body node '{b}' classifies as an orchestrator checkpoint "
                     f"({b_reason}); a loop body must be entirely background — an "
                     f"orchestrator member silently drops the do/while scaffold", 1)
+
+    # --- wire: auto — materialize declared pass-through forwards (pre-emit) ---
+    # Opt-in per node (shared helpers with validate-workflow): every input the
+    # node's TARGET declares (the resolved microskill profile config's inputs
+    # for a use: node — already resolved by classify, which DIED on an
+    # unresolvable target; the child WORKFLOW.yaml's declared inputs for a
+    # workflow: node — an unreadable child is a hard die here) that the node
+    # does not explicitly supply, and whose name exactly matches a declared
+    # workflow input, materializes as `inputs.<name>: ${workflow.inputs.<name>}`
+    # — byte-identical to the hand-written forward. Explicit always wins; wired
+    # pairs append after the explicit pairs in sorted name order. Runs AFTER
+    # classify and BEFORE the freeze/partition/emit so segments, nested
+    # checkpoints, needs, and fingerprints all see the materialized map — the
+    # sugar is fully desugared at compile time and never reaches the manifest
+    # as itself. A wired ref is ${workflow.inputs.*}-only, so it can never add
+    # a node edge or perturb the topo order computed above. Auto-wired pairs
+    # are surfaced under --explain; auto-satisfying a REQUIRED target input
+    # warns on stderr (collision risk on generic names like 'name').
+    auto_wired = {}
+    declared_wf_inputs = wf.get("inputs") if isinstance(wf.get("inputs"), dict) else {}
+    for nid in order:
+        node = node_by_id[nid]
+        if node.get("wire") != "auto":
+            continue
+        perr = wire_auto_placement_error(node)
+        if perr:
+            die(f"node '{nid}': {perr}", 1)
+        if node.get("workflow"):
+            child_path = defs_root / node["workflow"] / "WORKFLOW.yaml"
+            try:
+                child_doc = yaml.safe_load(child_path.read_text()) or {}
+            except OSError:
+                die(f"node '{nid}': wire: auto needs the child workflow's declared "
+                    f"inputs, but workflow: '{node['workflow']}' does not resolve "
+                    f"to {child_path}", 1)
+            except yaml.YAMLError as e:
+                die(f"node '{nid}': wire: auto needs the child workflow's declared "
+                    f"inputs, but '{node['workflow']}' WORKFLOW.yaml failed to "
+                    f"parse: {e}", 1)
+            target_inputs = (child_doc.get("inputs")
+                             if isinstance(child_doc.get("inputs"), dict) else {})
+        else:
+            payload = node.get("_resolved_payload") or {}
+            cfg = payload.get("config") if isinstance(payload.get("config"), dict) else {}
+            target_inputs = cfg.get("inputs") if isinstance(cfg.get("inputs"), dict) else {}
+        wired, required_wired = auto_wire_node_inputs(node, target_inputs, declared_wf_inputs)
+        if wired:
+            auto_wired[nid] = wired
+        for rname in required_wired:
+            sys.stderr.write(
+                f"warning: node '{nid}': wire: auto satisfied REQUIRED target input "
+                f"'{rname}' from ${{workflow.inputs.{rname}}} — verify the same-named "
+                f"workflow input is really the intended source\n")
 
     # --- compile closure: freeze each resolved use: node's resolver payload ---
     # The resolver payload (rendered body, directives, config, schemas) is part
@@ -1782,6 +1900,10 @@ def main():
     if args.explain:
         summary["classification"] = classification
         summary["fingerprints"] = fingerprint_detail
+        # Every wire:auto-materialized pair, node -> sorted wired input names
+        # (each wired as inputs.<name>: ${workflow.inputs.<name>}), in topo
+        # order. Stdout-only — the written bytes never fork on flags.
+        summary["auto_wired"] = auto_wired
     if args.plan:
         summary["plan"] = True
         # --plan writes NO manifest.json, and the lean summary carries none of

@@ -331,6 +331,50 @@ output node (mismatch → **warn**). **Nesting depth is 1**: a child that itself
 node is blocked, and an import cycle across the reachable import graph is blocked. Without
 `--defs-root` these checks are skipped (backward-compatible single-file validation).
 
+### `wire: auto` — declared pass-through forwarding
+
+Most node wiring contains pure name-identical forwards (`harness_root: ${workflow.inputs.harness_root}`).
+`wire: auto` declares them once:
+
+```yaml
+- id: build
+  workflow: build-workflow-from-plan
+  wire: auto                          # harness_root / harness_yaml forward themselves
+  inputs:
+    plan_path: ${plan.output.plan_path}   # explicit entries always win
+    name: ${plan.output.name}
+```
+
+At pre-emit time (compile **and** validate, one shared helper — the two tools can never disagree),
+every input the node's **target** declares (the resolved microskill profile config's `inputs` for a
+`use:` node; the child `WORKFLOW.yaml`'s declared `inputs` for a `workflow:` node) that the node
+does **not** explicitly supply, and whose name **exactly matches a declared workflow input**,
+materializes as `inputs.<name>: ${workflow.inputs.<name>}` — **byte-identical to the hand-written
+forward** (the sugar is fully desugared before emission; segments, nested checkpoints, `needs`, and
+fingerprints all see the materialized map, and the manifest never carries `wire` itself). Explicit
+entries keep their authored order; wired pairs append after them in **sorted name order**.
+`compile-workflow --explain` lists every auto-wired pair (`auto_wired: {node: [names]}`).
+
+Rules (fail-loud, never fail-safe):
+
+- **Placement** — only a `use:` node that actually resolves, or a `workflow:` node. On an
+  `agent:`/orchestrator-native node (no declared input contract), or a `use:` node under the
+  `delegation: orchestrator` escape hatch (resolution is skipped, so the declared inputs are
+  unknowable), it is a **hard error**.
+- **Unresolvable target = block** — a `use:` target that fails to resolve already dies in compile;
+  validate escalates its hermetic-friendly warn to a **block** on a `wire: auto` node (the wire set
+  is uncomputable). A `workflow:` child whose `WORKFLOW.yaml` is missing/unparseable blocks in both
+  tools, even in standalone validation.
+- **Required-input satisfaction = warn** — auto-wiring an input the target declares
+  `required: true` warns (compile: stderr; validate: warn issue). Generic names collide: in
+  `workflow-create`, the child *requires* `name` (the planner's proposal) while the parent declares
+  an optional same-named `name` override — auto-wiring it would be wrong. Keep required inputs as
+  explicit, deliberate wires; let `wire: auto` carry the optional plumbing.
+
+A wired ref is `${workflow.inputs.*}`-only, so it can never add a dependency edge or perturb the
+topological order; a wire that materializes the same pairs as the hand-written forwards leaves the
+compiled segments, `manifest_hash`, and the committed `closure.lock.json` **unchanged**.
+
 ### Full node field reference
 
 | Field | Applies to | Meaning |
@@ -343,6 +387,7 @@ node is blocked, and an import cycle across the reachable import graph is blocke
 | `side_effect` | all | `true` is a **readable alias for `delegation: orchestrator`** — normalized to it before classification (an explicit `delegation: orchestrator` is a no-op; pairing it with `delegation: auto` is a **hard error** in both compile and validate). Use it to mark a node that does filesystem side effects / human interaction. |
 | `depends_on` | all | Upstream node ids → **pure ordering** DAG edges (no ref carries them). Unioned with ref-implied edges (§7); restating a ref-implied edge is a validate **warn**. |
 | `inputs` | (a)(b)(d) | Map of input field → `${...}` expression (or literal). Wires data in. |
+| `wire` | (a)(d) | `auto` — declared pass-through forwarding (§5): every target-declared, unsupplied input whose name matches a declared workflow input materializes as `inputs.<name>: ${workflow.inputs.<name>}`, byte-identical to the hand-written forward. Explicit wins; wired pairs append sorted after the authored entries; `--explain` lists every pair. Hard error on `agent:`/orchestrator-native nodes and under `delegation: orchestrator`; unresolvable target = block; auto-satisfying a `required: true` target input = warn. |
 | `prompt` | (b)(c) | Task prompt template. May contain `${...}`. (For `use:` nodes the body comes from the microskill.) |
 | `output_schema` | (a)(b) | JSON-Schema fragment forcing structured output. Passed to `agent()`'s `schema`. A `use:` node **omitting** this inherits the microskill's resolved schema (§11) — preferred; an inline schema that merely restates the resolved one is a validate **warn** (omit it), a diverging one warns to reconcile or document the narrowing. |
 | `when` | all | Conditional guard (see §6). |

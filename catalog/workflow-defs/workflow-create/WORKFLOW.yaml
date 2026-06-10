@@ -96,16 +96,20 @@ nodes:
   # invokes no further nested workflow, so recursion stays bounded (depth = 1).
   # The explicit depends_on edge on `provision` is PURE ORDERING (no ref carries
   # it): the provisioned microskills must exist before the build starts.
+  # wire: auto forwards the OPTIONAL harness plumbing the child declares
+  # (harness_root, harness_yaml) as ${workflow.inputs.<name>} pass-throughs;
+  # the child's REQUIRED inputs stay explicit — `name` must be the planner's
+  # proposal (NOT this workflow's optional `name` override), and
+  # requirement_path / staging_dir stay deliberate wires for the same reason.
   - id: build
     workflow: build-workflow-from-plan
     when: ${plan.output.scope_advisory == null}
     depends_on: [provision]
+    wire: auto
     inputs:
       plan_path: ${plan.output.plan_path}
       name: ${plan.output.name}
       requirement_path: ${workflow.inputs.requirement_path}
-      harness_root: ${workflow.inputs.harness_root}
-      harness_yaml: ${workflow.inputs.harness_yaml}
       staging_dir: ${workflow.inputs.staging_dir}
 
 # Human-approval gate after `plan`. Approving the plan also authorizes creation

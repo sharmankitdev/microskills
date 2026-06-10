@@ -7,8 +7,11 @@ profile overlays against workflow-schema.json, then runs DAG checks (node
 shape, unique ids, depends_on completeness, ${ref} declaration, cycles, gate
 and loop anchoring), resolves every use: target through the SAME
 resolve-microskill subprocess the compiler uses (typed-ref checks fall back to
-the resolved output_schema; inline-schema redundancy is linted), and lints
-redundant depends_on entries + undeclared ${workflow.inputs.x} refs.
+the resolved output_schema; inline-schema redundancy is linted), materializes
+`wire: auto` pass-through forwards via the SAME shared helper as compile (an
+unresolvable wire: auto target is always a block; auto-wiring a REQUIRED
+target input warns), and lints redundant depends_on entries + undeclared
+${workflow.inputs.x} refs.
 
 Usage:
   validate-workflow <WORKFLOW.yaml> [<profile.yaml> ...] [--defs-root <dir>] [--strict]
@@ -92,6 +95,8 @@ apply_workflow_vars = _cw.apply_workflow_vars
 expand_static_fanout = _cw.expand_static_fanout
 scoped_ref_ids = _cw.scoped_ref_ids
 resolve_microskill_directives = _cw.resolve_microskill_directives
+wire_auto_placement_error = _cw.wire_auto_placement_error
+auto_wire_node_inputs = _cw.auto_wire_node_inputs
 NODE_OUTPUT_FIELD_RE = _cw.NODE_OUTPUT_FIELD_RE
 NODE_ITEMS_RE = _cw.NODE_ITEMS_RE
 
@@ -352,16 +357,22 @@ def main():
     skill_root = resolve_defs_root.parent / "microskills"
     unres_sev = "block" if (args.defs_root or args.strict) else "warn"
     resolved_schemas = {}
+    resolved_payloads = {}
     _res_cache = {}
     for nid, n in node_by_id.items():
         use_name = n.get("use")
         if (not use_name or n.get("delegation") == "orchestrator"
                 or n.get("side_effect") is True):
             continue
+        # A wire: auto node's auto-wire set is computed FROM the resolution —
+        # an unresolvable target makes it uncomputable, so the failure is a
+        # BLOCK even in standalone (no --defs-root) validation, never the
+        # hermetic-friendly warn (BLOCK, not fail-safe — verifier guardrail).
+        node_unres_sev = "block" if n.get("wire") == "auto" else unres_sev
         ms_path = skill_root / str(use_name) / "MICROSKILL.md"
         if not ms_path.exists():
             # Cheap stat short-circuit — no subprocess when the target is absent.
-            add(issues, unres_sev, f"nodes/{nid}",
+            add(issues, node_unres_sev, f"nodes/{nid}",
                 f"use: '{use_name}' does not resolve to {ms_path} (compile fails "
                 f"loud on an unresolvable use: target; mark the node "
                 f"delegation: orchestrator if a checkpoint is intended)")
@@ -374,12 +385,13 @@ def main():
                 use_name, cust, resolve_defs_root)
         resolved = _res_cache[key]
         if resolved["directives"] is None:
-            add(issues, unres_sev, f"nodes/{nid}",
+            add(issues, node_unres_sev, f"nodes/{nid}",
                 f"use: '{use_name}' failed to resolve "
                 f"({resolved.get('error') or 'resolution failed'})")
             continue
         rsch = resolved.get("output_schema")
         resolved_schemas[nid] = rsch
+        resolved_payloads[nid] = resolved.get("payload")
         inline = n.get("output_schema")
         if isinstance(inline, dict) and rsch is not None:
             if inline == rsch:
@@ -392,6 +404,50 @@ def main():
                     f"inline output_schema diverges from use: '{use_name}' "
                     f"resolved output_schema — reconcile them, or keep the "
                     f"override and document the narrowing")
+
+    # --- wire: auto — materialize declared pass-through forwards (shared helper) ---
+    # Mirrors compile EXACTLY (same auto_wire_node_inputs / wire_auto_placement_error
+    # helpers, so the two tools can never disagree on the wired set): for an
+    # opted-in node, every TARGET-declared, unsupplied input whose name matches a
+    # declared workflow input gains inputs.<name>: ${workflow.inputs.<name>} —
+    # explicit wins; wired pairs append sorted after the authored entries.
+    # Materialized HERE: after the use: resolution pass above (the wire set needs
+    # the target's declared inputs) and BEFORE the per-node ref checks and the
+    # nested-workflow required-child-input check, so a wired input counts as
+    # supplied exactly like a hand-written forward. Guardrails: a placement
+    # violation is a BLOCK; an unresolvable use: target was escalated to a BLOCK
+    # in the pass above (the wired set is uncomputable); an unreadable workflow:
+    # child is a BLOCK here; auto-satisfying a REQUIRED target input is a WARN
+    # (collision risk on generic names like 'name', where the right value is
+    # often an upstream output, not the same-named workflow input).
+    wf_inputs_map = merged.get("inputs") if isinstance(merged.get("inputs"), dict) else {}
+    for nid, n in node_by_id.items():
+        if n.get("wire") != "auto":
+            continue
+        perr = wire_auto_placement_error(n)
+        if perr:
+            add(issues, "block", f"nodes/{nid}", perr)
+            continue
+        if n.get("workflow"):
+            doc, err = load_child_doc(resolve_defs_root, n["workflow"])
+            if doc is None:
+                add(issues, "block", f"nodes/{nid}",
+                    f"wire: auto needs the child workflow's declared inputs, but "
+                    f"workflow: '{n['workflow']}' {err}")
+                continue
+            target_inputs = doc.get("inputs") if isinstance(doc.get("inputs"), dict) else {}
+        else:
+            payload = resolved_payloads.get(nid)
+            if payload is None:
+                continue  # unresolvable use: — already a BLOCK above
+            cfg = payload.get("config") if isinstance(payload.get("config"), dict) else {}
+            target_inputs = cfg.get("inputs") if isinstance(cfg.get("inputs"), dict) else {}
+        wired, required_wired = auto_wire_node_inputs(n, target_inputs, wf_inputs_map)
+        for rname in required_wired:
+            add(issues, "warn", f"nodes/{nid}",
+                f"wire: auto satisfied REQUIRED target input '{rname}' from "
+                f"${{workflow.inputs.{rname}}} — verify the same-named workflow "
+                f"input is really the intended source")
 
     # phase_group is a cosmetic /workflows progress-group label (emit-only). A
     # phase_group equal to a DIFFERENT node's id would merge that group's box with
