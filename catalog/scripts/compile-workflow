@@ -509,6 +509,80 @@ def loop_max_parallel_errors(nodes):
     return out
 
 
+# --- Declared gate policy (defaults + headless), SHARED by compile and validate ---
+# An options-less human_approval gate is presented by the dispatcher with the
+# implicit confirm/stop pair, so that pair IS the gate's effective option set
+# for every membership check (a declared `default`, a ${<gate-id>.output.choice}
+# comparison literal).
+GATE_FALLBACK_OPTIONS = ("confirm", "stop")
+
+
+def gate_effective_options(gate):
+    """The option labels a gate actually offers: declared `options`, or the
+    dispatcher's implicit confirm/stop pair when none are declared."""
+    opts = gate.get("options")
+    return list(opts) if opts else list(GATE_FALLBACK_OPTIONS)
+
+
+def gate_pauses(gate):
+    """A hard-severity gate (hard is the default) pauses the dispatcher; a warn
+    human_approval gate renders + continues without pausing."""
+    return gate.get("severity", "hard") == "hard"
+
+
+def gate_policy_errors(gates):
+    """SHARED mode-independent declared-gate-policy checks (compile dies, validate
+    blocks — the two tools can never disagree):
+      - a declared `default` must be a member of the gate's EFFECTIVE options
+        (declared `options`, or the implicit confirm/stop pair when none) — the
+        recorded auto/warn choice must be a label the gate actually offers;
+      - `on_headless: take_default` requires a declared `default` (there is
+        nothing to take otherwise).
+    Returns [(gate_id, message), ...] in declaration order."""
+    errs = []
+    for g in gates or []:
+        if not isinstance(g, dict):
+            continue
+        gid = g.get("id", "?")
+        default = g.get("default")
+        opts = gate_effective_options(g)
+        if default is not None and default not in opts:
+            suffix = ("" if g.get("options")
+                      else " (an options-less gate offers the implicit confirm/stop pair)")
+            errs.append((gid, f"default '{default}' is not one of the gate's "
+                              f"options {opts}{suffix}"))
+        if g.get("on_headless") == "take_default" and default is None:
+            errs.append((gid, "on_headless: take_default requires a declared "
+                              "'default' option to take"))
+    return errs
+
+
+def gate_headless_errors(gates):
+    """SHARED gate-mode=auto feasibility check: a PAUSING gate (severity hard —
+    the default) with no declared `default` and no explicit `on_headless: fail`
+    makes a headless run impossible — the dispatcher could neither take an
+    author-declared choice nor legitimately stop. Failing at compile time (and
+    as a validate block when the merged doc declares gate_mode: auto) is the
+    fail-loud guarantee that a headless run never sits waiting on
+    AskUserQuestion and never fabricates a pick. `on_headless: fail` is legal:
+    the run executes up to that gate, then stops with a nonzero outcome
+    (run-state stays resumable interactively). Warn gates never pause, so they
+    are always headless-safe (they record their declared default, or
+    {choice: null} when none is declared). Returns [(gate_id, message), ...]."""
+    errs = []
+    for g in gates or []:
+        if not isinstance(g, dict) or not gate_pauses(g):
+            continue
+        if g.get("on_headless") == "fail" or g.get("default") is not None:
+            continue
+        errs.append((g.get("id", "?"),
+                     "hard gate declares no 'default' — a gate-mode=auto (headless) "
+                     "run cannot take a choice; declare `default:` (optionally with "
+                     "on_headless: take_default), declare `on_headless: fail` to stop "
+                     "the run at this gate, or run interactively"))
+    return errs
+
+
 def wire_auto_placement_error(node):
     """SHARED `wire: auto` placement check used by BOTH compile and validate.
     The auto-wire set is computed from the TARGET's DECLARED inputs, so the
@@ -1275,6 +1349,19 @@ def main():
                          "Value parses exactly like --override (YAML; leading-'#' "
                          "stays a literal string). Repeatable; later flags win on "
                          "the same node+path.")
+    ap.add_argument("--gate-mode", choices=["auto", "interactive"], default=None,
+                    help="Gate policy for this compile. 'auto' (headless) stamps "
+                         "gate_mode: auto into the manifest (inside manifest_hash) "
+                         "so the dispatcher takes each gate's declared default and "
+                         "records it verbatim — and the compile dies loud when a "
+                         "pausing gate has neither a default nor on_headless: fail. "
+                         "The merged doc's own gate_mode (profile-declarable) WINS "
+                         "over this flag, so a child profile-declared mode beats "
+                         "parent inheritance. Omitted/'interactive' → nothing is "
+                         "stamped (existing defs stay byte-identical). The "
+                         "MICROSKILLS_HEADLESS=1 env signal is read by the "
+                         "DISPATCHER (which passes this flag), never here — compile "
+                         "output stays a pure function of argv + files.")
     ap.add_argument("--defs-root", default=str(DEFAULT_DEFS_ROOT))
     ap.add_argument("--plan", action="store_true",
                     help="Dry-run: compute and print the full plan but write NOTHING to "
@@ -1421,6 +1508,27 @@ def main():
     if errs:
         msgs = ["schema " + ("/".join(str(x) for x in e.path) or "<root>") + ": " + e.message for e in errs]
         die("merged workflow fails schema validation", 1, schema_errors=msgs)
+
+    # --- Declared gate policy (shared helpers with validate-workflow) ---
+    # Mode-independent coherence first: a declared default must be one of the
+    # gate's effective options; on_headless: take_default needs a default.
+    gp_errs = gate_policy_errors(wf.get("gates"))
+    if gp_errs:
+        gid, gmsg = gp_errs[0]
+        die(f"gate '{gid}': {gmsg}", 1)
+
+    # Effective gate mode: the merged doc's declared gate_mode (a profile overlay
+    # may set it — e.g. the autonomous profiles) WINS over the --gate-mode flag
+    # (the parent-dispatcher inheritance channel), which wins over the
+    # interactive default. Under auto, a pausing gate that can neither take a
+    # declared default nor legitimately stop (on_headless: fail) dies HERE —
+    # before any work — rather than stranding a headless run at AskUserQuestion.
+    effective_gate_mode = wf.get("gate_mode") or args.gate_mode or "interactive"
+    if effective_gate_mode == "auto":
+        gh_errs = gate_headless_errors(wf.get("gates"))
+        if gh_errs:
+            gid, gmsg = gh_errs[0]
+            die(f"gate '{gid}': {gmsg}", 1)
 
     nodes = wf.get("nodes") or []
 
@@ -1762,6 +1870,12 @@ def main():
         "output": wf.get("output"),
         "steps": manifest_steps,
     }
+    # gate_mode is stamped ONLY when the effective mode is auto (and INSIDE the
+    # hashed payload): an interactive compile of an existing def stays
+    # byte-identical, while an auto compile gets a DISTINCT manifest_hash so
+    # interactive run-state never resumes into a headless run (or vice versa).
+    if effective_gate_mode == "auto":
+        manifest["gate_mode"] = "auto"
     # Applied per-node overrides (effective customize.overrides AFTER any
     # --node-override flags merged in), recorded ONLY when non-empty so an
     # override-free compile stays byte-identical — and, being inside the hashed

@@ -5,6 +5,12 @@ version: 1
 # best-effort gap-fill from the SOURCES ONLY (never AskUserQuestion) and auto-accept, so the run never
 # pauses. Same compiled shape (segment[assemble] · clarify · approve); only the prompts change. The
 # gaps_count `when` guards are inherited from the base nodes, so the branch split is unchanged.
+#
+# NOT migrated to `gate_mode: auto` — this def is gate-free, and its interactivity lives in
+# ORCHESTRATOR-NODE prompts (the clarify loop), which gate_mode cannot soften: under a headless run
+# the base clarify node REQUIRES AskUserQuestion, so the dispatcher stops the run naming it. The
+# base refine-requirements def is therefore NOT headless-able; this prompt-rewriting profile is the
+# supported unattended path.
 nodes:
   patch:
     - id: clarify

@@ -97,6 +97,9 @@ scoped_ref_ids = _cw.scoped_ref_ids
 resolve_microskill_directives = _cw.resolve_microskill_directives
 wire_auto_placement_error = _cw.wire_auto_placement_error
 auto_wire_node_inputs = _cw.auto_wire_node_inputs
+gate_effective_options = _cw.gate_effective_options
+gate_policy_errors = _cw.gate_policy_errors
+gate_headless_errors = _cw.gate_headless_errors
 NODE_OUTPUT_FIELD_RE = _cw.NODE_OUTPUT_FIELD_RE
 NODE_ITEMS_RE = _cw.NODE_ITEMS_RE
 
@@ -107,6 +110,19 @@ AS_RE = re.compile(r"^[a-z][a-z0-9_]*$")  # safe JS identifier for for_each `as`
 # membership against the declared inputs map (a misspelled name used to pass
 # both tools and die at runtime as undefined).
 WF_INPUT_RE = re.compile(r"\bworkflow\.inputs\.([A-Za-z_][A-Za-z0-9_]*)")
+# Gate-choice comparisons: <gate-id>.output.choice ==/!= '<literal>' (and the
+# JS ===/!== spellings, and the reversed literal-first order). The extracted
+# literal is membership-checked against the gate's EFFECTIVE options — a
+# casing/typo literal silently dead-ends both branches at run time.
+GATE_CHOICE_CMP_RE = re.compile(
+    r"\b([a-z][a-z0-9_-]*)\.output\.choice\s*(?:===|!==|==|!=)\s*"
+    r"(?:'([^']*)'|\"([^\"]*)\")")
+GATE_CHOICE_CMP_REV_RE = re.compile(
+    r"(?:'([^']*)'|\"([^\"]*)\")\s*(?:===|!==|==|!=)\s*"
+    r"([a-z][a-z0-9_-]*)\.output\.choice\b")
+# Any reference to a gate's recorded choice (comparison or not) — used to FORCE
+# a declared default on a warn gate whose choice is branched on.
+GATE_CHOICE_REF_RE = re.compile(r"\b([a-z][a-z0-9_-]*)\.output\.choice\b")
 
 
 def add(issues, severity, location, message):
@@ -801,6 +817,163 @@ def main():
             add(issues, "block", f"gates/{g.get('id','?')}", f"'after' references unknown node '{after}'")
         if after:
             gates_after.setdefault(after, []).append(g)
+
+    # --- Declared gate policy: defaults + headless coherence (shared helpers) ---
+    # Same gate_policy_errors / gate_headless_errors compile-workflow dies on, so
+    # the two tools can never disagree: a declared `default` must be one of the
+    # gate's EFFECTIVE options (declared options, or the implicit confirm/stop
+    # pair of an options-less gate); on_headless: take_default needs a default;
+    # and a merged doc that DECLARES gate_mode: auto (e.g. an autonomous profile
+    # overlay) must leave no pausing gate without a default or an explicit
+    # on_headless: fail.
+    gates_list = [g for g in (merged.get("gates") or []) if isinstance(g, dict)]
+    gate_by_id = {g.get("id"): g for g in gates_list if g.get("id")}
+    for p_gid, p_msg in gate_policy_errors(gates_list):
+        add(issues, "block", f"gates/{p_gid}", p_msg)
+    if merged.get("gate_mode") == "auto":
+        for h_gid, h_msg in gate_headless_errors(gates_list):
+            add(issues, "block", f"gates/{h_gid}", h_msg)
+
+    # --- present: declared gate presentation — checked, then rendered MECHANICALLY ---
+    # A gate's `present` is an ordered list of field paths the dispatcher renders
+    # verbatim (the model output-rubric is only the fallback), so the approver
+    # sees the SAME evidence every run. Checks: (a) the leading id must be a known
+    # node (or an EARLIER gate — only `choice` is ever recorded for a gate);
+    # (b) a typed producer's first field after .output must be declared (same
+    # machinery as the node-ref S-FIELD check, resolved-schema inheritance
+    # included); (c) the producer must already have RUN when the gate fires — the
+    # gate fires immediately after its `after` node, so a path may only name a
+    # node at-or-before that anchor in the shared topo order (a later node's
+    # result would render undefined on every run).
+    order_pos = ({o_nid: i for i, o_nid in enumerate(topo_sort(well_formed_nodes))}
+                 if not cycle_found[0] else None)
+    gate_decl_pos = {g.get("id"): i for i, g in enumerate(gates_list) if g.get("id")}
+
+    def present_paths(g):
+        for entry in (g.get("present") or []):
+            if isinstance(entry, str):
+                yield entry
+            elif isinstance(entry, dict) and isinstance(entry.get("read_file"), str):
+                yield entry["read_file"]
+
+    for g in gates_list:
+        gid = g.get("id", "?")
+        after = g.get("after")
+        loc = f"gates/{gid}/present"
+        for path in present_paths(g):
+            parts = path.split(".")
+            lead, field = parts[0], (parts[2] if len(parts) > 2 else None)
+            if lead in gate_id_set:
+                if lead == gid:
+                    add(issues, "block", loc,
+                        f"path '{path}' references this gate's own choice — not yet "
+                        f"recorded when the gate fires")
+                    continue
+                src = gate_by_id.get(lead) or {}
+                if (order_pos is not None and after in order_pos
+                        and src.get("after") in order_pos):
+                    fires_before = (
+                        order_pos[src["after"]] < order_pos[after]
+                        or (src["after"] == after
+                            and gate_decl_pos.get(lead, 0) < gate_decl_pos.get(gid, 0)))
+                    if not fires_before:
+                        add(issues, "block", loc,
+                            f"path '{path}' references gate '{lead}', which fires at or "
+                            f"after this gate — its choice is not yet recorded")
+                        continue
+                if field is not None and field != "choice":
+                    add(issues, "block", loc,
+                        f"path '{path}': a gate records only {{choice}} — field "
+                        f"'{field}' is never recorded")
+                continue
+            if lead not in id_set:
+                add(issues, "block", loc,
+                    f"path '{path}' references unknown node '{lead}'")
+                continue
+            if (order_pos is not None and after in order_pos and lead in order_pos
+                    and order_pos[lead] > order_pos[after]):
+                add(issues, "block", loc,
+                    f"path '{path}' references node '{lead}', which runs after this "
+                    f"gate's anchor '{after}' — not yet produced when the gate fires")
+                continue
+            if field is not None:
+                p_osch = node_by_id[lead].get("output_schema")
+                if p_osch is None:
+                    p_osch = resolved_schemas.get(lead)
+                if (isinstance(p_osch, dict) and p_osch.get("type") == "object"
+                        and isinstance(p_osch.get("properties"), dict)
+                        and field not in p_osch["properties"]):
+                    add(issues, "block", loc,
+                        f"path '{path}' names field '{field}' but node '{lead}' "
+                        f"output_schema does not declare property '{field}'")
+
+    # --- Gate-choice literal cross-check ---
+    # Every string literal compared against ${<gate-id>.output.choice} must be a
+    # member of that gate's EFFECTIVE options: the dispatcher only ever records
+    # one of the offered labels (or the declared default, verbatim), so a literal
+    # outside the set makes the comparison CONSTANT — a casing typo silently
+    # dead-ends both branches of a fork. Bounded extraction in the same spirit as
+    # the exclusivity lint's comparison grammar: ==/!= (and the JS ===/!==
+    # spellings), one quoted literal, either operand order; anything more complex
+    # is out of grammar and skipped.
+    choice_scan = [(f"nodes/{s_nid}",
+                    {k: s_n.get(k) for k in ("inputs", "prompt", "when", "for_each")
+                     if k in s_n})
+                   for s_nid, s_n in node_by_id.items()]
+    if isinstance(merged.get("loop"), dict):
+        choice_scan.append(
+            ("loop", {k: merged["loop"].get(k) for k in ("while", "carry")}))
+
+    def choice_literal_hits(obj):
+        for s in collect_strings(obj):
+            for m in GATE_CHOICE_CMP_RE.finditer(s):
+                yield m.group(1), (m.group(2) if m.group(2) is not None else m.group(3))
+            for m in GATE_CHOICE_CMP_REV_RE.finditer(s):
+                yield m.group(3), (m.group(1) if m.group(1) is not None else m.group(2))
+
+    for c_loc, scoped_obj in choice_scan:
+        for ref_gid, lit in choice_literal_hits(scoped_obj):
+            cg = gate_by_id.get(ref_gid)
+            if cg is None:
+                continue  # not a gate id — a node's own output is 'any', out of scope
+            c_opts = gate_effective_options(cg)
+            if lit not in c_opts:
+                c_suffix = ("" if cg.get("options")
+                            else " (an options-less gate offers the implicit "
+                                 "confirm/stop pair)")
+                add(issues, "block", c_loc,
+                    f"compares ${{{ref_gid}.output.choice}} against '{lit}', which is "
+                    f"not one of gate '{ref_gid}' options {c_opts}{c_suffix} — the "
+                    f"recorded choice is always one of the gate's offered labels, so "
+                    f"this comparison is constant and the branch is dead")
+
+    # --- FORCE a default on a warn gate whose choice is branched on ---
+    # The dispatcher no longer fabricates a pick at a non-pausing gate: a warn
+    # human_approval gate records its DECLARED default verbatim, or {choice: null}
+    # when none is declared — so branching on a defaultless warn gate's choice
+    # could never fire. And a warn gate of any non-human_approval type emits NO
+    # checkpoint at all (dropped at compile), so its choice is NEVER recorded.
+    referenced_gids = set()
+    for _c_loc, scoped_obj in choice_scan:
+        for s in collect_strings(scoped_obj):
+            referenced_gids.update(GATE_CHOICE_REF_RE.findall(s))
+    for g in gates_list:
+        gid = g.get("id")
+        if not gid or gid not in referenced_gids:
+            continue
+        if g.get("severity", "hard") != "warn":
+            continue  # a hard gate pauses — the human's pick is always recorded
+        if g.get("type") != "human_approval":
+            add(issues, "block", f"gates/{gid}",
+                f"${{{gid}.output.choice}} is branched on, but a warn gate of type "
+                f"'{g.get('type')}' emits no checkpoint at all (dropped at compile) — "
+                f"its choice is never recorded; make it human_approval or severity: hard")
+        elif g.get("default") is None:
+            add(issues, "block", f"gates/{gid}",
+                f"${{{gid}.output.choice}} is branched on, but this warn gate declares "
+                f"no 'default' — a warn gate never pauses, and the dispatcher records "
+                f"the DECLARED default verbatim (or {{choice: null}} when none; never a "
+                f"fabricated pick), so the branch could never fire; declare default:")
 
     # --- max_parallel placement: only valid on a for_each node (shared with compile) ---
     for mp_id, mp_msg in loop_max_parallel_errors(well_formed_nodes):

@@ -92,6 +92,13 @@ gates:
     severity: hard
     prompt: <what to ask the user>
     options: [approve, revise, abandon]
+    # default: approve          # author-declared pick: taken VERBATIM under gate-mode auto
+    #                           # (headless) and recorded at warn pass-throughs; must be a
+    #                           # member of the effective options (confirm/stop when omitted)
+    # on_headless: take_default # take_default | fail (fail = stop the headless run here)
+    # present:                  # OPTIONAL declared evidence, rendered mechanically in order
+    #   - <node>.output.<field>
+    #   - read_file: <node>.output.<path_field>
 
 # Guarded loop over a contiguous subset of nodes (optional, at most one).
 # loop:

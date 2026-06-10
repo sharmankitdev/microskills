@@ -2167,3 +2167,218 @@ gates:
     assert rc == 1 and data["pass"] is False
     assert any("nope" in i["message"] and "not declared" in i["message"]
                for i in data["issues"]), data["issues"]
+
+
+# ---------------------------------------------------------------------------
+# Declared gate policy (default / on_headless / gate_mode), present:, and the
+# gate-choice literal cross-check
+# ---------------------------------------------------------------------------
+
+CHOICE_FLOW = """\
+version: 1
+name: choice-flow
+nodes:
+  - id: plan
+    agent: ag
+    prompt: do plan
+    output_schema:
+      type: object
+      properties:
+        name: { type: string }
+        plan_path: { type: string }
+      required: [name]
+  - id: deep
+    agent: ag
+    when: ${review.output.choice == 'deep_review'}
+    prompt: deep using ${plan.output.name}
+gates:
+  - id: review
+    after: plan
+    type: human_approval
+    prompt: Approve, or send to deep review?
+    options: [approve, deep_review]
+"""
+
+
+def test_choice_literal_in_options_passes(tmp_path):
+    rc, data, _ = run(write_wf(tmp_path, CHOICE_FLOW))
+    assert rc == 0, data
+    assert data["pass"] is True
+
+
+def test_choice_literal_typo_blocks(tmp_path):
+    body = CHOICE_FLOW.replace("== 'deep_review'", "== 'Deep_Review'")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert any("'Deep_Review'" in i["message"] and "review" in i["message"]
+               for i in data["issues"]), data["issues"]
+
+
+def test_choice_literal_neq_nonoption_blocks(tmp_path):
+    # != against a label the gate never offers is ALWAYS true — equally dead.
+    body = CHOICE_FLOW.replace("== 'deep_review'", "!= 'nope'")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert any("'nope'" in i["message"] for i in data["issues"])
+
+
+def test_choice_literal_reversed_operands_checked(tmp_path):
+    body = CHOICE_FLOW.replace(
+        "${review.output.choice == 'deep_review'}",
+        "${'Deep_Review' == review.output.choice}")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert any("'Deep_Review'" in i["message"] for i in data["issues"])
+
+
+def test_choice_literal_optionless_gate_uses_confirm_stop(tmp_path):
+    # An options-less gate offers the implicit confirm/stop pair.
+    base = CHOICE_FLOW.replace("    options: [approve, deep_review]\n", "")
+    ok = base.replace("== 'deep_review'", "== 'confirm'")
+    rc, data, _ = run(write_wf(tmp_path, ok))
+    assert rc == 0, data
+    bad = base.replace("== 'deep_review'", "== 'approve'")
+    rc2, data2, _ = run(write_wf(tmp_path, bad))
+    assert rc2 == 1
+    assert any("confirm/stop" in i["message"] for i in data2["issues"])
+
+
+def test_gate_default_member_checked(tmp_path):
+    ok = CHOICE_FLOW + "    default: approve\n"
+    rc, data, _ = run(write_wf(tmp_path, ok))
+    assert rc == 0, data
+    bad = CHOICE_FLOW + "    default: yes-do-it\n"
+    rc2, data2, _ = run(write_wf(tmp_path, bad))
+    assert rc2 == 1
+    assert any("yes-do-it" in i["message"] and i["location"] == "gates/review"
+               for i in data2["issues"]), data2["issues"]
+
+
+def test_on_headless_take_default_requires_default(tmp_path):
+    body = CHOICE_FLOW + "    on_headless: take_default\n"
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert any("take_default" in i["message"] for i in data["issues"])
+
+
+def test_gate_mode_auto_blocks_defaultless_hard_gate(tmp_path):
+    body = "gate_mode: auto\n" + CHOICE_FLOW
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert any("headless" in i["message"] and i["location"] == "gates/review"
+               for i in data["issues"]), data["issues"]
+    # A declared default clears it; so does an explicit on_headless: fail.
+    rc2, data2, _ = run(write_wf(tmp_path, body + "    default: approve\n"))
+    assert rc2 == 0, data2
+    rc3, data3, _ = run(write_wf(tmp_path, body + "    on_headless: fail\n"))
+    assert rc3 == 0, data3
+
+
+def test_gate_mode_bad_value_fails_schema(tmp_path):
+    rc, data, _ = run(write_wf(tmp_path, "gate_mode: yolo\n" + CHOICE_FLOW))
+    assert rc == 1
+    assert any(i["location"].startswith("schema:gate_mode") for i in data["issues"])
+
+
+def test_warn_gate_branched_on_forces_default(tmp_path):
+    # The dispatcher records a warn gate's DECLARED default (or {choice: null}) —
+    # never a fabricated pick — so a branched-on warn gate must declare one.
+    body = CHOICE_FLOW.replace("    prompt: Approve, or send to deep review?\n",
+                               "    severity: warn\n"
+                               "    prompt: Approve, or send to deep review?\n")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert any("default" in i["message"] and i["location"] == "gates/review"
+               for i in data["issues"]), data["issues"]
+    rc2, data2, _ = run(write_wf(tmp_path, body + "    default: approve\n"))
+    assert rc2 == 0, data2
+
+
+def test_warn_gate_not_branched_on_needs_no_default(tmp_path):
+    # Without any ${review.output.choice} ref, a defaultless warn gate is fine.
+    body = CHOICE_FLOW.replace("    when: ${review.output.choice == 'deep_review'}\n", "") \
+                      .replace("    prompt: Approve, or send to deep review?\n",
+                               "    severity: warn\n"
+                               "    prompt: Approve, or send to deep review?\n")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 0, data
+
+
+def test_warn_nonapproval_gate_branched_on_blocks(tmp_path):
+    # A warn verification gate emits NO checkpoint at all — its choice is never
+    # recorded, so branching on it is always broken.
+    body = CHOICE_FLOW.replace("    type: human_approval\n",
+                               "    type: verification\n    severity: warn\n") \
+                      .replace("    prompt: Approve, or send to deep review?\n", "") \
+                      .replace("    options: [approve, deep_review]\n", "") \
+                      .replace("== 'deep_review'", "== 'confirm'")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert any("no checkpoint" in i["message"] for i in data["issues"]), data["issues"]
+
+
+PRESENT_FLOW = CHOICE_FLOW.replace("    options: [approve, deep_review]\n", """\
+    options: [approve, deep_review]
+    present:
+      - plan.output.name
+      - read_file: plan.output.plan_path
+""")
+
+
+def test_present_valid_paths_pass(tmp_path):
+    rc, data, _ = run(write_wf(tmp_path, PRESENT_FLOW))
+    assert rc == 0, data
+    assert data["pass"] is True
+
+
+def test_present_unknown_node_blocks(tmp_path):
+    body = PRESENT_FLOW.replace("- plan.output.name", "- ghost.output.name")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert any(i["location"] == "gates/review/present"
+               and "unknown node 'ghost'" in i["message"] for i in data["issues"])
+
+
+def test_present_undeclared_field_blocks(tmp_path):
+    body = PRESENT_FLOW.replace("- plan.output.name", "- plan.output.bogus")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert any("does not declare property 'bogus'" in i["message"]
+               for i in data["issues"]), data["issues"]
+
+
+def test_present_later_node_blocks(tmp_path):
+    # 'deep' runs after the gate's anchor 'plan' — not yet produced when the
+    # gate fires.
+    body = PRESENT_FLOW.replace("- plan.output.name", "- deep.output.name")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert any("not yet produced" in i["message"] for i in data["issues"]), data["issues"]
+
+
+def test_present_malformed_entry_fails_schema(tmp_path):
+    body = PRESENT_FLOW.replace("- plan.output.name", "- Plan Output Name")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert any(i["location"].startswith("schema:gates") for i in data["issues"])
+
+
+def test_present_gate_self_and_field_rules(tmp_path):
+    # A gate may present an EARLIER gate's recorded choice; its own (not yet
+    # recorded) and any non-choice field are blocks.
+    body = PRESENT_FLOW.replace("- plan.output.name", "- review.output.choice")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert any("own choice" in i["message"] for i in data["issues"]), data["issues"]
+    two_gates = PRESENT_FLOW.replace("- plan.output.name", "- review.output.choice") + """\
+  - id: early
+    after: plan
+    type: human_approval
+    prompt: early check?
+"""
+    # 'early' is declared AFTER 'review' on the same anchor, so review still
+    # cannot present it; flip the reference to the earlier-declared gate instead.
+    body2 = two_gates.replace("- review.output.choice", "- early.output.choice")
+    rc2, data2, _ = run(write_wf(tmp_path, body2))
+    assert rc2 == 1
+    assert any("not yet recorded" in i["message"] for i in data2["issues"]), data2["issues"]

@@ -469,17 +469,21 @@ def test_gates_patch_verb_equals_full_restatement(tmp_path):
 
 
 def test_real_autonomous_gate_patch_applies():
-    # The shipped autonomous profiles soften approve_plan via gates:{patch:[...]}.
-    # Verify the patch merged by id on the REAL defs: severity→warn + the autonomous
-    # prompt land, while after/type/options are inherited from the base gate.
-    for name, domain in [("microskill-create", "microskill"), ("workflow-create", "workflow")]:
+    # The shipped autonomous profiles are pure flips to the declared gate-policy
+    # mechanism: gate_mode: auto + a declared default patched onto approve_plan
+    # by id (gates:{patch:[...]}) — severity/prompt/after/type/options are all
+    # inherited from the base gate (no more warn-softening or prompt swap; the
+    # dispatcher takes the declared default and records it verbatim).
+    for name in ("microskill-create", "workflow-create"):
         rc, data, out, err = run(REAL_DEFS, name, "--profile", "autonomous")
         assert rc == 0, err
+        m = json.loads((REAL_DEFS / name / ".compiled" / "manifest.json").read_text())
+        assert m["gate_mode"] == "auto"
         gate = _gate_checkpoint(REAL_DEFS, name)
         assert gate["id"] == "approve_plan"
-        assert gate["severity"] == "warn"
-        assert gate["prompt"].startswith("(autonomous)")
-        assert f"created {domain} afterward" in gate["prompt"]
+        assert gate["severity"] == "hard"          # NOT flipped any more
+        assert gate["default"] == "approve"        # the patch merged by id
+        assert "(autonomous)" not in gate["prompt"]
         assert gate["after"] == "plan"
         assert gate["type"] == "human_approval"
         assert gate["options"] == ["approve", "revise", "abandon"]
@@ -3626,3 +3630,153 @@ def test_real_refine_requirements_orchestrator_contracts(tmp_path):
     approve = chks["approve"]["io"]["approve"]
     assert set(approve["schema"]["required"]) == {
         "choice", "final_document_path", "remaining_gaps"}
+
+
+# ---------------------------------------------------------------------------
+# Declared gate policy + headless mode (gate default / on_headless / gate_mode)
+# ---------------------------------------------------------------------------
+
+GATED_DEFAULT = GATED.replace(
+    "    options: [approve, abandon]\n",
+    "    options: [approve, abandon]\n    default: approve\n")
+
+
+def _manifest(defs_root, name):
+    return json.loads(
+        (defs_root / name / ".compiled" / "manifest.json").read_text())
+
+
+def test_gate_mode_unstamped_keeps_byte_identity(tmp_path):
+    # A def with NO gate-policy fields compiles byte-identically with no flag and
+    # with an explicit --gate-mode interactive: nothing is ever stamped unless
+    # the effective mode is auto.
+    d = make_flow(tmp_path, "gated-flow", GATED.replace("name: linear-flow", "name: gated-flow"))
+    rc, data, out, err = run(tmp_path, "gated-flow")
+    assert rc == 0, err
+    first = {p.name: p.read_text() for p in (d / ".compiled").iterdir()}
+    assert "gate_mode" not in _manifest(tmp_path, "gated-flow")
+    rc2, data2, out2, err2 = run(tmp_path, "gated-flow", "--gate-mode", "interactive")
+    assert rc2 == 0, err2
+    second = {p.name: p.read_text() for p in (d / ".compiled").iterdir()}
+    assert first == second
+    assert data["manifest_hash"] == data2["manifest_hash"]
+
+
+def test_gate_mode_auto_stamps_manifest_and_changes_hash(tmp_path):
+    make_flow(tmp_path, "gated-flow",
+              GATED_DEFAULT.replace("name: linear-flow", "name: gated-flow"))
+    rc, data, out, err = run(tmp_path, "gated-flow")
+    assert rc == 0, err
+    interactive_hash = data["manifest_hash"]
+    rc2, data2, out2, err2 = run(tmp_path, "gated-flow", "--gate-mode", "auto")
+    assert rc2 == 0, err2
+    m = _manifest(tmp_path, "gated-flow")
+    assert m["gate_mode"] == "auto"
+    # Distinct hash: interactive run-state must never resume into a headless run.
+    assert data2["manifest_hash"] != interactive_hash
+    # Partition is untouched — auto gates remain orchestrator checkpoints.
+    assert data2["sequence"] == data["sequence"] == ["segment[a]", "gate", "segment[b]"]
+
+
+def test_gate_mode_auto_dies_on_defaultless_hard_gate(tmp_path):
+    make_flow(tmp_path, "gated-flow", GATED.replace("name: linear-flow", "name: gated-flow"))
+    rc, data, out, err = run(tmp_path, "gated-flow", "--gate-mode", "auto")
+    assert rc == 1
+    assert "g1" in data["error"] and "default" in data["error"]
+
+
+def test_gate_mode_auto_allows_declared_on_headless_fail(tmp_path):
+    # on_headless: fail is the author-declared "do the work, then stop at this
+    # gate" escape — a mode=auto compile must succeed (the dispatcher stops at
+    # run time, with resumable state).
+    body = GATED.replace("name: linear-flow", "name: gated-flow") + \
+        "    on_headless: fail\n"
+    make_flow(tmp_path, "gated-flow", body)
+    rc, data, out, err = run(tmp_path, "gated-flow", "--gate-mode", "auto")
+    assert rc == 0, err
+    assert _manifest(tmp_path, "gated-flow")["gate_mode"] == "auto"
+
+
+def test_gate_default_must_be_member_of_options(tmp_path):
+    # Mode-independent: the recorded auto/warn choice must be a label the gate
+    # actually offers — even an interactive compile dies.
+    body = GATED_DEFAULT.replace("default: approve", "default: yes-do-it") \
+                        .replace("name: linear-flow", "name: gated-flow")
+    make_flow(tmp_path, "gated-flow", body)
+    rc, data, out, err = run(tmp_path, "gated-flow")
+    assert rc == 1
+    assert "yes-do-it" in data["error"] and "options" in data["error"]
+
+
+def test_optionless_gate_default_checked_against_confirm_stop(tmp_path):
+    # An options-less gate offers the implicit confirm/stop pair: default:
+    # confirm compiles; default: approve dies naming the implicit pair.
+    base = GATED.replace("name: linear-flow", "name: gated-flow") \
+                .replace("    options: [approve, abandon]\n", "")
+    make_flow(tmp_path, "gated-flow", base + "    default: confirm\n")
+    rc, data, out, err = run(tmp_path, "gated-flow", "--gate-mode", "auto")
+    assert rc == 0, err
+    make_flow(tmp_path / "w2", "gated-flow", base + "    default: approve\n")
+    rc2, data2, out2, err2 = run(tmp_path / "w2", "gated-flow")
+    assert rc2 == 1
+    assert "confirm/stop" in data2["error"]
+
+
+def test_on_headless_take_default_requires_default(tmp_path):
+    body = GATED.replace("name: linear-flow", "name: gated-flow") + \
+        "    on_headless: take_default\n"
+    make_flow(tmp_path, "gated-flow", body)
+    rc, data, out, err = run(tmp_path, "gated-flow")
+    assert rc == 1
+    assert "take_default" in data["error"] and "default" in data["error"]
+
+
+def test_profile_declared_gate_mode_wins_over_flag(tmp_path):
+    # (a) A profile overlay declaring gate_mode: auto stamps without any flag.
+    d = make_flow(tmp_path, "gated-flow",
+                  GATED_DEFAULT.replace("name: linear-flow", "name: gated-flow"))
+    (d / "profiles" / "autonomous.yaml").write_text("version: 1\ngate_mode: auto\n")
+    rc, data, out, err = run(tmp_path, "gated-flow", "--profile", "autonomous")
+    assert rc == 0, err
+    assert _manifest(tmp_path, "gated-flow")["gate_mode"] == "auto"
+    # (b) A doc-declared interactive PINS interactive even under --gate-mode auto
+    # (child profile-declared mode wins over parent inheritance).
+    (d / "profiles" / "pinned.yaml").write_text("version: 1\ngate_mode: interactive\n")
+    rc2, data2, out2, err2 = run(tmp_path, "gated-flow", "--profile", "pinned",
+                                 "--gate-mode", "auto")
+    assert rc2 == 0, err2
+    assert "gate_mode" not in _manifest(tmp_path, "gated-flow")
+
+
+def test_gate_policy_fields_ride_manifest_step_verbatim(tmp_path):
+    body = GATED_DEFAULT.replace("name: linear-flow", "name: gated-flow") + """\
+    on_headless: take_default
+    present:
+      - a.output.x
+      - read_file: a.output.path
+"""
+    make_flow(tmp_path, "gated-flow", body)
+    rc, data, out, err = run(tmp_path, "gated-flow")
+    assert rc == 0, err
+    m = _manifest(tmp_path, "gated-flow")
+    gate = next(s for s in m["steps"] if s.get("checkpoint_type") == "gate")["gate"]
+    assert gate["default"] == "approve"
+    assert gate["on_headless"] == "take_default"
+    assert gate["present"] == ["a.output.x", {"read_file": "a.output.path"}]
+
+
+def test_real_microskill_create_autonomous_profile_is_headless(tmp_path):
+    # The migrated autonomous profile is a pure flip to the new mechanism:
+    # gate_mode: auto + a declared default on the (still hard) approval gate.
+    # --plan writes nothing, so this cannot perturb the runtime .compiled/ that
+    # other e2e tests read.
+    rc, data, out, err = run(REAL_DEFS, "microskill-create",
+                             "--profile", "autonomous", "--plan")
+    assert rc == 0, err
+    assert data["profile_used"] == "autonomous"
+    m = data["manifest"]
+    assert m["gate_mode"] == "auto"
+    gate = next(s for s in m["steps"] if s.get("checkpoint_type") == "gate")["gate"]
+    assert gate["id"] == "approve_plan"
+    assert gate["default"] == "approve"
+    assert gate["severity"] == "hard"   # severity is NOT flipped any more

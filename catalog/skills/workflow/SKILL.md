@@ -24,11 +24,21 @@ checkpoint in the main loop (where `AskUserQuestion` works), and threads outputs
    token from a shim). If no `.claude/workflow-defs/<name>/WORKFLOW.yaml` exists, stop and report.
 2. **Profile / overrides** — detect `<profile>` (slash position 2 or `"with <profile> profile"`) and
    any `override workflow-config: <field>=<value>` clauses.
+   **Headless signal** — the run is headless when the invocation args carry `--gate-mode auto` (or
+   `--headless`), OR the environment sets `MICROSKILLS_HEADLESS=1` (check once via Bash:
+   `echo "${MICROSKILLS_HEADLESS:-}"`). The signal only feeds the compile flag in step 3 — at run
+   time the MANIFEST is authoritative.
 3. **Compile** — run via Bash: `.claude/scripts/compile-workflow <name> [--profile "<profile>"]
-   [--override <k>=<v> ...]`. The compile summary and the written manifest always carry
-   `manifest_hash` (the resume check in step 5 needs it); `--explain` is optional diagnostics only.
-   Non-zero exit → stop and surface the JSON `error` / `schema_errors`. (Never pass `--plan` here —
+   [--override <k>=<v> ...] [--gate-mode auto when the headless signal is set]`. The compile summary
+   and the written manifest always carry `manifest_hash` (the resume check in step 5 needs it);
+   `--explain` is optional diagnostics only. Non-zero exit → stop and surface the JSON `error` /
+   `schema_errors` — under a headless signal this includes the fail-loud "hard gate declares no
+   'default'" error: never retry without the flag to sneak past it. (Never pass `--plan` here —
    that is a dry-run that writes nothing.)
+   **`manifest.gate_mode == "auto"` is the authoritative runtime mode** for everything below (a
+   def/profile may declare `gate_mode: auto` with no flag at all, and a profile-declared mode wins
+   over the flag inside compile). Auto mode means: no human is present — `AskUserQuestion` must
+   never be called anywhere in the run; every gate takes its author-declared `default` verbatim.
 4. **Read the manifest** — read the `manifest_path` from the compile summary
    (`.claude/workflow-defs/<name>/.compiled/manifest.json`). Note `manifest.manifest_hash`.
 5. **Resume check** — all runtime state is namespaced per run under
@@ -38,7 +48,9 @@ checkpoint in the main loop (where `AskUserQuestion` works), and threads outputs
    `.claude/scripts/run-journal latest --runs-dir '.claude/workflow-defs/<name>/.compiled/runs' --manifest-hash '<manifest.manifest_hash>' --steps <manifest.steps.length>`
    It scans `runs/*/run-state.json` for the newest unfinished run (greatest run id) whose stored
    `manifest_hash` equals the current one — a mismatched hash means the workflow was recompiled /
-   changed, so stored node outputs no longer line up and that run is simply not offered. Parse the JSON:
+   changed, so stored node outputs no longer line up and that run is simply not offered. **Under auto
+   mode never ask: skip the offer and start fresh at step 6** (prior run dirs stay as provenance; an
+   auto compile has a distinct manifest_hash anyway, so interactive state never matches). Parse the JSON:
    - `found: true` → **offer to resume** via `AskUserQuestion` ("Resume run {run_id} from step
      {step_index+1}, or start fresh?"). On resume: adopt that `run_dir` as this run's directory, seed
      `inputs` from the `inputs` map in `<run_dir>/run-config.json` (skip Setup steps 6-8 — the run's
@@ -62,7 +74,9 @@ checkpoint in the main loop (where `AskUserQuestion` works), and threads outputs
 7. **Gather inputs** — initialize `inputs = {}`. For each name in `manifest.required_inputs`: if the
    caller's prompt supplies a literal value, use it; otherwise gather via `AskUserQuestion`. Apply
    `manifest.input_defaults` for any non-required input not supplied. (Do not fall back to a default
-   for a required input.)
+   for a required input.) **Under auto mode `AskUserQuestion` is unavailable**: a required input the
+   caller did not supply → journal a `run_error` naming the input and stop with a nonzero outcome —
+   never invent a value.
    **Then normalize each large / multi-shape input by reference.** For every name in
    `manifest.materialize_inputs` that has a gathered value `v` (skip an optional one with no value),
    produce ONE canonical file and set `inputs[name]` to its **absolute** path — so only a short path
@@ -175,8 +189,20 @@ is untouched. On a clean finish leave the run dir in place — it is the run's p
    fabricate a result (skip the recap; report the failure instead).
 
 ### `kind: "checkpoint"`, `checkpoint_type: "gate"`
-A human-approval / hard gate. First **render `results[gate.after]` as readable markdown** — it is an
-`output_schema`-shaped object. **Never show raw JSON.** Match the shape:
+A human-approval / hard gate. First render the gate's evidence:
+
+**`gate.present` declared → render it MECHANICALLY**, entries in declared order — no synthesis, so
+the approver sees the same evidence every run:
+- a string path `<id>.output[.<field>...]` → resolve against `results` and print `**<last path
+  segment>**: <value>` (a scalar verbatim; an object/array as a fenced ```json block).
+- `{read_file: <path>}` → resolve the path against `results` to a FILE PATH, **Read that file**, and
+  show its contents in a fenced block (language from the extension; if long, show it in full anyway —
+  present is the author's explicit ask).
+- a path that resolves to `undefined`/`null` → print `**<path>**: (not produced)` — never invent a
+  value.
+
+**No `present` → fall back to the output rubric**: render `results[gate.after]` as readable
+markdown — it is an `output_schema`-shaped object. **Never show raw JSON.** Match the shape:
 - **plan** (`{plan_path, name, ...}`) → **Read the file at `plan_path`** and show its contents in a fenced ```yaml
   block, prefixed by `name`. If long, show the node graph + key decisions, not every line.
 - **verdict** (`{pass, issues[]}`) → bold **PASS** / **FAIL**, then `issues` as a bullet list (summarize
@@ -185,10 +211,24 @@ A human-approval / hard gate. First **render `results[gate.after]` as readable m
 - **scope advisory** (`{kind, reason, recommendation}` / `missing_microskills[]`) → the advisory in prose;
   list each missing microskill's `name` + one-line `requirement`.
 - **default** → summarize key fields in 2-5 lines of prose; omit internal/verbose fields. Prefer shorter.
-Then ask via `AskUserQuestion`: `gate.prompt` is the question, `gate.options` the choices (default
-`confirm / stop`). **Give each option a one-line `description` of its consequence** — `approve`/`confirm`
-→ "Continue to the next step."; `revise` → "Re-run this segment with your notes."; `abandon`/`stop` →
-"Stop the run and clean up staging." (map other labels to the nearest).
+
+**Auto mode (`manifest.gate_mode == "auto"`) — never `AskUserQuestion` at a gate:**
+- `gate.on_headless == "fail"` → journal a `run_error` (`--label 'gate <id> declares on_headless:
+  fail'`) and **STOP with a nonzero outcome, naming the gate**. The committed run-state is resumable
+  interactively later — that is the declared "do the work, then hand off to a human" pattern.
+- otherwise take **`gate.default`** (compile guarantees a pausing gate declares one under auto):
+  record `results[gate.id] = { choice: <gate.default> }` — the author-declared label **VERBATIM**,
+  never a re-phrasing — print one line `Gate <id>: auto — taking declared default '<default>'`, and
+  journal the step with `--gate '<gate.id>' --choice '<gate.default>'`. Then act on that recorded
+  choice exactly per the mapping below, with one exception: a `revise`-style default cannot gather
+  human notes — journal a `run_error` and stop, naming the gate.
+- a pausing gate with NO `default` (a hand-edited manifest — compile never emits this) → journal a
+  `run_error` and stop. **Never pick an option yourself.**
+
+**Interactive mode** — ask via `AskUserQuestion`: `gate.prompt` is the question, `gate.options` the
+choices (default `confirm / stop`). **Give each option a one-line `description` of its consequence**
+— `approve`/`confirm` → "Continue to the next step."; `revise` → "Re-run this segment with your
+notes."; `abandon`/`stop` → "Stop the run and clean up staging." (map other labels to the nearest).
 
 **Record the human's pick — `results[gate.id] = { choice: <selected option> }`** (the chosen option's
 label, verbatim). A gate id is a legal `${...}` ref target: a later node/segment whose `when` or `inputs`
@@ -202,8 +242,12 @@ below; always store the pick, then act on it. Then act:
   input (e.g. append them to the `requirement` arg). Then re-render the output and re-present the gate
   (re-recording `results[gate.id]` on the re-presented choice).
 - An `abandon`/`stop` choice → stop the run cleanly (clean up any staging the segments created).
-For `severity: warn` gates, render the output + emit the prompt, then continue without pausing — still
-record `results[gate.id] = { choice: <selected option> }` so a downstream branch on the warn-gate pick resolves.
+For `severity: warn` gates (any mode), render the evidence + emit the prompt, then continue without
+pausing — record `results[gate.id] = { choice: <gate.default> }` when the gate declares a `default`
+(the author-declared label, verbatim), else `{ choice: null }`. **Never record an option nobody
+selected**: the recorded choice is always author-declared or null (validate forces a `default` on any
+warn gate whose choice is branched on, so a downstream branch always resolves against a real label).
+Journal the warn pass-through with `--outcome skipped` (plus `--choice` when a default was recorded).
 
 ### `kind: "checkpoint"`, `checkpoint_type: "orchestrator_node"`
 An orchestrator-native step (a node with neither `use` nor `agent`, or `delegation: orchestrator`).
@@ -214,6 +258,14 @@ Execute its `prompt` here in the main loop, resolving `${...}` references agains
 carries a non-null `schema`, that is the node's declared RETURN CONTRACT**: store an object with
 exactly those fields (the post-step `check-step-io` validates it) — never a prose summary in its
 place.
+
+**Auto mode (`manifest.gate_mode == "auto"`): `AskUserQuestion` is unavailable — there is no human.**
+A prompt that REQUIRES asking the user (it instructs an interactive loop, or a decision only a human
+can make) → journal a `run_error` **naming the node** and STOP with a nonzero outcome; never answer
+on the user's behalf (a fabricated answer is worse than a stop). A prompt that needs no human input
+executes normally. (Example: `refine-requirements`' base `clarify` node is NOT headless-able — its
+`autonomous` profile, which rewrites the prompt to an unattended single pass, is the supported
+unattended path.)
 
 Before executing, honor the conditional / fan-out fields if the step carries them
 (segment-internal `when`/`for_each` are already compiled — these apply only to orchestrator nodes):
@@ -240,7 +292,11 @@ collecting an array into `results[node]`). Then:
    `.claude/workflow-defs/${step.workflow}/WORKFLOW.yaml`, passing **`--profile ${step.profile}` when the
    checkpoint carries a `profile`** (a `customize: {profile}` on the `workflow:` node — e.g. `provision`
    runs `microskill-create` with the `autonomous` profile so its plan gate never pauses; omit the flag
-   when absent), and run its manifest, supplying the resolved map as the child's gathered `inputs`
+   when absent). **When this run's mode is auto (`manifest.gate_mode == "auto"`), also pass
+   `--gate-mode auto` to the child's compile** — mode inheritance; a child whose merged doc/profile
+   DECLARES `gate_mode` keeps its own declaration (inside compile, the doc wins over the flag), so a
+   child profile-declared mode always beats parent inheritance. Then run its manifest, supplying the
+   resolved map as the child's gathered `inputs`
    (skip the interactive gathering — the inputs are already provided by the parent; the child still
    mints its OWN run dir under its own def's `.compiled/runs/` and records them, Setup steps 6-8). **Still
    run the normalization pass (Setup step 7) over the child's `manifest.materialize_inputs`** before its
@@ -276,3 +332,9 @@ already covered the play-by-play — don't re-summarize each segment here.
   synthesize a replacement output.
 - **Required input unresolved** — stop, name the input.
 - **Gate abandoned** — stop cleanly, report partial state.
+- **Headless gate stop** — auto mode reached a gate with `on_headless: fail` (or a pausing gate with
+  no usable `default` in a hand-edited manifest). Journal `run_error` naming the gate, stop with a
+  nonzero outcome; the run-state stays resumable interactively.
+- **Headless interaction required** — auto mode reached an orchestrator node whose prompt requires
+  `AskUserQuestion`, or a required input was missing. Journal `run_error` naming the node/input, stop
+  with a nonzero outcome. Never fabricate the human's side.

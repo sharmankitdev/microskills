@@ -10,6 +10,7 @@
     "version": { "const": 1, "description": "Schema version. Only 1 is recognized. Omitting it defaults to 1 (set by compile/validate before validation); an explicit value other than 1 still blocks." },
     "name": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$", "description": "Bare workflow identifier (kebab-case)." },
     "description": { "type": "string", "description": "One-line description of the workflow." },
+    "gate_mode": { "enum": ["auto", "interactive"], "description": "Declared gate policy for runs of this (profile-merged) def. `auto` = headless: the dispatcher takes each gate's declared `default` and records it verbatim, never AskUserQuestion at a gate; compile dies when a pausing (hard) gate has neither a `default` nor `on_headless: fail`. Profile-declarable (the autonomous profiles set it), and the merged doc's value WINS over the compile-workflow `--gate-mode` flag — so a child workflow's profile-declared mode beats parent inheritance. Stamped into the manifest (inside manifest_hash) ONLY when the effective mode is `auto`, so existing interactive defs compile byte-identically. `interactive` (the default when absent) pins the def to interactive even under an inherited `--gate-mode auto`." },
     "base": { "type": "boolean", "description": "Catalog curation hint: true marks this as a base component that initialize-harness seeds into a new project's harness.yaml. Ignored by the compiler." },
     "profile": {
       "type": "object",
@@ -106,7 +107,20 @@
           "type": { "enum": ["human_approval", "verification", "tool_check"] },
           "severity": { "enum": ["warn", "hard"], "default": "hard" },
           "prompt": { "type": "string" },
-          "options": { "type": "array", "items": { "type": "string" }, "description": "Choices for a human_approval gate (e.g. approve/revise/abandon)." }
+          "options": { "type": "array", "items": { "type": "string" }, "description": "Choices for a human_approval gate (e.g. approve/revise/abandon). When OMITTED the dispatcher offers the implicit confirm/stop pair — every membership check (a declared `default`, a ${<gate-id>.output.choice} comparison literal) runs against that effective set." },
+          "default": { "type": "string", "description": "The author-declared choice: taken VERBATIM (and recorded as results[<gate-id>].choice) when the run's gate mode is auto (headless), and recorded at a severity:warn pass-through in interactive runs too — the dispatcher never records an option nobody selected. Must be a member of the gate's effective options (declared `options`, or the implicit confirm/stop pair) — compile dies / validate blocks otherwise. validate FORCES a default on a warn gate whose choice is branched on (a defaultless warn gate records {choice: null})." },
+          "on_headless": { "enum": ["take_default", "fail"], "description": "Behavior under gate mode auto (headless). `take_default` (the implied behavior when a `default` is declared) requires a declared `default`. `fail` = this gate refuses headless: the run executes up to the gate, then stops with a nonzero outcome naming it (run-state stays resumable interactively). A pausing (hard) gate with NEITHER a default NOR on_headless: fail makes a gate-mode=auto compile die loud." },
+          "present": {
+            "type": "array",
+            "minItems": 1,
+            "description": "Declarative gate presentation, rendered MECHANICALLY by the dispatcher in declared order (the model output-rubric is the fallback when absent — so the approver sees the SAME evidence every run). Entries are field paths into upstream results: a string path renders the resolved value; {read_file: <path>} resolves the path to a file path and shows that file's contents. A path may only name a producer that has already run when the gate fires (validate blocks a later one).",
+            "items": {
+              "oneOf": [
+                { "type": "string", "pattern": "^[a-z][a-z0-9_-]*\\.output(\\.[A-Za-z_][A-Za-z0-9_]*)*$", "description": "Field path into a produced result, e.g. plan.output.name (or plan.output for the whole object)." },
+                { "type": "object", "additionalProperties": false, "required": ["read_file"], "properties": { "read_file": { "type": "string", "pattern": "^[a-z][a-z0-9_-]*\\.output(\\.[A-Za-z_][A-Za-z0-9_]*)+$", "description": "Field path that resolves to a FILE PATH; the dispatcher Reads that file and shows its contents in a fenced block." } } }
+              ]
+            }
+          }
         },
         "allOf": [
           {

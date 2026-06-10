@@ -95,6 +95,7 @@ arbitrary embedded JSON-Schema fragment) and the map-typed `vars` / `inputs` / `
 | `vars` | — | Intra-def variable map (see below). `{{key}}` substitution; profile-overridable; no file include. |
 | `inputs` | — | Caller-supplied typed inputs. Referenced as `${workflow.inputs.<name>}`. |
 | `gates` | — | Checkpoints anchored `after:` a node. Hard / human-approval gates become segment boundaries. |
+| `gate_mode` | — | `auto` \| `interactive`. Declared gate policy: `auto` = headless — gates take their declared `default`, recorded verbatim (§8). Profile-declarable; the doc value wins over the `--gate-mode` flag. Stamped into the manifest **only when auto**. |
 | `loop` | — | At most one. A guarded loop (`while` *or* `until`) over a **contiguous** subset of nodes. |
 | `output` | — | `{from: <node-id>}` — whose result is the workflow's aggregate output. |
 | `profile` | — | `base.yaml` only: `{default: <name>}` names the default overlay when `--profile` is omitted. |
@@ -598,6 +599,11 @@ gates:
     severity: hard               # hard (default) | warn
     prompt: Review the plan. Approve to implement, revise to re-plan, or abandon.
     options: [approve, revise, abandon]   # choices for a human_approval gate
+    default: approve             # author-declared choice for auto (headless) / warn recording
+    on_headless: take_default    # take_default | fail — behavior under gate-mode auto
+    present:                     # OPTIONAL declared presentation, rendered mechanically
+      - plan.output.name                  # field path into upstream results
+      - read_file: plan.output.plan_path  # resolve to a file path, show that file
 ```
 
 **What makes a gate split a segment:** a gate of `type: human_approval` **or** `severity: hard`
@@ -615,17 +621,41 @@ time and the dispatcher never renders it.)
 | `type` | `human_approval` \| `verification` \| `tool_check`. `human_approval` **requires** a `prompt`. |
 | `severity` | `hard` (default) \| `warn`. Hard → segment boundary + pause. |
 | `prompt` | The question shown to the human. |
-| `options` | Choices for `human_approval` (e.g. `[approve, revise, abandon]`). The dispatcher maps these to consequences: approve → continue; revise → re-run the segment with notes; abandon → stop + clean staging. |
+| `options` | Choices for `human_approval` (e.g. `[approve, revise, abandon]`). The dispatcher maps these to consequences: approve → continue; revise → re-run the segment with notes; abandon → stop + clean staging. **When omitted the dispatcher offers the implicit `confirm`/`stop` pair — that pair is the gate's EFFECTIVE option set** for every membership check below. |
+| `default` | The **author-declared** choice. Taken verbatim under gate-mode `auto` (headless), and recorded at a `warn` pass-through in interactive runs too. **Must be a member of the gate's effective options** — compile dies / validate blocks otherwise (shared `gate_policy_errors`). |
+| `on_headless` | `take_default` \| `fail`. `take_default` (the implied behavior when a `default` exists) requires a declared `default`. `fail` = this gate refuses headless: the run does the work up to the gate, then **stops with a nonzero outcome naming it** (run-state stays resumable interactively). |
+| `present` | Ordered field paths the dispatcher renders **mechanically** (§ below). Optional; the model output-rubric is the fallback. |
 
 > Only `human_approval` gates are exercised by the built-in workflows. `verification` / `tool_check`
 > are valid `type` values in the schema; a `hard`-severity gate of any type still forms a segment
 > boundary.
 
+### Declarative presentation — `present:`
+
+Without `present`, the gate render is a model rubric ("summarize key fields, prefer shorter") — the
+approver sees a *different* summary each run. `present:` pins it: an **ordered list of field paths
+into upstream results**, rendered mechanically by the dispatcher with no synthesis:
+
+- a string path `<id>.output[.<field>...]` → the resolved value, printed verbatim (an object/array as
+  a fenced block);
+- `{read_file: <path>}` → the path resolves to a **file path**; the dispatcher Reads that file and
+  shows its contents in a fenced block;
+- a path that resolves to nothing renders `(not produced)` — never an invented value.
+
+validate-workflow checks every path: the leading id must be a **known node** (or an *earlier* gate —
+only its recorded `choice` field exists), a typed producer's first field after `.output` must be
+declared by its effective `output_schema` (resolved-schema inheritance included), and the producer
+must **already have run when the gate fires** — a path naming a node topologically *after* the gate's
+anchor is a block (it would render undefined on every run). The orchestrator-node freeform-label
+variant is explicitly out of scope.
+
 ### Gate-choice branching
 
-The dispatcher records the human's pick at a gate as `results[<gate-id>] = { choice: <selected
-option> }` (the chosen label, verbatim — recorded for `warn` gates too). A downstream node can branch
-on that pick:
+The dispatcher records the pick at a gate as `results[<gate-id>] = { choice: <label> }` — the
+human's selected option in an interactive pause, the gate's declared `default` under gate-mode
+`auto`, and at a `warn` pass-through the declared `default` (or `{choice: null}` when none is
+declared — **never a fabricated pick**: every recorded choice is human-selected or author-declared).
+A downstream node can branch on that pick:
 
 ```yaml
 gates:
@@ -644,6 +674,50 @@ nodes:
 A `${<gate-id>.output.choice}` ref is **accepted** by validate (treated as `any`, never field-checked)
 and creates **no dependency edge** (a gate isn't a node), so it can't perturb ordering. This composes
 with the advisory-fork pattern — opposite-`choice` guards keep the branches mutually exclusive.
+
+**Choice-literal cross-check (validate block).** Every string literal compared against
+`${<gate-id>.output.choice}` (`==`/`!=`, the JS `===`/`!==` spellings, either operand order) is
+extracted — the same bounded comparison grammar as the exclusivity lint — and **must be a member of
+the gate's effective options** (declared `options`, or the implicit `confirm`/`stop` pair of an
+options-less gate). The recorded choice is always one of the offered labels, so an out-of-set
+literal makes the comparison **constant**: a casing typo (`'Deep_Review'` vs `deep_review`) used to
+silently dead-end both branches; now it blocks. Two related blocks: a **warn** gate whose choice is
+branched on **must declare a `default`** (a defaultless warn gate records `{choice: null}`, so the
+branch could never fire), and branching on a warn gate of a non-`human_approval` type is always
+broken (it emits **no** checkpoint at all — its choice is never recorded).
+
+### Declared gate policy + headless mode — `gate_mode: auto`
+
+A run is **headless** when the *effective gate mode* is `auto`. Precedence, resolved inside
+`compile-workflow`: the merged doc's **`gate_mode:`** (top-level, profile-declarable — the
+autonomous profiles set it) **wins over** the **`--gate-mode auto`** CLI flag (the
+parent-inheritance channel), which wins over the interactive default. The dispatcher passes the flag
+when its invocation carries `--gate-mode auto` / `--headless` or the environment sets
+`MICROSKILLS_HEADLESS=1` (the env signal is read by the **dispatcher only** — compile output stays a
+pure function of argv + files). `manifest.gate_mode == "auto"` is the authoritative runtime mode.
+
+Under auto mode:
+
+- **Every pausing (hard) gate takes its declared `default`** and records it **verbatim** —
+  `results[<gate-id>] = {choice: <default>}` — then the run continues without `AskUserQuestion`.
+- A pausing gate with **no `default`** makes the compile **die loud** (nonzero) — never a runtime
+  surprise; declare `default:`, or `on_headless: fail`, or run interactively.
+- A gate with **`on_headless: fail`** compiles fine; the run executes up to it, then **stops with a
+  nonzero outcome naming the gate** — run-state stays resumable interactively (the "do the work
+  overnight, approve in the morning" pattern).
+- An **orchestrator node whose prompt requires `AskUserQuestion`** stops the run naming the node —
+  the dispatcher never answers on the user's behalf. (`refine-requirements`' base `clarify` loop is
+  therefore **not headless-able**; its `autonomous` profile — which rewrites the prompt to an
+  unattended pass — is the supported unattended path.)
+- **Partition and segment bytes are provably unchanged**: auto gates remain orchestrator
+  checkpoints. The manifest is stamped `gate_mode: "auto"` (inside `manifest_hash`) **only when the
+  effective mode is auto**, so existing interactive defs compile byte-identically and interactive
+  run-state never resumes into a headless run.
+- A parent running headless passes `--gate-mode auto` to a nested child's compile (inheritance); a
+  child whose own doc/profile declares `gate_mode` keeps its declaration — **child profile-declared
+  mode wins over parent inheritance**.
+
+See `templates/headless-ci.md` for the CI recipe (`claude -p` + `MICROSKILLS_HEADLESS=1`).
 
 ---
 
@@ -764,8 +838,9 @@ overlay can surgically `add` / `patch` / `remove` workflow `nodes:` and `gates:`
 
 ```yaml
 # profiles/autonomous.yaml
+gate_mode: auto                                    # headless: gates take their declared default
 gates:
-  patch: [{ id: approve_plan, severity: warn }]   # soften an existing gate by id
+  patch: [{ id: approve_plan, default: approve }]  # declare the default on an existing gate by id
 nodes:
   patch: [{ id: implement, customize: { profile: fast } }]
   add:   [{ id: extra_check, agent: checker, depends_on: [implement] }]
@@ -825,9 +900,10 @@ compile stays byte-identical and an override run correctly refuses stale resume 
 lockfile. The CLI twin is `--node-override` (above); a `value` of `null` is stripped pre-validation
 (the entry simply disappears).
 
-Example — the `autonomous` profile of `microskill-create` softens the approval gate from `hard` to
-`warn`: the structure stays (2 segments, the gate checkpoint still exists) but the run never pauses
-for a human.
+Example — the `autonomous` profile of `microskill-create` declares `gate_mode: auto` and patches
+`default: approve` onto the approval gate (severity stays `hard`): the structure stays (2 segments,
+the gate checkpoint still exists) but the run never pauses — the dispatcher records the declared
+default verbatim and continues (§8, *Declared gate policy + headless mode*).
 
 ---
 
@@ -976,10 +1052,13 @@ For each manifest step in order:
   (`.compiled/seg-N.js`), so the dispatcher resolves it against `.claude/workflow-defs/<name>/`.
   The segment returns an object keyed by its `produces` node ids;
   store each into `results`. (A loop segment also returns `__rounds`.)
-- **`checkpoint` / gate** → render `results[gate.after]` as readable markdown (never raw JSON), then
-  `AskUserQuestion` with the gate's prompt + options. Approve → continue; revise → re-run the
-  producing segment with folded-in notes; abandon → stop + clean staging. `warn` gates render +
-  continue without pausing.
+- **`checkpoint` / gate** → render the gate's `present:` paths mechanically when declared (the
+  output rubric over `results[gate.after]` is the fallback — never raw JSON), then `AskUserQuestion`
+  with the gate's prompt + options. Approve → continue; revise → re-run the producing segment with
+  folded-in notes; abandon → stop + clean staging. Under `manifest.gate_mode == "auto"` there is no
+  ask: the gate's declared `default` is recorded verbatim (`on_headless: fail` → stop naming the
+  gate). `warn` gates render + continue without pausing, recording their declared `default` (or
+  `{choice: null}` when none) — never a fabricated pick.
 - **`checkpoint` / orchestrator_node** → execute the node's `prompt` in the main loop, resolving
   `${...}` against `inputs`/`results`. Honor `when` (skip → `null`) and `for_each` (run per item,
   bind `${as}`). This is where side-effects and `AskUserQuestion` happen. Store into `results[node]`.
@@ -1004,8 +1083,14 @@ compiled segment's fail-loud args guard, never duplicated here.
 
 At the end, report `results[manifest.output.from]`.
 
-### `--plan`, `--explain`, `--lock`, `--check`, `--annotate` (compile flags)
+### `--plan`, `--explain`, `--lock`, `--check`, `--annotate`, `--gate-mode` (compile flags)
 
+- **`compile-workflow … --gate-mode auto`** — compile for a **headless** run: dies loud when a
+  pausing gate has neither a declared `default` nor `on_headless: fail`, and stamps
+  `gate_mode: "auto"` into the manifest (inside `manifest_hash`) so the dispatcher takes each gate's
+  declared default. The merged doc's own `gate_mode` (profile-declarable) **wins over the flag** —
+  child profile-declared mode beats parent inheritance. Omitted / `interactive` → nothing stamped:
+  existing defs compile **byte-identically** (§8, *Declared gate policy + headless mode*).
 - **`compile-workflow … --plan`** — a **dry-run**: compute the full plan (segment JS, `needs`,
   `produces`, frozen payloads, manifest, summary) but **write nothing** — no `mkdir`, no stale-clean,
   no `seg-*.js`, no `resolved/*.json`, no `manifest.json`. The printed summary is identical to a real
