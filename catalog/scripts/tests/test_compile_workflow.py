@@ -3481,3 +3481,148 @@ def test_recompile_preserves_runs_tree_and_legacy_run_state(tmp_path):
     assert (run_dir / "journal.jsonl").exists()
     assert (run_dir / "run-inputs" / "x.cat").exists()
     assert legacy.exists()
+
+
+# ---------------------------------------------------------------------------
+# Per-node IO contracts: every manifest step records io: {<node-id>: {schema,
+# guarded, fan_out}} for the nodes it produces — the dispatcher's post-step
+# check-step-io validates run-state results against it. Deterministic: derived
+# from the merged doc + resolution only (inside manifest_hash).
+
+
+IO_CONTRACT_WF = """\
+version: 1
+name: ioc-flow
+inputs:
+  items:
+    type: array
+    required: true
+nodes:
+  - id: a
+    agent: ag
+    prompt: do a
+    output_schema:
+      type: object
+      required: [x]
+      properties:
+        x: { type: string }
+  - id: b
+    agent: ag
+    when: ${a.output.x == 'go'}
+    depends_on: [a]
+    prompt: maybe b
+  - id: scan
+    agent: ag
+    depends_on: [a]
+    for_each: ${workflow.inputs.items}
+    as: item
+    prompt: scan ${item}
+  - id: fin
+    delegation: orchestrator
+    depends_on: [scan]
+    prompt: finalize
+    output_schema:
+      type: object
+      required: [choice]
+      properties:
+        choice: { type: string }
+gates:
+  - id: g1
+    after: fin
+    type: human_approval
+    prompt: ok?
+    options: [approve, abandon]
+"""
+
+
+def test_manifest_steps_carry_per_node_io(tmp_path):
+    d = make_flow(tmp_path, "ioc-flow", IO_CONTRACT_WF)
+    rc, data, out, err = run(tmp_path, "ioc-flow")
+    assert rc == 0, err
+    m = json.loads((d / ".compiled" / "manifest.json").read_text())
+
+    seg = m["steps"][0]
+    assert set(seg["io"]) == set(seg["produces"])
+    assert seg["io"]["a"] == {
+        "schema": {"type": "object", "required": ["x"],
+                   "properties": {"x": {"type": "string"}}},
+        "guarded": False, "fan_out": False}
+    # A when-guarded node: null is a legal skip; no declared schema -> null.
+    assert seg["io"]["b"] == {"schema": None, "guarded": True, "fan_out": False}
+    # A for_each node fans out: the stored result is an ARRAY of schema items.
+    assert seg["io"]["scan"]["fan_out"] is True
+
+    chk = m["steps"][1]
+    assert chk["checkpoint_type"] == "orchestrator_node"
+    assert chk["io"]["fin"] == {
+        "schema": {"type": "object", "required": ["choice"],
+                   "properties": {"choice": {"type": "string"}}},
+        "guarded": False, "fan_out": False}
+
+    # Gates are not nodes: a gate checkpoint carries no io block.
+    gate = m["steps"][2]
+    assert gate["checkpoint_type"] == "gate"
+    assert "io" not in gate
+
+
+def test_use_node_io_schema_is_the_inherited_microskill_schema(tmp_path):
+    # A use: node with no inline output_schema records the microskill's RESOLVED
+    # schema in io (same effective-schema rule node_call_js bakes into seg JS).
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF)
+    rc, data, out, err = run(defs_root, "inh-flow")
+    assert rc == 0, err
+    m = json.loads((d / ".compiled" / "manifest.json").read_text())
+    io_e = m["steps"][0]["io"]["e"]
+    assert io_e["schema"]["required"] == ["echoed"]
+    assert io_e["guarded"] is False and io_e["fan_out"] is False
+
+
+def test_nested_workflow_checkpoint_carries_io(tmp_path):
+    # A workflow: node's checkpoint records io too (schema only when the node
+    # declares one inline — the child's output contract is not resolved here).
+    defs_root = tmp_path / "workflow-defs"
+    child = defs_root / "child-flow"
+    (child / "profiles").mkdir(parents=True)
+    (child / "WORKFLOW.yaml").write_text(
+        "version: 1\nname: child-flow\nnodes:\n  - id: c\n    agent: ag\n    prompt: c\n")
+    (child / "profiles" / "base.yaml").write_text("version: 1\n")
+    parent = defs_root / "parent-flow"
+    (parent / "profiles").mkdir(parents=True)
+    (parent / "WORKFLOW.yaml").write_text("""\
+version: 1
+name: parent-flow
+imports: [child-flow]
+nodes:
+  - id: a
+    agent: ag
+    prompt: do a
+  - id: build
+    workflow: child-flow
+    when: ${a.output.ok}
+    depends_on: [a]
+    inputs: {}
+""")
+    (parent / "profiles" / "base.yaml").write_text("version: 1\n")
+    rc, data, out, err = run(defs_root, "parent-flow")
+    assert rc == 0, err
+    m = json.loads((parent / ".compiled" / "manifest.json").read_text())
+    chk = next(s for s in m["steps"] if s.get("checkpoint_type") == "nested_workflow")
+    assert chk["io"]["build"] == {"schema": None, "guarded": True, "fan_out": False}
+
+
+def test_real_refine_requirements_orchestrator_contracts(tmp_path):
+    # The prose-only orchestrator return contracts now ride as declared
+    # output_schema blocks: clarify + approve carry them into their checkpoint io.
+    rc, data, out, err = run(REAL_DEFS, "refine-requirements")
+    assert rc == 0, err
+    m = json.loads(
+        (REAL_DEFS / "refine-requirements" / ".compiled" / "manifest.json").read_text())
+    chks = {s["node"]: s for s in m["steps"]
+            if s.get("checkpoint_type") == "orchestrator_node"}
+    clarify = chks["clarify"]["io"]["clarify"]
+    assert clarify["guarded"] is True            # when: gaps_count > 0
+    assert set(clarify["schema"]["required"]) == {
+        "choice", "final_document_path", "rounds", "converged", "remaining_gaps"}
+    approve = chks["approve"]["io"]["approve"]
+    assert set(approve["schema"]["required"]) == {
+        "choice", "final_document_path", "remaining_gaps"}

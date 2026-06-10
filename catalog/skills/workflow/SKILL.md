@@ -110,8 +110,8 @@ and track the 0-based position `i` as you walk. **Before running each step, prin
 A skipped step (a `warn` gate, or an orchestrator node whose `when` is false) still gets a header, marked skipped.
 Walk `manifest.steps` in order (starting at the resume position `i` from the Setup resume check, default 0):
 
-**Persist run-state + journal after each step.** After a step completes (and its output is stored into
-`results`), checkpoint in two moves:
+**Persist run-state + journal after each step, then check the step's IO.** After a step completes
+(and its output is stored into `results`), checkpoint in three moves:
 1. Use the **Write tool** to write
    `{ "manifest_hash": manifest.manifest_hash, "step_index": <the index of the NEXT step to run>, "results": results }`
    to `<run_dir>/run-state.json.tmp` (a structured tool parameter — node outputs never ride a shell
@@ -124,13 +124,25 @@ Walk `manifest.steps` in order (starting at the resume position `i` from the Set
    leaves a half-written state) and appends one machine-readable line to `<run_dir>/journal.jsonl`,
    recording its own timestamp and computing byte sizes by reading the committed state itself — content
    never rides argv.
+3. **Post-step IO check** — run ONE Bash call:
+   `.claude/scripts/check-step-io --manifest '.claude/workflow-defs/<name>/.compiled/manifest.json' --run-state '<run_dir>/run-state.json' --step <i>`
+   It receives only PATHS (node outputs never ride argv) and validates every value this step
+   produced against the per-node `io` contract on the manifest step (`{schema, guarded, fan_out}`:
+   the node's effective output_schema; `fan_out` → an array of that schema; a guarded node's `null`
+   is a legal skip; an unguarded `null`/`{}` against a required-props schema = probable
+   native-engine truncation or subagent fabrication). **Non-zero exit → STOP**: surface the JSON
+   `errors` readably, journal a `run_error` (see below), and do not run the next step — never
+   re-synthesize or repair the failed output yourself (re-running the producing step after a fix is
+   the human's call). Exit 0 → continue; surface any `warnings` (e.g. an oversized result a later
+   segment threads through `args` — the compiled args guard is the enforcement point there; the
+   warning just names the producing node early).
 This is the dispatcher's in-memory `results{}` checkpointed to disk so a run that dies mid-way can
 resume (see the Setup resume check) instead of restarting from step 0 and re-running expensive segments.
 It is dispatcher runtime state, quarantined from the compiled bytes — the compiler never reads `runs/`
 and its stale-clean (which globs only `seg-*.js` and `resolved/*.json`) never deletes it, so determinism
 is untouched. On a clean finish leave the run dir in place — it is the run's provenance record (the
 `latest` scan skips finished runs via `--steps`). Do not let journaling block the run. On a stop
-(segment error, abandoned gate, unresolvable input), record it before stopping:
+(segment error, failed IO check, abandoned gate, unresolvable input), record it before stopping:
 `.claude/scripts/run-journal append --run-dir '<run_dir>' --event run_error --step-index <i> --outcome error --label '<short reason>'`.
 
 ### `kind: "segment"`
@@ -198,7 +210,10 @@ An orchestrator-native step (a node with neither `use` nor `agent`, or `delegati
 Execute its `prompt` here in the main loop, resolving `${...}` references against `inputs` and
 `results` (e.g. `${workflow.inputs.output_dir}` → `inputs.output_dir`, `${evaluate.output.pass}` →
 `results.evaluate.pass`). This is where filesystem side effects and interactive decisions
-(`AskUserQuestion`) happen. Store its result into `results[node]`.
+(`AskUserQuestion`) happen. Store its result into `results[node]`. **When the step's `io[<node>]`
+carries a non-null `schema`, that is the node's declared RETURN CONTRACT**: store an object with
+exactly those fields (the post-step `check-step-io` validates it) — never a prose summary in its
+place.
 
 Before executing, honor the conditional / fan-out fields if the step carries them
 (segment-internal `when`/`for_each` are already compiled — these apply only to orchestrator nodes):
@@ -256,5 +271,8 @@ already covered the play-by-play — don't re-summarize each segment here.
 - **Unknown workflow** — no `WORKFLOW.yaml` at `.claude/workflow-defs/<name>/`. Stop.
 - **Compile error** — `compile-workflow` non-zero exit. Surface `error` / `schema_errors`, stop.
 - **Segment error** — a segment returns an error (fail-loud node). Stop, surface it, do not proceed.
+- **Step IO check failed** — `check-step-io` exits non-zero after a step (schema violation, missing
+  result, or the probable-truncation/fabrication signature). Stop, surface its `errors`, never
+  synthesize a replacement output.
 - **Required input unresolved** — stop, name the input.
 - **Gate abandoned** — stop cleanly, report partial state.

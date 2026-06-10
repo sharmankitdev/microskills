@@ -38,7 +38,10 @@ Stdout: JSON summary { name, profile_used, compiled_dir, manifest_path, segments
 checkpoints, manifest_hash, sequence }. The written manifest always carries
 manifest_hash plus schema_sha256 (provenance of the validating schema, excluded
 from the hash), and stores segment script paths RELATIVE to the def dir so
-manifest bytes are portable across checkouts. manifest_hash folds in per-node
+manifest bytes are portable across checkouts. Every step that produces node
+results (segments + orchestrator/nested-workflow checkpoints) records a per-node
+"io": {schema, guarded, fan_out} contract — the dispatcher's post-step
+check-step-io validates stored results against it. manifest_hash folds in per-node
 SEMANTIC fingerprints (substituted prompt, inputs, effective schema, executor
 identity, when/for_each/as, frozen-resolution sha256 — phase_group excluded), so
 a registry edit or prompt change is hash-visible even though those bytes live
@@ -568,6 +571,27 @@ def auto_wire_node_inputs(node, target_inputs, workflow_inputs):
         for name in wired:
             inputs[name] = "${workflow.inputs." + name + "}"
     return wired, required_wired
+
+
+def node_io(node):
+    """Per-node IO contract recorded on the manifest step it is produced by
+    (consumed by check-step-io, the dispatcher's post-step validator):
+      - schema  — the node's EFFECTIVE output schema: an explicit node-level
+        output_schema wins, else a use: node's resolved microskill schema
+        stashed on _exec_schema by classify() (the SAME rule node_call_js
+        bakes into the agent()/runMicroskill call); null when neither exists.
+      - guarded — the node carries a `when` guard, so a stored null result is
+        a LEGAL skip (an UNGUARDED null/{} against a required-props schema is
+        the truncation/fabrication signature check-step-io hard-fails on).
+      - fan_out — the node fans out over for_each, so the stored result is an
+        ARRAY of schema-shaped items.
+    Pure function of the merged doc + resolution → deterministic; rides inside
+    the manifest dict, hence inside manifest_hash."""
+    return {
+        "schema": node.get("output_schema") or node.get("_exec_schema"),
+        "guarded": bool(node.get("when")),
+        "fan_out": bool(node.get("for_each")),
+    }
 
 
 def rel(p):
@@ -1646,6 +1670,10 @@ def main():
             for k in ("when", "for_each", "as"):
                 if node.get(k) is not None:
                     chk[k] = node[k]
+            # Per-node IO contract: an orchestrator checkpoint's declared
+            # output_schema is its RETURN CONTRACT (check-step-io validates the
+            # stored result against it after the step) — no longer prose-only.
+            chk["io"] = {nid: node_io(node)}
             steps.append(chk)
         else:
             seg.append(nid)
@@ -1701,6 +1729,10 @@ def main():
                 "is_loop": bool(loop) and set(step["nodes"]) == set((loop or {}).get("body") or []),
                 "needs": needs,
                 "produces": produces,
+                # Per-node IO contract for every produced node (topo order) —
+                # check-step-io validates the dispatcher-stored results against
+                # it between steps.
+                "io": {nid: node_io(node_by_id[nid]) for nid in step["nodes"]},
             })
         else:
             manifest_steps.append(step)

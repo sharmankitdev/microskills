@@ -299,6 +299,12 @@ The stale-clean that precedes each compile globs `seg-*.js` **and** `resolved/*.
 Orchestrator nodes run in the **main loop**: they do filesystem side-effects, `AskUserQuestion`, and
 **nested-workflow invocation**. They become checkpoints in the compiled sequence.
 
+An orchestrator node whose output a downstream node consumes (or whose prompt promises a structured
+`RETURN {...}`) should declare that contract as an `output_schema` — the compiler records it in the
+checkpoint's per-node `io` block and the dispatcher validates the stored result against it right
+after the step (`check-step-io`), so a prose-shaped summary or a fabricated `null` stops the run
+instead of riding forward (see refine-requirements' `clarify`/`approve` and decompose's `provision`).
+
 ### (d) `workflow:` — invoke a nested workflow (first-class)
 
 ```yaml
@@ -391,7 +397,7 @@ compiled segments, `manifest_hash`, and the committed `closure.lock.json` **unch
 | `inputs` | (a)(b)(d) | Map of input field → `${...}` expression (or literal). Wires data in. |
 | `wire` | (a)(d) | `auto` — declared pass-through forwarding (§5): every target-declared, unsupplied input whose name matches a declared workflow input materializes as `inputs.<name>: ${workflow.inputs.<name>}`, byte-identical to the hand-written forward. Explicit wins; wired pairs append sorted after the authored entries; `--explain` lists every pair. Hard error on `agent:`/orchestrator-native nodes and under `delegation: orchestrator`; unresolvable target = block; auto-satisfying a `required: true` target input = warn. |
 | `prompt` | (b)(c) | Task prompt template. May contain `${...}`. (For `use:` nodes the body comes from the microskill.) |
-| `output_schema` | (a)(b) | JSON-Schema fragment forcing structured output. Passed to `agent()`'s `schema`. A `use:` node **omitting** this inherits the microskill's resolved schema (§11) — preferred; an inline schema that merely restates the resolved one is a validate **warn** (omit it), a diverging one warns to reconcile or document the narrowing. |
+| `output_schema` | all | JSON-Schema fragment forcing structured output. On (a)(b) it is passed to `agent()`'s `schema`; a `use:` node **omitting** this inherits the microskill's resolved schema (§11) — preferred; an inline schema that merely restates the resolved one is a validate **warn** (omit it), a diverging one warns to reconcile or document the narrowing. On (c)(d) it is the checkpoint's **declared return contract** — recorded in the manifest step's per-node `io` block and validated post-step by `check-step-io` (no longer prose-only). |
 | `when` | all | Conditional guard (see §6). |
 | `for_each` + `as` | all | Fan-out over a collection (see §6). |
 | `max_parallel` | for_each only | Bound the fan-out to batches of K (`parallelChunked`) instead of one unbounded `parallel()`. **Only valid on a `for_each` node** — on a non-fan-out node it is a block. |
@@ -986,6 +992,16 @@ For each manifest step in order:
   Depth ≤ 1 is compiler-guaranteed, so recursion is bounded. Store the child's `output.from` result
   into `results[node]`.
 
+**After every step** (once the run-state checkpoint is committed) the dispatcher runs
+`check-step-io --manifest <…/manifest.json> --run-state <run_dir>/run-state.json --step <i>` —
+**paths only**, node outputs never ride argv — which validates each produced value against the
+per-node `io: {schema, guarded, fan_out}` contract the manifest step carries (the node's effective
+`output_schema`; `fan_out` → an array of that schema; a **guarded null is a legal skip**; an
+**unguarded `null`/`{}` against a required-props schema is a hard "probable truncation/fabrication"
+error**). Non-zero exit stops the run. It also **warns** when a result a later segment threads
+through `args` exceeds the size budget (default 32 KiB) — a warning only: enforcement is the
+compiled segment's fail-loud args guard, never duplicated here.
+
 At the end, report `results[manifest.output.from]`.
 
 ### `--plan`, `--explain`, `--lock`, `--check`, `--annotate` (compile flags)
@@ -1385,6 +1401,11 @@ nodes:
       "Don't post"; approve|comment -> "Post to PR" / "Don't post". For "Show blockers to fix", list
       the blocker findings from ${review.output.findings} and stop. Return ONLY
       {"choice":"<the selected label, verbatim>"}.
+    output_schema:                      # declared return contract — validated post-step (check-step-io)
+      type: object
+      required: [choice]
+      properties:
+        choice: { type: string }
   - id: post                            # declarative side-effect, guarded on the recorded choice
     delegation: orchestrator
     when: ${review_decision.output.choice == 'Post to PR' || review_decision.output.choice == 'Post anyway'}
@@ -1394,11 +1415,12 @@ output: { from: review }
 ```
 > **Why an orchestrator node, not a gate:** a gate can't vary its prompt/options by an upstream verdict —
 > gate `prompt`/`options` are static and never `${...}`-resolved (§8). An orchestrator node's prompt IS
-> resolved and it can call `AskUserQuestion`, so verdict-conditional prompting lives there. **Soft
-> contract:** an orchestrator checkpoint has no `output_schema`, so the `{choice}` shape and the
-> option-label ↔ `when`-literal coupling are enforced by prompt discipline, not validation — keep the
-> AskUserQuestion labels and the `when` strings a single hand-maintained set (a typo silently dead-ends a
-> branch). **Caveat:** a `workflow:` node is *always* a checkpoint, so a declarative `loop:` can't wrap the
+> resolved and it can call `AskUserQuestion`, so verdict-conditional prompting lives there. **Declare the
+> return contract:** give the node an `output_schema` (here `{choice}`) — the compiler records it in the
+> checkpoint's `io` block and `check-step-io` validates the stored result post-step, so the shape is
+> enforced, not prose-only. The option-label ↔ `when`-literal coupling is still prompt discipline — keep
+> the AskUserQuestion labels and the `when` strings a single hand-maintained set (a typo silently
+> dead-ends a branch). **Caveat:** a `workflow:` node is *always* a checkpoint, so a declarative `loop:` can't wrap the
 > nested review (loop-contiguity, §9) — a fix→re-run cycle is orchestrator/human-driven (re-invoke on a
 > fresh diff), not an engine loop.
 

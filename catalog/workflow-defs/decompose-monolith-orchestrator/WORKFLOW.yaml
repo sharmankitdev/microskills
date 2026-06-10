@@ -130,6 +130,19 @@ nodes:
 
       Emit a provisioning summary: built_microskills[], built_workflows[],
       invoked_existing_workflows[], advised[], failed[], missing_agents[].
+    # The DECLARED return contract for the prose summary above (consumed by `report` via
+    # ${provision.output}): compile records it in the checkpoint's per-node io and
+    # check-step-io validates the stored result after the step.
+    output_schema:
+      type: object
+      required: [built_microskills, built_workflows, invoked_existing_workflows, advised, failed, missing_agents]
+      properties:
+        built_microskills: { type: array, description: Microskill names built and synced in PHASE 2. }
+        built_workflows: { type: array, description: Nested-workflow names built and synced in PHASE 2. }
+        invoked_existing_workflows: { type: array, description: exists=true nested workflows invoked as-is (never built). }
+        advised: { type: array, description: Candidates skipped on a planner scope advisory. }
+        failed: { type: array, description: Candidates whose build failed or early-aborted. }
+        missing_agents: { type: array, description: Imported agents absent under .claude/agents/ (never fabricated). }
 
   # When the planner returns a scope_advisory instead of a plan (e.g. the
   # monolith orchestrator is really two independent workflows → split, or a

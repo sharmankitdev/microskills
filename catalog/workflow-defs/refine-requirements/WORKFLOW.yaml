@@ -104,6 +104,19 @@ nodes:
       document as-is; revise → gather change notes, append them to the ledger, re-invoke
       /assimilate-requirements once more, then re-present. RETURN
       {choice, final_document_path, rounds, converged, remaining_gaps}.
+    # The DECLARED return contract for the prose RETURN above: compile records it in the
+    # checkpoint's per-node io and check-step-io validates the stored result after the step
+    # (so a prose-shaped summary or a fabricated null fails loud instead of riding forward).
+    # Holds for the autonomous profile too — its patched prompt returns the same field set.
+    output_schema:
+      type: object
+      required: [choice, final_document_path, rounds, converged, remaining_gaps]
+      properties:
+        choice: { type: string, description: "approve | reject | revise outcome (autonomous: auto-accepted)." }
+        final_document_path: { type: string, description: Path of the finished requirements document. }
+        rounds: { type: integer, description: Refinement rounds actually run. }
+        converged: { type: boolean, description: True when the final re-assimilation reported gaps_count 0. }
+        remaining_gaps: { type: array, description: Gaps still open at stop (empty when converged). }
 
   # Branch B: no gaps from the first pass. Mutually exclusive with `clarify`
   # (opposite gaps_count guard), so neither depends on the other — no skipped-dependency edge.
@@ -120,6 +133,14 @@ nodes:
       output_dir=${workflow.inputs.output_dir}, document_name=${workflow.inputs.document_name},
       template_path=${workflow.inputs.template_path}, and prior_answers_path set to that ledger, then
       re-present. RETURN {choice, final_document_path, remaining_gaps}.
+    # Declared return contract for the prose RETURN (validated post-step by check-step-io).
+    output_schema:
+      type: object
+      required: [choice, final_document_path, remaining_gaps]
+      properties:
+        choice: { type: string, description: "approve | reject | revise outcome (autonomous: auto-accepted)." }
+        final_document_path: { type: string, description: Path of the finished requirements document. }
+        remaining_gaps: { type: array, description: Always empty on this no-gaps branch. }
 
 # The refinement path is the primary result; like microskill-create's guarded `finalize`, output.from
 # may name a when-guarded node — it is null when the clean-first-pass `approve` branch ran instead.
