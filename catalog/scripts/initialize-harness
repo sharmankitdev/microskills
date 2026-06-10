@@ -243,6 +243,14 @@ def engine_outputs(catalog, deploy_root):
             if f.suffix == ".pyc":
                 continue
             out.append((f, deploy_root / "templates" / f.relative_to(tdir)))
+    # Shared prompt snippets ({{snippet:NAME}} includes) are plugin/ENGINE-owned in V1:
+    # catalog/workflow-defs/_snippets/ is vendored to .claude/workflow-defs/_snippets/
+    # HERE (tracked/pruned in the engine ledger) and only here — _snippets is not a
+    # component, never appears in harness.yaml, and harness-sync never touches it.
+    sdir = catalog / "workflow-defs" / "_snippets"
+    if sdir.is_dir():
+        for f in sorted(p for p in sdir.rglob("*") if p.is_file()):
+            out.append((f, deploy_root / "workflow-defs" / "_snippets" / f.relative_to(sdir)))
     return out
 
 

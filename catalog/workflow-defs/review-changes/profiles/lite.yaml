@@ -1,15 +1,12 @@
 version: 1
 
-# Lite review: correctness only. Removes the security + performance dimension nodes and
-# unwires them from `collect` — leaving the dangling `${review_security.output}` /
-# `${review_performance.output}` refs would orphan-block validation, so the patch deletes
-# those input keys (overlay null = delete) and narrows collect's depends_on. The surviving
-# review_correctness keeps phase_group: review, so it shows under the "review" group.
+# Lite review: correctness only — ONE patch narrowing the expand template's `over`
+# list (lists replace wholesale on merge). The security/performance siblings are
+# simply never generated, and collect's inputs_each fan-in follows the narrowed
+# list automatically — no node removal, no collect rewiring, no dangling refs. The
+# surviving review_correctness keeps phase_group: review.
 nodes:
-  remove: [review_security, review_performance]
   patch:
-    - id: collect
-      depends_on: [review_correctness]
-      inputs:
-        security: null
-        performance: null
+    - id: review
+      expand:
+        over: [correctness]

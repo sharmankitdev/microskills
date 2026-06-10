@@ -171,3 +171,30 @@ def test_adopt_base_preserves_header_and_custom_entry(tmp_path):
     assert text.startswith("# Harness manifest (v2)")  # header comment survived
     assert "name: greet-user" in text and "source: custom" in text  # custom entry survived
     assert "profiles: [base]" in text  # custom entry's profiles survived
+
+
+def test_init_vendors_snippets_as_engine(tmp_path):
+    # V1: catalog/workflow-defs/_snippets/ ({{snippet:NAME}} includes) is
+    # plugin/ENGINE-owned — materialized to .claude/workflow-defs/_snippets/ by
+    # initialize-harness and tracked in the ENGINE ledger (not as a component, so
+    # harness-sync never touches it).
+    init_project(tmp_path)
+    snip = tmp_path / ".claude" / "workflow-defs" / "_snippets" / "finalize-protocol.md"
+    assert snip.exists(), "_snippets not materialized into .claude/workflow-defs/"
+    src = REPO / "catalog" / "workflow-defs" / "_snippets" / "finalize-protocol.md"
+    assert snip.read_bytes() == src.read_bytes()
+    state = json.loads((tmp_path / ".claude" / ".harness-state.json").read_text())
+    assert ".claude/workflow-defs/_snippets/finalize-protocol.md" in state["engine"]["installed_paths"]
+    assert "_snippets" not in state.get("components", {})
+
+
+def test_init_compiles_snippet_consuming_def_in_fresh_project(tmp_path):
+    # End-to-end: a fresh project's materialized runtime can compile a def whose
+    # prompt is a {{snippet:...}} include (the runtime _snippets/ resolves it).
+    init_project(tmp_path)
+    rc, out, err = run_materialized(tmp_path, "compile-workflow", "microskill-create", "--plan")
+    assert rc == 0, out + err
+    data = json.loads(out)
+    fin = [s for s in data["manifest"]["steps"] if s.get("node") == "finalize"][0]
+    assert "vendoring the approved microskill" in fin["prompt"]
+    assert "{{snippet:" not in fin["prompt"]

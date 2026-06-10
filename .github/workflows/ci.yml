@@ -30,6 +30,9 @@ jobs:
       - name: Closure drift gate (catalog lockfiles)
         run: |
           for d in catalog/workflow-defs/*/; do
+            # Skip non-def dirs (e.g. _snippets/, the engine-owned shared-prompt
+            # includes) — only a dir with a WORKFLOW.yaml is a compilable def.
+            [ -f "$d/WORKFLOW.yaml" ] || continue
             catalog/scripts/compile-workflow "$(basename "$d")" --defs-root catalog/workflow-defs --check
           done
       - name: Run tests

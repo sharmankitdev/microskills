@@ -20,7 +20,7 @@
     "vars": {
       "type": "object",
       "additionalProperties": { "type": ["string", "number", "boolean"] },
-      "description": "Intra-def variable map. Double-brace {{key}} tokens anywhere in the merged doc are substituted from this map by compile/validate AFTER deep-merge (so a profile may override a var) and BEFORE schema validation. Pure textual pre-compile transform — no file include / cross-file mechanism. An unresolved {{key}} is left intact (warns)."
+      "description": "Intra-def variable map. Double-brace {{key}} tokens anywhere in the merged doc are substituted from this map by compile/validate AFTER deep-merge (so a profile may override a var) and BEFORE schema validation. Pure textual pre-compile transform. An unresolved {{key}} is left intact (warns). Cross-file shared prose rides the separate {{snippet:NAME}} token, replaced (BEFORE var substitution, so snippets may carry vars) with the bytes of <defs-root>/_snippets/NAME.md — an unresolved snippet is a HARD block. V1: _snippets/ is plugin/engine-owned, vendored by initialize-harness only."
     },
     "imports": {
       "type": "array",
@@ -45,7 +45,7 @@
     "nodes": {
       "type": "array",
       "minItems": 1,
-      "description": "DAG nodes. Each is a leaf microskill (use:) or an agent invocation (agent:).",
+      "description": "DAG nodes. Each is a leaf microskill (use:) or an agent invocation (agent:). NOTE: the static fan-out sugar — a template node's `expand: {over: [...]}` and a consumer's `inputs_each: <template-id>` — is desugared by compile/validate BEFORE this schema runs (generating ordinary <id>_<item> sibling nodes and the fan-in inputs/depends_on), so it is intentionally NOT part of this closed grammar; the schema only ever sees the generated nodes.",
       "items": {
         "type": "object",
         "additionalProperties": false,

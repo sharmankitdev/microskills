@@ -85,6 +85,7 @@ loop_while_until_error = _cw.loop_while_until_error
 desugar_loop_until = _cw.desugar_loop_until
 loop_max_parallel_errors = _cw.loop_max_parallel_errors
 apply_workflow_vars = _cw.apply_workflow_vars
+expand_static_fanout = _cw.expand_static_fanout
 NODE_OUTPUT_FIELD_RE = _cw.NODE_OUTPUT_FIELD_RE
 NODE_ITEMS_RE = _cw.NODE_ITEMS_RE
 
@@ -192,16 +193,41 @@ def main():
 
     merged = strip_nulls(merged)
 
-    # --- INTRA-DEF VARS: double-brace {{key}} pre-pass (Phase 5b) ---
-    # Mirror compile-workflow EXACTLY (shared apply_workflow_vars): substitute {{key}}
-    # tokens throughout the merged doc from the top-level vars: map AFTER deep-merge +
-    # strip_nulls (so a profile may override a var) and BEFORE schema validation. An
-    # unresolved {{key}} is left intact and surfaced as a WARN (never a crash/block),
-    # consistent with resolve-microskill. A doc with no {{...}} tokens is unchanged.
+    # --- INTRA-DEF VARS: {{snippet:NAME}} includes, then {{key}} vars (Phase 5b) ---
+    # Mirror compile-workflow EXACTLY (shared apply_workflow_vars): substitute
+    # {{snippet:NAME}} tokens from <defs-root>/_snippets/NAME.md FIRST (so a snippet
+    # may carry vars), then {{key}} tokens from the top-level vars: map, AFTER
+    # deep-merge + strip_nulls (so a profile may override a var) and BEFORE schema
+    # validation. The snippets root is --defs-root when given, else derived from the
+    # standard <defs-root>/<name>/WORKFLOW.yaml layout. An unresolved {{key}} is left
+    # intact and surfaced as a WARN (never a crash/block), consistent with
+    # resolve-microskill; an unresolvable SNIPPET is a HARD block (mirrors compile's
+    # die — a missing include must never ship a literal token).
     if isinstance(merged, dict):
-        merged, unresolved_vars = apply_workflow_vars(merged)
+        snip_root = Path(args.defs_root) if args.defs_root else wf_path.resolve().parent.parent
+        merged, unresolved_vars, snippet_errors = apply_workflow_vars(
+            merged, snippets_dir=snip_root / "_snippets")
+        for se in snippet_errors:
+            add(issues, "block", "snippets", se)
+        if snippet_errors:
+            print(json.dumps({"pass": False, "issues": issues}, indent=2))
+            sys.exit(1)
         for uk in unresolved_vars:
             add(issues, "warn", "vars", f"unresolved variable '{{{{{uk}}}}}' left intact")
+
+    # --- COMPILE-TIME EXPAND: static fan-out templates (shared desugar) ---
+    # Mirror compile-workflow EXACTLY: desugar expand:/inputs_each: immediately after
+    # the vars pre-pass and BEFORE schema validation (the closed node schema never
+    # sees the sugar; generated nodes are ordinary nodes validated below). A desugar
+    # error is a HARD block — the half-desugared doc is structurally unusable, so
+    # report and stop (mirrors the list-verb error path).
+    if isinstance(merged, dict):
+        merged, expand_errors = expand_static_fanout(merged)
+        for ee in expand_errors:
+            add(issues, "block", "expand", ee)
+        if expand_errors:
+            print(json.dumps({"pass": False, "issues": issues}, indent=2))
+            sys.exit(1)
 
     # An OMITTED version defaults to 1 BEFORE schema validation (mirrors
     # compile-workflow / resolve-microskill). The const:1 check stays intact, so an
@@ -394,38 +420,159 @@ def main():
         if as_var and not has_for_each:
             add(issues, "warn", f"nodes/{nid}", "'as' declared without 'for_each'; it has no effect")
 
-    # --- Branch-exclusivity lint (rank12): WARN-only, never a block ---
-    # Catches the malformed-fork footgun: two+ sibling nodes that form an advisory
-    # fork which is NOT provably mutually exclusive, so more than one branch fires.
-    # SOUND + CONSERVATIVE heuristic — fires ONLY on the clearest case: two sibling
-    # nodes whose effective dependency set is IDENTICAL and whose `when` conditions
-    # are TEXTUALLY IDENTICAL (after whitespace normalization). Both guards on the
-    # same condition off the same producers => both always run together. Deliberately
-    # NO general expression analysis: an opposite-when fork (cond vs !(cond)) has
-    # DIFFERENT when-text and is therefore never flagged, and a node with no `when`
-    # (unconditional) is never a fork branch. This composes with gate-choice branching
-    # (forks guarded on ${gate.output.choice} are exclusive only if their texts differ).
+    # --- Branch-exclusivity lint (rank12, STRENGTHENED): bounded comparison analysis ---
+    # Catches the malformed-fork footgun: sibling nodes (identical effective
+    # dependency set) that form an advisory fork which is NOT mutually exclusive.
+    # Within the locked design (branch = exclusivity-lint only — no forks:
+    # construct), the lint now runs a BOUNDED comparison-pattern analysis on each
+    # when-guard pair:
+    #   - PROVABLY BOTH FIRE (textually identical guards, or guards whose bounded
+    #     parse yields the same canonical comparison, e.g. `x != 1` vs `!(x == 1)`)
+    #     → BLOCK: a deterministic guard pair that always fires together can never
+    #     be an exclusive fork.
+    #   - same-field guards that are neither identical nor provably disjoint
+    #     (e.g. `x > 0` vs `x > 1` — overlapping ranges) → WARN: both branches may
+    #     fire together for some values.
+    #   - provably disjoint (`x == null` vs `x != null`, `x > 0` vs `x == 0`,
+    #     truthy vs falsy, distinct == literals, non-overlapping numeric ranges)
+    #     → clean.
+    # The grammar is deliberately bounded — one field, one comparison operator, one
+    # null/bool/number/string literal, any !-parity and balanced parens; anything
+    # else parses to None and falls back to the textual-identity check only. This
+    # composes with gate-choice branching (forks guarded on ${gate.output.choice}
+    # literals parse as string comparisons and prove disjoint when literals differ).
     def _norm_when(w):
         return re.sub(r"\s+", "", str(w)) if w else None
 
+    def _strip_outer_parens(s):
+        while s.startswith("(") and s.endswith(")"):
+            depth = 0
+            whole = True
+            for i, ch in enumerate(s):
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0 and i < len(s) - 1:
+                        whole = False  # closes before the end → not one wrapper
+                        break
+            if not whole or depth != 0:
+                break
+            s = s[1:-1].strip()
+        return s
+
+    _GUARD_CMP_RE = re.compile(
+        r"^(?P<field>[A-Za-z_][\w.]*)\s*"
+        r"(?:(?P<op>===|!==|==|!=|>=|<=|>|<)\s*"
+        r"(?P<lit>null|true|false|-?\d+(?:\.\d+)?|'[^']*'|\"[^\"]*\"))?$")
+    _NEG_OP = {"==": "!=", "!=": "==", ">": "<=", "<=": ">", "<": ">=", ">=": "<",
+               "truthy": "falsy", "falsy": "truthy"}
+
+    def _parse_guard(when):
+        """Bounded parse of a when-guard → canonical (field, op, value) or None.
+        op ∈ {==,!=,>,>=,<,<=,truthy,falsy}; value is a (kind, payload) literal
+        tuple (None for truthy/falsy). Negation folds into the operator."""
+        if not isinstance(when, str):
+            return None
+        s = when.strip()
+        m = re.fullmatch(r"\$\{(.*)\}", s, flags=re.S)
+        if m:
+            s = m.group(1).strip()
+        if "${" in s:
+            return None  # embedded refs beyond one whole-value wrapper → unknown
+        neg = False
+        while True:
+            stripped = _strip_outer_parens(s)
+            if stripped != s:
+                s = stripped
+                continue
+            if s.startswith("!"):
+                neg = not neg
+                s = s[1:].strip()
+                continue
+            break
+        m = _GUARD_CMP_RE.match(s)
+        if not m:
+            return None
+        field, op, lit = m.group("field"), m.group("op"), m.group("lit")
+        if op is None:
+            return (field, "falsy" if neg else "truthy", None)
+        op = {"===": "==", "!==": "!="}.get(op, op)
+        if neg:
+            op = _NEG_OP[op]
+        if lit == "null":
+            value = ("null", None)
+        elif lit in ("true", "false"):
+            value = ("bool", lit == "true")
+        elif lit[0] in "'\"":
+            value = ("str", lit[1:-1])
+        else:
+            value = ("num", float(lit))
+        return (field, op, value)
+
+    def _interval(op, x):
+        """Numeric comparison as (lo, hi, lo_closed, hi_closed), or None for !=."""
+        inf = float("inf")
+        return {"==": (x, x, True, True), ">": (x, inf, False, True),
+                ">=": (x, inf, True, True), "<": (-inf, x, True, False),
+                "<=": (-inf, x, True, True)}.get(op)
+
+    def _provably_disjoint(p1, p2):
+        """True only when the two same-field comparisons can NEVER both hold."""
+        (_, op1, v1), (_, op2, v2) = p1, p2
+        ops = {op1, op2}
+        if ops == {"truthy", "falsy"}:
+            return True
+        if "truthy" in ops or "falsy" in ops:
+            return False
+        if op1 == "==" and op2 == "==":
+            return v1 != v2
+        if ops == {"==", "!="}:
+            return v1 == v2
+        if v1 is not None and v2 is not None and v1[0] == "num" and v2[0] == "num":
+            i1, i2 = _interval(op1, v1[1]), _interval(op2, v2[1])
+            if i1 and i2:
+                (alo, ahi, aloc, ahic), (blo, bhi, bloc, bhic) = i1, i2
+                if ahi < blo or bhi < alo:
+                    return True
+                if ahi == blo and not (ahic and bloc):
+                    return True
+                if bhi == alo and not (bhic and aloc):
+                    return True
+        return False
+
     # Effective sibling key = the UNION edge set (explicit depends_on + ref-implied),
-    # so siblings are compared on what actually gates them, not just literal depends_on.
+    # so siblings are compared on what actually gates them, not just literal
+    # depends_on. A node with no `when` (unconditional) is never a fork branch.
     fork_edges = union_edges([n for n in nodes if isinstance(n, dict) and n.get("id")])
     fork_groups = {}
     for nid in node_ids:
-        w = _norm_when(node_by_id[nid].get("when"))
-        if not w:
-            continue  # an unconditional node is not a guarded fork branch
-        key = (frozenset(fork_edges.get(nid, set())), w)
-        fork_groups.setdefault(key, []).append(nid)
-    for (dep_set, _w), members in fork_groups.items():
-        if len(members) > 1:
-            sib = ", ".join(sorted(members))
-            dep_desc = ("{" + ", ".join(sorted(dep_set)) + "}") if dep_set else "{}"
-            add(issues, "warn", "nodes",
-                f"sibling nodes [{sib}] share dependencies {dep_desc} and have "
-                f"textually identical 'when' conditions; this advisory fork is not "
-                f"mutually exclusive (all branches fire). Did you mean to negate one?")
+        if not node_by_id[nid].get("when"):
+            continue
+        fork_groups.setdefault(frozenset(fork_edges.get(nid, set())), []).append(nid)
+    for dep_set, members in fork_groups.items():
+        if len(members) < 2:
+            continue
+        dep_desc = ("{" + ", ".join(sorted(dep_set)) + "}") if dep_set else "{}"
+        members = sorted(members)
+        for i in range(len(members)):
+            for j in range(i + 1, len(members)):
+                a, b = members[i], members[j]
+                wa, wb = node_by_id[a].get("when"), node_by_id[b].get("when")
+                pa, pb = _parse_guard(wa), _parse_guard(wb)
+                if _norm_when(wa) == _norm_when(wb) or (pa is not None and pa == pb):
+                    add(issues, "block", "nodes",
+                        f"sibling nodes [{a}, {b}] share dependencies {dep_desc} and "
+                        f"their 'when' guards provably BOTH fire (equivalent "
+                        f"conditions); this fork is not mutually exclusive — negate "
+                        f"or change one")
+                elif pa is not None and pb is not None and pa[0] == pb[0] \
+                        and not _provably_disjoint(pa, pb):
+                    add(issues, "warn", "nodes",
+                        f"sibling nodes [{a}, {b}] share dependencies {dep_desc} and "
+                        f"guard the same field '{pa[0]}' with conditions that are "
+                        f"neither identical nor provably disjoint; both branches may "
+                        f"fire together — verify the fork is exclusive")
 
     # --- Cycle detection over the UNION edge set (refs + depends_on) ---
     # CRITICAL: a ref-only cycle (A reads ${B.output}, B reads ${A.output}, neither

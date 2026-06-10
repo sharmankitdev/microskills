@@ -12,10 +12,8 @@ inputs:
     required: true
     materialize: file
     description: >-
-      The requirement material to assimilate, passed BY REFERENCE. `materialize: file` lets the
-      dispatcher accept a raw string (a CLI brain-dump), a single file, or a directory of notes and
-      normalize them into one canonical file, threading only the short path into the run (dodging the
-      args-size truncation). assimilate-requirements Reads it.
+      The requirement material to assimilate — a raw brain-dump, a single file, or a
+      directory of notes. assimilate-requirements Reads the path.
   output_dir:
     type: string
     required: false
@@ -29,11 +27,9 @@ inputs:
     required: false
     materialize: file
     description: >-
-      Optional custom SE requirements template (a different section skeleton), passed BY REFERENCE like
-      sources_path — `materialize: file` lets a caller hand a template file OR inline template content,
-      normalized to one canonical path. Absent → the
-      microskill's built-in template. Threaded to the first pass and every refinement re-pass so the
-      section set stays identical across rounds.
+      Optional custom SE requirements template (a different section skeleton). Absent → the
+      microskill's built-in template. Threaded to the first pass and every refinement re-pass
+      so the section set stays identical across rounds.
   prior_answers_path:
     type: string
     required: false

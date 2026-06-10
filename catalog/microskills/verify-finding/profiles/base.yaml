@@ -1,7 +1,5 @@
 version: 1
-# `diff_path` carries the diff BY REFERENCE: `materialize: file` tells the
-# dispatcher to normalize the caller's string/file/dir into one canonical file and
-# supply only the short path (the body Reads it), dodging args-size truncation —
+# `diff_path` is passed by reference (`materialize: file`; the body Reads it) —
 # critical here because verify-finding fans out per finding, so an inline diff
 # would be duplicated into every parallel call.
 inputs:

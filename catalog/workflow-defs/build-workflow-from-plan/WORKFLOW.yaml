@@ -25,10 +25,8 @@ inputs:
     required: true
     materialize: file
     description: >-
-      The originating requirement — the evaluator's semantic ground truth — passed BY
-      REFERENCE. `materialize: file` lets the dispatcher normalize a raw string, a single
-      file, or a directory into one canonical file and thread only the short path; a
-      caller passing an already-normalized path hits the file rule (pass-through). task-evaluate Reads it.
+      The originating requirement — the evaluator's semantic ground truth.
+      task-evaluate Reads the path.
   harness_root:
     type: string
     required: false
@@ -47,6 +45,25 @@ inputs:
 imports:
   - microskills/task-implement
   - microskills/task-evaluate
+
+# Parameters for the SHARED finalize protocol (_snippets/finalize-protocol.md,
+# included below via {{snippet:finalize-protocol}} — snippets resolve before vars,
+# so these {{...}} tokens parameterize the shared prose). microskill-create carries
+# the microskill-domain twin of this block; the protocol text itself lives in ONE
+# place so the two finalizes cannot drift.
+vars:
+  finalize_kind: workflow
+  finalize_plan_ref: ${workflow.inputs.plan_path}
+  finalize_name_source: <name> = ${workflow.inputs.name}
+  finalize_dest_subdir: workflow-defs
+  finalize_staged_layout: WORKFLOW.yaml + profiles/* + references/* — do NOT include any .compiled/ dir
+  finalize_epilogue: >-
+    proceed. FINALLY, now that sync has vendored the source into
+    .claude/workflow-defs/<name>/, run `.claude/scripts/compile-workflow <name>` to
+    populate its .compiled/ run manifest (sync does not compile). Print a summary:
+    the harness/ source path, the synced .claude/ paths + generated shim, and that
+    .compiled/ was regenerated. Do not claim success on an unresolved sync conflict
+    or a failed compile.
 
 # No plan node and no approval gate (those live in the caller). The whole workflow is one
 # background segment (the implement ↔ evaluate loop) followed by the orchestrator finalize.
@@ -87,37 +104,12 @@ nodes:
   # into harness/ (source of truth), upsert the manifest, let sync-harness generate the
   # .claude/ runtime copy + shim + ledger, THEN compile-workflow to populate .compiled/
   # (sync does not compile). Shared by every creator so the vendoring can never diverge.
+  # The prompt is the SHARED finalize protocol (one snippet, parameterized by the
+  # vars: block above) — edit _snippets/finalize-protocol.md, not a per-def copy.
   - id: finalize
     delegation: orchestrator
     depends_on: [implement, evaluate]
-    prompt: >
-      Finalize by vendoring the approved workflow into the harness source-of-truth and syncing
-      it into the runtime. The approved plan is at ${workflow.inputs.plan_path}; staged files are
-      ${implement.output.staging_paths}; evaluator verdict ${evaluate.output.pass} with issues
-      ${evaluate.output.issues}.
-      FIRST, if issues is non-empty (e.g. warn-severity findings that passed but were never
-      fixed), present each as severity + message and AskUserQuestion (fix-and-finalize /
-      accept-as-is / abandon): for fix-and-finalize, apply the fixes to the staged files before
-      moving them; for abandon, stop and clean staging.
-      THEN take <name> = ${workflow.inputs.name}. Compute dest = ${workflow.inputs.harness_root}/workflow-defs/<name>.
-      If dest already exists OR ${workflow.inputs.harness_yaml} already lists a workflow named
-      <name>, AskUserQuestion (overwrite / pick-new-name / abandon); pick-new-name re-computes dest.
-      Move the staged files into dest (WORKFLOW.yaml + profiles/* + references/*); do NOT include
-      any .compiled/ dir, and do NOT write a shim or copy into .claude/ directly — sync owns those.
-      THEN upsert the manifest (v2 shape): read ${workflow.inputs.harness_yaml}, and under the
-      top-level `workflows:` list add (or replace in place if already present) the entry
-      {name: <name>, source: custom, profiles: [the profile stems under dest/profiles]},
-      preserving every other entry under `microskills:`/`workflows:` and the `version` field,
-      and write it back.
-      THEN run `.claude/scripts/harness-sync --apply` from the project root and parse its JSON.
-      Exit 2 → surface and stop. Exit 1 (an unmanaged .claude/ path of the same name exists) →
-      present the conflict and AskUserQuestion (overwrite / abandon); on overwrite re-run
-      `.claude/scripts/harness-sync --apply --resolve <name>=overwrite`. Exit 0 → proceed.
-      FINALLY, now that sync has vendored the source into .claude/workflow-defs/<name>/, run
-      `.claude/scripts/compile-workflow <name>` to populate its .compiled/ run manifest (sync does
-      not compile). Print a summary: the harness/ source path, the synced .claude/ paths + generated
-      shim, and that .compiled/ was regenerated. Do not claim success on an unresolved sync conflict
-      or a failed compile.
+    prompt: "{{snippet:finalize-protocol}}"
 
 # Guarded loop: repeat implement→evaluate until the evaluator passes or the cap.
 loop:

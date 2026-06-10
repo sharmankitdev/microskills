@@ -10,11 +10,8 @@ inputs:
     required: true
     materialize: file
     description: >-
-      Natural-language description of the microskill to create, passed BY REFERENCE.
-      `materialize: file` lets the dispatcher accept a raw string, a single file, or a
-      directory of files and normalize it into one canonical file, threading only the
-      short path into the run (dodging the args-size truncation). task-plan / task-evaluate
-      Read the path.
+      Natural-language description of the microskill to create. task-plan /
+      task-evaluate Read the path.
   name:
     type: string
     required: false
@@ -39,6 +36,22 @@ imports:
   - microskills/task-plan
   - microskills/task-implement
   - microskills/task-evaluate
+
+# Parameters for the SHARED finalize protocol (_snippets/finalize-protocol.md,
+# included below via {{snippet:finalize-protocol}} — snippets resolve before vars,
+# so these {{...}} tokens parameterize the shared prose). build-workflow-from-plan
+# carries the workflow-domain twin of this block; the protocol text itself lives in
+# ONE place so the two finalizes cannot drift.
+vars:
+  finalize_kind: microskill
+  finalize_plan_ref: ${plan.output.plan_path}
+  finalize_name_source: <name> from the plan
+  finalize_dest_subdir: microskills
+  finalize_staged_layout: MICROSKILL.md + profiles/*
+  finalize_epilogue: >-
+    done. Print a summary: the harness/ source path, the synced .claude/ paths +
+    generated shim .claude/commands/<name>.md, and the manifest entry. Do not claim
+    success on an unresolved sync conflict.
 
 nodes:
   # Seg 1 (background): plan the microskill. The planner is autonomous — it
@@ -110,36 +123,13 @@ nodes:
   # Checkpoint (orchestrator): vendor the approved microskill into harness/ (source
   # of truth), upsert the manifest, then let sync-harness generate the .claude/
   # runtime copy + slash shim + ledger. No agent/use → an orchestrator-native step.
+  # The prompt is the SHARED finalize protocol (one snippet, parameterized by the
+  # vars: block above) — edit _snippets/finalize-protocol.md, not a per-def copy.
   - id: finalize
     delegation: orchestrator
     when: ${plan.output.scope_advisory == null}
     depends_on: [plan, implement, evaluate]
-    prompt: >
-      Finalize by vendoring the approved microskill into the harness source-of-truth and
-      syncing it into the runtime. The approved plan is at ${plan.output.plan_path}; staged
-      files are ${implement.output.staging_paths}; evaluator verdict ${evaluate.output.pass}
-      with issues ${evaluate.output.issues}.
-      FIRST, if issues is non-empty (e.g. warn-severity findings that passed but were never
-      fixed), present each as severity + message and AskUserQuestion (fix-and-finalize /
-      accept-as-is / abandon): for fix-and-finalize, apply the fixes to the staged files
-      before moving them; for abandon, stop and clean staging.
-      THEN take <name> from the plan. Compute dest = ${workflow.inputs.harness_root}/microskills/<name>.
-      If dest already exists OR ${workflow.inputs.harness_yaml} already lists a microskill named
-      <name>, AskUserQuestion (overwrite / pick-new-name / abandon); pick-new-name re-computes dest.
-      Move the staged files into dest (MICROSKILL.md + profiles/*). Do NOT write a slash shim or
-      copy into .claude/ directly — sync owns those.
-      THEN upsert the manifest (v2 shape): read ${workflow.inputs.harness_yaml}, and under the
-      top-level `microskills:` list add (or replace in place if already present) the entry
-      {name: <name>, source: custom, profiles: [the profile stems under dest/profiles]},
-      preserving every other entry under `microskills:`/`workflows:` and the file's `version`
-      field, and write it back.
-      THEN run `.claude/scripts/harness-sync --apply` from the project root and parse its JSON.
-      Exit 2 → surface the error and stop. Exit 1 (an unmanaged .claude/ path of the same name
-      exists) → present the conflict and AskUserQuestion (overwrite / abandon); on overwrite re-run
-      `.claude/scripts/harness-sync --apply --resolve <name>=overwrite`. Exit 0 → done.
-      Print a summary: the harness/ source path, the synced .claude/ paths + generated shim
-      .claude/commands/<name>.md, and the manifest entry. Do not claim success on an unresolved
-      sync conflict.
+    prompt: "{{snippet:finalize-protocol}}"
 
 # Human-approval gate after `plan` — the segment boundary between Seg 1 and Seg 2.
 gates:

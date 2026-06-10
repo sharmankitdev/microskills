@@ -987,12 +987,13 @@ gates:
     assert not any("cycle" in i["message"] for i in data["issues"])
 
 
-# --- Phase 4b: branch-exclusivity lint (WARN-only, never a block) ---
+# --- Branch-exclusivity lint (rank12, STRENGTHENED): bounded comparison analysis ---
+# Inside the locked design (branch = exclusivity-lint only): provably-both-fire
+# guard pairs are now a BLOCK; same-field pairs neither identical nor provably
+# disjoint WARN; provably disjoint pairs stay clean.
 
-def test_identical_when_siblings_warn(tmp_path):
-    # Two sibling nodes with the SAME depends_on set and TEXTUALLY IDENTICAL when
-    # conditions form a malformed advisory fork (both fire). Emit a WARN; pass stays true.
-    body = """\
+def _fork(when_x, when_y):
+    return f"""\
 version: 1
 name: fork
 nodes:
@@ -1002,46 +1003,99 @@ nodes:
   - id: x
     agent: ag
     depends_on: [p]
-    when: ${p.output.ok}
+    when: {when_x}
     prompt: branch x
   - id: y
     agent: ag
     depends_on: [p]
-    when: ${p.output.ok}
+    when: {when_y}
     prompt: branch y
 """
-    rc, data, _ = run(write_wf(tmp_path, body))
-    assert rc == 0 and data["pass"] is True
-    warns = [i for i in data["issues"] if i["severity"] == "warn"]
-    assert any("mutually exclusive" in i["message"] or "fork" in i["message"].lower()
-               for i in warns), data["issues"]
+
+
+def test_identical_when_siblings_block(tmp_path):
+    # Two sibling nodes with the SAME depends_on set and TEXTUALLY IDENTICAL when
+    # conditions PROVABLY both fire — escalated from the old WARN to a BLOCK.
+    rc, data, _ = run(write_wf(tmp_path, _fork("${p.output.ok}", "${p.output.ok}")))
+    assert rc == 1 and data["pass"] is False
+    blocks = [i for i in data["issues"] if i["severity"] == "block"]
+    assert any("BOTH fire" in i["message"] for i in blocks), data["issues"]
 
 
 def test_opposite_when_fork_no_warn(tmp_path):
-    # A proper opposite-when fork (cond vs !(cond)) is provably exclusive — NO warn.
-    body = """\
-version: 1
-name: fork
-nodes:
-  - id: p
-    agent: ag
-    prompt: plan
-  - id: x
-    agent: ag
-    depends_on: [p]
-    when: ${p.output.ok}
-    prompt: branch x
-  - id: y
-    agent: ag
-    depends_on: [p]
-    when: ${!(p.output.ok)}
-    prompt: branch y
-"""
-    rc, data, _ = run(write_wf(tmp_path, body))
+    # A proper opposite-when fork (cond vs !(cond)) is provably exclusive
+    # (truthy vs falsy on the same field) — NO warn, NO block.
+    rc, data, _ = run(write_wf(tmp_path, _fork("${p.output.ok}", "${!(p.output.ok)}")))
+    assert rc == 0 and data["pass"] is True
+    assert not any("fire" in i["message"] or "disjoint" in i["message"]
+                   for i in data["issues"]), data["issues"]
+
+
+def test_equivalent_guards_via_negation_block(tmp_path):
+    # `x != 1` vs `!(x == 1)` — textually different, canonically EQUAL: the bounded
+    # comparison parse folds the negation, so the pair provably both fires → block.
+    rc, data, _ = run(write_wf(tmp_path,
+                               _fork("${p.output.n != 1}", "${!(p.output.n == 1)}")))
+    assert rc == 1 and data["pass"] is False
+    assert any("BOTH fire" in i["message"] for i in data["issues"]
+               if i["severity"] == "block"), data["issues"]
+
+
+def test_disjoint_comparison_forks_stay_clean(tmp_path):
+    # Provably disjoint same-field pairs raise NOTHING: == null vs != null,
+    # > 0 vs == 0 (touching open/closed interval bounds), distinct == literals.
+    cases = [
+        ("${p.output.adv == null}", "${p.output.adv != null}"),
+        ("${p.output.gaps > 0}", "${p.output.gaps == 0}"),
+        ("${p.output.choice == 'approve'}", "${p.output.choice == 'revise'}"),
+        ("${p.output.n >= 5}", "${p.output.n < 5}"),
+    ]
+    for wx, wy in cases:
+        rc, data, _ = run(write_wf(tmp_path, _fork(wx, wy)))
+        assert rc == 0 and data["pass"] is True, (wx, wy, data["issues"])
+        assert not any("fire" in i["message"] or "disjoint" in i["message"]
+                       for i in data["issues"]), (wx, wy, data["issues"])
+
+
+def test_same_field_overlapping_guards_warn(tmp_path):
+    # Same-field guards that are neither identical nor provably disjoint — e.g.
+    # overlapping numeric ranges — WARN (both branches may fire); pass stays true.
+    rc, data, _ = run(write_wf(tmp_path,
+                               _fork("${p.output.n > 0}", "${p.output.n > 1}")))
     assert rc == 0 and data["pass"] is True
     warns = [i for i in data["issues"] if i["severity"] == "warn"]
-    assert not any("mutually exclusive" in i["message"] or "fork" in i["message"].lower()
-                   for i in warns), data["issues"]
+    assert any("neither identical nor provably disjoint" in i["message"]
+               for i in warns), data["issues"]
+
+
+def test_different_field_guards_stay_clean(tmp_path):
+    # Guards on DIFFERENT fields are outside the bounded analysis — no warn/block
+    # (unchanged behavior; only textual identity or same-field analysis fires).
+    rc, data, _ = run(write_wf(tmp_path,
+                               _fork("${p.output.a}", "${p.output.b}")))
+    assert rc == 0 and data["pass"] is True
+    assert not any("fire" in i["message"] or "disjoint" in i["message"]
+                   for i in data["issues"]), data["issues"]
+
+
+def test_unparseable_identical_text_still_blocks(tmp_path):
+    # Guards beyond the bounded grammar (compound expressions) fall back to the
+    # textual-identity check: identical compound guards still provably both fire.
+    w = "${p.output.a && p.output.b}"
+    rc, data, _ = run(write_wf(tmp_path, _fork(w, w)))
+    assert rc == 1 and data["pass"] is False
+    assert any("BOTH fire" in i["message"] for i in data["issues"]
+               if i["severity"] == "block"), data["issues"]
+
+
+def test_unparseable_different_text_stays_clean(tmp_path):
+    # Different unparseable guards: no analysis possible → unchanged (clean).
+    rc, data, _ = run(write_wf(tmp_path,
+                               _fork("${p.output.a && p.output.b}",
+                                     "${p.output.a || p.output.b}")))
+    assert rc == 0 and data["pass"] is True
+    assert not any("fire" in i["message"] or "disjoint" in i["message"]
+                   for i in data["issues"]), data["issues"]
 
 
 # --- PHASE 5b FEATURE A: ${<id>.items} the per-item-results array ref form ---
@@ -1610,3 +1664,123 @@ nodes:
     assert rc == 1
     assert any("explicit orchestrator checkpoint" in i["message"]
                for i in data["issues"])
+
+
+# --- {{snippet:NAME}} includes (validate mirrors compile's pre-pass) ---
+
+SNIP_WF = """\
+version: 1
+name: snip-flow
+vars:
+  topic: kubernetes
+nodes:
+  - id: a
+    agent: ag
+    prompt: "{{snippet:greet}} now"
+"""
+
+
+def _snip_world(tmp_path, snippet_text=None):
+    """Standard <defs-root>/<name>/WORKFLOW.yaml layout + optional _snippets/greet.md."""
+    defs = tmp_path / "defs"
+    d = defs / "snip-flow"
+    d.mkdir(parents=True)
+    (d / "WORKFLOW.yaml").write_text(SNIP_WF)
+    if snippet_text is not None:
+        (defs / "_snippets").mkdir()
+        (defs / "_snippets" / "greet.md").write_text(snippet_text)
+    return d / "WORKFLOW.yaml", defs
+
+
+def test_snippet_resolves_via_derived_defs_root(tmp_path):
+    # Without --defs-root, the snippets root derives from the standard
+    # <defs-root>/<name>/WORKFLOW.yaml layout (parent of the def dir).
+    wf, _ = _snip_world(tmp_path, "research {{topic}} thoroughly\n")
+    rc, data, _ = run(wf)
+    assert rc == 0, data
+    assert data["pass"] is True
+    # the snippet's {{topic}} var resolved (no unresolved-var warn for it)
+    assert not any("topic" in i["message"] for i in data["issues"]), data["issues"]
+
+
+def test_snippet_resolves_via_explicit_defs_root(tmp_path):
+    wf, defs = _snip_world(tmp_path, "research {{topic}} thoroughly\n")
+    rc, data, _ = run(wf, "--defs-root", str(defs))
+    assert rc == 0, data
+    assert data["pass"] is True
+
+
+def test_missing_snippet_blocks_validate(tmp_path):
+    # Unresolvable snippet → HARD block (mirrors compile's die), never a warn.
+    wf, _ = _snip_world(tmp_path, snippet_text=None)
+    rc, data, _ = run(wf)
+    assert rc == 1 and data["pass"] is False
+    assert any(i["location"] == "snippets" and "greet" in i["message"]
+               for i in data["issues"] if i["severity"] == "block"), data["issues"]
+
+
+# --- compile-time expand: (validate mirrors compile's shared desugar) ---
+
+EXPAND_WF = """\
+version: 1
+name: fan-flow
+nodes:
+  - id: seed
+    agent: ag
+    prompt: seed
+  - id: scan
+    agent: ag
+    depends_on: [seed]
+    expand:
+      over: [alpha, beta]
+    prompt: scan {{each.item}} with ${seed.output.x}
+  - id: gather
+    agent: ag
+    inputs_each: scan
+    prompt: gather everything
+"""
+
+
+def test_expand_desugars_and_validates(tmp_path):
+    # The sugar never reaches the closed node schema: the template is replaced by
+    # ordinary generated siblings pre-validation, the fan-in wires real node ids,
+    # and the result passes clean.
+    rc, data, _ = run(write_wf(tmp_path, EXPAND_WF))
+    assert rc == 0, data
+    assert data["pass"] is True
+    assert data["issues"] == []
+
+
+def test_expand_bad_shape_blocks_validate(tmp_path):
+    body = EXPAND_WF.replace("over: [alpha, beta]", "over: []")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    assert any(i["location"] == "expand" and "non-empty" in i["message"]
+               for i in data["issues"]), data["issues"]
+
+
+def test_inputs_each_unknown_template_blocks_validate(tmp_path):
+    body = EXPAND_WF.replace("inputs_each: scan", "inputs_each: seed")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    assert any(i["location"] == "expand" and "inputs_each" in i["message"]
+               for i in data["issues"]), data["issues"]
+
+
+def test_expand_leftover_each_token_blocks_validate(tmp_path):
+    body = EXPAND_WF.replace("{{each.item}}", "{{each.profile}}")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    assert any(i["location"] == "expand" and "each" in i["message"]
+               for i in data["issues"]), data["issues"]
+
+
+def test_real_review_changes_validates_with_expand():
+    # The flagship adoption validates clean under all three profiles.
+    rc_dir = REPO / "catalog" / "workflow-defs" / "review-changes"
+    base = rc_dir / "profiles" / "base.yaml"
+    for overlays in ([], ["comprehensive.yaml"], ["lite.yaml"]):
+        paths = [rc_dir / "WORKFLOW.yaml", base] + [rc_dir / "profiles" / o for o in overlays]
+        rc, data, _ = run(*paths)
+        assert rc == 0, (overlays, data)
+        assert data["pass"] is True, (overlays, data["issues"])

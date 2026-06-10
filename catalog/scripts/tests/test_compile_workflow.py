@@ -3054,3 +3054,297 @@ inputs:
     rc2, data2, *_ = run(tmp_path, "gated-flow")
     assert rc2 == 0
     assert "manifest" not in data2
+
+
+# --- {{snippet:NAME}} includes (shared prose from <defs-root>/_snippets/) ---
+# Resolved by the SHARED apply_workflow_vars pre-pass BEFORE ordinary {{var}}
+# substitution, so a snippet body may carry vars. Unresolved snippet → HARD block.
+
+SNIPPET_FLOW = """\
+version: 1
+name: snip-flow
+vars:
+  topic: kubernetes
+nodes:
+  - id: a
+    agent: ag
+    prompt: "{{snippet:greet}} now"
+"""
+
+
+def test_snippet_resolves_before_vars(tmp_path):
+    # The include lands first, THEN {{topic}} inside the snippet body resolves —
+    # parameterized shared prose.
+    (tmp_path / "_snippets").mkdir()
+    (tmp_path / "_snippets" / "greet.md").write_text("research {{topic}} thoroughly\n")
+    d = make_flow(tmp_path, "snip-flow", SNIPPET_FLOW)
+    rc, data, out, err = run(tmp_path, "snip-flow")
+    assert rc == 0, err
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert "research kubernetes thoroughly now" in seg
+    assert "{{snippet:" not in seg
+
+
+def test_missing_snippet_hard_blocks(tmp_path):
+    # An unresolvable {{snippet:...}} is a HARD compile error (exit 1) — never a
+    # warn, never a literal token shipped into a compiled prompt.
+    make_flow(tmp_path, "snip-flow", SNIPPET_FLOW)  # no _snippets dir at all
+    rc, data, out, err = run(tmp_path, "snip-flow")
+    assert rc == 1, out
+    assert "snippet" in json.dumps(data).lower()
+    assert any("greet" in e for e in data.get("snippet_errors", [])), data
+
+
+def test_nested_snippet_blocks(tmp_path):
+    # A snippet that itself contains a {{snippet:...}} token is unsupported (V1:
+    # one pass, no recursion) — hard block, not silent passthrough.
+    (tmp_path / "_snippets").mkdir()
+    (tmp_path / "_snippets" / "greet.md").write_text("outer {{snippet:inner}}\n")
+    (tmp_path / "_snippets" / "inner.md").write_text("inner\n")
+    make_flow(tmp_path, "snip-flow", SNIPPET_FLOW)
+    rc, data, out, err = run(tmp_path, "snip-flow")
+    assert rc == 1, out
+    assert any("nested" in e for e in data.get("snippet_errors", [])), data
+
+
+def test_snippet_trailing_newline_stripped_once(tmp_path):
+    # The include is the file text minus ONE trailing newline (POSIX convention),
+    # so a snippet embeds cleanly mid-string.
+    (tmp_path / "_snippets").mkdir()
+    (tmp_path / "_snippets" / "greet.md").write_text("research {{topic}} thoroughly\n")
+    d = make_flow(tmp_path, "snip-flow", SNIPPET_FLOW)
+    run(tmp_path, "snip-flow")
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert "thoroughly\n now" not in seg
+    assert "thoroughly now" in seg
+
+
+def test_real_finalize_snippet_renders_in_both_creators():
+    # The shared finalize protocol (ONE snippet, ~6 vars) renders into BOTH
+    # microskill-create and build-workflow-from-plan with the domain literals
+    # substituted and no token residue.
+    rc, data, out, err = run(REAL_DEFS, "microskill-create", "--plan")
+    assert rc == 0, err
+    fin = [s for s in data["manifest"]["steps"] if s.get("node") == "finalize"][0]
+    assert "vendoring the approved microskill" in fin["prompt"]
+    assert "harness_root}/microskills/<name>" in fin["prompt"]
+    assert "`microskills:` list" in fin["prompt"]
+    assert "{{" not in fin["prompt"]
+    rc, data, out, err = run(REAL_DEFS, "build-workflow-from-plan", "--plan")
+    assert rc == 0, err
+    fin = [s for s in data["manifest"]["steps"] if s.get("node") == "finalize"][0]
+    assert "vendoring the approved workflow" in fin["prompt"]
+    assert "harness_root}/workflow-defs/<name>" in fin["prompt"]
+    assert "`workflows:` list" in fin["prompt"]
+    assert "compile-workflow <name>" in fin["prompt"]   # workflow epilogue compiles
+    assert "{{" not in fin["prompt"]
+
+
+# --- compile-time expand: — static fan-out templates + inputs_each fan-in ---
+# Desugared PRE-VALIDATION (immediately after apply_workflow_vars), so the closed
+# node schema never sees the sugar; generated <id>_<item> siblings are ordinary nodes.
+
+EXPANDED_FAN = """\
+version: 1
+name: fan-flow
+nodes:
+  - id: seed
+    agent: ag
+    prompt: seed
+  - id: scan
+    agent: ag
+    depends_on: [seed]
+    expand:
+      over: [alpha, beta]
+    prompt: scan {{each.item}} with ${seed.output.x}
+  - id: gather
+    agent: ag
+    inputs_each: scan
+    prompt: gather everything
+"""
+
+HAND_FAN = """\
+version: 1
+name: fan-flow
+nodes:
+  - id: seed
+    agent: ag
+    prompt: seed
+  - id: scan_alpha
+    agent: ag
+    depends_on: [seed]
+    prompt: scan alpha with ${seed.output.x}
+  - id: scan_beta
+    agent: ag
+    depends_on: [seed]
+    prompt: scan beta with ${seed.output.x}
+  - id: gather
+    agent: ag
+    inputs:
+      alpha: ${scan_alpha.output}
+      beta: ${scan_beta.output}
+    depends_on: [scan_alpha, scan_beta]
+    prompt: gather everything
+"""
+
+
+def test_expand_byte_identical_to_hand_written(tmp_path):
+    # DETERMINISM: the expanded template compiles BYTE-IDENTICAL to the
+    # hand-cloned sibling form — same generated ids, same fan-in inputs map, same
+    # explicit depends_on, same manifest_hash.
+    da = make_flow(tmp_path / "a", "fan-flow", EXPANDED_FAN)
+    db = make_flow(tmp_path / "b", "fan-flow", HAND_FAN)
+    rc, d1, out, err = run(tmp_path / "a", "fan-flow")
+    assert rc == 0, err
+    rc, d2, out, err = run(tmp_path / "b", "fan-flow")
+    assert rc == 0, err
+    files_a = {p.name: p.read_text() for p in (da / ".compiled").iterdir() if p.is_file()}
+    files_b = {p.name: p.read_text() for p in (db / ".compiled").iterdir() if p.is_file()}
+    assert files_a == files_b
+    assert d1["manifest_hash"] == d2["manifest_hash"]
+    assert d1["sequence"] == ["segment[seed,scan_alpha,scan_beta,gather]"]
+
+
+def test_expand_siblings_share_rank_and_parallelize(tmp_path):
+    # Generated siblings depend only on the template's deps, so they land in one
+    # dependency rank → ONE parallel([...]) batch.
+    d = make_flow(tmp_path, "fan-flow", EXPANDED_FAN)
+    run(tmp_path, "fan-flow")
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert "const [n_scan_alpha, n_scan_beta] = await parallel([" in seg
+    assert "scan alpha with" in seg and "scan beta with" in seg
+
+
+def test_expand_item_extras_deep_merge(tmp_path):
+    # A map over-entry's extras (minus 'item') deep-merge onto the generated node:
+    # per-item variation rides in the over list, not a forked template.
+    body = """\
+version: 1
+name: fan-flow
+inputs:
+  min_cov: { type: integer, default: 80 }
+nodes:
+  - id: seed
+    agent: ag
+    prompt: seed
+  - id: scan
+    agent: ag
+    depends_on: [seed]
+    expand:
+      over:
+        - alpha
+        - item: test-coverage
+          inputs:
+            threshold: ${workflow.inputs.min_cov}
+    inputs:
+      common: ${seed.output.x}
+    prompt: scan {{each.item}}
+"""
+    make_flow(tmp_path, "fan-flow", body)
+    rc, data, out, err = run(tmp_path, "fan-flow", "--explain")
+    assert rc == 0, err
+    fp = {f["node"]: f["fingerprint"] for f in data["fingerprints"]}
+    # '-' normalizes to '_' in the generated id; the raw item name feeds {{each.item}}.
+    assert "scan_test_coverage" in fp
+    assert fp["scan_test_coverage"]["inputs"] == {
+        "common": "${seed.output.x}",
+        "threshold": "${workflow.inputs.min_cov}"}
+    assert fp["scan_test_coverage"]["prompt"] == "scan test-coverage"
+    assert fp["scan_alpha"]["inputs"] == {"common": "${seed.output.x}"}
+
+
+def test_expand_profile_patches_over_list_only(tmp_path):
+    # Profile merge precedes expansion: an overlay patches the TEMPLATE's over
+    # list (lists replace wholesale) and the whole fan-out + fan-in follows.
+    d = make_flow(tmp_path, "fan-flow", EXPANDED_FAN)
+    (d / "profiles" / "narrow.yaml").write_text(
+        "version: 1\nnodes:\n  patch:\n    - id: scan\n      expand:\n        over: [alpha]\n")
+    rc, data, out, err = run(tmp_path, "fan-flow", "--profile", "narrow")
+    assert rc == 0, err
+    assert data["sequence"] == ["segment[seed,scan_alpha,gather]"]
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert "scan_beta" not in seg
+
+
+def test_expand_empty_over_blocks(tmp_path):
+    body = EXPANDED_FAN.replace("over: [alpha, beta]", "over: []")
+    make_flow(tmp_path, "fan-flow", body)
+    rc, data, out, err = run(tmp_path, "fan-flow")
+    assert rc == 1
+    assert any("non-empty" in e for e in data.get("expand_errors", [])), data
+
+
+def test_expand_duplicate_item_blocks(tmp_path):
+    body = EXPANDED_FAN.replace("over: [alpha, beta]", "over: [alpha, alpha]")
+    make_flow(tmp_path, "fan-flow", body)
+    rc, data, out, err = run(tmp_path, "fan-flow")
+    assert rc == 1
+    assert any("duplicate" in e for e in data.get("expand_errors", [])), data
+
+
+def test_inputs_each_without_template_blocks(tmp_path):
+    body = """\
+version: 1
+name: fan-flow
+nodes:
+  - id: seed
+    agent: ag
+    prompt: seed
+  - id: gather
+    agent: ag
+    inputs_each: seed
+    prompt: gather
+"""
+    make_flow(tmp_path, "fan-flow", body)
+    rc, data, out, err = run(tmp_path, "fan-flow")
+    assert rc == 1
+    assert any("inputs_each" in e for e in data.get("expand_errors", [])), data
+
+
+def test_leftover_each_token_blocks(tmp_path):
+    # Only {{each.item}} is substituted; any other {{each.*}} token (or one outside
+    # a template) is fail-loud — it would otherwise ship verbatim.
+    body = EXPANDED_FAN.replace("scan {{each.item}}", "scan {{each.threshold}}")
+    make_flow(tmp_path, "fan-flow", body)
+    rc, data, out, err = run(tmp_path, "fan-flow")
+    assert rc == 1
+    assert any("each" in e for e in data.get("expand_errors", [])), data
+
+
+def test_real_review_changes_expand_matches_hand_cloned_shape():
+    # The flagship adoption: review-changes' ONE expand template generates the
+    # exact node ids + collect fan-in the hand-cloned siblings used to declare.
+    rc, data, out, err = run(REAL_DEFS, "review-changes", "--plan", "--explain")
+    assert rc == 0, err
+    seg = [s for s in data["manifest"]["steps"] if s["kind"] == "segment"][0]
+    assert seg["nodes"] == ["summarize", "review_correctness", "review_security",
+                            "review_performance", "collect", "verify", "synthesize"]
+    fp = {f["node"]: f["fingerprint"] for f in data["fingerprints"]}
+    assert fp["collect"]["inputs"] == {
+        "correctness": "${review_correctness.output}",
+        "security": "${review_security.output}",
+        "performance": "${review_performance.output}"}
+    assert fp["review_security"]["profile"] == "security"
+    assert fp["review_correctness"]["profile"] == "correctness"
+
+
+def test_real_review_changes_lite_is_one_over_patch():
+    rc, data, out, err = run(REAL_DEFS, "review-changes", "--plan", "--profile", "lite")
+    assert rc == 0, err
+    seg = [s for s in data["manifest"]["steps"] if s["kind"] == "segment"][0]
+    assert seg["nodes"] == ["summarize", "review_correctness", "collect", "verify",
+                            "synthesize"]
+
+
+def test_real_review_changes_comprehensive_adds_dimensions():
+    rc, data, out, err = run(REAL_DEFS, "review-changes", "--plan", "--profile",
+                             "comprehensive", "--explain")
+    assert rc == 0, err
+    seg = [s for s in data["manifest"]["steps"] if s["kind"] == "segment"][0]
+    assert seg["nodes"] == ["summarize", "review_correctness", "review_security",
+                            "review_performance", "review_style", "review_documentation",
+                            "review_test_coverage", "collect", "verify", "synthesize"]
+    fp = {f["node"]: f["fingerprint"] for f in data["fingerprints"]}
+    assert fp["review_test_coverage"]["inputs"]["threshold"] == "${workflow.inputs.min_coverage}"
+    assert fp["review_test_coverage"]["profile"] == "test-coverage"
+    assert "test_coverage" in fp["collect"]["inputs"]

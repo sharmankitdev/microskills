@@ -10,10 +10,7 @@ inputs:
     required: true
     materialize: file
     description: >-
-      Natural-language description of the workflow to create, passed BY REFERENCE.
-      `materialize: file` lets the dispatcher accept a raw string, a single file, or a
-      directory of files and normalize it into one canonical file, threading only the
-      short path into the run (dodging the args-size truncation). task-plan / task-evaluate
+      Natural-language description of the workflow to create. task-plan / task-evaluate
       Read the path; the nested build-workflow-from-plan receives the same path.
   name:
     type: string

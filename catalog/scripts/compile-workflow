@@ -53,6 +53,7 @@ Exit codes: 0 OK · 1 block (schema/DAG error/closure drift) · 2 environment/sc
 """
 
 import argparse
+import copy
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -127,6 +128,20 @@ NODE_ITEMS_RE = re.compile(r"(?<!\.)\b([a-z][a-z0-9_-]*)\.items\b")
 NODE_OUTPUT_FIELD_RE = re.compile(r"\b([a-z][a-z0-9_-]*)\.output\.([a-zA-Z0-9_]+)")
 # Fields that may carry ${id.output} / ${id.items} refs that imply a dependency edge.
 SCOPED_REF_FIELDS = ("inputs", "prompt", "when", "for_each")
+# {{snippet:NAME}} include token — resolved from <defs-root>/_snippets/NAME.md by the
+# SHARED apply_workflow_vars pre-pass BEFORE ordinary {{var}} substitution (so a snippet
+# body may carry {{var}} tokens). The colon keeps it out of resolve-microskill's
+# PLACEHOLDER_RE ([\w-]+ only), so the two token namespaces can never collide.
+SNIPPET_RE = re.compile(r"\{\{snippet:([a-z][a-z0-9_-]*)\}\}")
+# {{each.item}} — the expand: template's per-item substitution token (resolved by
+# expand_static_fanout below, AFTER the vars pre-pass). Dotted, so PLACEHOLDER_RE
+# never matches it either. EACH_ANY_RE catches any leftover {{each.*}} token after
+# expansion — an unsupported key or a stray token outside a template is fail-loud.
+EACH_ITEM_RE = re.compile(r"\{\{each\.item\}\}")
+EACH_ANY_RE = re.compile(r"\{\{each\.[^}]*\}\}")
+# Legal expand.over item name: lowercase identifier; '-' is normalized to '_' when the
+# item is used as a generated-node-id suffix / fan-in input key.
+EXPAND_ITEM_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
 
 
 def substitute_vars_deep(obj, vars_map, unresolved):
@@ -143,20 +158,221 @@ def substitute_vars_deep(obj, vars_map, unresolved):
     return obj
 
 
-def apply_workflow_vars(wf):
-    """SHARED intra-def vars pre-pass used by BOTH compile and validate. Substitute
-    double-brace {{key}} tokens throughout the merged doc from the top-level vars:
-    map (reusing resolve-microskill's substitute_vars). Returns (new_doc, unresolved).
+def apply_snippets_deep(obj, snippets_dir, cache, errors):
+    """Recursively replace every {{snippet:NAME}} token in a nested structure with the
+    text of <snippets_dir>/NAME.md (minus ONE trailing newline — the POSIX file
+    convention — so a snippet embeds cleanly mid-string). Dict keys are walked too,
+    mirroring substitute_vars_deep. An unresolvable snippet (no snippets dir, missing
+    file, or a snippet that itself carries a {{snippet:...}} token — nesting is
+    unsupported) records a message in `errors` and leaves the token intact; the
+    CALLER turns a non-empty `errors` into a HARD block (compile die / validate
+    block) — never a warn, never silent. `cache` memoizes per-name reads so one
+    snippet referenced twice is read once (and reported once)."""
+    if isinstance(obj, str):
+        def repl(m):
+            name = m.group(1)
+            if name not in cache:
+                path = (Path(snippets_dir) / f"{name}.md") if snippets_dir else None
+                if path is None or not path.is_file():
+                    errors.append(
+                        f"snippet '{name}' does not resolve to "
+                        f"{path if path is not None else '<no _snippets dir>'}")
+                    cache[name] = None
+                else:
+                    text = path.read_text()
+                    if SNIPPET_RE.search(text):
+                        errors.append(
+                            f"snippet '{name}' itself contains a {{{{snippet:...}}}} "
+                            f"token; nested includes are not supported")
+                        cache[name] = None
+                    else:
+                        cache[name] = text[:-1] if text.endswith("\n") else text
+            return m.group(0) if cache[name] is None else cache[name]
+        return SNIPPET_RE.sub(repl, obj)
+    if isinstance(obj, dict):
+        return {apply_snippets_deep(k, snippets_dir, cache, errors):
+                apply_snippets_deep(v, snippets_dir, cache, errors)
+                for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [apply_snippets_deep(v, snippets_dir, cache, errors) for v in obj]
+    return obj
 
-    vars values are coerced to str by substitute_vars at substitution time. A doc
-    with no vars: (empty/absent map) still walks the tree but replaces nothing — a
-    {{key}} with no matching var is left intact and recorded in `unresolved`. With
-    NO {{...}} tokens at all the output is byte-identical to the input doc."""
+
+def apply_workflow_vars(wf, snippets_dir=None):
+    """SHARED intra-def vars pre-pass used by BOTH compile and validate. TWO ordered
+    textual passes over the merged doc:
+
+      1. {{snippet:NAME}} include — replaced with the text of
+         <snippets_dir>/NAME.md (snippets_dir is <defs-root>/_snippets). Runs FIRST
+         so a snippet body may itself carry {{var}} tokens. An unresolved snippet is
+         a HARD error (returned in snippet_errors; the caller blocks) — a missing
+         include must never ship a literal token into a compiled prompt. Snippet
+         files join the compile input set exactly like profile overlays: same
+         bytes, same output.
+      2. ordinary {{key}} substitution from the top-level vars: map (reusing
+         resolve-microskill's substitute_vars).
+
+    Returns (new_doc, unresolved, snippet_errors). vars values are coerced to str by
+    substitute_vars at substitution time. A doc with no vars: (empty/absent map)
+    still walks the tree but replaces nothing — a {{key}} with no matching var is
+    left intact and recorded in `unresolved`. With NO {{...}} tokens at all the
+    output is byte-identical to the input doc (the _snippets dir is never read)."""
     if not isinstance(wf, dict):
-        return wf, []
+        return wf, [], []
+    snippet_errors = []
+    wf = apply_snippets_deep(wf, snippets_dir, {}, snippet_errors)
     vars_map = wf.get("vars") or {}
     unresolved = []
-    return substitute_vars_deep(wf, vars_map, unresolved), unresolved
+    return substitute_vars_deep(wf, vars_map, unresolved), unresolved, snippet_errors
+
+
+def _each_item_deep(obj, item):
+    """Recursively replace {{each.item}} tokens with the raw item name (strings AND
+    dict keys, mirroring substitute_vars_deep). Pure textual transform."""
+    if isinstance(obj, str):
+        return EACH_ITEM_RE.sub(item, obj)
+    if isinstance(obj, dict):
+        return {_each_item_deep(k, item): _each_item_deep(v, item) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_each_item_deep(v, item) for v in obj]
+    return obj
+
+
+def _expand_suffix(item):
+    """An over item's id-safe suffix / fan-in key: '-' normalized to '_' (so item
+    `test-coverage` yields node `<id>_test_coverage` and input key `test_coverage`)."""
+    return item.replace("-", "_")
+
+
+def expand_static_fanout(wf):
+    """SHARED compile-time `expand:` desugar used by BOTH compile and validate.
+    Runs immediately AFTER apply_workflow_vars and BEFORE schema validation —
+    placement is load-bearing: the sugar (`expand:` / `inputs_each:` node keys) is
+    consumed here, so the CLOSED node schema needs zero changes and never sees it.
+
+    A node carrying `expand: {over: [...]}` is a TEMPLATE for static fan-out: it is
+    replaced IN PLACE (preserving position, hence definition/topo order) by one
+    concrete sibling per over entry, id `<template-id>_<suffix>`. Each over entry is
+    an item-name string, or a map carrying `item` plus EXTRAS deep-merged onto the
+    generated node (per-item variation, e.g. one dimension's extra input). The
+    template's {{each.item}} tokens resolve to the raw item name (e.g. its
+    customize.profile). Because profile merge precedes this pass, an overlay
+    customizes the fan-out by patching the template's `over` list only.
+
+    A node carrying `inputs_each: <template-id>` is the paired FAN-IN: for each over
+    item (in over order) it gains `inputs[<suffix>] = ${<template-id>_<suffix>.output}`
+    plus an explicit depends_on edge on the generated node.
+
+    Pure function of the merged static doc — deterministic; a doc with neither key
+    is returned unchanged. Returns (wf, errors); non-empty errors are a HARD block
+    in both tools (the sugar must never half-desugar silently)."""
+    errors = []
+    if not isinstance(wf, dict) or not isinstance(wf.get("nodes"), list):
+        return wf, errors
+    nodes = wf["nodes"]
+
+    # Pass 1: validate every template and collect its (item, extras) list.
+    templates = {}
+    for n in nodes:
+        if not (isinstance(n, dict) and "expand" in n):
+            continue
+        nid = n.get("id") or "?"
+        exp = n.get("expand")
+        if not (isinstance(exp, dict) and set(exp.keys()) == {"over"}):
+            errors.append(f"node '{nid}': expand must be a mapping with exactly one "
+                          f"key, 'over' (a static list)")
+            continue
+        over = exp["over"]
+        if not isinstance(over, list) or not over:
+            errors.append(f"node '{nid}': expand.over must be a non-empty list")
+            continue
+        items, seen, bad = [], set(), False
+        for ent in over:
+            if isinstance(ent, str):
+                item, extras = ent, {}
+            elif isinstance(ent, dict) and isinstance(ent.get("item"), str):
+                item = ent["item"]
+                extras = {k: v for k, v in ent.items() if k != "item"}
+            else:
+                errors.append(f"node '{nid}': expand.over entries must be item-name "
+                              f"strings or maps carrying 'item'")
+                bad = True
+                break
+            if not EXPAND_ITEM_RE.match(item):
+                errors.append(f"node '{nid}': expand.over item '{item}' must match "
+                              f"{EXPAND_ITEM_RE.pattern}")
+                bad = True
+                break
+            if item in seen:
+                errors.append(f"node '{nid}': duplicate expand.over item '{item}'")
+                bad = True
+                break
+            illegal = {"id", "expand", "inputs_each"} & set(extras)
+            if illegal:
+                errors.append(f"node '{nid}': expand.over item '{item}' extras may "
+                              f"not carry {sorted(illegal)} (the generated id is "
+                              f"derived; sugar cannot nest)")
+                bad = True
+                break
+            seen.add(item)
+            items.append((item, extras))
+        if bad:
+            continue
+        templates[nid] = items
+    if errors:
+        return wf, errors
+
+    # Pass 2: replace each template in place with its generated siblings.
+    new_nodes = []
+    for n in nodes:
+        if not (isinstance(n, dict) and "expand" in n):
+            new_nodes.append(n)
+            continue
+        nid = n["id"]
+        for item, extras in templates[nid]:
+            gen = copy.deepcopy(n)
+            gen.pop("expand", None)
+            gen = _each_item_deep(gen, item)
+            gen = deep_merge(gen, copy.deepcopy(extras))
+            gen["id"] = f"{nid}_{_expand_suffix(item)}"
+            new_nodes.append(gen)
+
+    # Pass 3: desugar every inputs_each fan-in against the collected templates.
+    for n in new_nodes:
+        if not (isinstance(n, dict) and "inputs_each" in n):
+            continue
+        nid = n.get("id") or "?"
+        src = n.pop("inputs_each")
+        if not (isinstance(src, str) and src in templates):
+            errors.append(f"node '{nid}': inputs_each must name an expand template "
+                          f"node id; {src!r} is not one")
+            continue
+        inputs = n.setdefault("inputs", {})
+        deps = n.setdefault("depends_on", [])
+        for item, _extras in templates[src]:
+            key = _expand_suffix(item)
+            gen_id = f"{src}_{key}"
+            if key in inputs:
+                errors.append(f"node '{nid}': inputs_each key '{key}' collides with "
+                              f"an explicit inputs entry; remove one")
+                continue
+            inputs[key] = "${" + gen_id + ".output}"
+            if gen_id not in deps:
+                deps.append(gen_id)
+
+    # Fail-loud: any surviving {{each.*}} token is an unsupported key inside a
+    # template, or a stray token outside one — it would otherwise ship verbatim.
+    for n in new_nodes:
+        for s in collect_strings(n):
+            m = EACH_ANY_RE.search(s)
+            if m:
+                errors.append(f"node '{n.get('id', '?') if isinstance(n, dict) else '?'}': "
+                              f"unresolved {m.group(0)} token (only {{{{each.item}}}} is "
+                              f"substituted, and only inside an expand template)")
+                break
+
+    wf["nodes"] = new_nodes
+    return wf, errors
 
 
 def collect_strings(obj):
@@ -1013,16 +1229,32 @@ def main():
 
     wf = strip_nulls(wf)
 
-    # --- INTRA-DEF VARS: double-brace {{key}} pre-pass (Phase 5b) ---
-    # Substitute {{key}} tokens throughout the merged doc from the top-level vars:
-    # map, using the SAME substitute_vars resolve-microskill already ships. Runs
-    # AFTER deep-merge + strip_nulls (so a profile may override a var) and BEFORE
-    # schema validation. Pure textual pre-compile transform → deterministic; a
-    # workflow with no vars: leaves every string byte-identical. An unresolved
-    # {{key}} is left intact and recorded (warned), consistent with resolve-microskill.
-    wf, unresolved_vars = apply_workflow_vars(wf)
+    # --- INTRA-DEF VARS: {{snippet:NAME}} includes, then {{key}} vars (Phase 5b) ---
+    # Substitute {{snippet:NAME}} tokens from <defs-root>/_snippets/NAME.md FIRST
+    # (so a snippet body may carry vars), then {{key}} tokens from the top-level
+    # vars: map, using the SAME substitute_vars resolve-microskill already ships.
+    # Runs AFTER deep-merge + strip_nulls (so a profile may override a var) and
+    # BEFORE schema validation. Pure textual pre-compile transform → deterministic;
+    # snippet files join the compile input set exactly like profile overlays. An
+    # unresolved {{key}} is left intact and recorded (warned), consistent with
+    # resolve-microskill; an unresolved SNIPPET is a HARD block (a missing include
+    # must never ship a literal token into a compiled prompt).
+    wf, unresolved_vars, snippet_errors = apply_workflow_vars(
+        wf, snippets_dir=defs_root / "_snippets")
+    if snippet_errors:
+        die("unresolvable {{snippet:...}} include(s)", 1, snippet_errors=snippet_errors)
     for _uk in unresolved_vars:
         sys.stderr.write(f"warning: unresolved workflow var '{_uk}' left intact\n")
+
+    # --- COMPILE-TIME EXPAND: static fan-out templates (shared desugar) ---
+    # Immediately after the vars pre-pass and BEFORE schema validation (placement is
+    # load-bearing: the closed node schema never sees the expand:/inputs_each:
+    # sugar). Generated nodes are ordinary use:/agent: nodes classified after
+    # expansion; profile merge already ran, so overlays customize the fan-out by
+    # patching the template's over list only.
+    wf, expand_errors = expand_static_fanout(wf)
+    if expand_errors:
+        die("expand: desugar failed", 1, expand_errors=expand_errors)
 
     # An OMITTED version defaults to 1 BEFORE schema validation (the const:1 check
     # stays intact, so an EXPLICIT wrong version still blocks). Mirrors the

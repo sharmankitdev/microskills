@@ -115,10 +115,38 @@ loop:
 A `{{key}}` token **anywhere** in the merged doc (values *and* dict keys) is textually replaced from
 the `vars:` map by **both** `compile-workflow` and `validate-workflow`, **after** deep-merge +
 strip-nulls (so a profile overlay may override a var) and **before** schema validation. Values coerce
-to string at substitution time. It is a **pure textual transform** — *not* `$include`, no cross-file
-mechanism. An unresolved `{{key}}` (no matching var) is **left intact** and surfaced as a `warn`
-(stderr from compile; a `warn` issue from validate) — never a block. A doc with no `{{...}}` tokens
-compiles byte-identically.
+to string at substitution time. It is a **pure textual transform** — *not* `$include` (cross-file
+prose has its own dedicated token, `{{snippet:NAME}}`, below). An unresolved `{{key}}` (no matching
+var) is **left intact** and surfaced as a `warn` (stderr from compile; a `warn` issue from validate)
+— never a block. A doc with no `{{...}}` tokens compiles byte-identically.
+
+### `{{snippet:NAME}}` — shared-prose includes
+
+```yaml
+vars:
+  finalize_kind: microskill        # parameterizes the shared prose
+nodes:
+  - id: finalize
+    delegation: orchestrator
+    prompt: "{{snippet:finalize-protocol}}"   # ← bytes of <defs-root>/_snippets/finalize-protocol.md
+```
+
+A `{{snippet:NAME}}` token anywhere in the merged doc is replaced with the text of
+**`<defs-root>/_snippets/NAME.md`** (minus one trailing newline), by the same shared pre-pass —
+**before** ordinary `{{var}}` substitution, so a snippet body may itself carry `{{var}}` tokens and
+each def parameterizes the shared prose via its own `vars:` map (that is how `microskill-create` and
+`build-workflow-from-plan` share ONE finalize protocol without drifting). Rules:
+
+- **Unresolved snippet → hard block** (compile dies, validate blocks) — a missing include must never
+  ship a literal token into a compiled prompt. (Contrast: an unresolved `{{var}}` only warns.)
+- **No nesting** — a snippet containing a `{{snippet:...}}` token is a block (one pass, V1).
+- **Determinism** — snippet files join the compile input set exactly like profile overlays: same
+  bytes in, same bytes out. A def with no snippet tokens never reads `_snippets/`.
+- **Ownership (V1)** — `_snippets/` is **plugin/engine-owned**: vendored into
+  `.claude/workflow-defs/_snippets/` by `initialize-harness` only (tracked in the engine ledger);
+  it is not a component, never appears in `harness.yaml`, and `harness-sync` never touches it.
+- Validate resolves `_snippets/` from `--defs-root` when given, else from the standard
+  `<defs-root>/<name>/WORKFLOW.yaml` layout (the def dir's parent).
 
 ### `imports` — the child-workflow allowlist
 
@@ -352,6 +380,16 @@ evaluates `when` in the main loop: false → store `null`, continue.
 > **Advisory-fork pattern** (used by every built-in creator): two nodes guarded by opposite
 > conditions (`== null` vs `!= null`) so exactly one runs. The main path builds; the advisory path
 > surfaces guidance and stops.
+>
+> **Exclusivity lint (validate)** — sibling nodes (identical effective dependency set) with `when`
+> guards are checked pairwise by a *bounded* comparison analysis (`<field> <op> <literal>`, any
+> `!`-parity/parens; one field, one comparison — nothing fancier):
+> **provably-both-fire** pairs (textually identical guards, or canonically equal ones like `x != 1`
+> vs `!(x == 1)`) are a **block**; same-field pairs **neither identical nor provably disjoint**
+> (`x > 0` vs `x > 1`) are a **warn**; provably disjoint pairs (`== null` vs `!= null`, `cond` vs
+> `!(cond)`, `> 0` vs `== 0`, distinct `==` literals) are clean. Guards beyond the bounded grammar
+> fall back to the textual-identity check only. If both siblings genuinely should run together,
+> don't shape them as a fork — give one a `depends_on` edge or fold them into one node.
 
 ### `for_each` + `as` — fan-out
 
@@ -390,7 +428,74 @@ Run one instance per item in a collection. `as` names the per-item loop variable
 > on the same upstream node). The compiler runs same-rank siblings in parallel automatically (§12,
 > *Intra-segment parallelism*). Reach for sibling nodes when the parallel branches differ structurally
 > (different microskill, or the same microskill under a different `customize.profile` — which
-> `for_each` can't vary per item); reach for `for_each` when it's the same call over N data items.
+> `for_each` can't vary per item); reach for `for_each` when it's the same call over N data items —
+> and for `expand:` (below) when the sibling set is **static** and you don't want to hand-clone it.
+
+### `expand:` + `inputs_each:` — compile-time static fan-out
+
+`for_each` fans out over *runtime data*; `expand:` fans out over a *static list at compile time*,
+replacing the hand-cloned-siblings pattern (N near-identical nodes differing only in a profile name):
+
+```yaml
+- id: review                                   # the TEMPLATE — replaced, never compiled itself
+  use: review-dimension
+  customize: { profile: "{{each.item}}" }      # {{each.item}} → the raw item name
+  phase_group: review
+  depends_on: [summarize]
+  expand:
+    over: [correctness, security, performance] # one generated sibling per entry
+  inputs:
+    diff_path: ${workflow.inputs.diff_path}
+    change_summary: ${summarize.output}
+
+- id: collect                                  # the paired FAN-IN
+  use: collect-findings
+  inputs_each: review                          # ← desugars the input map + depends_on below
+```
+
+Both keys are **sugar consumed pre-validation** by the shared desugar in compile *and* validate —
+immediately after the `vars` pre-pass, before schema validation — so the closed node schema never
+sees them and the generated nodes are **ordinary nodes** (classified, validated, ranked, emitted
+exactly like hand-written ones; same-rank siblings still parallelize per §12). The example desugars
+to three `review_<item>` siblings plus, on `collect`:
+
+```yaml
+  inputs:
+    correctness: ${review_correctness.output}   # one <suffix>: ${<template-id>_<suffix>.output}
+    security: ${review_security.output}         #   per over entry, in over order
+    performance: ${review_performance.output}
+  depends_on: [review_correctness, review_security, review_performance]
+```
+
+Rules:
+
+- **Generated id** = `<template-id>_<suffix>`, where suffix is the item name with `-` → `_`
+  (item `test-coverage` → node `review_test_coverage`, fan-in key `test_coverage`). Items must match
+  `^[a-z][a-z0-9_-]*$`, be unique, and `over` must be a non-empty list.
+- **`{{each.item}}`** is the only per-item token, replaced with the *raw* item name throughout the
+  template; any other `{{each.*}}` residue after expansion is a hard block.
+- **Per-item variation rides as map extras in `over`** — an entry may be a map carrying `item` plus
+  extra node fields that deep-merge onto that one generated node:
+  ```yaml
+  over:
+    - correctness
+    - item: test-coverage
+      inputs:
+        threshold: ${workflow.inputs.min_coverage}   # only this sibling gets the extra input
+  ```
+  Extras may not carry `id`/`expand`/`inputs_each`.
+- **Profile merge precedes expansion**, so an overlay customizes the fan-out by patching the
+  *template's* `over` list **only** (lists replace wholesale on merge): `review-changes`'
+  `comprehensive.yaml` is one six-entry `over` patch, `lite.yaml` is `over: [correctness]` — the
+  generated siblings *and* the `inputs_each` fan-in follow automatically, no collect rewiring.
+  Likewise `--node-override` addresses the **template** id (pre-expansion), applying to every
+  generated sibling.
+- **`inputs_each: <template-id>`** must name an expand template; a desugared key colliding with an
+  explicit `inputs` entry is a block. The expansion is a pure function of the merged doc — an
+  expanded def compiles **byte-identical** to its hand-cloned twin.
+- A leftover reference to the template id itself (`${review.output}`, `depends_on: [review]`, a gate
+  `after: review`) is **not** rewritten — after expansion the template id no longer exists, so the
+  ordinary unknown-node checks block it. Consume the fan-out via `inputs_each` or the generated ids.
 
 ---
 
@@ -1212,6 +1317,12 @@ Before you compile, confirm:
       / `output.from` pointing at a non-existent node.
 - [ ] Every `for_each` has a safe-identifier `as`; `max_parallel` only on `for_each` nodes; no
       `for_each` inside `loop.body`; `${id.items}` only targets a `for_each` node.
+- [ ] Every `expand:` is `{over: [...]}` (non-empty, unique items); consumers fan in via
+      `inputs_each: <template-id>` or the generated `<id>_<item>` ids — nothing references the
+      template id itself after expansion.
+- [ ] Every `{{snippet:NAME}}` resolves to `<defs-root>/_snippets/NAME.md` (unresolved = block);
+      sibling fork guards are mutually exclusive (identical guards now block, overlapping
+      same-field guards warn).
 - [ ] `loop` has `max_iters` + `body` and exactly one of `while`/`until`; `loop.body` nodes are
       contiguous with no orchestrator node / hard gate between them (now enforced).
 - [ ] Gate ids are unique and disjoint from node ids.
