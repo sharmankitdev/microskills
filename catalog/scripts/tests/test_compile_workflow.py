@@ -1181,11 +1181,12 @@ def test_manifest_hash_present_and_deterministic(tmp_path):
 
 def test_manifest_hash_excludes_itself_and_schema_sha(tmp_path):
     # The hash is computed over the SEMANTIC manifest PLUS the per-node semantic
-    # fingerprints: its own manifest_hash key AND the schema_sha256 provenance
-    # stamp are both OUTSIDE the hashed payload — recomputing over the on-disk
-    # manifest minus those two keys, joined with the --explain fingerprint
-    # digests, must reproduce the stored value (so a schema-bytes-only change
-    # never invalidates resume). This also pins the fingerprint fold recipe.
+    # fingerprints: its own manifest_hash key AND the schema_sha256 /
+    # schema_source provenance stamps are all OUTSIDE the hashed payload —
+    # recomputing over the on-disk manifest minus those keys, joined with the
+    # --explain fingerprint digests, must reproduce the stored value (so a
+    # schema-bytes-only or template-provenance-only change never invalidates
+    # resume). This also pins the fingerprint fold recipe.
     import hashlib
     d = make_flow(tmp_path, "gated-flow", GATED.replace("name: linear-flow", "name: gated-flow"))
     rc, data, out, err = run(tmp_path, "gated-flow", "--explain")
@@ -1193,6 +1194,7 @@ def test_manifest_hash_excludes_itself_and_schema_sha(tmp_path):
     m = json.loads((d / ".compiled" / "manifest.json").read_text())
     stored = m.pop("manifest_hash")
     m.pop("schema_sha256")
+    m.pop("schema_source")
     node_fps = {f["node"]: f["sha256"] for f in data["fingerprints"]}
     recomputed = hashlib.sha256(
         json.dumps({"manifest": m, "node_fingerprints": node_fps},
@@ -2273,6 +2275,29 @@ def test_schema_sha256_matches_validating_schema_bytes(tmp_path):
     m = json.loads((d / ".compiled" / "manifest.json").read_text())
     schema_path = REPO / "templates" / "references" / "workflow-schema.json"
     assert m["schema_sha256"] == hashlib.sha256(schema_path.read_bytes()).hexdigest()
+
+
+def test_schema_source_records_selected_tier_outside_hash(tmp_path):
+    # schema_source names WHICH fallback tier selected the validating schema
+    # (env:MICROSKILLS_TEMPLATES_ROOT | env:CLAUDE_PLUGIN_ROOT |
+    # runtime:.claude/templates | repo). Provenance only — like schema_sha256
+    # it sits OUTSIDE manifest_hash, so the same def compiled under two tiers
+    # keeps one hash (resume/lockfiles never fork on template provenance).
+    d = make_flow(tmp_path, "linear-flow", LINEAR)
+    rc, data, out, err = run(tmp_path, "linear-flow")  # _ENV pins the override
+    assert rc == 0, err
+    m1 = json.loads((d / ".compiled" / "manifest.json").read_text())
+    assert m1["schema_source"] == "env:MICROSKILLS_TEMPLATES_ROOT"
+    # Without the override the materialized runtime copy wins (the repo
+    # dogfood state — .claude/templates exists after initialize-harness).
+    env2 = {k: v for k, v in os.environ.items()
+            if k not in ("MICROSKILLS_TEMPLATES_ROOT", "CLAUDE_PLUGIN_ROOT")}
+    rc, data2, out, err = run(tmp_path, "linear-flow", env=env2)
+    assert rc == 0, err
+    m2 = json.loads((d / ".compiled" / "manifest.json").read_text())
+    assert m2["schema_source"] == "runtime:.claude/templates"
+    # provenance only: tier choice never moves manifest_hash
+    assert m1["manifest_hash"] == m2["manifest_hash"]
 
 
 def test_manifest_bytes_portable_across_checkouts(tmp_path):

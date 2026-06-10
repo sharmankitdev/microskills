@@ -36,9 +36,10 @@ Usage:
 
 Stdout: JSON summary { name, profile_used, compiled_dir, manifest_path, segments,
 checkpoints, manifest_hash, sequence }. The written manifest always carries
-manifest_hash plus schema_sha256 (provenance of the validating schema, excluded
-from the hash), and stores segment script paths RELATIVE to the def dir so
-manifest bytes are portable across checkouts. Every step that produces node
+manifest_hash plus schema_sha256 + schema_source (provenance of the validating
+schema — its exact bytes and WHICH templates-root fallback tier selected it —
+both excluded from the hash), and stores segment script paths RELATIVE to the
+def dir so manifest bytes are portable across checkouts. Every step that produces node
 results (segments + orchestrator/nested-workflow checkpoints) records a per-node
 "io": {schema, guarded, fan_out} contract — the dispatcher's post-step
 check-step-io validates stored results against it — plus, ONLY when a produced
@@ -94,26 +95,40 @@ PROJECT_ROOT = SCRIPT.parents[2]
 DEFAULT_DEFS_ROOT = PROJECT_ROOT / ".claude" / "workflow-defs"
 
 
-def _templates_root(script):
-    """Locate templates/ (schemas + component templates): an explicit
-    MICROSKILLS_TEMPLATES_ROOT override wins (used by hermetic tests to pin the
-    in-repo source schema before a reconcile materializes .claude/), then prefer
-    the materialized runtime copy under .claude/, then ${CLAUDE_PLUGIN_ROOT},
-    then the in-repo dogfood source."""
+def _templates_candidates(script):
+    """Ordered (path, source-label) candidates for templates/ (schemas +
+    component templates): an explicit MICROSKILLS_TEMPLATES_ROOT override wins
+    (used by hermetic tests to pin the in-repo source schema before a
+    reconcile materializes .claude/), then the materialized runtime copy under
+    .claude/, then ${CLAUDE_PLUGIN_ROOT}, then the in-repo dogfood source.
+    The label of the SELECTED tier is recorded into the manifest as
+    `schema_source` (provenance, outside manifest_hash) — the compile input
+    closure includes the env-selected schema file, so cross-host byte-identity
+    of manifest.json assumes consistent template provenance."""
     proj = script.parents[2]
     cands = []
     override = os.environ.get("MICROSKILLS_TEMPLATES_ROOT")
     if override:
-        cands.append(Path(override))
-    cands.append(proj / ".claude" / "templates")
+        cands.append((Path(override), "env:MICROSKILLS_TEMPLATES_ROOT"))
+    cands.append((proj / ".claude" / "templates", "runtime:.claude/templates"))
     env = os.environ.get("CLAUDE_PLUGIN_ROOT")
     if env:
-        cands.append(Path(env) / "templates")
-    cands.append(proj / "templates")
-    return next((c for c in cands if c.is_dir()), cands[0])
+        cands.append((Path(env) / "templates", "env:CLAUDE_PLUGIN_ROOT"))
+    cands.append((proj / "templates", "repo"))
+    return cands
 
 
-SCHEMA_PATH = _templates_root(SCRIPT) / "references" / "workflow-schema.json"
+def _templates_root(script):
+    cands = _templates_candidates(script)
+    return next((p for p, _ in cands if p.is_dir()), cands[0][0])
+
+
+# One selection, both facts: the chosen root AND the tier label that chose it
+# (computed together so the two can never disagree).
+_TPL_ROOT, SCHEMA_SOURCE = next(
+    ((p, label) for p, label in _templates_candidates(SCRIPT) if p.is_dir()),
+    _templates_candidates(SCRIPT)[0])
+SCHEMA_PATH = _TPL_ROOT / "references" / "workflow-schema.json"
 RESOLVE_SCRIPT = SCRIPT.parent / "resolve-microskill"
 
 # Reuse resolver helpers (extension-less file → SourceFileLoader).
@@ -2255,13 +2270,15 @@ def main():
         fingerprint_detail.append({"node": nid, "sha256": digest, "fingerprint": fp})
 
     # Deterministic content hash over the canonical (sorted-key, compact) JSON of
-    # the SEMANTIC manifest PLUS the per-node fingerprints above. Two keys live
+    # the SEMANTIC manifest PLUS the per-node fingerprints above. Three keys live
     # OUTSIDE the hashed payload:
     #   - manifest_hash itself (the hash can never depend on itself);
     #   - schema_sha256 — PROVENANCE ONLY. manifest_hash gates dispatcher resume
     #     (stored run-state is reusable only while partition/needs/produces still
     #     line up); a schema-bytes-only change moves no node output, so stamping
-    #     it INSIDE the hash would needlessly invalidate resumable run-state.
+    #     it INSIDE the hash would needlessly invalidate resumable run-state;
+    #   - schema_source — PROVENANCE ONLY (which _templates_candidates tier
+    #     selected the validating schema); same rationale.
     # Same inputs → same hash; any change to the partition/needs/produces — or to
     # any fingerprinted node semantic — changes it. The dispatcher compares it
     # against stored run-state before resuming; --check compares it against the
@@ -2272,14 +2289,18 @@ def main():
     ).hexdigest()
 
     manifest_path = compiled_dir / "manifest.json"
-    # SINGLE MANIFEST SHAPE: schema_sha256 and manifest_hash are ALWAYS written —
-    # a default compile and an --explain compile produce byte-identical .compiled/
-    # output (--explain only enriches the stdout summary). Migration note: adding
-    # these keys + the relative script path changes manifest bytes once; the
-    # dispatcher's run-state manifest_hash gate absorbs it (stale state is
-    # ignored, runs start fresh).
+    # SINGLE MANIFEST SHAPE: schema_sha256, schema_source and manifest_hash are
+    # ALWAYS written — a default compile and an --explain compile produce
+    # byte-identical .compiled/ output (--explain only enriches the stdout
+    # summary). Migration note: adding these keys + the relative script path
+    # changes manifest bytes once; the dispatcher's run-state manifest_hash
+    # gate absorbs it (stale state is ignored, runs start fresh) — and since
+    # both schema_* keys sit OUTSIDE manifest_hash, committed lockfiles (which
+    # pin manifest_hash + node fingerprints only) never need re-locking for a
+    # provenance-only delta.
     out_manifest = dict(manifest)
     out_manifest["schema_sha256"] = schema_sha256
+    out_manifest["schema_source"] = SCHEMA_SOURCE
     out_manifest["manifest_hash"] = manifest_hash
     if do_write:
         manifest_path.write_text(json.dumps(out_manifest, indent=2) + "\n")

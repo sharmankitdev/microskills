@@ -1245,9 +1245,9 @@ At the end, report `results[manifest.output.from]`.
   leftover sidecar (`.compiled/` stays a pure function of inputs + flags). Never changes
   manifest/segment bytes; cannot combine with `--plan`/`--check`.
 
-### Manifest provenance — `manifest_hash` and `schema_sha256` (always emitted)
+### Manifest provenance — `manifest_hash`, `schema_sha256` and `schema_source` (always emitted)
 
-Every compile writes two provenance keys into `manifest.json` (and surfaces `manifest_hash` in the
+Every compile writes three provenance keys into `manifest.json` (and surfaces `manifest_hash` in the
 stdout summary):
 
 - **`manifest_hash`** — a SHA-256 over the canonical (sorted-key, compact) JSON of the manifest
@@ -1269,10 +1269,25 @@ stdout summary):
   against (the templates-root fallback means different environments can hold different schema
   copies). It is **outside** `manifest_hash` by design: it is provenance only, and a
   schema-bytes-only change moves no node output, so it must not invalidate resumable run-state.
+- **`schema_source`** — which templates-root fallback tier selected that schema file:
+  `env:MICROSKILLS_TEMPLATES_ROOT` | `runtime:.claude/templates` | `env:CLAUDE_PLUGIN_ROOT` |
+  `repo` (in that resolution order). Also **outside** `manifest_hash` — provenance only, same
+  rationale as `schema_sha256`.
+
+**Cross-host byte-identity caveat.** The compile's input closure includes the **env-selected**
+schema file: which `workflow-schema.json` the compile reads depends on the environment
+(`MICROSKILLS_TEMPLATES_ROOT` / `CLAUDE_PLUGIN_ROOT` / what a reconcile materialized under
+`.claude/templates`). `manifest_hash` is immune by construction (both schema keys sit outside it),
+but **byte-identity of `manifest.json` across hosts therefore assumes consistent template
+provenance** — two hosts holding different schema bytes (or selecting different tiers) emit
+manifests differing in `schema_sha256`/`schema_source` even for an identical def. The
+`schema_source` stamp exists precisely so that delta is diagnosable at a glance.
 
 *Migration note:* introducing the relative `script` paths + always-on provenance keys changed
-manifest bytes once; the dispatcher's run-state `manifest_hash` gate absorbs it (pre-change
-run-state is simply ignored and the run starts fresh).
+manifest bytes once (and adding `schema_source` changed them once more); the dispatcher's
+run-state `manifest_hash` gate absorbs byte-only deltas (pre-change run-state is simply ignored
+and the run starts fresh), and committed lockfiles — which pin `manifest_hash` +
+`node_fingerprints` only — never need re-locking for a provenance-only change.
 
 ### Dispatcher runtime state — the per-run ledger (`.compiled/runs/<run-id>/`)
 
