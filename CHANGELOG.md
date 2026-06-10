@@ -1,3 +1,9 @@
+## [0.11.0](https://github.com/sharmankitdev/microskills/compare/v0.10.0...v0.11.0) (2026-06-10)
+
+### Features
+
+* **workflow:** engine hardening — determinism, authoring ergonomics, runtime customization ([#15](https://github.com/sharmankitdev/microskills/issues/15)) ([86dd66c](https://github.com/sharmankitdev/microskills/commit/86dd66cf449c382a4325c114c0dd2aca0520f941))
+
 ## [0.10.0](https://github.com/sharmankitdev/microskills/compare/v0.9.0...v0.10.0) (2026-06-10)
 
 ### Features
