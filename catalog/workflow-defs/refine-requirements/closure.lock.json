@@ -1,9 +1,9 @@
 {
-  "manifest_hash": "9ff4ee0ea7c1ce43c2273d621bbe30e01ed6ece098a992697ad7cd830d60bb71",
+  "manifest_hash": "9bba1cafd8b8e809cd0271eb12ea63aa3061a4ed685aabe252973dfe545f388b",
   "name": "refine-requirements",
   "node_fingerprints": {
     "approve": "492509d83cf7c249d759a1f7f4d9c85bef1655fa02326350d47084bc0b79fd37",
-    "assemble": "7c6cc3e44d183bf307ef3190c57993543639102a787e0f56b95f2315d5811851",
+    "assemble": "29f8112df2cb78e7c893df83aee8e5416efa083615221bf2920632dcdf0e8bff",
     "clarify": "116ff01f3b39b1db2ecb33c72985c83f56d24d2737a0331dc910f93daeb6d488"
   },
   "profile_used": "base"

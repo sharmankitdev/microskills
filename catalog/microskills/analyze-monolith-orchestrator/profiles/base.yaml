@@ -56,6 +56,10 @@ output_schema:
               properties:
                 concern: { type: string, description: "e.g. single-retry, report-and-ask, mcp-fallback, partial-entry-hydration, mode-branch." }
                 owner: { type: string, description: The workflow node/loop/gate that owns this concern. }
+    step_order:
+      type: array
+      items: { type: string }
+      description: Flat step ordering extracted from the monolith (mirrors control_flow.ordering) for quick human review at the approval gate.
     control_flow:
       type: object
       description: Ordering and conditional/iterative/fan-out/checkpoint structure implied by the monolith's instructions.

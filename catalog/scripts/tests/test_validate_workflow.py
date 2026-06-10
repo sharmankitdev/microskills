@@ -55,7 +55,10 @@ def test_valid_passes(tmp_path):
     rc, data, _ = run(write_wf(tmp_path, VALID))
     assert rc == 0
     assert data["pass"] is True
-    assert data["issues"] == []
+    # b restates the ref-implied edge a->b in depends_on, so the redundancy lint
+    # warns (2.2) — the only issue, and never a block.
+    assert all(i["severity"] == "warn" for i in data["issues"])
+    assert [i["location"] for i in data["issues"]] == ["nodes/b/depends_on"]
 
 
 def test_undeclared_output_ref_now_passes(tmp_path):
@@ -436,6 +439,10 @@ def test_real_flow_passes():
     rc, data, _ = run(REAL_FLOW / "WORKFLOW.yaml", REAL_FLOW / "profiles" / "base.yaml")
     assert rc == 0, data
     assert data["pass"] is True
+    # The shipped def is lint-clean: no redundant depends_on, no inline schema
+    # restating the resolved one (2.1/2.2 catalog cleanup).
+    assert not any("redundant" in i["message"] or "output_schema" in i["location"]
+                   for i in data["issues"]), data["issues"]
 
 
 def test_real_workflow_create_passes():
@@ -1292,10 +1299,11 @@ nodes:
 
 
 def test_no_vars_validate_unchanged(tmp_path):
-    # A workflow with no vars: validates exactly as before.
+    # A workflow with no vars: validates exactly as before (the only issue is
+    # VALID's redundant-depends_on warn — no vars-related issue appears).
     rc, data, _ = run(write_wf(tmp_path, VALID))
     assert rc == 0 and data["pass"] is True
-    assert data["issues"] == []
+    assert not any(i["location"] == "vars" for i in data["issues"])
 
 
 PHASE_GROUP = """\
@@ -1308,12 +1316,10 @@ nodes:
   - id: rb
     agent: some-agent
     phase_group: review
-    depends_on: [a]
     prompt: use ${a.output.x}
   - id: rc
     agent: some-agent
     phase_group: review
-    depends_on: [a]
     prompt: also ${a.output.x}
 """
 
@@ -1730,7 +1736,6 @@ nodes:
     prompt: seed
   - id: scan
     agent: ag
-    depends_on: [seed]
     expand:
       over: [alpha, beta]
     prompt: scan {{each.item}} with ${seed.output.x}
@@ -1784,3 +1789,381 @@ def test_real_review_changes_validates_with_expand():
         rc, data, _ = run(*paths)
         assert rc == 0, (overlays, data)
         assert data["pass"] is True, (overlays, data["issues"])
+
+
+# =============================================================================
+# 2.1 — validator-side schema inheritance: the typed-ref (S-FIELD) check falls
+# back to the use: target's RESOLVED output_schema (same resolve-microskill
+# subprocess compile uses); two-tier inline-schema redundancy lint; unresolvable
+# use: is WARN by default (hermetic standalone validation keeps passing) and
+# escalates to a block under --strict.
+# =============================================================================
+
+SCHEMA_MS_MD = """\
+---
+name: schema-ms
+description: minimal microskill with a resolved output_schema
+---
+
+# Schema MS
+
+## Purpose
+
+Emit a typed result.
+
+## Steps
+
+1. Return the result.
+"""
+
+SCHEMA_MS_BASE = """\
+version: 1
+output_schema:
+  type: object
+  required: [echoed]
+  properties:
+    echoed: { type: string }
+    score: { type: number }
+"""
+
+
+def make_schema_world(tmp_path, wf_body, ms_base=SCHEMA_MS_BASE, with_ms=True):
+    """<tmp>/workflow-defs/sch-flow + <tmp>/microskills/schema-ms — the
+    sibling-skill-root layout both tools derive from the defs root."""
+    defs_root = tmp_path / "workflow-defs"
+    if with_ms:
+        mdir = tmp_path / "microskills" / "schema-ms" / "profiles"
+        mdir.mkdir(parents=True)
+        (tmp_path / "microskills" / "schema-ms" / "MICROSKILL.md").write_text(SCHEMA_MS_MD)
+        (mdir / "base.yaml").write_text(ms_base)
+    return make_def(defs_root, "sch-flow", wf_body), defs_root
+
+
+SFIELD_FALLBACK_WF = """\
+version: 1
+name: sch-flow
+nodes:
+  - id: u
+    use: schema-ms
+  - id: c
+    agent: ag
+    prompt: use ${u.output.%s}
+"""
+
+
+def test_sfield_falls_back_to_resolved_schema_blocks_unknown_field(tmp_path):
+    # `u` declares NO inline output_schema; the field check must fall back to the
+    # RESOLVED microskill schema and block the undeclared field.
+    wf, defs_root = make_schema_world(tmp_path, SFIELD_FALLBACK_WF % "ghost")
+    rc, data, _ = run_defs(defs_root, wf)
+    assert rc == 1 and data["pass"] is False
+    assert any("ghost" in i["message"] and "does not declare" in i["message"]
+               for i in data["issues"]), data["issues"]
+
+
+def test_sfield_fallback_known_field_passes(tmp_path):
+    wf, defs_root = make_schema_world(tmp_path, SFIELD_FALLBACK_WF % "echoed")
+    rc, data, _ = run_defs(defs_root, wf)
+    assert rc == 0, data
+    assert data["pass"] is True
+
+
+def test_sfield_fallback_engages_without_defs_root(tmp_path):
+    # Standalone validation derives the defs root from the standard
+    # <defs-root>/<name>/WORKFLOW.yaml layout, so resolution still engages.
+    wf, _ = make_schema_world(tmp_path, SFIELD_FALLBACK_WF % "ghost")
+    rc, data, _ = run(wf)
+    assert rc == 1 and data["pass"] is False
+    assert any("ghost" in i["message"] and "does not declare" in i["message"]
+               for i in data["issues"]), data["issues"]
+
+
+def test_inline_schema_deep_equal_resolved_warns_omit(tmp_path):
+    # Inline schema deep-equal to the resolved one → redundancy lint tier 1: warn
+    # 'omit it' (never a block).
+    body = """\
+version: 1
+name: sch-flow
+nodes:
+  - id: u
+    use: schema-ms
+    output_schema:
+      type: object
+      required: [echoed]
+      properties:
+        echoed: { type: string }
+        score: { type: number }
+"""
+    wf, defs_root = make_schema_world(tmp_path, body)
+    rc, data, _ = run_defs(defs_root, wf)
+    assert rc == 0, data
+    assert data["pass"] is True
+    assert any(i["severity"] == "warn" and "omit" in i["message"]
+               and i["location"] == "nodes/u/output_schema"
+               for i in data["issues"]), data["issues"]
+
+
+def test_inline_schema_divergent_warns_reconcile(tmp_path):
+    # Inline schema diverging from the resolved one → tier 2: warn 'reconcile or
+    # document the narrowing'.
+    body = """\
+version: 1
+name: sch-flow
+nodes:
+  - id: u
+    use: schema-ms
+    output_schema:
+      type: object
+      required: [echoed]
+      properties:
+        echoed: { type: string }
+        extra_field: { type: string }
+"""
+    wf, defs_root = make_schema_world(tmp_path, body)
+    rc, data, _ = run_defs(defs_root, wf)
+    assert rc == 0, data
+    assert data["pass"] is True
+    assert any(i["severity"] == "warn" and "reconcile" in i["message"]
+               and i["location"] == "nodes/u/output_schema"
+               for i in data["issues"]), data["issues"]
+
+
+def test_unresolvable_use_warns_by_default_standalone(tmp_path):
+    # No microskills/ sibling at all and no --defs-root: hermetic standalone
+    # validation must keep passing — unresolvable use: is a WARN.
+    wf, _ = make_schema_world(tmp_path, SFIELD_FALLBACK_WF % "anything", with_ms=False)
+    rc, data, _ = run(wf)
+    assert rc == 0, data
+    assert data["pass"] is True
+    assert any(i["severity"] == "warn" and "does not resolve" in i["message"]
+               for i in data["issues"]), data["issues"]
+
+
+def test_strict_escalates_unresolvable_use_to_block(tmp_path):
+    wf, _ = make_schema_world(tmp_path, SFIELD_FALLBACK_WF % "anything", with_ms=False)
+    rc, data, _ = run(wf, "--strict")
+    assert rc == 1 and data["pass"] is False
+    assert any(i["severity"] == "block" and "does not resolve" in i["message"]
+               for i in data["issues"]), data["issues"]
+
+
+def test_resolution_failure_with_defs_root_blocks(tmp_path):
+    # MICROSKILL.md exists but its base.yaml is unparseable: with --defs-root
+    # (full-registry validation) a failed resolution is a block, mirroring
+    # compile's hard die. (A missing customize.profile is NOT a failure — the
+    # resolver falls back to base with a warning.)
+    wf, defs_root = make_schema_world(
+        tmp_path, SFIELD_FALLBACK_WF % "echoed",
+        ms_base="version: 1\n  bad_indent: [\n")
+    rc, data, _ = run_defs(defs_root, wf)
+    assert rc == 1 and data["pass"] is False
+    assert any("failed to resolve" in i["message"] for i in data["issues"]
+               if i["severity"] == "block"), data["issues"]
+
+
+def test_explicit_delegation_orchestrator_skips_resolution_lints(tmp_path):
+    # The escape hatch skips resolution in compile, so validate skips the
+    # resolution-driven lints too — no unresolvable warn even though the target
+    # is missing.
+    body = """\
+version: 1
+name: sch-flow
+nodes:
+  - id: u
+    use: schema-ms
+    delegation: orchestrator
+"""
+    wf, _ = make_schema_world(tmp_path, body, with_ms=False)
+    rc, data, _ = run(wf)
+    assert rc == 0, data
+    assert data["pass"] is True
+    assert not any("does not resolve" in i["message"] for i in data["issues"])
+
+
+# =============================================================================
+# 2.2 — lint pack: redundant depends_on (refs already imply the edge) with fix
+# text; every ${workflow.inputs.x} ref must appear in the declared inputs map.
+# =============================================================================
+
+def test_redundant_depends_on_warns_with_fix_text(tmp_path):
+    # VALID's node b restates the ref-implied edge a->b in depends_on → warn.
+    rc, data, _ = run(write_wf(tmp_path, VALID))
+    assert rc == 0 and data["pass"] is True
+    w = [i for i in data["issues"]
+         if i["severity"] == "warn" and i["location"] == "nodes/b/depends_on"]
+    assert len(w) == 1, data["issues"]
+    assert "redundant" in w[0]["message"] and "drop" in w[0]["message"]
+
+
+def test_pure_ordering_depends_on_does_not_warn(tmp_path):
+    # An explicit edge with NO matching ref is the legitimate use of depends_on.
+    body = """\
+version: 1
+name: tiny-flow
+nodes:
+  - id: a
+    agent: some-agent
+    prompt: do a
+  - id: b
+    agent: some-agent
+    depends_on: [a]
+    prompt: do b after a
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 0 and data["pass"] is True
+    assert not any("redundant" in i["message"] for i in data["issues"])
+
+
+def test_items_ref_redundant_depends_on_warns(tmp_path):
+    # A ${id.items} ref implies the edge exactly like ${id.output}.
+    body = """\
+version: 1
+name: items-flow
+nodes:
+  - id: fan
+    agent: ag
+    for_each: ${workflow.inputs.xs}
+    as: x
+    prompt: do ${x}
+  - id: join
+    agent: ag
+    depends_on: [fan]
+    prompt: join ${fan.items}
+inputs:
+  xs: { type: array }
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 0 and data["pass"] is True
+    assert any("redundant" in i["message"] and i["location"] == "nodes/join/depends_on"
+               for i in data["issues"]), data["issues"]
+
+
+def test_inputs_each_generated_fanin_not_linted(tmp_path):
+    # inputs_each desugars to inputs + an explicit depends_on per generated
+    # sibling BY CONSTRUCTION — the lint runs on the hand-authored (pre-expand)
+    # shape only, so the generated fan-in never warns.
+    body = """\
+version: 1
+name: fan-flow
+nodes:
+  - id: seed
+    agent: ag
+    prompt: seed
+  - id: scan
+    agent: ag
+    expand:
+      over: [alpha, beta]
+    prompt: scan {{each.item}} with ${seed.output.x}
+  - id: gather
+    agent: ag
+    inputs_each: scan
+    prompt: gather everything
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 0, data
+    assert data["pass"] is True
+    assert not any("redundant" in i["message"] for i in data["issues"]), data["issues"]
+
+
+def test_hand_authored_template_redundant_depends_on_warns(tmp_path):
+    # ...but a hand-authored redundant depends_on ON the template itself warns.
+    body = """\
+version: 1
+name: fan-flow
+nodes:
+  - id: seed
+    agent: ag
+    prompt: seed
+  - id: scan
+    agent: ag
+    depends_on: [seed]
+    expand:
+      over: [alpha, beta]
+    prompt: scan {{each.item}} with ${seed.output.x}
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 0, data
+    assert any("redundant" in i["message"] and i["location"] == "nodes/scan/depends_on"
+               for i in data["issues"]), data["issues"]
+
+
+def test_undeclared_workflow_input_ref_blocks(tmp_path):
+    body = """\
+version: 1
+name: wf-in
+inputs:
+  diff_path: { type: string }
+nodes:
+  - id: a
+    agent: ag
+    prompt: read ${workflow.inputs.dif_path}
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    assert any("dif_path" in i["message"] and "not declared" in i["message"]
+               for i in data["issues"] if i["severity"] == "block"), data["issues"]
+
+
+def test_declared_workflow_input_ref_passes(tmp_path):
+    body = """\
+version: 1
+name: wf-in
+inputs:
+  diff_path: { type: string }
+nodes:
+  - id: a
+    agent: ag
+    prompt: read ${workflow.inputs.diff_path}
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 0, data
+    assert data["pass"] is True
+
+
+def test_undeclared_input_with_no_inputs_map_blocks(tmp_path):
+    body = """\
+version: 1
+name: wf-in
+nodes:
+  - id: a
+    agent: ag
+    prompt: read ${workflow.inputs.anything}
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    assert any("anything" in i["message"] and "not declared" in i["message"]
+               for i in data["issues"]), data["issues"]
+
+
+def test_input_declared_by_profile_overlay_passes(tmp_path):
+    # comprehensive.yaml pattern: the overlay declares the input the patched
+    # node references — membership is checked on the MERGED doc.
+    wf = write_wf(tmp_path, """\
+version: 1
+name: wf-in
+inputs:
+  base_in: { type: string }
+nodes:
+  - id: a
+    agent: ag
+    prompt: read ${workflow.inputs.base_in} and ${workflow.inputs.extra_in}
+""")
+    overlay = tmp_path / "extra.yaml"
+    overlay.write_text("version: 1\ninputs:\n  extra_in: { type: string }\n")
+    rc, data, _ = run(wf, overlay)
+    assert rc == 0, data
+    assert data["pass"] is True
+
+
+def test_undeclared_input_in_gate_prompt_blocks(tmp_path):
+    body = VALID + """\
+gates:
+  - id: g1
+    after: a
+    type: human_approval
+    prompt: approve ${workflow.inputs.nope}?
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    assert any("nope" in i["message"] and "not declared" in i["message"]
+               for i in data["issues"]), data["issues"]

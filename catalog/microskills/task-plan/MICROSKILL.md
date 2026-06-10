@@ -41,7 +41,7 @@ Given a natural-language requirement, plan the domain artifact by following the 
 
 ## Output
 
-A structured JSON object carrying the path to the written plan. The `microskill` profile returns `{plan_path, scope_advisory}`; the `workflow` profile returns `{plan_path, name, scope_advisory, missing_microskills[]}`. `plan_path` is the path to the plan YAML file written under staging_dir (null when a scope advisory applies); `scope_advisory` is null unless the requirement should not become one artifact.
+A structured JSON object carrying the path to the written plan. The `microskill` profile returns `{plan_path, name, scope_advisory}`; the `workflow` profile returns `{plan_path, name, scope_advisory, missing_microskills[]}`. `plan_path` is the path to the plan YAML file written under staging_dir (null when a scope advisory applies); `name` is the proposed kebab-case artifact name (echoing name_override when supplied); `scope_advisory` is null unless the requirement should not become one artifact.
 
 ## Failure modes
 

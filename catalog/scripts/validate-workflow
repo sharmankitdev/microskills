@@ -5,16 +5,20 @@ validate-workflow — structural + schema + DAG validation for a WORKFLOW.yaml.
 Mirrors validate-microskill. Validates the deep-merge of WORKFLOW.yaml + any
 profile overlays against workflow-schema.json, then runs DAG checks (node
 shape, unique ids, depends_on completeness, ${ref} declaration, cycles, gate
-and loop anchoring).
+and loop anchoring), resolves every use: target through the SAME
+resolve-microskill subprocess the compiler uses (typed-ref checks fall back to
+the resolved output_schema; inline-schema redundancy is linted), and lints
+redundant depends_on entries + undeclared ${workflow.inputs.x} refs.
 
 Usage:
-  validate-workflow <WORKFLOW.yaml> [<profile.yaml> ...]
+  validate-workflow <WORKFLOW.yaml> [<profile.yaml> ...] [--defs-root <dir>] [--strict]
 
 Stdout: {"pass": bool, "issues": [{"severity","location","message"}]}
 Exit codes: 0 pass (no block) · 1 at least one block · 2 script/env error.
 """
 
 import argparse
+import copy
 import importlib.machinery
 import importlib.util
 import json
@@ -86,12 +90,18 @@ desugar_loop_until = _cw.desugar_loop_until
 loop_max_parallel_errors = _cw.loop_max_parallel_errors
 apply_workflow_vars = _cw.apply_workflow_vars
 expand_static_fanout = _cw.expand_static_fanout
+scoped_ref_ids = _cw.scoped_ref_ids
+resolve_microskill_directives = _cw.resolve_microskill_directives
 NODE_OUTPUT_FIELD_RE = _cw.NODE_OUTPUT_FIELD_RE
 NODE_ITEMS_RE = _cw.NODE_ITEMS_RE
 
 REF_RE = re.compile(r"\$\{([^}]*)\}")
 NODE_OUTPUT_RE = re.compile(r"\b([a-z][a-z0-9_-]*)\.output\b")
 AS_RE = re.compile(r"^[a-z][a-z0-9_]*$")  # safe JS identifier for for_each `as`
+# A ${workflow.inputs.<name>} ref names a top-level workflow input — pure set
+# membership against the declared inputs map (a misspelled name used to pass
+# both tools and die at runtime as undefined).
+WF_INPUT_RE = re.compile(r"\bworkflow\.inputs\.([A-Za-z_][A-Za-z0-9_]*)")
 
 
 def add(issues, severity, location, message):
@@ -155,6 +165,10 @@ def main():
                     help="Workflow-defs root enabling nested-workflow (workflow:) resolution checks "
                          "(import allowlist, target resolution, import-cycle, depth=1, required-child-input). "
                          "Absent → those checks are skipped (backward-compatible single-file validation).")
+    ap.add_argument("--strict", action="store_true",
+                    help="Escalate an unresolvable use: target from WARN to a block. "
+                         "Default keeps hermetic standalone validation passing when no "
+                         "microskill registry is reachable.")
     args = ap.parse_args()
 
     issues = []
@@ -221,7 +235,15 @@ def main():
     # sees the sugar; generated nodes are ordinary nodes validated below). A desugar
     # error is a HARD block — the half-desugared doc is structurally unusable, so
     # report and stop (mirrors the list-verb error path).
+    # SNAPSHOT the hand-authored node list first (deep copy: the desugar mutates
+    # inputs_each fan-in nodes in place): the redundant-depends_on lint below runs
+    # against what the AUTHOR wrote — inputs_each desugars to inputs + an explicit
+    # depends_on per generated sibling BY CONSTRUCTION, so generated nodes must
+    # never trip the lint.
+    pre_expand_nodes = []
     if isinstance(merged, dict):
+        pre_expand_nodes = copy.deepcopy(
+            [n for n in (merged.get("nodes") or []) if isinstance(n, dict)])
         merged, expand_errors = expand_static_fanout(merged)
         for ee in expand_errors:
             add(issues, "block", "expand", ee)
@@ -276,6 +298,100 @@ def main():
     # gate-id ref contributes no edge and cannot perturb topo_sort.
     gate_id_set = {g.get("id") for g in (merged.get("gates") or [])
                    if isinstance(g, dict) and g.get("id")}
+
+    # --- I-DECL: every ${workflow.inputs.<x>} ref must name a DECLARED input ---
+    # Pure set membership over the whole merged doc (node fields, gate prompts,
+    # loop, output — anywhere a ref can ride). A misspelled input name used to
+    # pass both tools and surface at run time as `undefined`; now it blocks.
+    declared_inputs = set((merged.get("inputs") or {}).keys()) \
+        if isinstance(merged.get("inputs"), dict) else set()
+    _reported_inputs = set()
+    for inner in refs_in(merged):
+        for in_name in WF_INPUT_RE.findall(inner):
+            if in_name not in declared_inputs and in_name not in _reported_inputs:
+                _reported_inputs.add(in_name)
+                add(issues, "block", "inputs",
+                    f"${{workflow.inputs.{in_name}}} is referenced but '{in_name}' is "
+                    f"not declared in the workflow inputs map; at run time it would "
+                    f"be undefined")
+
+    # --- LINT: redundant depends_on (a ref already implies the edge) ---
+    # Runs on the HAND-AUTHORED (pre-expand) nodes via the SHARED scoped_ref_ids
+    # helper, so the lint and the union edge model can never disagree — and the
+    # inputs_each-generated fan-in (explicit depends_on by construction) is
+    # exempt. Warn-only: the union dedupes, so a restated edge is harmless noise.
+    pre_ids = {n.get("id") for n in pre_expand_nodes if n.get("id")}
+    for n in pre_expand_nodes:
+        nid = n.get("id")
+        if not nid:
+            continue
+        implied = {r for r in scoped_ref_ids(n) if r in pre_ids and r != nid}
+        for d in (n.get("depends_on") or []):
+            if d in implied:
+                add(issues, "warn", f"nodes/{nid}/depends_on",
+                    f"entry '{d}' is redundant — a ${{{d}.output...}}/${{{d}.items}} "
+                    f"ref already implies the edge; drop it (depends_on is for pure "
+                    f"ordering edges that carry no ref)")
+
+    # --- VALIDATOR-SIDE SCHEMA INHERITANCE: resolve use: targets like compile ---
+    # Each background use: node resolves through the SAME resolve-microskill
+    # subprocess (and the same sibling-`microskills/` skill-root derivation)
+    # compile-workflow uses, so the two tools read identical resolved
+    # output_schemas. The resolved schema (a) feeds the typed-ref S-FIELD check
+    # below as the fallback for a node with no inline schema, and (b) drives the
+    # two-tier inline-schema redundancy lint (deep-equal → 'omit it'; divergent →
+    # 'reconcile or document the narrowing').
+    # Failure handling: with --defs-root (full-registry validation) an
+    # unresolvable/failed use: is a BLOCK — fail-loud parity with compile's hard
+    # die. Standalone (defs root derived from the WORKFLOW.yaml layout) it is a
+    # WARN so hermetic single-file validation keeps passing; --strict escalates
+    # it to a block. Explicit delegation: orchestrator (incl. the side_effect
+    # alias) skips resolution in compile, so it skips all of this here too.
+    resolve_defs_root = (Path(args.defs_root) if args.defs_root
+                         else wf_path.parent.parent).resolve()
+    skill_root = resolve_defs_root.parent / "microskills"
+    unres_sev = "block" if (args.defs_root or args.strict) else "warn"
+    resolved_schemas = {}
+    _res_cache = {}
+    for nid, n in node_by_id.items():
+        use_name = n.get("use")
+        if (not use_name or n.get("delegation") == "orchestrator"
+                or n.get("side_effect") is True):
+            continue
+        ms_path = skill_root / str(use_name) / "MICROSKILL.md"
+        if not ms_path.exists():
+            # Cheap stat short-circuit — no subprocess when the target is absent.
+            add(issues, unres_sev, f"nodes/{nid}",
+                f"use: '{use_name}' does not resolve to {ms_path} (compile fails "
+                f"loud on an unresolvable use: target; mark the node "
+                f"delegation: orchestrator if a checkpoint is intended)")
+            continue
+        cust = n.get("customize") if isinstance(n.get("customize"), dict) else None
+        key = (str(use_name), (cust or {}).get("profile"),
+               json.dumps((cust or {}).get("overrides") or {}, sort_keys=True))
+        if key not in _res_cache:
+            _res_cache[key] = resolve_microskill_directives(
+                use_name, cust, resolve_defs_root)
+        resolved = _res_cache[key]
+        if resolved["directives"] is None:
+            add(issues, unres_sev, f"nodes/{nid}",
+                f"use: '{use_name}' failed to resolve "
+                f"({resolved.get('error') or 'resolution failed'})")
+            continue
+        rsch = resolved.get("output_schema")
+        resolved_schemas[nid] = rsch
+        inline = n.get("output_schema")
+        if isinstance(inline, dict) and rsch is not None:
+            if inline == rsch:
+                add(issues, "warn", f"nodes/{nid}/output_schema",
+                    f"inline output_schema is identical to use: '{use_name}' "
+                    f"resolved output_schema — omit it (a use: node inherits the "
+                    f"resolved schema)")
+            else:
+                add(issues, "warn", f"nodes/{nid}/output_schema",
+                    f"inline output_schema diverges from use: '{use_name}' "
+                    f"resolved output_schema — reconcile them, or keep the "
+                    f"override and document the narrowing")
 
     # phase_group is a cosmetic /workflows progress-group label (emit-only). A
     # phase_group equal to a DIFFERENT node's id would merge that group's box with
@@ -366,8 +482,11 @@ def main():
         # requires an explicit depends_on entry). We still guard genuine typos:
         # the referenced id must be a real node. S-FIELD: when the referenced
         # producer carries an object output_schema with declared properties, the
-        # FIRST field after .output must be one of them (a schema-less producer is
-        # treated as 'any' and never flagged).
+        # FIRST field after .output must be one of them. A producer with NO
+        # inline schema falls back to its RESOLVED microskill output_schema
+        # (validator-side inheritance — same precedence as compile: explicit
+        # wins, resolution fills absence). A producer with neither (agent node,
+        # unresolvable use:, schema-less microskill) is 'any' and never flagged.
         scoped = {k: n.get(k) for k in ("inputs", "prompt", "when", "for_each") if k in n}
         for s in collect_strings(scoped):
             for inner in REF_RE.findall(s):
@@ -383,6 +502,8 @@ def main():
                     if prod_id not in id_set:
                         continue  # already reported by the unknown-node guard above
                     osch = node_by_id[prod_id].get("output_schema")
+                    if osch is None:
+                        osch = resolved_schemas.get(prod_id)
                     if not (isinstance(osch, dict)
                             and osch.get("type") == "object"
                             and isinstance(osch.get("properties"), dict)):
@@ -688,26 +809,9 @@ def main():
     if isinstance(out, dict) and out.get("from") and out["from"] not in id_set:
         add(issues, "block", "output", f"'from' references unknown node '{out['from']}'")
 
-    # --- use: target existence — only with --defs-root ---
-    # Mirrors compile-workflow's fail-loud classification: an unresolvable use:
-    # target is a HARD compile error, so surface it at validate time too. The
-    # skill root is derived exactly as compile derives it — the sibling
-    # `microskills/` of the defs root. The explicit delegation: orchestrator
-    # escape hatch (incl. its side_effect alias) skips resolution in compile, so
-    # it skips the existence check here as well. Absent --defs-root → skipped
-    # (hermetic single-file validation keeps passing).
-    if args.defs_root:
-        skill_root = Path(args.defs_root).resolve().parent / "microskills"
-        for nid, n in node_by_id.items():
-            use_name = n.get("use")
-            if not use_name or n.get("delegation") == "orchestrator" or n.get("side_effect") is True:
-                continue
-            ms_path = skill_root / str(use_name) / "MICROSKILL.md"
-            if not ms_path.exists():
-                add(issues, "block", f"nodes/{nid}",
-                    f"use: '{use_name}' does not resolve to {ms_path} (compile fails "
-                    f"loud on an unresolvable use: target; mark the node "
-                    f"delegation: orchestrator if a checkpoint is intended)")
+    # (use: target existence/resolution now runs unconditionally in the
+    # validator-side schema-inheritance pass above: block with --defs-root,
+    # warn standalone, --strict escalates.)
 
     # --- Nested-workflow (workflow:) resolution — only with --defs-root ---
     # LOCKED: when --defs-root is ABSENT these checks are skipped, so existing

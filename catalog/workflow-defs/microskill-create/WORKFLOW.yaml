@@ -54,9 +54,10 @@ vars:
     success on an unresolved sync conflict.
 
 nodes:
-  # Seg 1 (background): plan the microskill. The planner is autonomous — it
-  # returns a structured plan (or a scope_advisory); the HUMAN approves it at
-  # the gate below, which is the orchestrator checkpoint.
+  # Plan the microskill. The planner is autonomous — it returns a structured
+  # plan (or a scope_advisory); the HUMAN approves it at the gate below. Node
+  # output shape: the resolved task-plan (microskill profile) output_schema
+  # (inherited).
   - id: plan
     use: task-plan
     customize: { profile: microskill }
@@ -64,21 +65,13 @@ nodes:
       requirement_path: ${workflow.inputs.requirement_path}
       name_override: ${workflow.inputs.name}
       staging_dir: ${workflow.inputs.staging_dir}
-    output_schema:
-      type: object
-      required: [plan_path, scope_advisory]
-      properties:
-        plan_path: { type: ["string", "null"], description: Path to the written plan YAML file under staging_dir, or null when a scope advisory applies. }
-        name: { type: ["string", "null"] }
-        scope_advisory: { type: ["object", "null"] }
 
-  # Checkpoint (orchestrator): when the planner returns a scope_advisory instead
-  # of a plan, surface it and stop — no microskill gets built. Guarded by `when`;
-  # defined BEFORE the loop body so it doesn't split the implement/evaluate seg.
+  # When the planner returns a scope_advisory instead of a plan, surface it and
+  # stop — no microskill gets built. Guarded by `when`; defined BEFORE the loop
+  # body so it doesn't split the implement/evaluate loop.
   - id: advise
     delegation: orchestrator
     when: ${plan.output.scope_advisory != null}
-    depends_on: [plan]
     prompt: >
       The planner returned a scope advisory instead of a plan:
       ${plan.output.scope_advisory}. Present it to the user. For kind=split, list
@@ -86,52 +79,38 @@ nodes:
       explain that the requirement needs a full skill (branches/gates), not a
       single atomic microskill. Do not implement anything — stop here.
 
-  # Seg 2 (background): the implement ↔ evaluate loop. Fully autonomous — runs
-  # as a JS while inside ONE segment, no human interaction between rounds. Both
-  # body nodes are guarded so the advisory path skips the loop entirely.
+  # The implement ↔ evaluate loop. Fully autonomous — runs as a JS while inside
+  # ONE segment, no human interaction between rounds. Both body nodes are
+  # guarded so the advisory path skips the loop entirely.
   - id: implement
     use: task-implement
     customize: { profile: microskill }
     when: ${plan.output.scope_advisory == null}
-    depends_on: [plan]
     inputs:
       plan_path: ${plan.output.plan_path}
       staging_dir: ${workflow.inputs.staging_dir}
       last_findings: ${loop.carry.last_findings}
-    output_schema:
-      type: object
-      required: [staging_paths]
-      properties:
-        staging_paths: { type: array, items: { type: string } }
 
   - id: evaluate
     use: task-evaluate
     customize: { profile: microskill }
     when: ${plan.output.scope_advisory == null}
-    depends_on: [implement, plan]
     inputs:
       staging_paths: ${implement.output.staging_paths}
       requirement_path: ${workflow.inputs.requirement_path}
       plan_path: ${plan.output.plan_path}
-    output_schema:
-      type: object
-      required: [pass, issues]
-      properties:
-        pass: { type: boolean }
-        issues: { type: array, items: { type: object } }
 
-  # Checkpoint (orchestrator): vendor the approved microskill into harness/ (source
-  # of truth), upsert the manifest, then let sync-harness generate the .claude/
-  # runtime copy + slash shim + ledger. No agent/use → an orchestrator-native step.
+  # Vendor the approved microskill into harness/ (source of truth), upsert the
+  # manifest, then let sync-harness generate the .claude/ runtime copy + slash
+  # shim + ledger. No agent/use → an orchestrator-native step.
   # The prompt is the SHARED finalize protocol (one snippet, parameterized by the
   # vars: block above) — edit _snippets/finalize-protocol.md, not a per-def copy.
   - id: finalize
     delegation: orchestrator
     when: ${plan.output.scope_advisory == null}
-    depends_on: [plan, implement, evaluate]
     prompt: "{{snippet:finalize-protocol}}"
 
-# Human-approval gate after `plan` — the segment boundary between Seg 1 and Seg 2.
+# Human-approval gate after `plan`.
 gates:
   - id: approve_plan
     after: plan

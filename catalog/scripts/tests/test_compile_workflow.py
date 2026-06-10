@@ -3348,3 +3348,96 @@ def test_real_review_changes_comprehensive_adds_dimensions():
     assert fp["review_test_coverage"]["inputs"]["threshold"] == "${workflow.inputs.min_coverage}"
     assert fp["review_test_coverage"]["profile"] == "test-coverage"
     assert "test_coverage" in fp["collect"]["inputs"]
+
+
+# =============================================================================
+# 2.2 — `--annotate`: write .compiled/PARTITION.md, a generated sidecar derived
+# from the data --explain already computes (classification + step sequence).
+# Replaces hand-maintained Seg/Checkpoint assertion comments in WORKFLOW.yaml.
+# =============================================================================
+
+ANNOTATE_WF = """\
+version: 1
+name: ann-flow
+nodes:
+  - id: a
+    agent: ag
+    prompt: do a
+  - id: fin
+    delegation: orchestrator
+    depends_on: [a]
+    prompt: finalize
+gates:
+  - id: g1
+    after: a
+    type: human_approval
+    prompt: approve a?
+    options: [approve, abandon]
+"""
+
+
+def test_annotate_writes_partition_sidecar(tmp_path):
+    d = make_flow(tmp_path, "ann-flow", ANNOTATE_WF)
+    rc, data, out, err = run(tmp_path, "ann-flow", "--annotate")
+    assert rc == 0, err
+    part = d / ".compiled" / "PARTITION.md"
+    assert part.exists()
+    text = part.read_text()
+    # Derived from the de-anonymized sequence + per-node classification.
+    assert "segment[a]" in text
+    assert "gate:g1" in text
+    assert "orchestrator_node:fin" in text
+    assert data["manifest_hash"] in text          # staleness is detectable
+    assert data["partition_path"].endswith("PARTITION.md")
+
+
+def test_annotate_never_changes_manifest_bytes(tmp_path):
+    d = make_flow(tmp_path, "ann-flow", ANNOTATE_WF)
+    rc1, data1, *_ = run(tmp_path, "ann-flow")
+    plain = (d / ".compiled" / "manifest.json").read_bytes()
+    rc2, data2, *_ = run(tmp_path, "ann-flow", "--annotate")
+    annotated = (d / ".compiled" / "manifest.json").read_bytes()
+    assert rc1 == rc2 == 0
+    assert plain == annotated
+    assert data1["manifest_hash"] == data2["manifest_hash"]
+
+
+def test_plain_recompile_removes_stale_partition_sidecar(tmp_path):
+    # .compiled/ stays a pure function of (inputs, flags): a non-annotate compile
+    # unlinks a leftover PARTITION.md exactly like the seg-*.js stale-clean.
+    d = make_flow(tmp_path, "ann-flow", ANNOTATE_WF)
+    run(tmp_path, "ann-flow", "--annotate")
+    assert (d / ".compiled" / "PARTITION.md").exists()
+    run(tmp_path, "ann-flow")
+    assert not (d / ".compiled" / "PARTITION.md").exists()
+
+
+def test_annotate_rejects_plan_and_check(tmp_path):
+    make_flow(tmp_path, "ann-flow", ANNOTATE_WF)
+    for flag in ("--plan", "--check"):
+        rc, data, out, err = run(tmp_path, "ann-flow", "--annotate", flag)
+        assert rc != 0
+        assert "annotate" in (data or {}).get("error", ""), out
+
+
+def test_annotate_loop_segment_marked(tmp_path):
+    wf = """\
+version: 1
+name: ann-loop
+nodes:
+  - id: x
+    agent: ag
+    prompt: do x
+  - id: y
+    agent: ag
+    prompt: check ${x.output.ok}
+loop:
+  while: ${!y.output.ok}
+  max_iters: 2
+  body: [x, y]
+"""
+    d = make_flow(tmp_path, "ann-loop", wf)
+    rc, data, out, err = run(tmp_path, "ann-loop", "--annotate")
+    assert rc == 0, err
+    text = (d / ".compiled" / "PARTITION.md").read_text()
+    assert "segment[x,y] (loop body)" in text

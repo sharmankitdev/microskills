@@ -65,11 +65,10 @@ vars:
     .compiled/ was regenerated. Do not claim success on an unresolved sync conflict
     or a failed compile.
 
-# No plan node and no approval gate (those live in the caller). The whole workflow is one
-# background segment (the implement ↔ evaluate loop) followed by the orchestrator finalize.
+# No plan node and no approval gate (those live in the caller).
 nodes:
-  # Seg 1 (background): the implement ↔ evaluate loop assembling and validating the
-  # WORKFLOW.yaml from the approved plan.
+  # The implement ↔ evaluate loop assembling and validating the WORKFLOW.yaml
+  # from the approved plan.
   - id: implement
     use: task-implement
     customize: { profile: workflow }
@@ -77,38 +76,27 @@ nodes:
       plan_path: ${workflow.inputs.plan_path}
       staging_dir: ${workflow.inputs.staging_dir}
       last_findings: ${loop.carry.last_findings}
-    output_schema:
-      type: object
-      required: [staging_paths]
-      properties:
-        staging_paths: { type: array, items: { type: string } }
 
   - id: evaluate
     use: task-evaluate
     customize: { profile: workflow }
-    depends_on: [implement]
     inputs:
       staging_paths: ${implement.output.staging_paths}
       requirement_path: ${workflow.inputs.requirement_path}
       plan_path: ${workflow.inputs.plan_path}
       name: ${workflow.inputs.name}
       staging_base: ${workflow.inputs.staging_dir}
-    output_schema:
-      type: object
-      required: [pass, issues]
-      properties:
-        pass: { type: boolean }
-        issues: { type: array, items: { type: object } }
 
-  # Checkpoint (orchestrator): THE canonical workflow finalize. Vendor the approved workflow
-  # into harness/ (source of truth), upsert the manifest, let sync-harness generate the
-  # .claude/ runtime copy + shim + ledger, THEN compile-workflow to populate .compiled/
-  # (sync does not compile). Shared by every creator so the vendoring can never diverge.
-  # The prompt is the SHARED finalize protocol (one snippet, parameterized by the
-  # vars: block above) — edit _snippets/finalize-protocol.md, not a per-def copy.
+  # THE canonical workflow finalize. Vendor the approved workflow into harness/
+  # (source of truth), upsert the manifest, let sync-harness generate the
+  # .claude/ runtime copy + shim + ledger, THEN compile-workflow to populate
+  # .compiled/ (sync does not compile). Shared by every creator so the vendoring
+  # can never diverge. The prompt is the SHARED finalize protocol (one snippet,
+  # parameterized by the vars: block above) — edit _snippets/finalize-protocol.md,
+  # not a per-def copy; its ${implement.output...}/${evaluate.output...} refs
+  # imply the dependency edges.
   - id: finalize
     delegation: orchestrator
-    depends_on: [implement, evaluate]
     prompt: "{{snippet:finalize-protocol}}"
 
 # Guarded loop: repeat implement→evaluate until the evaluator passes or the cap.

@@ -9,15 +9,18 @@ runtime:
   # model inherited from base (opus) via deep-merge.
 
 # Workflow plan shape — overrides the base output_schema wholesale (replace, not merge).
+# This resolved schema is what a use: node INHERITS (callers no longer restate it
+# inline), so it must carry every field a caller references.
 output_schema:
   type: object
   required: [plan_path, name, scope_advisory, missing_microskills]
   properties:
-    plan_path: { type: ["string", "null"] }
+    plan_path: { type: ["string", "null"], description: Path to the written WORKFLOW.yaml-design plan file under staging_dir, or null when a scope advisory applies. }
     name: { type: ["string", "null"] }
-    scope_advisory: { type: ["object", "null"] }
+    scope_advisory: { type: ["object", "null"], description: "{kind: split|promote|adapt, reason, recommendation} or null." }
     missing_microskills:
       type: array
+      description: Microskills the planned workflow needs that do not yet exist; each is created via microskill-create before implement.
       items:
         type: object
         properties:

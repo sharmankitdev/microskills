@@ -52,10 +52,11 @@ imports:
   - microskills/assimilate-requirements
 
 nodes:
-  # Seg 1 (BACKGROUND): the heavy first pass. assimilate-requirements Reads the normalized sources
+  # The heavy first pass. assimilate-requirements Reads the normalized sources
   # (+ optional template + optional seed answers), assimilates them into the SE requirements document
   # at output_dir/document_name, and returns the gaps array + gaps_count — the convergence signal. It
-  # Reads/Writes only (no AskUserQuestion) → classifies BACKGROUND.
+  # Reads/Writes only (no AskUserQuestion) → classifies background. Node output shape: the resolved
+  # assimilate-requirements output_schema (inherited).
   - id: assemble
     use: assimilate-requirements
     depends_on: []
@@ -65,23 +66,14 @@ nodes:
       document_name: ${workflow.inputs.document_name}
       template_path: ${workflow.inputs.template_path}
       prior_answers_path: ${workflow.inputs.prior_answers_path}
-    output_schema:
-      type: object
-      required: [document_path, gaps, gaps_count, summary]
-      properties:
-        document_path: { type: string }
-        gaps: { type: array, items: { type: object } }
-        gaps_count: { type: integer }
-        summary: { type: string }
 
-  # Checkpoint A (ORCHESTRATOR): gaps remain. Runs in the main loop, so AskUserQuestion + the
+  # Branch A: gaps remain. Runs in the main loop, so AskUserQuestion + the
   # microskill re-invocation are legal here. Owns the bounded human-in-the-loop refinement loop —
   # NOT a declarative loop: block (a loop body can't hold an orchestrator node / can't pause for a
   # human). Mutually exclusive with `approve` via the opposite gaps_count guard (advisory-fork).
   - id: clarify
     delegation: orchestrator
     when: ${assemble.output.gaps_count > 0}
-    depends_on: [assemble]
     prompt: >
       The assembled requirements document is at ${assemble.output.document_path}; it has
       ${assemble.output.gaps_count} open gap(s): ${assemble.output.gaps}. Refine it WITH the user.
@@ -113,12 +105,11 @@ nodes:
       /assimilate-requirements once more, then re-present. RETURN
       {choice, final_document_path, rounds, converged, remaining_gaps}.
 
-  # Checkpoint B (ORCHESTRATOR): no gaps from the first pass. Mutually exclusive with `clarify`
+  # Branch B: no gaps from the first pass. Mutually exclusive with `clarify`
   # (opposite gaps_count guard), so neither depends on the other — no skipped-dependency edge.
   - id: approve
     delegation: orchestrator
     when: ${assemble.output.gaps_count == 0}
-    depends_on: [assemble]
     prompt: >
       The assembled requirements document at ${assemble.output.document_path} has no open gaps —
       every template section is filled with no ambiguity or contradiction (summary:
