@@ -113,12 +113,38 @@ def test_record_inputs_merges_config_and_journals_sizes(tmp_path):
     assert config["inputs"] == {"diff_path": "/abs/d.cat", "post_to_pr": False}
     # the scratch file inside the run dir is consumed
     assert not scratch.exists()
+    # record-inputs SEEDS the resume checkpoint with the full run-state shape
+    # so the run-step kernel can build the first segment's args from it
+    assert data["run_state"].endswith("run-state.json")
+    state = json.loads((run_dir / "run-state.json").read_text())
+    assert state == {"manifest_hash": "sha256:h1", "step_index": 0,
+                     "inputs": {"diff_path": "/abs/d.cat", "post_to_pr": False},
+                     "results": {}}
+    assert not (run_dir / "run-state.json.tmp").exists()
     rec = journal_lines(run_dir)[-1]
     assert rec["event"] == "inputs_recorded"
     assert rec["input_bytes"] == {
         "diff_path": len(json.dumps("/abs/d.cat")),
         "post_to_pr": len(json.dumps(False)),
     }
+
+
+def test_record_inputs_refreshes_existing_state_keeping_progress(tmp_path):
+    # re-recording must not clobber step_index/results of an existing state
+    run_dir, _ = init_run(tmp_path)
+    state = {"manifest_hash": "sha256:h1", "step_index": 2,
+             "inputs": {"old": 1}, "results": {"plan": {"x": 1}}}
+    (run_dir / "s.tmp").write_text(json.dumps(state))
+    rc, *_ = run("append", "--run-dir", str(run_dir), "--event", "step_complete",
+                 "--step-index", "1", "--commit-state", "s.tmp")
+    assert rc == 0
+    (run_dir / "in.json").write_text(json.dumps({"new": 2}))
+    rc, *_ = run("record-inputs", "--run-dir", str(run_dir),
+                 "--inputs-file", "in.json")
+    assert rc == 0
+    got = json.loads((run_dir / "run-state.json").read_text())
+    assert got == {"manifest_hash": "sha256:h1", "step_index": 2,
+                   "inputs": {"new": 2}, "results": {"plan": {"x": 1}}}
 
 
 def test_record_inputs_leaves_outside_files_alone(tmp_path):
@@ -145,6 +171,7 @@ def test_record_inputs_rejects_non_object(tmp_path):
 def test_append_commit_state_promotes_tmp_and_sizes_from_state(tmp_path):
     run_dir, _ = init_run(tmp_path)
     state = {"manifest_hash": "sha256:h1", "step_index": 2,
+             "inputs": {"diff_path": "/d.cat"},
              "results": {"plan": {"plan_path": "/p.yaml"}, "g1": {"choice": "approve"}}}
     (run_dir / "run-state.json.tmp").write_text(json.dumps(state))
     rc, data, out, err = run("append", "--run-dir", str(run_dir),
@@ -172,7 +199,8 @@ def test_append_commit_state_promotes_tmp_and_sizes_from_state(tmp_path):
 
 def test_append_commit_state_manifest_hash_mismatch_fails_before_replace(tmp_path):
     run_dir, _ = init_run(tmp_path, manifest_hash="sha256:h1")
-    bad = {"manifest_hash": "sha256:OTHER", "step_index": 1, "results": {}}
+    bad = {"manifest_hash": "sha256:OTHER", "step_index": 1,
+           "inputs": {}, "results": {}}
     (run_dir / "run-state.json.tmp").write_text(json.dumps(bad))
     rc, data, *_ = run("append", "--run-dir", str(run_dir),
                        "--event", "step_complete", "--step-index", "0",
@@ -187,11 +215,25 @@ def test_append_commit_state_manifest_hash_mismatch_fails_before_replace(tmp_pat
 def test_append_commit_state_malformed_shape_fails(tmp_path):
     run_dir, _ = init_run(tmp_path)
     (run_dir / "s.tmp").write_text(json.dumps(
-        {"manifest_hash": "sha256:h1", "step_index": "two", "results": {}}))
+        {"manifest_hash": "sha256:h1", "step_index": "two",
+         "inputs": {}, "results": {}}))
     rc, data, *_ = run("append", "--run-dir", str(run_dir),
                        "--event", "step_complete", "--commit-state", "s.tmp")
     assert rc != 0
     assert "step_index" in data["error"]
+
+
+def test_append_commit_state_requires_inputs_map(tmp_path):
+    # the legacy {manifest_hash, step_index, results} shape is no longer
+    # committable — the run-step kernel reads inputs from the run-state
+    run_dir, _ = init_run(tmp_path)
+    (run_dir / "s.tmp").write_text(json.dumps(
+        {"manifest_hash": "sha256:h1", "step_index": 1, "results": {}}))
+    rc, data, *_ = run("append", "--run-dir", str(run_dir),
+                       "--event", "step_complete", "--commit-state", "s.tmp")
+    assert rc != 0
+    assert "inputs must be an object" in data["error"]
+    assert not (run_dir / "run-state.json").exists()
 
 
 def test_append_unknown_event_and_outcome_fail_loud(tmp_path):
@@ -220,7 +262,8 @@ def test_append_without_state_omits_size_fields(tmp_path):
 
 def seed_run(tmp, run_id, manifest_hash, step_index, finished=False):
     run_dir, _ = init_run(tmp, run_id, manifest_hash)
-    state = {"manifest_hash": manifest_hash, "step_index": step_index, "results": {}}
+    state = {"manifest_hash": manifest_hash, "step_index": step_index,
+             "inputs": {}, "results": {}}
     (run_dir / "s.tmp").write_text(json.dumps(state))
     rc, *_ = run("append", "--run-dir", str(run_dir), "--event", "step_complete",
                  "--step-index", str(step_index - 1), "--commit-state", "s.tmp")
@@ -282,6 +325,23 @@ def test_latest_ignores_run_dir_without_state(tmp_path):
     assert rc == 0 and data["found"] is False
 
 
+def test_latest_skips_pre_shape_state_without_inputs(tmp_path):
+    # a legacy state without an inputs map cannot be resumed by the run-step
+    # kernel — never offer it, even when its manifest_hash matches
+    legacy = tmp_path / "runs" / "20260610T110000Z-bbbbbb"
+    legacy.mkdir(parents=True)
+    (legacy / "run-state.json").write_text(json.dumps(
+        {"manifest_hash": "sha256:h1", "step_index": 1, "results": {}}))
+    rc, data, *_ = run("latest", "--runs-dir", str(tmp_path / "runs"),
+                       "--manifest-hash", "sha256:h1")
+    assert rc == 0 and data["found"] is False
+    seed_run(tmp_path, "20260610T100000Z-aaaaaa", "sha256:h1", 1)
+    rc, data, *_ = run("latest", "--runs-dir", str(tmp_path / "runs"),
+                       "--manifest-hash", "sha256:h1")
+    assert rc == 0 and data["found"] is True
+    assert data["run_id"] == "20260610T100000Z-aaaaaa"
+
+
 # --------------------------------------------------------- project / report
 
 def make_played_run(tmp, run_id):
@@ -292,7 +352,8 @@ def make_played_run(tmp, run_id):
     assert rc == 0
     for i, results in enumerate([{"a": {"x": 1}}, {"a": {"x": 1}, "g1": {"choice": "approve"}}]):
         (run_dir / "s.tmp").write_text(json.dumps(
-            {"manifest_hash": "sha256:h1", "step_index": i + 1, "results": results}))
+            {"manifest_hash": "sha256:h1", "step_index": i + 1,
+             "inputs": {"diff_path": "/d.cat"}, "results": results}))
         rc, *_ = run("append", "--run-dir", str(run_dir), "--event", "step_complete",
                      "--step-index", str(i), "--label", f"Step{i}",
                      "--commit-state", "s.tmp")

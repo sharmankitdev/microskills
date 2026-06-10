@@ -1,0 +1,561 @@
+#!/usr/bin/env python3
+"""run-step — the workflow dispatcher's deterministic step kernel.
+
+Two jobs the dispatcher previously performed "in the model's head" now run as
+CODE, with the COMPILER'S OWN grammar (no second implementation to drift):
+
+  args   Build a background segment's `args` object from the manifest step's
+         `needs` against the persisted run-state, emitted as canonical
+         sorted-key JSON. Every needed key is PRESENT (`null` is legal —
+         presence, not truthiness), exactly matching the compiled segment's
+         fail-loud args guard: `wf_<name>` from the recorded inputs (manifest
+         `input_defaults` applied; an ungathered REQUIRED input is a hard
+         error; an ungathered optional rides as explicit `null`), `<node-id>`
+         from recorded results (an absent key is a hard error — a guarded
+         skip must be stored as `null`, never omitted), `carry_<v>: null`
+         loop seeds. An OVERSIZED payload (past --budget, default 32 KiB —
+         headroom under the ~37KB native-engine truncation observed live)
+         FAILS LOUD, exit 1, and is never auto-spilled to a file: silently
+         substituting a path would corrupt the segment's `_args` derefs,
+         which expect the value itself. Moving an output by reference is a
+         DECLARED feature (`materialize: file` for workflow inputs; node
+         output spill is its own compiler feature), never a runtime improvisation.
+
+  eval   Evaluate a checkpoint step's declared `when` / `for_each` / `${...}`
+         expressions. The expressions are translated by IMPORTING
+         compile-workflow's translate_ref / tmpl_literal (SourceFileLoader —
+         the validate-workflow precedent) and EXECUTED as real JS via
+         `node -e` with the context object on STDIN. JS execution is the ONLY
+         evaluation path — there is deliberately NO Python re-implementation
+         of the expression semantics (a second evaluator would drift from the
+         compiled-segment world; JS truthiness, `==` coercion and undefined
+         propagation are load-bearing); a missing `node` binary fails loud.
+         For an orchestrator_node it returns the prompt with every `${...}`
+         ref substituted (per for_each item when fanning out). For a
+         nested_workflow it resolves the child's input map (a full `${ref}`
+         value keeps its TYPE; an embedded ref string-interpolates via the
+         segments' own `__ref`) and CROSS-CHECKS the resolved map against the
+         child's REQUIRED inputs pre-run (base.yaml + the step's profile
+         overlay applied, mirroring the child compile) — a missing/null
+         required input is a hard error BEFORE any segment of the child runs.
+
+RUN-STATE SHAPE. Both subcommands read the per-run resume checkpoint
+`runs/<run-id>/run-state.json` (see run-journal), which carries
+
+    {manifest_hash, step_index, inputs, results}
+
+`inputs` is the recorded gathered-input set (seeded by `run-journal
+record-inputs`, re-committed by the dispatcher with every step); `results`
+maps node id -> stored output. A run-state without an `inputs` object
+predates this shape and fails loud here (start a fresh run).
+
+PATHS-ONLY CONTRACT (injection doctrine). Flags carry the manifest path, the
+run-state path and a step index — node outputs / input values never ride argv.
+The generated JS program text is built ONLY from manifest-declared expressions
+(author-controlled — the same bytes the compiler bakes into segments); the
+runtime DATA (inputs/results) rides STDIN as JSON and is never spliced into
+code.
+
+Usage:
+  run-step args --manifest <path> --run-state <path> --step <i> [--budget N]
+  run-step eval --manifest <path> --run-state <path> --step <i> [--defs-root D]
+
+Stdout: one JSON object (sorted keys; `errors` always present).
+Exit codes: 0 OK · 1 contract violation (missing recorded result, ungathered
+required input, oversized args, expression error, uncovered child input) ·
+2 environment/usage error (unreadable file, wrong step kind, run-state/manifest
+mismatch, missing node binary).
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+SCRIPT = Path(__file__).resolve()
+
+# Import compile-workflow (extension-less file -> SourceFileLoader, the
+# validate-workflow precedent) so args/expression semantics can never drift
+# from the compiled-segment grammar: translate_ref/tmpl_literal/Needs ARE the
+# compiler's own. main() is guarded under __name__ == "__main__", so the
+# import is side-effect-free.
+_cw_loader = importlib.machinery.SourceFileLoader(
+    "compile_workflow", str(SCRIPT.parent / "compile-workflow"))
+_cw_spec = importlib.util.spec_from_loader("compile_workflow", _cw_loader)
+_cw = importlib.util.module_from_spec(_cw_spec)
+_cw_loader.exec_module(_cw)
+translate_ref = _cw.translate_ref
+tmpl_literal = _cw.tmpl_literal
+strip_ref_wrapper = _cw.strip_ref_wrapper
+Needs = _cw.Needs
+REF_RE = _cw.REF_RE
+deep_merge = _cw.deep_merge
+strip_nulls = _cw.strip_nulls
+yaml = _cw.yaml
+
+# The __ref interpolation helper is taken VERBATIM from the segments' own
+# HELPERS_JS so the two worlds cannot drift (same string-vs-JSON.stringify
+# coercion in template literals).
+_REF_HELPER_JS = next(
+    (line for line in _cw.HELPERS_JS.splitlines()
+     if line.startswith("function __ref(")), None)
+assert _REF_HELPER_JS, "compile-workflow HELPERS_JS drifted: __ref helper not found"
+
+# Default args-size budget (bytes of compact JSON) — aligned with
+# check-step-io's look-ahead warning budget: the native engine was observed
+# live to truncate a ~37KB args payload (and pass ~6.6KB); 32 KiB fails loud
+# with headroom. The compiled segment's own guard remains the in-segment
+# enforcement point; this pre-flight stops the run BEFORE paying for a doomed
+# segment.
+DEFAULT_BUDGET = 32768
+
+CHECKPOINT_EVAL_TYPES = ("orchestrator_node", "nested_workflow")
+
+# The stdin/stdout harness around the generated expression code. DATA rides
+# stdin; only manifest-declared expressions are spliced into __BODY__.
+_JS_WRAPPER = """\
+const __chunks = []
+process.stdin.on('data', (c) => __chunks.push(c))
+process.stdin.on('end', () => {
+  let _args
+  try { _args = JSON.parse(Buffer.concat(__chunks).toString('utf8')) } catch (e) {
+    process.stdout.write(JSON.stringify({ ok: false, error: 'context is not valid JSON: ' + e.message }))
+    return
+  }
+  __REF_HELPER__
+  const __out = {}
+  try {
+    __BODY__
+    process.stdout.write(JSON.stringify({ ok: true, out: __out }))
+  } catch (e) {
+    process.stdout.write(JSON.stringify({ ok: false, error: String((e && e.message) || e) }))
+  }
+})
+"""
+
+
+def die(msg, code=2, **extra):
+    payload = {"error": msg}
+    payload.update(extra)
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    sys.exit(code)
+
+
+def emit(payload, code):
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    sys.exit(code)
+
+
+def load_json(path, label):
+    p = Path(path)
+    try:
+        return json.loads(p.read_text())
+    except OSError as e:
+        die(f"{label} unreadable: {e}")
+    except json.JSONDecodeError as e:
+        die(f"{label} is not valid JSON: {e}")
+
+
+def get_step(manifest, index):
+    steps = manifest.get("steps")
+    if not isinstance(steps, list) or not steps:
+        die("manifest carries no steps list")
+    if not (0 <= index < len(steps)):
+        die(f"--step {index} out of range (manifest has {len(steps)} steps)")
+    return steps[index]
+
+
+def check_hash(manifest, run_state):
+    """Integrity gate (same rule as check-step-io): when both files carry a
+    manifest_hash and they differ, the run-state belongs to a different
+    compile — environment error, never a silent pass."""
+    m_hash = manifest.get("manifest_hash")
+    s_hash = run_state.get("manifest_hash")
+    if m_hash and s_hash and m_hash != s_hash:
+        die("run-state manifest_hash does not match the manifest — this "
+            "run-state belongs to a different compile; resume handling must "
+            "reconcile them before running steps")
+
+
+def require_state_obj(run_state, key):
+    val = run_state.get(key)
+    if not isinstance(val, dict):
+        die(f"run-state carries no '{key}' object — the persisted run-state "
+            f"shape is {{manifest_hash, step_index, inputs, results}} "
+            f"(run-journal record-inputs seeds it; a pre-shape run-state is "
+            f"not resumable — start a fresh run)")
+    return val
+
+
+def compact_bytes(value):
+    """Byte size as compact JSON — the same proxy check-step-io uses for what
+    rides the native engine's args string."""
+    return len(json.dumps(value, separators=(",", ":"),
+                          ensure_ascii=False).encode("utf-8"))
+
+
+def wf_input_value(name, inputs, manifest):
+    """Resolve one needed workflow input from the recorded inputs map.
+    Returns (value, error): recorded value wins; an unrecorded REQUIRED input
+    is a hard error (never invent a value); an unrecorded optional takes the
+    manifest default, else explicit null (presence, not truthiness)."""
+    if name in inputs:
+        return inputs[name], None
+    if name in (manifest.get("required_inputs") or []):
+        return None, (
+            f"required workflow input '{name}' is not in the recorded "
+            f"run-state inputs — gather and record it (run-journal "
+            f"record-inputs) before running this step; never invent a value")
+    defaults = manifest.get("input_defaults") or {}
+    if name in defaults:
+        return defaults[name], None
+    return None, None
+
+
+# ----------------------------------------------------------------- args
+
+def cmd_args(a):
+    manifest = load_json(a.manifest, "manifest")
+    run_state = load_json(a.run_state, "run-state")
+    check_hash(manifest, run_state)
+    step = get_step(manifest, a.step)
+    if step.get("kind") != "segment":
+        die(f"--step {a.step} is kind={step.get('kind')!r} "
+            f"(checkpoint_type={step.get('checkpoint_type')!r}) — `run-step "
+            f"args` builds args for segment steps only; checkpoints use "
+            f"`run-step eval`")
+    inputs = require_state_obj(run_state, "inputs")
+    results = require_state_obj(run_state, "results")
+
+    needs = step.get("needs") or {}
+    out_args = {}
+    errors = []
+    for name in needs.get("wf_inputs") or []:
+        value, err = wf_input_value(name, inputs, manifest)
+        if err:
+            errors.append(err)
+        else:
+            out_args[f"wf_{name}"] = value
+    for nid in needs.get("nodes") or []:
+        if nid in results:
+            out_args[nid] = results[nid]
+        else:
+            errors.append(
+                f"no recorded result for node '{nid}' — every produced node "
+                f"must be stored in run-state results (null for a guarded "
+                f"skip), never omitted")
+    for var in needs.get("carry") or []:
+        # Loops carry state internally across their own iterations; the
+        # cross-segment seed is always null (matches the compiled carry init).
+        out_args[f"carry_{var}"] = None
+
+    payload = {"step": a.step, "kind": "segment",
+               "script": step.get("script"), "errors": errors}
+    if errors:
+        emit(payload, 1)
+
+    size = compact_bytes(out_args)
+    payload["args"] = out_args
+    payload["args_bytes"] = size
+    if size > a.budget:
+        largest = sorted(((k, compact_bytes(v)) for k, v in out_args.items()),
+                         key=lambda kv: (-kv[1], kv[0]))[:3]
+        detail = ", ".join(f"{k}={n}B" for k, n in largest)
+        payload.pop("args")  # an oversized payload is never handed onward
+        payload["errors"] = [
+            f"args payload is {size} bytes (budget {a.budget}) — the native "
+            f"engine truncates oversized args and the compiled segment guard "
+            f"would fail loud mid-run. FAIL LOUD, NO AUTO-SPILL: silently "
+            f"substituting a file path here would corrupt the segment's "
+            f"_args derefs (they expect the value, not a path). Move the "
+            f"oversized payload by DECLARATION instead — `materialize: file` "
+            f"for a workflow input, or write the producing node's output to "
+            f"a file and thread the path. Largest keys: {detail}"]
+        emit(payload, 1)
+    emit(payload, 0)
+
+
+# ----------------------------------------------------------------- eval
+
+def derive_defs_root(manifest_path, flag):
+    if flag:
+        return Path(flag).resolve()
+    p = Path(manifest_path).resolve()
+    # Canonical layout: <defs-root>/<name>/.compiled/manifest.json
+    if p.parent.name == ".compiled":
+        return p.parent.parent.parent
+    return None
+
+
+def child_required_inputs(defs_root, child, profile):
+    """Required input names of the child workflow, with profiles applied the
+    same way the child compile will apply them (base.yaml merge, then the
+    step's profile or the child's own declared default)."""
+    wf_path = defs_root / child / "WORKFLOW.yaml"
+    if not wf_path.exists():
+        die(f"child workflow def not found: {wf_path} — the parent compile "
+            f"guaranteed it existed; the registry has drifted since")
+    try:
+        wf = yaml.safe_load(wf_path.read_text()) or {}
+    except yaml.YAMLError as e:
+        die(f"child WORKFLOW.yaml unparseable: {wf_path}: {e}")
+    profiles_dir = defs_root / child / "profiles"
+    base_path = profiles_dir / "base.yaml"
+    try:
+        if base_path.exists():
+            base_cfg = yaml.safe_load(base_path.read_text()) or {}
+            wf = deep_merge(wf, {k: v for k, v in base_cfg.items() if k != "version"})
+        effective = profile or (wf.get("profile") or {}).get("default")
+        if effective and effective != "base":
+            overlay_path = profiles_dir / f"{effective}.yaml"
+            if not overlay_path.exists():
+                die(f"child profile '{effective}' not found at {overlay_path}", 1)
+            overlay = yaml.safe_load(overlay_path.read_text()) or {}
+            wf = deep_merge(wf, {k: v for k, v in overlay.items() if k != "version"})
+    except ValueError as e:
+        die(f"child profile merge error: {e}", 1)
+    wf = strip_nulls(wf)
+    return sorted(name for name, spec in (wf.get("inputs") or {}).items()
+                  if isinstance(spec, dict) and spec.get("required"))
+
+
+def child_inputs_js(inputs_map, scope):
+    """JS object literal for a nested-workflow inputs map. A full `${ref}`
+    value keeps its TYPE (the translated ref rides as the value); a string
+    with embedded refs interpolates via the segments' own tmpl_literal/__ref;
+    anything else is a JSON literal."""
+    pairs = []
+    for key, expr in inputs_map.items():
+        if isinstance(expr, str):
+            m = REF_RE.fullmatch(expr.strip())
+            if m:
+                val = translate_ref(m.group(1), scope)
+            elif REF_RE.search(expr):
+                val = tmpl_literal(expr, scope)
+            else:
+                val = json.dumps(expr)
+        else:
+            val = json.dumps(expr)
+        pairs.append(f"{json.dumps(key)}: {val}")
+    return "{ " + ", ".join(pairs) + " }"
+
+
+def emit_eval_js(step, ctype):
+    """Generate the node program for one checkpoint step. Mirrors the
+    compiled-segment forms exactly: `when` is the guard ternary's truthiness;
+    `for_each` is ((coll) || []).map((as) => ...) with the per-item payload
+    bound to the `as` var; a false guard short-circuits the collection (the
+    segment ternary never evaluates its fan-out when skipped)."""
+    scope = set()  # a checkpoint has no in-segment vars: every node ref hits _args
+    lines = []
+    when = step.get("when")
+    if when:
+        cond = translate_ref(strip_ref_wrapper(when), scope)
+        lines.append(f"__out.when = Boolean({cond})")
+    else:
+        lines.append("__out.when = true")
+
+    if ctype == "orchestrator_node":
+        key, payload = "prompt", tmpl_literal(step.get("prompt") or "", scope)
+    else:
+        key, payload = "child_inputs", child_inputs_js(step.get("inputs") or {}, scope)
+
+    fe = step.get("for_each")
+    if fe:
+        as_var = step.get("as") or "item"
+        coll = translate_ref(strip_ref_wrapper(fe), scope)
+        lines.append("if (__out.when) {")
+        lines.append(f"  const __coll = ({coll}) || []")
+        lines.append("  if (!Array.isArray(__coll)) "
+                     "throw new Error('for_each collection is not an array: ' "
+                     "+ JSON.stringify(__coll))")
+        lines.append("  __out.items = __coll")
+        lines.append(f"  __out.iterations = __coll.map(({as_var}) => "
+                     f"({{ item: {as_var}, {key}: {payload} }}))")
+        lines.append("}")
+    else:
+        lines.append(f"if (__out.when) {{ __out.{key} = {payload} }}")
+
+    body = "\n    ".join(lines)
+    return (_JS_WRAPPER
+            .replace("__REF_HELPER__", _REF_HELPER_JS)
+            .replace("__BODY__", body))
+
+
+def cmd_eval(a):
+    manifest = load_json(a.manifest, "manifest")
+    run_state = load_json(a.run_state, "run-state")
+    check_hash(manifest, run_state)
+    step = get_step(manifest, a.step)
+    ctype = step.get("checkpoint_type")
+    if step.get("kind") != "checkpoint" or ctype not in CHECKPOINT_EVAL_TYPES:
+        die(f"--step {a.step} is kind={step.get('kind')!r} "
+            f"(checkpoint_type={ctype!r}) — `run-step eval` evaluates "
+            f"orchestrator_node / nested_workflow checkpoints only (gates "
+            f"carry no expressions; segments use `run-step args`)")
+    inputs = require_state_obj(run_state, "inputs")
+    results = require_state_obj(run_state, "results")
+
+    payload = {"step": a.step, "kind": "checkpoint", "checkpoint_type": ctype,
+               "node": step.get("node"), "errors": []}
+    if ctype == "nested_workflow":
+        payload["workflow"] = step.get("workflow")
+        if step.get("profile"):
+            payload["profile"] = step["profile"]
+
+    # Presence guard — the checkpoint twin of the compiled segment's args
+    # guard: every node this step's expressions reference must be PRESENT in
+    # results (null is legal — a guarded skip is stored as null). The step's
+    # `as` var is excluded: a per-item binding is not a node ref.
+    needs = Needs()
+    scope = set()
+    needs.scan(step.get("when"), scope)
+    needs.scan(step.get("for_each"), scope)
+    if ctype == "orchestrator_node":
+        needs.scan(step.get("prompt"), scope)
+    else:
+        for expr in (step.get("inputs") or {}).values():
+            needs.scan(expr, scope)
+    as_var = step.get("as") or "item"
+    missing = sorted(n for n in needs.nodes - {as_var} if n not in results)
+    if missing:
+        payload["errors"] = [
+            f"no recorded result for node '{nid}' — every produced node must "
+            f"be stored in run-state results (null for a guarded skip) "
+            f"before its consumers run" for nid in missing]
+        emit(payload, 1)
+
+    # Context object: the checkpoint sees exactly the cross-segment world a
+    # compiled segment would — wf_<name> for recorded inputs (manifest
+    # defaults applied; a needed-but-unrecorded optional rides as explicit
+    # null), bare node ids for recorded results. Data only — it rides stdin.
+    ctx = {f"wf_{k}": v for k, v in inputs.items()}
+    for name in sorted(needs.wf_inputs):
+        if f"wf_{name}" not in ctx:
+            value, err = wf_input_value(name, inputs, manifest)
+            if err:
+                payload["errors"].append(err)
+            ctx[f"wf_{name}"] = value
+    if payload["errors"]:
+        emit(payload, 1)
+    ctx.update(results)
+
+    if shutil.which("node") is None:
+        die("node not found on PATH — run-step evaluates checkpoint "
+            "expressions by EXECUTING the compiler's own translated JS under "
+            "node (`node -e`, context on stdin). This is the ONLY evaluation "
+            "path: there is deliberately no Python re-implementation to "
+            "drift from the compiled-segment semantics. Install Node.js and "
+            "re-run.")
+
+    program = emit_eval_js(step, ctype)
+    proc = subprocess.run(["node", "-e", program],
+                          input=json.dumps(ctx, ensure_ascii=False),
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        die(f"node failed evaluating checkpoint expressions: "
+            f"{(proc.stderr or proc.stdout).strip()[:500]}")
+    try:
+        verdict = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        die(f"node produced unparseable output: {proc.stdout[:200]!r}")
+    if not verdict.get("ok"):
+        payload["errors"] = [
+            f"checkpoint expression evaluation failed: {verdict.get('error')} "
+            f"— the same throw a compiled segment would produce for this "
+            f"expression; fix the upstream output or the declared expression, "
+            f"never hand-evaluate around it"]
+        emit(payload, 1)
+    out = verdict.get("out") or {}
+
+    when_val = bool(out.get("when"))
+    payload["when"] = ({"expr": step["when"], "value": when_val}
+                       if step.get("when") else None)
+    payload["skipped"] = not when_val
+    fe = step.get("for_each")
+    if not when_val:
+        # Guard short-circuits the fan-out, exactly like the segment ternary:
+        # the collection is never evaluated for a skipped node.
+        payload["for_each"] = ({"expr": fe, "as": as_var} if fe else None)
+        emit(payload, 0)
+
+    if fe:
+        payload["for_each"] = {"expr": fe, "as": as_var,
+                               "items": out.get("items") or []}
+        payload["iterations"] = out.get("iterations") or []
+    else:
+        payload["for_each"] = None
+        if ctype == "orchestrator_node":
+            payload["prompt"] = out.get("prompt")
+        else:
+            payload["child_inputs"] = out.get("child_inputs") or {}
+
+    if ctype == "nested_workflow":
+        defs_root = derive_defs_root(a.manifest, a.defs_root)
+        if defs_root is None:
+            die("cannot derive the defs root from the manifest path (expected "
+                "<defs-root>/<name>/.compiled/manifest.json) — pass --defs-root")
+        required = child_required_inputs(defs_root, step["workflow"],
+                                         step.get("profile"))
+        payload["child_required_inputs"] = required
+        if fe:
+            resolved = [(f" (for_each item {i})", it.get("child_inputs") or {})
+                        for i, it in enumerate(payload["iterations"])]
+        else:
+            resolved = [("", payload["child_inputs"])]
+        for where, mapping in resolved:
+            for name in required:
+                if mapping.get(name) is None:
+                    payload["errors"].append(
+                        f"child workflow '{step['workflow']}' required input "
+                        f"'{name}' is not covered by the resolved inputs "
+                        f"map{where} — missing or null; supply it via the "
+                        f"node's inputs (never invent a value)")
+    emit(payload, 1 if payload["errors"] else 0)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Deterministic step kernel for the workflow dispatcher "
+                    "(paths-only: --manifest --run-state --step; content "
+                    "never rides argv).")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("args", help="build a segment step's args object from "
+                                     "its needs against the run-state")
+    sp.add_argument("--manifest", required=True,
+                    help="Path to the compiled .compiled/manifest.json.")
+    sp.add_argument("--run-state", required=True,
+                    help="Path to the run's committed run-state.json.")
+    sp.add_argument("--step", required=True, type=int,
+                    help="0-based manifest step index (must be a segment).")
+    sp.add_argument("--budget", type=int, default=DEFAULT_BUDGET,
+                    help=f"Hard args-size budget in compact-JSON bytes "
+                         f"(default {DEFAULT_BUDGET}). Past it the build "
+                         f"FAILS LOUD — never auto-spills.")
+    sp.set_defaults(fn=cmd_args)
+
+    sp = sub.add_parser("eval", help="evaluate a checkpoint step's when / "
+                                     "for_each / ${...} expressions as JS")
+    sp.add_argument("--manifest", required=True,
+                    help="Path to the compiled .compiled/manifest.json.")
+    sp.add_argument("--run-state", required=True,
+                    help="Path to the run's committed run-state.json.")
+    sp.add_argument("--step", required=True, type=int,
+                    help="0-based manifest step index (orchestrator_node / "
+                         "nested_workflow checkpoint).")
+    sp.add_argument("--defs-root", default=None,
+                    help="Workflow defs root for the nested-child required-"
+                         "input cross-check (default: derived from the "
+                         "manifest path's <defs-root>/<name>/.compiled/ layout).")
+    sp.set_defaults(fn=cmd_eval)
+
+    args = ap.parse_args()
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()

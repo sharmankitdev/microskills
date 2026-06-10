@@ -1042,16 +1042,23 @@ fingerprints (and committed lockfiles) stay unchanged. Composes with profile `no
 
 For each manifest step in order:
 
-- **`segment`** → build `args`: `wf_<x>` for each needed workflow input, `<id>` for each needed
-  upstream node output, `carry_<v> = null` for loop carries. **Every needed key must be present —
-  pass `null`, never omit**: the compiled segment opens with a fail-loud guard that **throws** on
-  unparseable args (the native engine truncates oversized payloads — a truncated JSON string must
-  stop the run, not degrade to `{}` and let downstream nodes fabricate) and throws on any **absent**
-  needed key (presence, not truthiness — a guarded-skip `null` is legal). Invoke the Workflow engine
-  with the segment's `scriptPath` + `args` — the manifest stores `script` **relative to the def dir**
-  (`.compiled/seg-N.js`), so the dispatcher resolves it against `.claude/workflow-defs/<name>/`.
-  The segment returns an object keyed by its `produces` node ids;
-  store each into `results`. (A loop segment also returns `__rounds`.)
+- **`segment`** → `args` is built **in code** by `run-step args --manifest <…/manifest.json>
+  --run-state <run_dir>/run-state.json --step <i>` (paths only — values never ride argv): canonical
+  sorted-key JSON from the step's `needs` against the committed run-state — `wf_<x>` for each needed
+  workflow input (manifest `input_defaults` applied; an ungathered REQUIRED input is a hard error;
+  an ungathered optional rides as explicit `null`), `<id>` for each needed upstream node output (an
+  absent recorded result is a hard error; a guarded skip's stored `null` is legal), `carry_<v> =
+  null` loop seeds. **Every needed key is present — `null`, never omitted**: the compiled segment
+  opens with a fail-loud guard that **throws** on unparseable args (the native engine truncates
+  oversized payloads — a truncated JSON string must stop the run, not degrade to `{}` and let
+  downstream nodes fabricate) and throws on any **absent** needed key (presence, not truthiness).
+  An args payload past the size budget (default 32 KiB) **fails loud pre-flight — never
+  auto-spilled** (silently substituting a file path would corrupt the segment's `_args` derefs;
+  moving a payload by reference is a declared feature, e.g. `materialize: file`). Invoke the
+  Workflow engine with the segment's `scriptPath` + the emitted `args` verbatim — the manifest
+  stores `script` **relative to the def dir** (`.compiled/seg-N.js`), so the dispatcher resolves it
+  against `.claude/workflow-defs/<name>/`. The segment returns an object keyed by its `produces`
+  node ids; store each into `results`. (A loop segment also returns `__rounds`.)
 - **`checkpoint` / gate** → render the gate's `present:` paths mechanically when declared (the
   output rubric over `results[gate.after]` is the fallback — never raw JSON), then `AskUserQuestion`
   with the gate's prompt + options. Approve → continue; revise → re-run the producing segment with
@@ -1059,17 +1066,28 @@ For each manifest step in order:
   ask: the gate's declared `default` is recorded verbatim (`on_headless: fail` → stop naming the
   gate). `warn` gates render + continue without pausing, recording their declared `default` (or
   `{choice: null}` when none) — never a fabricated pick.
-- **`checkpoint` / orchestrator_node** → execute the node's `prompt` in the main loop, resolving
-  `${...}` against `inputs`/`results`. Honor `when` (skip → `null`) and `for_each` (run per item,
-  bind `${as}`). This is where side-effects and `AskUserQuestion` happen. Store into `results[node]`.
-- **`checkpoint` / nested_workflow** (a `workflow:` node) → honor `when`/`for_each` as above, resolve
-  the step's `inputs` refs against `inputs`/`results`, then **re-enter the same `workflow` skill** for
-  the child (compile + run its manifest, feeding the resolved inputs and skipping interactive input
-  gathering). **If the node carried `customize: { profile: <name> }`, compile the child with `--profile
-  <name>` (profile passthrough — e.g. `provision` compiles `microskill-create` with the `autonomous`
-  profile so the child's plan gate never pauses); absent → the child compiles with its own default.**
-  Depth ≤ 1 is compiler-guaranteed, so recursion is bounded. Store the child's `output.from` result
-  into `results[node]`.
+- **`checkpoint` / orchestrator_node** → the step's `when` / `for_each` / `${...}` refs are
+  evaluated **in code** by `run-step eval` (same paths-only flags), which imports the compiler's own
+  `translate_ref`/`tmpl_literal` and **executes the translated JS under `node`** with the
+  run-state-derived context on stdin — the one evaluation path, identical to the compiled-segment
+  semantics (JS truthiness, `==` coercion, undefined propagation; a missing `node` binary fails
+  loud, and there is deliberately no Python re-implementation to drift). A false `when` skips
+  (store `null`) **without evaluating the fan-out** (the segment-ternary short-circuit); otherwise
+  the dispatcher executes the returned fully-substituted `prompt` (one per `iterations` entry under
+  `for_each`, collecting an array; empty collection → `[]`) in the main loop — this is where
+  side-effects and `AskUserQuestion` happen. Store into `results[node]`.
+- **`checkpoint` / nested_workflow** (a `workflow:` node) → the same `run-step eval` call evaluates
+  `when`/`for_each` and additionally resolves the step's declared `inputs` map (a full `${ref}`
+  value keeps its TYPE; an embedded ref string-interpolates via the segments' own `__ref`) and
+  **cross-checks the resolved map against the child's required inputs pre-run** (child base.yaml +
+  the step's `profile` overlay applied, mirroring the child compile) — a missing/null required input
+  stops the run before any child segment is paid for. Then **re-enter the same `workflow` skill**
+  for the child (compile + run its manifest, feeding the resolved `child_inputs` and skipping
+  interactive input gathering). **If the node carried `customize: { profile: <name> }`, compile the
+  child with `--profile <name>` (profile passthrough — e.g. `provision` compiles `microskill-create`
+  with the `autonomous` profile so the child's plan gate never pauses); absent → the child compiles
+  with its own default.** Depth ≤ 1 is compiler-guaranteed, so recursion is bounded. Store the
+  child's `output.from` result into `results[node]`.
 
 **After every step** (once the run-state checkpoint is committed) the dispatcher runs
 `check-step-io --manifest <…/manifest.json> --run-state <run_dir>/run-state.json --step <i>` —
@@ -1080,6 +1098,16 @@ per-node `io: {schema, guarded, fan_out}` contract the manifest step carries (th
 error**). Non-zero exit stops the run. It also **warns** when a result a later segment threads
 through `args` exceeds the size budget (default 32 KiB) — a warning only: enforcement is the
 compiled segment's fail-loud args guard, never duplicated here.
+
+**`run-step` — the deterministic step kernel.** Args assembly and checkpoint expression evaluation
+are CODE, not model judgement: `run-step args` / `run-step eval` share the paths-only contract
+(`--manifest --run-state --step`), read the persisted `{manifest_hash, step_index, inputs, results}`
+run-state, and fail loud on a manifest_hash mismatch. `eval` imports `translate_ref`/`tmpl_literal`
+from compile-workflow itself and executes the translated expressions via `node -e` with the context
+object on stdin — the generated program text contains ONLY manifest-declared expressions (the same
+bytes the compiler bakes into segments); runtime data never rides argv or gets spliced into code.
+Control flow stays declarative: run-step evaluates exactly what the YAML declared, with the
+compiler's own grammar — it never invents a branch, an arg, or a value.
 
 At the end, report `results[manifest.output.from]`.
 
@@ -1166,10 +1194,14 @@ chronological) via `run-journal init` and namespaces ALL of a run's state under
   overrides[], inputs}` (additively extensible). The applied `--override` flags and the exact
   gathered input set are persisted here — sequential reruns no longer destroy provenance, and two
   concurrent runs of the same def no longer clobber one shared state file.
-- **`run-state.json`** — the resume checkpoint, `{manifest_hash, step_index, results}` as before,
-  now committed **atomically** (the dispatcher Writes a `.tmp` sibling; `run-journal append
+- **`run-state.json`** — the resume checkpoint, `{manifest_hash, step_index, inputs, results}`,
+  committed **atomically** (the dispatcher Writes a `.tmp` sibling; `run-journal append
   --commit-state` promotes it via `os.replace` — the harness-sync write protocol — after verifying
-  its `manifest_hash` matches the run's own `run-config.json`).
+  its `manifest_hash` matches the run's own `run-config.json` and that all four keys carry their
+  declared shapes). `run-journal record-inputs` **seeds** it (`{step_index: 0, results: {}}` plus
+  the recorded inputs) so the `run-step` kernel can build the FIRST segment's args from a committed
+  state; every later commit re-carries the `inputs` map. A legacy state without `inputs` is neither
+  committable nor offered for resume.
 - **`run-inputs/`** — per-run materialized inputs (`normalize-input` outputs), so one run's
   materialized diff can never be overwritten by the next run's.
 - **`journal.jsonl`** — an append-only machine-readable timeline written ONLY by the
@@ -1189,11 +1221,12 @@ and reconciles (determinism untouched).
 `run-journal latest` scans `runs/*/run-state.json` for the newest **unfinished** run (greatest
 run_id; `--steps <manifest step count>` filters out finished runs) whose stored `manifest_hash`
 matches the freshly compiled manifest. A match → offer to resume from its `step_index`, seeding
-`results` from its run-state and `inputs` from its run-config (re-using completed work — e.g. an
-expensive opus planner segment). A mismatched hash (the workflow was recompiled / changed, so
-stored node outputs no longer line up) or no match → mint a fresh run and start at step 0; prior
-run dirs stay in place as provenance. (The legacy single `.compiled/.run-state.json` is simply
-ignored — and, like `runs/`, never deleted.)
+`inputs` and `results` from its run-state — the record the `run-step` kernel reads (re-using
+completed work — e.g. an expensive opus planner segment; `run-config.json` stays the provenance
+record). A mismatched hash (the workflow was recompiled / changed, so stored node outputs no
+longer line up), a pre-shape state without an `inputs` map, or no match → mint a fresh run and
+start at step 0; prior run dirs stay in place as provenance. (The legacy single
+`.compiled/.run-state.json` is simply ignored — and, like `runs/`, never deleted.)
 
 **Known boundary — `runs/` isolates runtime state, NOT compiled artifacts.** Two concurrent runs
 of the *same def* compiled with *different profiles/overrides* still race on the shared

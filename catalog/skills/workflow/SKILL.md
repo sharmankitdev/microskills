@@ -53,9 +53,10 @@ checkpoint in the main loop (where `AskUserQuestion` works), and threads outputs
    auto compile has a distinct manifest_hash anyway, so interactive state never matches). Parse the JSON:
    - `found: true` → **offer to resume** via `AskUserQuestion` ("Resume run {run_id} from step
      {step_index+1}, or start fresh?"). On resume: adopt that `run_dir` as this run's directory, seed
-     `inputs` from the `inputs` map in `<run_dir>/run-config.json` (skip Setup steps 6-8 — the run's
-     inputs were already gathered and recorded; re-using completed work avoids re-running expensive
-     opus planner segments), seed `results` from the `results` map in `<run_dir>/run-state.json`, set
+     `inputs` and `results` from the `inputs` / `results` maps in `<run_dir>/run-state.json` — the
+     committed state carries both, and it is the record the `run-step` kernel reads (skip Setup
+     steps 6-8 — the run's inputs were already gathered and recorded; re-using completed work avoids
+     re-running expensive opus planner segments; `run-config.json` stays the provenance record), set
      the start position `i = step_index`, and journal the pickup:
      `.claude/scripts/run-journal append --run-dir '<run_dir>' --event resume --step-index <i>`.
    - `found: false`, or the user picks "start fresh" → continue with Setup step 6 (start at `i = 0`;
@@ -109,8 +110,10 @@ checkpoint in the main loop (where `AskUserQuestion` works), and threads outputs
    command), then run via Bash:
    `.claude/scripts/run-journal record-inputs --run-dir '<run_dir>' --inputs-file inputs.tmp.json`.
    It folds the inputs into `run-config.json` (so the run's full provenance — profile, overrides, and
-   the exact input set — is one record), journals an `inputs_recorded` event with per-input byte sizes,
-   and consumes the scratch file.
+   the exact input set — is one record), **seeds `<run_dir>/run-state.json` with
+   `{manifest_hash, step_index: 0, inputs, results: {}}`** (the `run-step` kernel below builds every
+   segment's args — including the first — from this committed state, never from memory), journals an
+   `inputs_recorded` event with per-input byte sizes, and consumes the scratch file.
 
 ## Execute the manifest
 
@@ -127,9 +130,10 @@ Walk `manifest.steps` in order (starting at the resume position `i` from the Set
 **Persist run-state + journal after each step, then check the step's IO.** After a step completes
 (and its output is stored into `results`), checkpoint in three moves:
 1. Use the **Write tool** to write
-   `{ "manifest_hash": manifest.manifest_hash, "step_index": <the index of the NEXT step to run>, "results": results }`
+   `{ "manifest_hash": manifest.manifest_hash, "step_index": <the index of the NEXT step to run>, "inputs": inputs, "results": results }`
    to `<run_dir>/run-state.json.tmp` (a structured tool parameter — node outputs never ride a shell
-   command).
+   command). All four keys are required — `run-step` reads args and checkpoint expressions from
+   this committed state, so `inputs` must always ride with it.
 2. Run ONE Bash call:
    `.claude/scripts/run-journal append --run-dir '<run_dir>' --event step_complete --step-index <i> --label '<the step header label>' --commit-state run-state.json.tmp`
    — for a gate step also pass `--gate '<gate.id>' --choice '<the recorded choice label>'`; for a
@@ -160,19 +164,25 @@ is untouched. On a clean finish leave the run dir in place — it is the run's p
 `.claude/scripts/run-journal append --run-dir '<run_dir>' --event run_error --step-index <i> --outcome error --label '<short reason>'`.
 
 ### `kind: "segment"`
-1. Build the `args` object the segment expects — **every needed key must be PRESENT; use `null`,
-   never omit a key** (the compiled segment fail-louds on an absent needed key and on unparseable
-   args; a `null` value is legal — presence, not truthiness):
-   - for each `n` in `step.needs.wf_inputs` → `args["wf_" + n] = inputs[n]` (an optional input with
-     no gathered value and no default → set `null` explicitly)
-   - for each `id` in `step.needs.nodes` → `args[id] = results[id]` (the upstream node's output; a
-     skipped node's stored `null` rides as `null`)
-   - for each `v` in `step.needs.carry` → `args["carry_" + v] = null` (loops carry state internally
-     across their own iterations; the seed is null)
+1. **Build `args` in code — never assemble it in your head.** Run ONE Bash call:
+   `.claude/scripts/run-step args --manifest '.claude/workflow-defs/<name>/.compiled/manifest.json' --run-state '<run_dir>/run-state.json' --step <i>`
+   It receives only PATHS (node outputs and input values never ride argv) and emits canonical
+   sorted-key JSON `{args, args_bytes, script, errors}` from the step's `needs` against the
+   committed run-state — every needed key PRESENT with the same presence-not-truthiness rule the
+   compiled segment's fail-loud guard enforces (`wf_<n>` from the recorded inputs with manifest
+   defaults applied, explicit `null` for an ungathered optional; `<node-id>` from results, a
+   guarded skip's stored `null` riding as `null`; `carry_<v>: null` loop seeds). **Non-zero exit →
+   STOP** and surface its JSON `errors` (journal a `run_error`): a missing recorded result, an
+   ungathered required input, or an **oversized args payload** — past the budget the native engine
+   truncates, run-step fails loud and never auto-spills (silently substituting a file path would
+   corrupt the segment's `_args` derefs). Never hand-assemble, trim, or summarize args to sneak
+   under the budget — an oversized payload means an upstream output must move to a file by
+   declaration (`materialize: file`), which is the author's fix, not yours.
 2. Invoke the **Workflow tool** with `scriptPath` = `step.script` **resolved against the def dir**:
    the manifest stores it relative to the def dir (e.g. `.compiled/seg-1.js` — portable across
    checkouts), so the path to pass is `.claude/workflow-defs/<name>/<step.script>`. Pass
-   `args = <the object above>`. The segment runs autonomously in the background on the native engine.
+   `args` = the `args` object from run-step **verbatim**. The segment runs autonomously in the
+   background on the native engine.
 3. When it completes, its return value is an object keyed by the node ids in `step.produces`. Store
    each into `results` (e.g. `results.plan = <returned>.plan`).
 4. **Emit a recap** (2-4 lines, human-readable, no raw JSON) of what the segment produced, before the
@@ -237,9 +247,10 @@ validate-workflow accepts). This is in addition to — not instead of — the ap
 below; always store the pick, then act on it. Then act:
 - An `approve`/`confirm` choice → continue to the next step.
 - A `revise`-style choice → **ask the user what to change** (a follow-up `AskUserQuestion` or their
-  free-text note), then re-run the segment that produced the gate's `after` node: re-invoke that
-  segment's script (no re-compile) with fresh `args` that fold the revision notes into the relevant
-  input (e.g. append them to the `requirement` arg). Then re-render the output and re-present the gate
+  free-text note), then re-run the segment that produced the gate's `after` node: rebuild that
+  segment's base `args` via `run-step args` (same call as the segment step, no re-compile), fold the
+  revision notes into the relevant input value (e.g. append them to the `requirement` arg), and
+  re-invoke the segment's script. Then re-render the output and re-present the gate
   (re-recording `results[gate.id]` on the re-presented choice).
 - An `abandon`/`stop` choice → stop the run cleanly (clean up any staging the segments created).
 For `severity: warn` gates (any mode), render the evidence + emit the prompt, then continue without
@@ -251,9 +262,24 @@ Journal the warn pass-through with `--outcome skipped` (plus `--choice` when a d
 
 ### `kind: "checkpoint"`, `checkpoint_type: "orchestrator_node"`
 An orchestrator-native step (a node with neither `use` nor `agent`, or `delegation: orchestrator`).
-Execute its `prompt` here in the main loop, resolving `${...}` references against `inputs` and
-`results` (e.g. `${workflow.inputs.output_dir}` → `inputs.output_dir`, `${evaluate.output.pass}` →
-`results.evaluate.pass`). This is where filesystem side effects and interactive decisions
+**First evaluate the step's declared expressions in code** — run ONE Bash call:
+`.claude/scripts/run-step eval --manifest '.claude/workflow-defs/<name>/.compiled/manifest.json' --run-state '<run_dir>/run-state.json' --step <i>`
+It executes the step's `when` / `for_each` / `${...}` refs as the compiler's own translated JS
+(under node, context from the committed run-state) — **never evaluate an expression or substitute a
+`${...}` ref in your head**; the segment world runs these as real JS, and this is the same JS.
+Parse its JSON and act on it:
+- `skipped: true` (a false `when`) → store `results[node] = null`, journal the step with
+  `--outcome skipped`, and continue to the next step — do not execute the prompt.
+- no `for_each` → `prompt` is the node's prompt with every `${...}` ref already substituted.
+  Execute it here in the main loop.
+- `for_each` → `iterations` is the resolved fan-out: execute each entry's `prompt` once, in order,
+  collect the per-item results into an array and store it as `results[node]`. Empty `items` → store
+  `[]` (never null).
+- **Non-zero exit → STOP** and surface its `errors` (journal a `run_error`): an unrecorded upstream
+  node, an ungathered required input, or an expression that throws (e.g. a field read through a
+  missing object — the same throw a compiled segment would produce). Never patch around it by
+  evaluating the expression yourself.
+Executing the (already-resolved) prompt is where filesystem side effects and interactive decisions
 (`AskUserQuestion`) happen. Store its result into `results[node]`. **When the step's `io[<node>]`
 carries a non-null `schema`, that is the node's declared RETURN CONTRACT**: store an object with
 exactly those fields (the post-step `check-step-io` validates it) — never a prose summary in its
@@ -267,27 +293,28 @@ executes normally. (Example: `refine-requirements`' base `clarify` node is NOT h
 `autonomous` profile, which rewrites the prompt to an unattended single pass, is the supported
 unattended path.)
 
-Before executing, honor the conditional / fan-out fields if the step carries them
-(segment-internal `when`/`for_each` are already compiled — these apply only to orchestrator nodes):
-- **`when`** — resolve the condition (an inner-of-`${...}` JS expression) against `inputs`/`results`.
-  If it is false, **skip** the node: store `results[node] = null` and continue to the next step.
-- **`for_each`** — resolve the expression to a collection. Run the node's `prompt` once per item,
-  binding `${<as>}` to the current item (`as` is the step's loop-variable name). Collect the
-  per-item results into an array and store it as `results[node]`. An empty/absent collection → `[]`.
-- A step with both: evaluate `when` first; if false, skip without iterating.
-
 The main loop is also the only place a node may invoke a **nested workflow** (e.g. a `provision`
 node running `microskill-create` with the autonomous profile, once per missing microskill via
 `for_each`). Background segments cannot — their subagents have no orchestration context.
 
 ### `kind: "checkpoint"`, `checkpoint_type: "nested_workflow"`
 A first-class nested-workflow call — a `workflow: <name>` node. The child runs here in the main loop,
-never in a segment. Honor `when`/`for_each` exactly as for an orchestrator node above (a false `when`
-→ store `results[node] = null` and skip; `for_each` → run the child once per item, binding `${<as>}`,
-collecting an array into `results[node]`). Then:
-1. **Resolve the step's `inputs` map** — for each `key: value`, resolve any `${...}` references in
-   `value` against `inputs`/`results` (same rules as an orchestrator node). The resolved map is the
-   child's input set.
+never in a segment.
+1. **Evaluate and resolve in code** — run the same ONE Bash call as an orchestrator node:
+   `.claude/scripts/run-step eval --manifest '.claude/workflow-defs/<name>/.compiled/manifest.json' --run-state '<run_dir>/run-state.json' --step <i>`
+   For a nested step it additionally resolves the declared `inputs` map (a full `${ref}` value keeps
+   its type; an embedded ref string-interpolates) and **cross-checks the resolved map against the
+   child's required inputs pre-run** (base profile + the step's `profile` overlay applied). Parse
+   its JSON:
+   - `skipped: true` (a false `when`) → store `results[node] = null`, journal with
+     `--outcome skipped`, continue — never compile or enter the child.
+   - no `for_each` → `child_inputs` is the child's fully resolved input set.
+   - `for_each` → `iterations` carries one resolved `child_inputs` per item: run the child once per
+     entry, in order, collecting the per-child results into an array stored as `results[node]`.
+     Empty `items` → store `[]`.
+   - **Non-zero exit → STOP** and surface its `errors` (journal a `run_error`) — in particular an
+     uncovered required child input means an upstream output or wiring is wrong; never invent the
+     missing value or start the child anyway.
 2. **Re-enter this same `workflow` skill for `step.workflow`** — compile
    `.claude/workflow-defs/${step.workflow}/WORKFLOW.yaml`, passing **`--profile ${step.profile}` when the
    checkpoint carries a `profile`** (a `customize: {profile}` on the `workflow:` node — e.g. `provision`
@@ -330,6 +357,10 @@ already covered the play-by-play — don't re-summarize each segment here.
 - **Step IO check failed** — `check-step-io` exits non-zero after a step (schema violation, missing
   result, or the probable-truncation/fabrication signature). Stop, surface its `errors`, never
   synthesize a replacement output.
+- **run-step failed** — `run-step args` or `run-step eval` exits non-zero (missing recorded result,
+  ungathered required input, oversized args payload, a throwing expression, an uncovered nested-child
+  required input, or a missing `node` binary). Journal `run_error`, surface its `errors`/`error`,
+  stop. Never substitute your own args assembly or expression evaluation for the kernel's.
 - **Required input unresolved** — stop, name the input.
 - **Gate abandoned** — stop cleanly, report partial state.
 - **Headless gate stop** — auto mode reached a gate with `on_headless: fail` (or a pausing gate with
