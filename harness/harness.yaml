@@ -29,6 +29,10 @@ microskills:
     source: plugin
   - name: review-dimension
     source: plugin
+  # domain: software-engineering (requirements) — atomic assimilation microskill composed by
+  # the refine-requirements workflow.
+  - name: assimilate-requirements
+    source: plugin
 workflows:
   - name: microskill-create
     source: plugin
@@ -40,4 +44,8 @@ workflows:
     source: plugin
   # domain: software-engineering (code-review) — flagship pipeline over the review microskills.
   - name: review-changes
+    source: plugin
+  # domain: software-engineering (requirements) — wraps assimilate-requirements with a
+  # when-split, bounded gap-refinement loop driven by AskUserQuestion.
+  - name: refine-requirements
     source: plugin

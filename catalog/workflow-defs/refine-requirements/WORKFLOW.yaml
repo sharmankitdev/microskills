@@ -1,0 +1,142 @@
+version: 1
+name: refine-requirements
+description: >-
+  Assemble requirements from one source into a structured SE requirements document, then refine it
+  with the user — branch on the gaps the assembler emits: none → approve/reject/revise; some → ask
+  clarifying questions and re-assimilate in a bounded loop until the gaps clear.
+
+# Caller-supplied inputs (referenced as ${workflow.inputs.<name>}).
+inputs:
+  sources_path:
+    type: string
+    required: true
+    materialize: file
+    description: >-
+      The requirement material to assimilate, passed BY REFERENCE. `materialize: file` lets the
+      dispatcher accept a raw string (a CLI brain-dump), a single file, or a directory of notes and
+      normalize them into one canonical file, threading only the short path into the run (dodging the
+      args-size truncation). assimilate-requirements Reads it.
+  output_dir:
+    type: string
+    required: false
+    description: Directory the assembled document is written to (the microskill defaults it to ".").
+  document_name:
+    type: string
+    required: false
+    description: Filename of the assembled document under output_dir (the microskill defaults it to requirements.md).
+  template_path:
+    type: string
+    required: false
+    materialize: file
+    description: >-
+      Optional custom SE requirements template (a different section skeleton), passed BY REFERENCE like
+      sources_path — `materialize: file` lets a caller hand a template file OR inline template content,
+      normalized to one canonical path. Absent → the
+      microskill's built-in template. Threaded to the first pass and every refinement re-pass so the
+      section set stays identical across rounds.
+  prior_answers_path:
+    type: string
+    required: false
+    materialize: file
+    description: >-
+      Optional path to previously-gathered gap answers, letting a caller seed / resume refinement.
+      Absent on a fresh run; the clarify node writes its own running ledger and re-feeds it the same way.
+  max_iterations:
+    type: integer
+    required: false
+    default: 5
+    description: Safety cap on refinement rounds inside the clarify node (the orchestrator-owned loop bound).
+  staging_dir:
+    type: string
+    required: false
+    default: .claude/.workflow-staging/refine-requirements
+    description: Scratch dir where the clarify node persists its accumulating gap-answer ledger (round-resumable).
+
+imports:
+  - microskills/assimilate-requirements
+
+nodes:
+  # Seg 1 (BACKGROUND): the heavy first pass. assimilate-requirements Reads the normalized sources
+  # (+ optional template + optional seed answers), assimilates them into the SE requirements document
+  # at output_dir/document_name, and returns the gaps array + gaps_count — the convergence signal. It
+  # Reads/Writes only (no AskUserQuestion) → classifies BACKGROUND.
+  - id: assemble
+    use: assimilate-requirements
+    depends_on: []
+    inputs:
+      sources_path: ${workflow.inputs.sources_path}
+      output_dir: ${workflow.inputs.output_dir}
+      document_name: ${workflow.inputs.document_name}
+      template_path: ${workflow.inputs.template_path}
+      prior_answers_path: ${workflow.inputs.prior_answers_path}
+    output_schema:
+      type: object
+      required: [document_path, gaps, gaps_count, summary]
+      properties:
+        document_path: { type: string }
+        gaps: { type: array, items: { type: object } }
+        gaps_count: { type: integer }
+        summary: { type: string }
+
+  # Checkpoint A (ORCHESTRATOR): gaps remain. Runs in the main loop, so AskUserQuestion + the
+  # microskill re-invocation are legal here. Owns the bounded human-in-the-loop refinement loop —
+  # NOT a declarative loop: block (a loop body can't hold an orchestrator node / can't pause for a
+  # human). Mutually exclusive with `approve` via the opposite gaps_count guard (advisory-fork).
+  - id: clarify
+    delegation: orchestrator
+    when: ${assemble.output.gaps_count > 0}
+    depends_on: [assemble]
+    prompt: >
+      The assembled requirements document is at ${assemble.output.document_path}; it has
+      ${assemble.output.gaps_count} open gap(s): ${assemble.output.gaps}. Refine it WITH the user.
+      You run in the MAIN LOOP, so you MAY call AskUserQuestion.
+
+      Maintain a gap-answer ledger at ${workflow.inputs.staging_dir}/answers.json (seed it from
+      ${workflow.inputs.prior_answers_path} if that is set). Iterate in ROUNDS, hard-capped at
+      ${workflow.inputs.max_iterations} rounds. EACH ROUND:
+      1. Read the current gaps. With none left, stop looping (converged).
+      2. Group the gaps by section / topic and ask the user with AskUserQuestion: at most 4 questions
+         per call (make several calls, highest-severity gaps first, when more remain); for every
+         question use the gap's question text, name its section, and supply 2-4 concrete options you
+         derive from the sources and the surrounding document. Do NOT add an "Other" option —
+         AskUserQuestion supplies free-form "Other" itself.
+      3. Record every answer (including free-form "Other" text and any "skip / decide later") into the
+         ledger under its gap id, and write the ledger file.
+      4. Re-invoke the assimilate-requirements microskill (run /assimilate-requirements) with
+         sources_path=${workflow.inputs.sources_path}, output_dir=${workflow.inputs.output_dir},
+         document_name=${workflow.inputs.document_name}, template_path=${workflow.inputs.template_path},
+         AND prior_answers_path set to the ledger (when an input is empty, the microskill's own default
+         applies, matching the first pass). It rewrites the document in place and returns a FRESH gaps
+         array + gaps_count. Re-run
+         this way (not by hand-editing) so gap detection stays on one code path and catches any new gap
+         an answer introduces.
+      Stop the loop once gaps_count reaches 0 (converged), the user chooses to stop early, or you reach
+      ${workflow.inputs.max_iterations} rounds. THEN present the completed document and ask the user
+      with AskUserQuestion to approve / reject / revise: approve → finalize; reject → stop, keep the
+      document as-is; revise → gather change notes, append them to the ledger, re-invoke
+      /assimilate-requirements once more, then re-present. RETURN
+      {choice, final_document_path, rounds, converged, remaining_gaps}.
+
+  # Checkpoint B (ORCHESTRATOR): no gaps from the first pass. Mutually exclusive with `clarify`
+  # (opposite gaps_count guard), so neither depends on the other — no skipped-dependency edge.
+  - id: approve
+    delegation: orchestrator
+    when: ${assemble.output.gaps_count == 0}
+    depends_on: [assemble]
+    prompt: >
+      The assembled requirements document at ${assemble.output.document_path} has no open gaps —
+      every template section is filled with no ambiguity or contradiction (summary:
+      ${assemble.output.summary}). Present it to the user and ask with AskUserQuestion to
+      approve / reject / revise: approve → finalize; reject → stop, keep the document as-is;
+      revise → gather change notes, write them to ${workflow.inputs.staging_dir}/answers.json and
+      re-invoke /assimilate-requirements once with sources_path=${workflow.inputs.sources_path},
+      output_dir=${workflow.inputs.output_dir}, document_name=${workflow.inputs.document_name},
+      template_path=${workflow.inputs.template_path}, and prior_answers_path set to that ledger, then
+      re-present. RETURN {choice, final_document_path, remaining_gaps}.
+
+# The refinement path is the primary result; like microskill-create's guarded `finalize`, output.from
+# may name a when-guarded node — it is null when the clean-first-pass `approve` branch ran instead.
+# Consumers must read the finished document from output_dir/document_name (BOTH branches always write
+# it there), NOT rely on this node output being non-null.
+output:
+  from: clarify

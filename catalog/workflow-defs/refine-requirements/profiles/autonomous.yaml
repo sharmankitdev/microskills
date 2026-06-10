@@ -1,0 +1,29 @@
+version: 1
+
+# Autonomous overlay — unattended / nested runs. CONTRADICTION worth stating: an autonomous run has
+# no human, so it cannot fill gaps by asking. This `patch`es both orchestrator branches (by id) to do
+# best-effort gap-fill from the SOURCES ONLY (never AskUserQuestion) and auto-accept, so the run never
+# pauses. Same compiled shape (segment[assemble] · clarify · approve); only the prompts change. The
+# gaps_count `when` guards are inherited from the base nodes, so the branch split is unchanged.
+nodes:
+  patch:
+    - id: clarify
+      prompt: >
+        Finalize the assembled requirements document at ${assemble.output.document_path} UNATTENDED —
+        there is NO human, so you MUST NOT call AskUserQuestion. It has ${assemble.output.gaps_count}
+        open gap(s): ${assemble.output.gaps}. Fill a gap ONLY when its answer is unambiguously
+        inferable from the sources at ${workflow.inputs.sources_path} or a safe documented default;
+        record what you inferred and why. For every gap you cannot fill confidently, leave that
+        section's content as an explicit "Open question for human review:" line quoting the gap's
+        question. Write the confidently-inferred answers to a ledger at
+        ${workflow.inputs.staging_dir}/answers.json and re-invoke /assimilate-requirements ONCE with
+        prior_answers_path set to that ledger to rewrite the document and re-emit gaps. Do exactly ONE
+        pass (no rounds — there is no one to ask). RETURN {choice: "auto-accepted",
+        final_document_path, rounds: 1, converged: <true only when the re-emitted gaps_count is 0>,
+        remaining_gaps}.
+    - id: approve
+      prompt: >
+        UNATTENDED finalize — do NOT call AskUserQuestion. The assembled document at
+        ${assemble.output.document_path} has no open gaps; accept it as-is. RETURN
+        {choice: "auto-accepted", final_document_path: ${assemble.output.document_path},
+        remaining_gaps: []}.
