@@ -54,6 +54,7 @@ def test_init_mints_run_dir_config_and_journal(tmp_path):
         "manifest_hash": "sha256:h1",
         "profile_used": "autonomous",
         "overrides": ["io.x=1", "io.y=2"],
+        "gate_mode": "interactive",
         "inputs": {},
     }
     # no stray tmp file left by the atomic write
@@ -65,6 +66,25 @@ def test_init_mints_run_dir_config_and_journal(tmp_path):
     assert lines[0]["profile"] == "autonomous"
     assert lines[0]["overrides"] == 2
     assert "ts" in lines[0] and lines[0]["v"] == 1
+
+
+def test_init_records_gate_mode_auto(tmp_path):
+    # The effective gate mode is COMPILE-INPUT PROVENANCE (the one compile
+    # input the old run-config did not record — rerun had to guess it via a
+    # recompile-retry heuristic). init records it verbatim.
+    run_dir, _ = init_run(tmp_path, "20260610T120000Z-aaaaaa", "sha256:h1",
+                          "--gate-mode", "auto")
+    config = json.loads((run_dir / "run-config.json").read_text())
+    assert config["gate_mode"] == "auto"
+    lines = journal_lines(run_dir)
+    assert lines[0]["event"] == "run_start" and lines[0]["gate_mode"] == "auto"
+
+
+def test_init_rejects_unknown_gate_mode(tmp_path):
+    rc, data, out, err = run("init", "--runs-dir", str(tmp_path / "runs"),
+                             "--manifest-hash", "sha256:h1",
+                             "--gate-mode", "yolo")
+    assert rc != 0
 
 
 def test_init_default_run_id_is_timestamped_and_unique(tmp_path):
@@ -364,6 +384,23 @@ def test_latest_without_hash_filter_returns_newest_committed_any_hash(tmp_path):
     assert data["manifest_hash"] == "sha256:h2"
     assert data["profile_used"] == "lite"
     assert data["overrides"] == ["io.x=1"]
+    assert data["gate_mode"] == "interactive"
+
+
+def test_latest_surfaces_recorded_gate_mode_auto(tmp_path):
+    # The rerun caller recompiles with the RECORDED gate mode directly — no
+    # recompile-retry heuristic — so the source scan must surface it.
+    run_dir, _ = init_run(tmp_path, "20260610T110000Z-bbbbbb", "sha256:h2",
+                          "--gate-mode", "auto")
+    state = {"manifest_hash": "sha256:h2", "step_index": 1,
+             "inputs": {}, "results": {"a": {"x": 1}}}
+    (run_dir / "s.tmp").write_text(json.dumps(state))
+    rc, *_ = run("append", "--run-dir", str(run_dir), "--event", "step_complete",
+                 "--commit-state", "s.tmp")
+    assert rc == 0
+    rc, data, out, err = run("latest", "--runs-dir", str(tmp_path / "runs"))
+    assert rc == 0, out + err
+    assert data["found"] is True and data["gate_mode"] == "auto"
 
 
 def test_latest_resume_scan_still_filters_on_hash(tmp_path):
@@ -405,9 +442,10 @@ def write_manifest(tmp, manifest_hash="sha256:h1"):
 
 def make_source_run(tmp, run_id="20260610T100000Z-source", step_index=4,
                     results=RERUN_RESULTS, inputs=RERUN_INPUTS,
-                    manifest_hash="sha256:h1"):
+                    manifest_hash="sha256:h1", init_extra=()):
     run_dir, _ = init_run(tmp, run_id, manifest_hash,
-                          "--profile", "lite", "--override", "io.x=1")
+                          "--profile", "lite", "--override", "io.x=1",
+                          *init_extra)
     (run_dir / "in.json").write_text(json.dumps(inputs))
     rc, *_ = run("record-inputs", "--run-dir", str(run_dir),
                  "--inputs-file", "in.json")
@@ -457,6 +495,7 @@ def test_rerun_seeds_pre_from_results_replays_gates_and_flags_confirms(tmp_path)
         "manifest_hash": "sha256:h1",
         "profile_used": "lite",            # provenance copied from the source
         "overrides": ["io.x=1"],
+        "gate_mode": "interactive",        # gate mode rides the copy verbatim
         "inputs": RERUN_INPUTS,
         "rerun_of": "20260610T100000Z-source",
         "from_step_index": 2,
@@ -474,6 +513,18 @@ def test_rerun_seeds_pre_from_results_replays_gates_and_flags_confirms(tmp_path)
     assert src_state["step_index"] == 4 and src_state["results"] == RERUN_RESULTS
     assert [l["event"] for l in journal_lines(src)] == [
         "run_start", "inputs_recorded", "step_complete"]
+
+
+def test_rerun_copies_recorded_gate_mode(tmp_path):
+    # A rerun reproduces the recorded compile, gate mode included — the new
+    # run-config carries the source's gate_mode verbatim so ITS provenance is
+    # complete too.
+    make_source_run(tmp_path, init_extra=("--gate-mode", "auto"))
+    rc, data, out, err = do_rerun(tmp_path, "--from", "2")
+    assert rc == 0, out + err
+    new_config = json.loads(
+        (Path(data["run_dir"]) / "run-config.json").read_text())
+    assert new_config["gate_mode"] == "auto"
 
 
 def test_rerun_snaps_mid_segment_node_to_segment_start(tmp_path):

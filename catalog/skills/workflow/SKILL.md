@@ -80,11 +80,12 @@ checkpoint in the main loop (where `AskUserQuestion` works), and threads outputs
    - `found: false`, or the user picks "start fresh" → continue with Setup step 6 (start at `i = 0`;
      any prior run dirs are left in place as provenance).
 6. **Mint the run** — run via Bash:
-   `.claude/scripts/run-journal init --runs-dir '.claude/workflow-defs/<name>/.compiled/runs' --manifest-hash '<manifest.manifest_hash>' [--profile '<profile>'] [--override '<k>=<v>' ...]`
-   (pass `--profile` / each `--override` exactly as passed to compile in step 3, so the run's
-   provenance is recorded verbatim). It mints a fresh `run_id`, creates
+   `.claude/scripts/run-journal init --runs-dir '.claude/workflow-defs/<name>/.compiled/runs' --manifest-hash '<manifest.manifest_hash>' [--profile '<profile>'] [--override '<k>=<v>' ...] [--gate-mode auto when manifest.gate_mode == "auto"]`
+   (pass `--profile` / each `--override` exactly as passed to compile in step 3, and `--gate-mode
+   auto` when the manifest carries `gate_mode: "auto"`, so the run's FULL compile provenance —
+   gate mode included — is recorded verbatim). It mints a fresh `run_id`, creates
    `<run_dir>/` + `<run_dir>/run-inputs/`, writes `<run_dir>/run-config.json`
-   (`{run_id, manifest_hash, profile_used, overrides, inputs}`), and opens `<run_dir>/journal.jsonl`
+   (`{run_id, manifest_hash, profile_used, overrides, gate_mode, inputs}`), and opens `<run_dir>/journal.jsonl`
    with a `run_start` event. Parse the JSON output and note `run_dir` — every runtime file below
    (run-state, run-inputs, journal) lives under it. (`run-journal report --run-dir '<run_dir>'`
    renders the journal human-readably for a post-mortem; `runs/` isolates *runtime* state only — two
@@ -184,17 +185,17 @@ requirement) needs a changed input, which is a NEW run, never a rerun.
    `.claude/scripts/run-journal latest --runs-dir '.claude/workflow-defs/<name>/.compiled/runs'`
    — no `--manifest-hash`, no `--steps`: the newest run with a committed run-state, FINISHED runs
    included (a finished run is rerun's normal case). `found: false` → stop: nothing recorded to
-   rerun. Note its `run_id`, `manifest_hash`, `profile_used`, and `overrides`. A non-null
-   `failed_step` caps the from-point: that step failed its IO contract, so the seeder (step 3)
-   refuses any `--from` beyond it — tell the user up front.
+   rerun. Note its `run_id`, `manifest_hash`, `profile_used`, `overrides`, and `gate_mode`. A
+   non-null `failed_step` caps the from-point: that step failed its IO contract, so the seeder
+   (step 3) refuses any `--from` beyond it — tell the user up front.
 2. **Recompile with the RECORDED provenance** — the Setup step 3 compile, but passing
-   `--profile '<profile_used>'` and each recorded override verbatim (never this invocation's own —
-   a rerun reproduces the recorded compile). If the fresh summary's `manifest_hash` differs from
-   the recorded one, retry ONCE adding `--gate-mode auto` (the one compile input `run-config.json`
-   does not record — the recorded run may have been headless); still different → **STOP: rerun
-   REQUIRES manifest_hash equality.** The def, registry, or profile changed since the recorded
-   run, so its stored node outputs no longer line up — start a fresh run instead. Never improvise
-   a partial reuse.
+   `--profile '<profile_used>'`, each recorded override verbatim, and `--gate-mode auto` when the
+   recorded `gate_mode` is `"auto"` (never this invocation's own flags — a rerun reproduces the
+   recorded compile, and `run-config.json` records every compile input including the gate mode).
+   If the fresh summary's `manifest_hash` differs from the recorded one → **STOP: rerun REQUIRES
+   manifest_hash equality.** The def, registry, or profile changed since the recorded run, so its
+   stored node outputs no longer line up — start a fresh run instead. Never improvise a partial
+   reuse, and never retry the compile with different flags to chase the hash.
 3. **Seed the rerun in code** — run via Bash:
    `.claude/scripts/run-journal rerun --runs-dir '.claude/workflow-defs/<name>/.compiled/runs'
    --manifest '.claude/workflow-defs/<name>/.compiled/manifest.json' --source-run '<run_id>'
@@ -507,9 +508,10 @@ already covered the play-by-play — don't re-summarize each segment here.
 - **Gate abandoned** — stop cleanly, report partial state.
 - **No recorded run (rerun)** — the `run-journal latest` source scan found nothing committed
   under `runs/`. Stop: there is nothing to rerun.
-- **Rerun hash mismatch** — the fresh compile's `manifest_hash` differs from the recorded run's,
-  even after the one `--gate-mode auto` retry. Stop — rerun requires equality; a changed
-  def/registry/profile means the recorded outputs no longer line up. Start a fresh run.
+- **Rerun hash mismatch** — the fresh compile's `manifest_hash` differs from the recorded run's
+  (the recompile already used the recorded profile/overrides/gate_mode from `run-config.json`).
+  Stop — rerun requires equality; a changed def/registry/profile means the recorded outputs no
+  longer line up. Start a fresh run.
 - **Rerun seed failed** — `run-journal rerun` exits non-zero (unknown `--from` selector,
   from-point beyond the recorded progress or past a recorded `failed_step`, a missing recorded
   result, a pre-shape run-state). Surface its `error`, stop — never hand-assemble the seed.

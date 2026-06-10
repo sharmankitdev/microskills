@@ -230,6 +230,10 @@ class Harness:
                 "--run-id", RUN_ID]
         if self.profile:
             args += ["--profile", self.profile]
+        # Mirror the dispatcher's Setup step 6: the effective gate mode is
+        # recorded into run-config.json as compile provenance.
+        if self.auto:
+            args += ["--gate-mode", "auto"]
         data = kernel("run-journal init", RUN_JOURNAL, *args)
         self.run_dir = Path(data["run_dir"]).resolve()
         self.run_state = self.run_dir / "run-state.json"

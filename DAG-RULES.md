@@ -1281,9 +1281,12 @@ chronological) via `run-journal init` and namespaces ALL of a run's state under
 `.compiled/runs/<run-id>/`:
 
 - **`run-config.json`** — the run's provenance record: `{v, run_id, manifest_hash, profile_used,
-  overrides[], inputs}` (additively extensible). The applied `--override` flags and the exact
-  gathered input set are persisted here — sequential reruns no longer destroy provenance, and two
-  concurrent runs of the same def no longer clobber one shared state file.
+  overrides[], gate_mode, inputs}` (additively extensible; `gate_mode` is the v1 additive
+  extension). The applied `--override` flags, the **effective gate mode**
+  (`"interactive"|"auto"` — so a rerun reproduces the recorded compile directly, with no
+  recompile-retry guessing) and the exact gathered input set are persisted here — sequential
+  reruns no longer destroy provenance, and two concurrent runs of the same def no longer clobber
+  one shared state file.
 - **`run-state.json`** — the resume checkpoint, `{manifest_hash, step_index, inputs, results}`,
   committed **atomically** (the dispatcher Writes a `.tmp` sibling; `run-journal append
   --commit-state` promotes it via `os.replace` — the harness-sync write protocol — after verifying
@@ -1332,8 +1335,9 @@ and, like `runs/`, never deleted.)
 **Rerun — `/workflow <name> rerun [--from <step|node>]`.** Deterministic partial re-execution of
 a recorded run (finished or not) on its **frozen recorded inputs**. The dispatcher locates the
 source run (`run-journal latest` with no `--manifest-hash` — newest committed run, any hash,
-finished included), recompiles with the run's recorded `profile_used`/`overrides` from
-`run-config.json`, and `run-journal rerun` then **REQUIRES `manifest_hash` equality** between the
+finished included), recompiles with the run's recorded `profile_used`/`overrides`/`gate_mode` from
+`run-config.json` (every compile input is recorded — the recompile is exact, never a
+flag-guessing retry), and `run-journal rerun` then **REQUIRES `manifest_hash` equality** between the
 fresh compile and the recorded run — a mismatch is a hard stop (the def/registry/profile changed;
 the stored node outputs no longer line up), never a partial reuse. A recorded `failed_step` **caps
 the from-point**: a step that failed its IO contract has no trustworthy result, so seeding from
