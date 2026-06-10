@@ -20,6 +20,14 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Install dependencies
         run: python -m pip install --upgrade pip pyyaml jsonschema pytest
+      # Node is required by the run-step eval kernel (checkpoint expressions run
+      # as the compiler's own JS) and by the golden-run harness (run-segment-host
+      # executes compiled segments under a mocked engine). Tests that need node
+      # skip cleanly when it is absent — pin it here so they actually run in CI.
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
       - name: Rebuild runtime from catalog
         run: catalog/scripts/initialize-harness --apply --project-root . --catalog ./catalog
       # Compile-closure drift gate: recompile every catalog def IN MEMORY (--check
