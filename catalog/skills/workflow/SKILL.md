@@ -65,7 +65,12 @@ checkpoint in the main loop (where `AskUserQuestion` works), and threads outputs
    mode never ask: skip the offer and start fresh at step 6** (prior run dirs stay as provenance; an
    auto compile has a distinct manifest_hash anyway, so interactive state never matches). Parse the JSON:
    - `found: true` → **offer to resume** via `AskUserQuestion` ("Resume run {run_id} from step
-     {step_index+1}, or start fresh?"). On resume: adopt that `run_dir` as this run's directory, seed
+     {step_index+1}, or start fresh?"). If the output carries a **non-null `failed_step`**, the
+     offer must say so: the run's last attempt at that step FAILED its post-step IO check (its
+     result was never committed), so resuming re-runs that step — e.g. "Resume run {run_id}? Its
+     last attempt at step {failed_step+1} failed the IO check; resuming re-runs it." (The scan
+     itself never offers a poisoned record whose progress advanced past a `failed_step`.) On
+     resume: adopt that `run_dir` as this run's directory, seed
      `inputs` and `results` from the `inputs` / `results` maps in `<run_dir>/run-state.json` — the
      committed state carries both, and it is the record the `run-step` kernel reads (skip Setup
      steps 6-8 — the run's inputs were already gathered and recorded; re-using completed work avoids
@@ -179,7 +184,9 @@ requirement) needs a changed input, which is a NEW run, never a rerun.
    `.claude/scripts/run-journal latest --runs-dir '.claude/workflow-defs/<name>/.compiled/runs'`
    — no `--manifest-hash`, no `--steps`: the newest run with a committed run-state, FINISHED runs
    included (a finished run is rerun's normal case). `found: false` → stop: nothing recorded to
-   rerun. Note its `run_id`, `manifest_hash`, `profile_used`, and `overrides`.
+   rerun. Note its `run_id`, `manifest_hash`, `profile_used`, and `overrides`. A non-null
+   `failed_step` caps the from-point: that step failed its IO contract, so the seeder (step 3)
+   refuses any `--from` beyond it — tell the user up front.
 2. **Recompile with the RECORDED provenance** — the Setup step 3 compile, but passing
    `--profile '<profile_used>'` and each recorded override verbatim (never this invocation's own —
    a rerun reproduces the recorded compile). If the fresh summary's `manifest_hash` differs from
@@ -231,33 +238,42 @@ and track the 0-based position `i` as you walk. **Before running each step, prin
 A skipped step (a `warn` gate, or an orchestrator node whose `when` is false) still gets a header, marked skipped.
 Walk `manifest.steps` in order (starting at the resume position `i` from the Setup resume check, default 0):
 
-**Persist run-state + journal after each step, then check the step's IO.** After a step completes
-(and its output is stored into `results`), checkpoint in three moves:
+**Check the step's IO, then persist run-state + journal — the check gates the commit.** After a
+step completes (and its output is stored into `results`), checkpoint in three moves:
 1. Use the **Write tool** to write
    `{ "manifest_hash": manifest.manifest_hash, "step_index": <the index of the NEXT step to run>, "inputs": inputs, "results": results }`
    to `<run_dir>/run-state.json.tmp` (a structured tool parameter — node outputs never ride a shell
    command). All four keys are required — `run-step` reads args and checkpoint expressions from
-   this committed state, so `inputs` must always ride with it.
-2. Run ONE Bash call:
+   the committed state, so `inputs` must always ride with it. This is only the CANDIDATE state —
+   it is not committed until move 3.
+2. **Pre-commit IO check** — run ONE Bash call:
+   `.claude/scripts/check-step-io --manifest '.claude/workflow-defs/<name>/.compiled/manifest.json' --run-state '<run_dir>/run-state.json.tmp' --step <i>`
+   It receives only PATHS (node outputs never ride argv) and validates every value this step
+   produced — read from the CANDIDATE state — against the per-node `io` contract on the manifest
+   step (`{schema, guarded, fan_out}`: the node's effective output_schema; `fan_out` → an array of
+   that schema; a guarded node's `null` is a legal skip; an unguarded `null`/`{}` against a
+   required-props schema = probable native-engine truncation or subagent fabrication).
+   **Non-zero exit → STOP WITHOUT COMMITTING** — the failed output must never enter the committed,
+   resumable record (the committed run-state still points at step `<i>`, so a later resume re-runs
+   the failed step instead of threading the corrupt value forward). Surface the JSON `errors`
+   readably, then journal the failure WITH the failure stamp, ONE Bash call:
+   `.claude/scripts/run-journal append --run-dir '<run_dir>' --event run_error --step-index <i> --outcome error --label '<short reason>' --mark-failed-step <i>`
+   (it stamps `failed_step: <i>` into the still-committed previous run-state — `latest` surfaces it
+   in the resume offer and `rerun` refuses to seed past it — and never touches the tmp file: leave
+   `run-state.json.tmp` in place as evidence). Do not run the next step, and never re-synthesize or
+   repair the failed output yourself (re-running the producing step after a fix is the human's
+   call). Exit 0 → continue; surface any `warnings` (e.g. an oversized result a later segment
+   threads through `args` — the compiled args guard is the enforcement point there; the warning
+   just names the producing node early).
+3. **Commit + journal** — run ONE Bash call:
    `.claude/scripts/run-journal append --run-dir '<run_dir>' --event step_complete --step-index <i> --label '<the step header label>' --commit-state run-state.json.tmp`
    — for a gate step also pass `--gate '<gate.id>' --choice '<the recorded choice label>'`; for a
    skipped step (a false `when`, or a warn gate passed through) add `--outcome skipped`. The helper
    atomically promotes the tmp file to `<run_dir>/run-state.json` (tmp + `os.replace` — a crash never
-   leaves a half-written state) and appends one machine-readable line to `<run_dir>/journal.jsonl`,
-   recording its own timestamp and computing byte sizes by reading the committed state itself — content
-   never rides argv.
-3. **Post-step IO check** — run ONE Bash call:
-   `.claude/scripts/check-step-io --manifest '.claude/workflow-defs/<name>/.compiled/manifest.json' --run-state '<run_dir>/run-state.json' --step <i>`
-   It receives only PATHS (node outputs never ride argv) and validates every value this step
-   produced against the per-node `io` contract on the manifest step (`{schema, guarded, fan_out}`:
-   the node's effective output_schema; `fan_out` → an array of that schema; a guarded node's `null`
-   is a legal skip; an unguarded `null`/`{}` against a required-props schema = probable
-   native-engine truncation or subagent fabrication). **Non-zero exit → STOP**: surface the JSON
-   `errors` readably, journal a `run_error` (see below), and do not run the next step — never
-   re-synthesize or repair the failed output yourself (re-running the producing step after a fix is
-   the human's call). Exit 0 → continue; surface any `warnings` (e.g. an oversized result a later
-   segment threads through `args` — the compiled args guard is the enforcement point there; the
-   warning just names the producing node early).
+   leaves a half-written state; a passing re-run of a previously failed step clears its `failed_step`
+   stamp, because the four-key candidate replaces the state wholesale) and appends one
+   machine-readable line to `<run_dir>/journal.jsonl`, recording its own timestamp and computing
+   byte sizes by reading the committed state itself — content never rides argv.
 This is the dispatcher's in-memory `results{}` checkpointed to disk so a run that dies mid-way can
 resume (see the Setup resume check) instead of restarting from step 0 and re-running expensive segments.
 It is dispatcher runtime state, quarantined from the compiled bytes — the compiler never reads `runs/`
@@ -267,8 +283,9 @@ rerun's seed: a later `/workflow <name> rerun` freezes this run's recorded input
 materialized values reference this dir's `run-inputs/` files by absolute path — deleting a
 finished run dir breaks reruns of it (the `latest` resume scan skips finished runs via `--steps`,
 so retention costs nothing at resume time). Do not let journaling block the run. On a stop
-(segment error, failed IO check, abandoned gate, unresolvable input), record it before stopping:
-`.claude/scripts/run-journal append --run-dir '<run_dir>' --event run_error --step-index <i> --outcome error --label '<short reason>'`.
+(segment error, abandoned gate, unresolvable input), record it before stopping:
+`.claude/scripts/run-journal append --run-dir '<run_dir>' --event run_error --step-index <i> --outcome error --label '<short reason>'`
+(a failed IO check uses the move-2 form above, with `--mark-failed-step <i>`).
 
 ### `kind: "segment"`
 1. **Build `args` in code — never assemble it in your head.** Run ONE Bash call:
@@ -474,9 +491,11 @@ already covered the play-by-play — don't re-summarize each segment here.
 - **Unknown workflow** — no `WORKFLOW.yaml` at `.claude/workflow-defs/<name>/`. Stop.
 - **Compile error** — `compile-workflow` non-zero exit. Surface `error` / `schema_errors`, stop.
 - **Segment error** — a segment returns an error (fail-loud node). Stop, surface it, do not proceed.
-- **Step IO check failed** — `check-step-io` exits non-zero after a step (schema violation, missing
-  result, or the probable-truncation/fabrication signature). Stop, surface its `errors`, never
-  synthesize a replacement output.
+- **Step IO check failed** — `check-step-io` exits non-zero on the CANDIDATE state after a step
+  (schema violation, missing result, or the probable-truncation/fabrication signature). Stop
+  WITHOUT committing: journal `run_error` with `--mark-failed-step <i>`, surface the `errors`,
+  never synthesize a replacement output. The committed run-state still points at the failed step,
+  so a later resume re-runs it — the corrupt value can never thread forward.
 - **run-step failed** — `run-step args` or `run-step eval` exits non-zero (missing recorded result,
   ungathered required input, oversized args payload, a throwing expression, an uncovered nested-child
   required input, or a missing `node` binary). Journal `run_error`, surface its `errors`/`error`,
@@ -489,8 +508,8 @@ already covered the play-by-play — don't re-summarize each segment here.
   even after the one `--gate-mode auto` retry. Stop — rerun requires equality; a changed
   def/registry/profile means the recorded outputs no longer line up. Start a fresh run.
 - **Rerun seed failed** — `run-journal rerun` exits non-zero (unknown `--from` selector,
-  from-point beyond the recorded progress, a missing recorded result, a pre-shape run-state).
-  Surface its `error`, stop — never hand-assemble the seed.
+  from-point beyond the recorded progress or past a recorded `failed_step`, a missing recorded
+  result, a pre-shape run-state). Surface its `error`, stop — never hand-assemble the seed.
 - **Rerun re-execution declined** — the human declined a `confirm_steps` re-execution. Journal
   `run_error` naming the step, stop cleanly.
 - **Headless gate stop** — auto mode reached a gate with `on_headless: fail` (or a pausing gate with

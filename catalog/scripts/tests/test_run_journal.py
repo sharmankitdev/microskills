@@ -586,6 +586,157 @@ def test_rerun_run_is_resumable_via_latest(tmp_path):
     assert data["step_index"] == 2
 
 
+# --------------------------------------- failed IO checks (--mark-failed-step)
+#
+# A hard check-step-io failure must never be silently resumable past the failed
+# check: the dispatcher never commits the failing candidate state; instead it
+# stamps failed_step into the STILL-COMMITTED previous state. latest surfaces
+# the stamp (and refuses a poisoned record committed past it); rerun refuses a
+# from-point beyond it.
+
+def test_append_mark_failed_step_stamps_state_and_journals(tmp_path):
+    run_dir, _ = init_run(tmp_path)
+    state = {"manifest_hash": "sha256:h1", "step_index": 2,
+             "inputs": {"d": "/d.cat"}, "results": {"a": {"x": 1}}}
+    (run_dir / "s.tmp").write_text(json.dumps(state))
+    rc, *_ = run("append", "--run-dir", str(run_dir), "--event", "step_complete",
+                 "--step-index", "1", "--commit-state", "s.tmp")
+    assert rc == 0
+    rc, data, out, err = run("append", "--run-dir", str(run_dir),
+                             "--event", "run_error", "--step-index", "2",
+                             "--outcome", "error", "--label", "IO check failed",
+                             "--mark-failed-step", "2")
+    assert rc == 0, out + err
+    got = json.loads((run_dir / "run-state.json").read_text())
+    # ONLY the stamp is added — progress, inputs, results untouched
+    assert got == {**state, "failed_step": 2}
+    line = journal_lines(run_dir)[-1]
+    assert line["event"] == "run_error"
+    assert line["failed_step"] == 2 and line["outcome"] == "error"
+
+
+def test_append_mark_failed_step_requires_committed_state(tmp_path):
+    run_dir, _ = init_run(tmp_path)
+    rc, data, *_ = run("append", "--run-dir", str(run_dir),
+                       "--event", "run_error", "--mark-failed-step", "0")
+    assert rc != 0
+    assert "no committed run-state" in data["error"]
+
+
+def test_append_mark_failed_step_rejects_commit_state(tmp_path):
+    # A failed IO check must NEVER commit the candidate — combining the flags
+    # is a contract violation, refused before anything is written.
+    run_dir, _ = init_run(tmp_path)
+    state = {"manifest_hash": "sha256:h1", "step_index": 1,
+             "inputs": {}, "results": {"a": None}}
+    (run_dir / "run-state.json.tmp").write_text(json.dumps(state))
+    rc, data, *_ = run("append", "--run-dir", str(run_dir),
+                       "--event", "run_error", "--mark-failed-step", "0",
+                       "--commit-state", "run-state.json.tmp")
+    assert rc != 0
+    assert "never commit" in data["error"]
+    assert not (run_dir / "run-state.json").exists()
+    assert (run_dir / "run-state.json.tmp").exists()  # candidate left as evidence
+
+
+def test_successful_recommit_clears_failed_step(tmp_path):
+    # Resume re-runs the failed step; its PASSING commit promotes the four-key
+    # candidate wholesale, clearing the stamp — the run is healthy again.
+    run_dir, _ = init_run(tmp_path)
+    state = {"manifest_hash": "sha256:h1", "step_index": 1,
+             "inputs": {}, "results": {"a": {"x": 1}}}
+    (run_dir / "s.tmp").write_text(json.dumps(state))
+    rc, *_ = run("append", "--run-dir", str(run_dir), "--event", "step_complete",
+                 "--step-index", "0", "--commit-state", "s.tmp")
+    assert rc == 0
+    rc, *_ = run("append", "--run-dir", str(run_dir), "--event", "run_error",
+                 "--outcome", "error", "--mark-failed-step", "1")
+    assert rc == 0
+    assert json.loads((run_dir / "run-state.json").read_text())["failed_step"] == 1
+    good = {"manifest_hash": "sha256:h1", "step_index": 2,
+            "inputs": {}, "results": {"a": {"x": 1}, "b": {"y": 2}}}
+    (run_dir / "s.tmp").write_text(json.dumps(good))
+    rc, *_ = run("append", "--run-dir", str(run_dir), "--event", "step_complete",
+                 "--step-index", "1", "--commit-state", "s.tmp")
+    assert rc == 0
+    assert json.loads((run_dir / "run-state.json").read_text()) == good
+
+
+def test_latest_surfaces_failed_step_in_offer(tmp_path):
+    # The normal failure shape (step_index == failed_step) IS offered — resume
+    # re-runs the failed step — with failed_step surfaced for the offer text.
+    seed_run(tmp_path, "20260610T100000Z-aaaaaa", "sha256:h1", 1)
+    rc, *_ = run("append", "--run-dir",
+                 str(tmp_path / "runs" / "20260610T100000Z-aaaaaa"),
+                 "--event", "run_error", "--outcome", "error",
+                 "--mark-failed-step", "1")
+    assert rc == 0
+    rc, data, out, err = run("latest", "--runs-dir", str(tmp_path / "runs"),
+                             "--manifest-hash", "sha256:h1")
+    assert rc == 0, out + err
+    assert data["found"] is True
+    assert data["run_id"] == "20260610T100000Z-aaaaaa"
+    assert data["step_index"] == 1
+    assert data["failed_step"] == 1
+    # a healthy run surfaces failed_step: null (the dispatcher branches on it)
+    seed_run(tmp_path, "20260610T110000Z-bbbbbb", "sha256:h1", 2)
+    rc, data, *_ = run("latest", "--runs-dir", str(tmp_path / "runs"),
+                       "--manifest-hash", "sha256:h1")
+    assert rc == 0 and data["run_id"] == "20260610T110000Z-bbbbbb"
+    assert data["failed_step"] is None
+
+
+def test_latest_refuses_poisoned_record_committed_past_failed_step(tmp_path):
+    # step_index > failed_step: no valid protocol commits past a failed IO
+    # check — the stored results beyond the failure are untrustworthy. Never
+    # offered, for resume OR as a rerun source.
+    seed_run(tmp_path, "20260610T110000Z-bbbbbb", "sha256:h1", 3)
+    rc, *_ = run("append", "--run-dir",
+                 str(tmp_path / "runs" / "20260610T110000Z-bbbbbb"),
+                 "--event", "run_error", "--outcome", "error",
+                 "--mark-failed-step", "1")
+    assert rc == 0
+    rc, data, *_ = run("latest", "--runs-dir", str(tmp_path / "runs"),
+                       "--manifest-hash", "sha256:h1")
+    assert rc == 0 and data["found"] is False
+    assert data["skipped"] == ["20260610T110000Z-bbbbbb"]
+    # the rerun source scan (no --manifest-hash) refuses it too
+    rc, data, *_ = run("latest", "--runs-dir", str(tmp_path / "runs"))
+    assert rc == 0 and data["found"] is False
+    # an older healthy run is still found behind it
+    seed_run(tmp_path, "20260610T100000Z-aaaaaa", "sha256:h1", 1)
+    rc, data, *_ = run("latest", "--runs-dir", str(tmp_path / "runs"),
+                       "--manifest-hash", "sha256:h1")
+    assert rc == 0 and data["found"] is True
+    assert data["run_id"] == "20260610T100000Z-aaaaaa"
+
+
+def test_rerun_refuses_from_beyond_failed_step(tmp_path):
+    # A recorded failed_step CAPS the from-point: results at/after a step that
+    # failed its IO contract can never seed a rerun.
+    make_source_run(tmp_path)  # full record through step 4
+    rc, *_ = run("append", "--run-dir",
+                 str(tmp_path / "runs" / "20260610T100000Z-source"),
+                 "--event", "run_error", "--outcome", "error",
+                 "--mark-failed-step", "2")
+    assert rc == 0
+    rc, data, *_ = do_rerun(tmp_path, "--from", "3")
+    assert rc == 1
+    assert "failed its post-step IO contract" in data["error"]
+    assert "failed_step: 2" in data["error"]
+    # no new run dir was minted
+    assert sorted(p.name for p in (tmp_path / "runs").iterdir()) == [
+        "20260610T100000Z-source"]
+    # --from AT the failed step is legal: it re-runs the failed step, seeding
+    # only the trustworthy pre-failure results (c, fin dropped)
+    rc, data, out, err = do_rerun(tmp_path, "--from", "2")
+    assert rc == 0, out + err
+    assert data["seeded_results"] == ["a", "b", "g1"]
+    state = json.loads((Path(data["run_dir"]) / "run-state.json").read_text())
+    # the NEW run never inherits the stamp (it re-produces the failed step)
+    assert "failed_step" not in state
+
+
 # --------------------------------------------------------- project / report
 
 def make_played_run(tmp, run_id):

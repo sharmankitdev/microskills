@@ -29,9 +29,11 @@ head:
     stop/abandon choice stops the run cleanly. A revise-style choice is NOT
     supported (the revise loop folds human notes into an input — there is no
     human here): fail loud.
-  - after every step: run-state is committed via run-journal append
-    --commit-state and validated via check-step-io — the dispatcher's
-    post-step IO gate runs for real.
+  - after every step: the CANDIDATE run-state (run-state.json.tmp) is
+    validated via check-step-io BEFORE run-journal append --commit-state
+    promotes it — the dispatcher's pre-commit IO gate runs for real (a
+    failed check stamps failed_step into the committed state and stops;
+    the candidate is never committed).
 
 SCENARIO file (JSON; sibling paths resolve against its directory):
     {
@@ -280,8 +282,11 @@ class Harness:
             f.write(json.dumps(line, sort_keys=True) + "\n")
 
     def commit_step(self, i, label, gate=None, choice=None, outcome=None):
-        """The dispatcher's three-move post-step checkpoint: commit run-state
-        via run-journal append, then gate the stored results via check-step-io."""
+        """The dispatcher's three-move post-step checkpoint: write the
+        CANDIDATE run-state, gate it via check-step-io BEFORE committing,
+        then commit via run-journal append --commit-state. A failed check
+        never commits the candidate — it stamps failed_step into the
+        still-committed previous state and stops."""
         tmp = self.run_dir / "run-state.json.tmp"
         tmp.write_text(json.dumps({
             "manifest_hash": self.manifest["manifest_hash"],
@@ -289,6 +294,19 @@ class Harness:
             "inputs": self.inputs,
             "results": self.results,
         }, indent=2, sort_keys=True) + "\n")
+        rc, data, out, err = run_py(CHECK_STEP_IO,
+                                    "--manifest", str(self.manifest_path),
+                                    "--run-state", str(tmp),
+                                    "--step", str(i))
+        if rc != 0:
+            run_py(RUN_JOURNAL, "append", "--run-dir", str(self.run_dir),
+                   "--event", "run_error", "--step-index", str(i),
+                   "--outcome", "error", "--label", f"IO check failed: {label}",
+                   "--mark-failed-step", str(i))
+            die(f"check-step-io failed after step {i} ({label}) — candidate "
+                f"state not committed: "
+                f"{json.dumps((data or {}).get('errors') or out[:800])}",
+                1 if rc == 1 else 2)
         args = ["append", "--run-dir", str(self.run_dir),
                 "--event", "step_complete", "--step-index", str(i),
                 "--label", label, "--commit-state", "run-state.json.tmp"]
@@ -299,14 +317,6 @@ class Harness:
         if outcome is not None:
             args += ["--outcome", outcome]
         kernel("run-journal append", RUN_JOURNAL, *args)
-        rc, data, out, err = run_py(CHECK_STEP_IO,
-                                    "--manifest", str(self.manifest_path),
-                                    "--run-state", str(self.run_state),
-                                    "--step", str(i))
-        if rc != 0:
-            die(f"check-step-io failed after step {i} ({label}): "
-                f"{json.dumps((data or {}).get('errors') or out[:800])}",
-                1 if rc == 1 else 2)
 
     # ----------------------------------------------------------- steps
     def run_segment(self, i, step):

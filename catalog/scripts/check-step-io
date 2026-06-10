@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """check-step-io — the workflow dispatcher's post-step IO validator.
 
-After each manifest step completes (and the dispatcher has committed the run's
-run-state.json via run-journal), this checker validates every value the step
-PRODUCED against the per-node `io` contract compile-workflow records on the
-manifest step:
+After each manifest step completes, the dispatcher writes the CANDIDATE
+run-state (the four-key {manifest_hash, step_index, inputs, results} shape,
+step_index already advanced) to `<run_dir>/run-state.json.tmp` and runs this
+checker against THAT file — BEFORE `run-journal append --commit-state`
+promotes it. A hard failure here means the candidate is never committed: the
+run's resumable record still points at the failed step (the dispatcher stamps
+`failed_step` via `run-journal append --mark-failed-step`), so a resume
+re-runs the failed step instead of silently threading the corrupt value into
+downstream segments. The checker validates every value the step PRODUCED
+against the per-node `io` contract compile-workflow records on the manifest
+step:
 
     io: { <node-id>: { schema, guarded, fan_out } }
 
@@ -43,10 +50,11 @@ exists to fix. ENFORCEMENT lives in the compiled segment's fail-loud args guard
 it.
 
 PATHS-ONLY CONTRACT (injection doctrine). Flags carry the manifest path, the
-run-state path, and a step index — node output CONTENT never rides argv (where
-it would be shell-quoted, truncated, or logged). The checker reads both files
-itself. Integrity gate: when both files carry manifest_hash and they differ,
-the run-state belongs to a different compile — environment error, not a pass.
+run-state path (normally the CANDIDATE `run-state.json.tmp`), and a step index
+— node output CONTENT never rides argv (where it would be shell-quoted,
+truncated, or logged). The checker reads both files itself. Integrity gate:
+when both files carry manifest_hash and they differ, the run-state belongs to
+a different compile — environment error, not a pass.
 
 Usage:
   check-step-io --manifest <path> --run-state <path> --step <index> [--budget N]

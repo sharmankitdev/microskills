@@ -1164,15 +1164,22 @@ For each manifest step in order:
   with its own default.** Depth ≤ 1 is compiler-guaranteed, so recursion is bounded. Store the
   child's `output.from` result into `results[node]`.
 
-**After every step** (once the run-state checkpoint is committed) the dispatcher runs
-`check-step-io --manifest <…/manifest.json> --run-state <run_dir>/run-state.json --step <i>` —
+**After every step, BEFORE its run-state checkpoint commits,** the dispatcher writes the CANDIDATE
+state to `<run_dir>/run-state.json.tmp` and runs
+`check-step-io --manifest <…/manifest.json> --run-state <run_dir>/run-state.json.tmp --step <i>` —
 **paths only**, node outputs never ride argv — which validates each produced value against the
 per-node `io: {schema, guarded, fan_out}` contract the manifest step carries (the node's effective
 `output_schema`; `fan_out` → an array of that schema; a **guarded null is a legal skip**; an
 **unguarded `null`/`{}` against a required-props schema is a hard "probable truncation/fabrication"
-error**). Non-zero exit stops the run. It also **warns** when a result a later segment threads
-through `args` exceeds the size budget (default 32 KiB) — a warning only: enforcement is the
-compiled segment's fail-loud args guard, never duplicated here.
+error**). Non-zero exit stops the run **without committing** — the failed value never enters the
+resumable record: the committed run-state still points at the failed step, and the dispatcher
+stamps `failed_step: <i>` into it (`run-journal append … --mark-failed-step <i>`), so the resume
+scan surfaces the failure in its offer (and refuses outright a poisoned record whose progress
+somehow advanced past a `failed_step`) and `rerun` refuses to seed from beyond it. Exit 0 →
+`run-journal append --commit-state` promotes the candidate (a passing re-run clears the stamp —
+the four-key candidate replaces the state wholesale). The checker also **warns** when a result a
+later segment threads through `args` exceeds the size budget (default 32 KiB) — a warning only:
+enforcement is the compiled segment's fail-loud args guard, never duplicated here.
 
 **`run-step` — the deterministic step kernel.** Args assembly and checkpoint expression evaluation
 are CODE, not model judgement: `run-step args` / `run-step eval` share the paths-only contract
@@ -1310,10 +1317,14 @@ run_id; `--steps <manifest step count>` filters out finished runs) whose stored 
 matches the freshly compiled manifest. A match → offer to resume from its `step_index`, seeding
 `inputs` and `results` from its run-state — the record the `run-step` kernel reads (re-using
 completed work — e.g. an expensive opus planner segment; `run-config.json` stays the provenance
-record). A mismatched hash (the workflow was recompiled / changed, so stored node outputs no
-longer line up), a pre-shape state without an `inputs` map, or no match → mint a fresh run and
-start at step 0; prior run dirs stay in place as provenance. (The legacy single
-`.compiled/.run-state.json` is simply ignored — and, like `runs/`, never deleted.)
+record). A run whose state carries `failed_step` (its last attempt failed the post-step IO check;
+the failing result was never committed) is offered **with the failure surfaced** — resuming
+re-runs that step. A mismatched hash (the workflow was recompiled / changed, so stored node
+outputs no longer line up), a pre-shape state without an `inputs` map, a poisoned record whose
+`step_index` advanced past its `failed_step` (never offered — its stored results beyond the
+failure are untrustworthy), or no match → mint a fresh run and start at step 0; prior run dirs
+stay in place as provenance. (The legacy single `.compiled/.run-state.json` is simply ignored —
+and, like `runs/`, never deleted.)
 
 **Rerun — `/workflow <name> rerun [--from <step|node>]`.** Deterministic partial re-execution of
 a recorded run (finished or not) on its **frozen recorded inputs**. The dispatcher locates the
@@ -1321,10 +1332,12 @@ source run (`run-journal latest` with no `--manifest-hash` — newest committed 
 finished included), recompiles with the run's recorded `profile_used`/`overrides` from
 `run-config.json`, and `run-journal rerun` then **REQUIRES `manifest_hash` equality** between the
 fresh compile and the recorded run — a mismatch is a hard stop (the def/registry/profile changed;
-the stored node outputs no longer line up), never a partial reuse. It mints a NEW run dir seeded
-with the recorded `inputs` and every pre-from-point result (results at/after the from-point are
-**dropped**, so a stale later output can never leak forward; the source dir is provenance — never
-modified) and reports three things the dispatcher acts on: `replayed_gates` — gates before the
+the stored node outputs no longer line up), never a partial reuse. A recorded `failed_step` **caps
+the from-point**: a step that failed its IO contract has no trustworthy result, so seeding from
+beyond it is refused (`--from` at/before the failed step re-runs it and is legal). It mints a NEW
+run dir seeded with the recorded `inputs` and every pre-from-point result (results at/after the
+from-point are **dropped**, so a stale later output can never leak forward; the source dir is
+provenance — never modified) and reports three things the dispatcher acts on: `replayed_gates` — gates before the
 from-point **replay their recorded `{choice}`**, already seeded for downstream branches, never
 re-asked; `from.snapped_to_segment` — a from-point naming a node **inside** a segment snaps to the
 segment start (segments are atomic; the whole segment re-runs); `confirm_steps` —

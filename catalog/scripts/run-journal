@@ -37,14 +37,26 @@ Subcommands:
   append         append one event (step_complete | resume | run_complete |
                  run_error); --commit-state atomically promotes a tmp run-state
                  file to run-state.json first, then sizes are computed from the
-                 committed state
+                 committed state. --mark-failed-step N (run_error after a failed
+                 post-step IO check; never combinable with --commit-state — a
+                 failed check must NOT commit the candidate state) stamps
+                 `failed_step: N` into the STILL-COMMITTED previous run-state,
+                 so the failure is visible to `latest`/`rerun` instead of the
+                 run dir looking like an ordinary mid-run crash. A later
+                 successful --commit-state of the re-run step promotes the
+                 four-key candidate wholesale, clearing the stamp.
   latest         scan runs/*/run-state.json for the newest run (greatest run_id —
                  minted ids are UTC-timestamp-prefixed, so lexical == chronological)
                  matching --manifest-hash, for the dispatcher's resume offer.
                  --manifest-hash is optional: omitted (with no --steps), it is the
                  rerun source scan — newest committed run, any hash, finished
                  included — and the output surfaces the run's recorded provenance
-                 (manifest_hash, profile_used, overrides)
+                 (manifest_hash, profile_used, overrides). A state carrying
+                 `failed_step` is surfaced in the output (the offer must say the
+                 step's last attempt failed its IO contract; resuming re-runs it);
+                 a POISONED record whose step_index advanced PAST its failed_step
+                 (no valid protocol commits past a failed IO check) is never
+                 offered at all
   rerun          seed a deterministic partial re-run: REQUIRES manifest_hash
                  equality between the freshly compiled --manifest and the
                  --source-run's recorded run-config/run-state (a mismatch means
@@ -61,6 +73,10 @@ Subcommands:
                  never re-asks them) and `confirm_steps` (orchestrator_node /
                  nested_workflow checkpoints at/after the from-point re-execute
                  SIDE EFFECTS — the dispatcher confirm-gates each interactively).
+                 A source run-state carrying `failed_step` CAPS the from-point:
+                 a step that failed its post-step IO contract has no trustworthy
+                 result, so seeding from beyond it is refused (--from at/before
+                 the failed step re-runs it and is legal).
                  The rerun FREEZES the recorded input set: the seeded inputs may
                  reference the source run's run-inputs/ files by absolute path,
                  which is why finished run dirs are retained, never deleted.
@@ -250,6 +266,25 @@ def cmd_append(args):
         die(f"invalid outcome {args.outcome!r} (want one of: {', '.join(OUTCOMES)})")
     config = load_json(p["config"], "run-config.json")
 
+    if args.mark_failed_step is not None:
+        # A failed post-step IO check: the candidate state must NEVER be
+        # committed (that would make the failure silently resumable past the
+        # failed check) — instead stamp `failed_step` into the still-committed
+        # previous run-state so `latest` surfaces it and `rerun` refuses to
+        # seed past it. The stamp clears when the re-run step's passing
+        # candidate is later committed (a four-key wholesale promote).
+        if args.commit_state:
+            die("--mark-failed-step cannot ride with --commit-state — a step "
+                "that failed its IO check must never commit the candidate "
+                "run-state (the failure would become silently resumable)")
+        if not p["state"].exists():
+            die(f"no committed run-state.json to mark: {p['state']}")
+        state = load_json(p["state"], "run-state.json")
+        if not isinstance(state, dict):
+            die(f"run-state.json is not a JSON object: {p['state']}")
+        state["failed_step"] = args.mark_failed_step
+        write_json_atomic(p["state"], state)
+
     if args.commit_state:
         tmp = Path(args.commit_state)
         if not tmp.is_absolute():
@@ -280,6 +315,7 @@ def cmd_append(args):
         "gate": args.gate,
         "choice": args.choice,
         "outcome": args.outcome,
+        "failed_step": args.mark_failed_step,
     }
     fields.update(state_sizes(run_dir))
     journal = journal_append(run_dir, args.event, fields)
@@ -313,14 +349,26 @@ def cmd_latest(args):
             if not isinstance(state.get("inputs"), dict):
                 continue
             step_index = state.get("step_index")
+            failed_step = state.get("failed_step")
+            # POISONED record: progress committed PAST a step recorded as
+            # having failed its IO contract. No valid protocol produces this
+            # shape (a failed check never commits the candidate state) — the
+            # stored results beyond failed_step are untrustworthy, so never
+            # offer it for resume or as a rerun source.
+            if isinstance(failed_step, int) and isinstance(step_index, int) \
+                    and step_index > failed_step:
+                skipped.append(d.name)
+                continue
             if args.steps is not None and isinstance(step_index, int) \
                     and step_index >= args.steps:
                 continue  # this run already finished — nothing to resume
-            candidates.append((d, step_index, state.get("manifest_hash")))
+            candidates.append((d, step_index, state.get("manifest_hash"),
+                               failed_step))
     if not candidates:
         print(json.dumps({"found": False, "skipped": skipped}, indent=2))
         return
-    d, step_index, state_hash = candidates[0]  # greatest run_id == newest minted
+    # greatest run_id == newest minted
+    d, step_index, state_hash, failed_step = candidates[0]
     # Recorded compile provenance (short strings) so a rerun caller can
     # reproduce the recorded compile without reading run-config itself.
     cfg = {}
@@ -337,6 +385,10 @@ def cmd_latest(args):
         "run_state": str(d / "run-state.json"),
         "run_config": str(d / "run-config.json"),
         "step_index": step_index,
+        # Non-null: the run's last attempt at this step FAILED its post-step IO
+        # check (its result was never committed) — the dispatcher's offer must
+        # say so; resuming re-runs that step.
+        "failed_step": failed_step,
         "manifest_hash": state_hash,
         "profile_used": cfg.get("profile_used"),
         "overrides": cfg.get("overrides") or [],
@@ -429,6 +481,18 @@ def cmd_rerun(args):
         die("source run-state carries no inputs/results objects — a pre-shape "
             "run-state is not rerunnable (start a fresh run)", 1)
     from_idx, snapped = resolve_from_point(steps, args.from_)
+    # --- failed_step CAPS the from-point ---
+    # A step that failed its post-step IO contract has no trustworthy result
+    # (the failing candidate state was never committed; in a poisoned record
+    # the stored value is exactly the corruption the check caught) — nothing
+    # at/after it may seed a rerun. --from at/before the failed step re-runs
+    # it and is legal.
+    failed_step = state.get("failed_step")
+    if isinstance(failed_step, int) and from_idx > failed_step:
+        die(f"the source run's step {failed_step} failed its post-step IO "
+            f"contract (run-state records failed_step: {failed_step}) — "
+            f"results at/after it cannot seed a rerun; choose "
+            f"--from {failed_step} or earlier so the failed step re-runs", 1)
     recorded_idx = state.get("step_index")
     if not isinstance(recorded_idx, int) or recorded_idx < from_idx:
         die(f"--from resolves to step {from_idx} but the source run only "
@@ -613,6 +677,12 @@ def main():
     sp.add_argument("--commit-state", default=None,
                     help="tmp run-state file to promote to run-state.json via os.replace "
                          "before sizing (relative paths resolve against --run-dir)")
+    sp.add_argument("--mark-failed-step", type=int, default=None,
+                    help="stamp failed_step: N into the COMMITTED run-state.json "
+                         "(a failed post-step IO check — the candidate state is "
+                         "never committed; latest surfaces the failure, rerun "
+                         "refuses to seed past it). Never combinable with "
+                         "--commit-state.")
     sp.set_defaults(fn=cmd_append)
 
     sp = sub.add_parser("latest",
