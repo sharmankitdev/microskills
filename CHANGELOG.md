@@ -1,3 +1,9 @@
+## [0.10.0](https://github.com/sharmankitdev/microskills/compare/v0.9.0...v0.10.0) (2026-06-10)
+
+### Features
+
+* **workflow:** add requirements domain — assimilate-requirements + refine-requirements ([#14](https://github.com/sharmankitdev/microskills/issues/14)) ([c76f146](https://github.com/sharmankitdev/microskills/commit/c76f146a7879b1d00b0c2fd27045b34997a65c1e))
+
 ## [0.9.0](https://github.com/sharmankitdev/microskills/compare/v0.8.0...v0.9.0) (2026-06-07)
 
 ### Features
