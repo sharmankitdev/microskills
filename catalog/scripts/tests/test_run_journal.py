@@ -342,6 +342,250 @@ def test_latest_skips_pre_shape_state_without_inputs(tmp_path):
     assert data["run_id"] == "20260610T100000Z-aaaaaa"
 
 
+# ------------------------------------------------- latest (rerun source scan)
+
+def test_latest_without_hash_filter_returns_newest_committed_any_hash(tmp_path):
+    # The rerun source scan: --manifest-hash omitted -> newest committed run
+    # regardless of hash, FINISHED runs included (no --steps), with the
+    # recorded compile provenance surfaced so the caller can reproduce it.
+    seed_run(tmp_path, "20260610T100000Z-aaaaaa", "sha256:h1", 2)
+    run_dir, _ = init_run(tmp_path, "20260610T110000Z-bbbbbb", "sha256:h2",
+                          "--profile", "lite", "--override", "io.x=1")
+    state = {"manifest_hash": "sha256:h2", "step_index": 4,
+             "inputs": {"diff_path": "/d.cat"}, "results": {"a": {"x": 1}}}
+    (run_dir / "s.tmp").write_text(json.dumps(state))
+    rc, *_ = run("append", "--run-dir", str(run_dir), "--event", "run_complete",
+                 "--outcome", "ok", "--commit-state", "s.tmp")
+    assert rc == 0
+    rc, data, out, err = run("latest", "--runs-dir", str(tmp_path / "runs"))
+    assert rc == 0, out + err
+    assert data["found"] is True
+    assert data["run_id"] == "20260610T110000Z-bbbbbb"  # newest, finished, h2
+    assert data["manifest_hash"] == "sha256:h2"
+    assert data["profile_used"] == "lite"
+    assert data["overrides"] == ["io.x=1"]
+
+
+def test_latest_resume_scan_still_filters_on_hash(tmp_path):
+    # the resume scan (--manifest-hash given) is unchanged by the relaxation
+    seed_run(tmp_path, "20260610T100000Z-aaaaaa", "sha256:h1", 1)
+    seed_run(tmp_path, "20260610T110000Z-bbbbbb", "sha256:OTHER", 1)
+    rc, data, *_ = run("latest", "--runs-dir", str(tmp_path / "runs"),
+                       "--manifest-hash", "sha256:h1")
+    assert rc == 0 and data["found"] is True
+    assert data["run_id"] == "20260610T100000Z-aaaaaa"
+    assert data["manifest_hash"] == "sha256:h1"
+
+
+# ------------------------------------------------------------------- rerun
+
+# A 4-step manifest: segment[a,b] -> gate g1 -> segment[c] -> orchestrator fin.
+RERUN_STEPS = [
+    {"kind": "segment", "index": 1, "script": ".compiled/seg-1.js",
+     "nodes": ["a", "b"], "produces": ["a", "b"], "needs": {}, "io": {}},
+    {"kind": "checkpoint", "checkpoint_type": "gate",
+     "gate": {"id": "g1", "type": "human_approval", "after": "b",
+              "prompt": "approve?", "options": ["approve", "abandon"]}},
+    {"kind": "segment", "index": 2, "script": ".compiled/seg-2.js",
+     "nodes": ["c"], "produces": ["c"], "needs": {}, "io": {}},
+    {"kind": "checkpoint", "checkpoint_type": "orchestrator_node",
+     "node": "fin", "prompt": "finalize", "io": {}},
+]
+RERUN_RESULTS = {"a": {"x": 1}, "b": {"y": 2}, "g1": {"choice": "approve"},
+                 "c": {"z": 3}, "fin": {"done": True}}
+RERUN_INPUTS = {"diff_path": "/runs/src/run-inputs/diff.cat", "depth": "lite"}
+
+
+def write_manifest(tmp, manifest_hash="sha256:h1"):
+    path = tmp / "manifest.json"
+    path.write_text(json.dumps({
+        "name": "flow", "manifest_hash": manifest_hash, "steps": RERUN_STEPS}))
+    return path
+
+
+def make_source_run(tmp, run_id="20260610T100000Z-source", step_index=4,
+                    results=RERUN_RESULTS, inputs=RERUN_INPUTS,
+                    manifest_hash="sha256:h1"):
+    run_dir, _ = init_run(tmp, run_id, manifest_hash,
+                          "--profile", "lite", "--override", "io.x=1")
+    (run_dir / "in.json").write_text(json.dumps(inputs))
+    rc, *_ = run("record-inputs", "--run-dir", str(run_dir),
+                 "--inputs-file", "in.json")
+    assert rc == 0
+    state = {"manifest_hash": manifest_hash, "step_index": step_index,
+             "inputs": inputs, "results": results}
+    (run_dir / "s.tmp").write_text(json.dumps(state))
+    rc, *_ = run("append", "--run-dir", str(run_dir), "--event", "step_complete",
+                 "--step-index", str(step_index - 1), "--commit-state", "s.tmp")
+    assert rc == 0
+    return run_dir
+
+
+def do_rerun(tmp, *extra, manifest_hash="sha256:h1"):
+    manifest = write_manifest(tmp, manifest_hash)
+    return run("rerun", "--runs-dir", str(tmp / "runs"),
+               "--manifest", str(manifest),
+               "--source-run", "20260610T100000Z-source",
+               "--run-id", "20260610T200000Z-rerun", *extra)
+
+
+def test_rerun_seeds_pre_from_results_replays_gates_and_flags_confirms(tmp_path):
+    src = make_source_run(tmp_path)
+    rc, data, out, err = do_rerun(tmp_path, "--from", "c")
+    assert rc == 0, out + err
+    assert data["from"] == {"selector": "c", "step_index": 2,
+                            "snapped_to_segment": False}
+    # gates BEFORE the from-point replay their recorded choice — never re-asked
+    assert data["replayed_gates"] == [
+        {"step_index": 1, "gate": "g1", "choice": "approve"}]
+    # orchestrator-world steps at/after the from-point re-execute side effects
+    assert data["confirm_steps"] == [
+        {"step_index": 3, "checkpoint_type": "orchestrator_node", "node": "fin"}]
+    assert data["seeded_results"] == ["a", "b", "g1"]
+    run_dir = Path(data["run_dir"])
+    state = json.loads((run_dir / "run-state.json").read_text())
+    # results at/after the from-point are DROPPED (c, fin never leak forward);
+    # inputs are FROZEN verbatim from the record
+    assert state == {"manifest_hash": "sha256:h1", "step_index": 2,
+                     "inputs": RERUN_INPUTS,
+                     "results": {"a": {"x": 1}, "b": {"y": 2},
+                                 "g1": {"choice": "approve"}}}
+    config = json.loads((run_dir / "run-config.json").read_text())
+    assert config == {
+        "v": 1,
+        "run_id": "20260610T200000Z-rerun",
+        "manifest_hash": "sha256:h1",
+        "profile_used": "lite",            # provenance copied from the source
+        "overrides": ["io.x=1"],
+        "inputs": RERUN_INPUTS,
+        "rerun_of": "20260610T100000Z-source",
+        "from_step_index": 2,
+    }
+    assert (run_dir / "run-inputs").is_dir()
+    lines = journal_lines(run_dir)
+    assert [l["event"] for l in lines] == ["run_start", "rerun"]
+    assert lines[0]["rerun_of"] == "20260610T100000Z-source"
+    assert lines[0]["from_step_index"] == 2
+    assert lines[1]["replayed_gates"] == {"g1": "approve"}
+    assert "snapped_to_segment" not in lines[1]
+    # PIN clean-finish retention: the source run dir is provenance — untouched
+    assert src.is_dir()
+    src_state = json.loads((src / "run-state.json").read_text())
+    assert src_state["step_index"] == 4 and src_state["results"] == RERUN_RESULTS
+    assert [l["event"] for l in journal_lines(src)] == [
+        "run_start", "inputs_recorded", "step_complete"]
+
+
+def test_rerun_snaps_mid_segment_node_to_segment_start(tmp_path):
+    # --from b names a node INSIDE segment[a,b]: segments are atomic, so the
+    # from-point snaps to the segment start (the whole segment re-runs)
+    make_source_run(tmp_path)
+    rc, data, out, err = do_rerun(tmp_path, "--from", "b")
+    assert rc == 0, out + err
+    assert data["from"] == {"selector": "b", "step_index": 0,
+                            "snapped_to_segment": True}
+    assert data["replayed_gates"] == [] and data["seeded_results"] == []
+    state = json.loads((Path(data["run_dir"]) / "run-state.json").read_text())
+    assert state["step_index"] == 0 and state["results"] == {}
+    assert state["inputs"] == RERUN_INPUTS  # inputs frozen even for a full replay
+
+
+def test_rerun_from_gate_re_presents_it(tmp_path):
+    # the gate AT the from-point is re-presented (a fresh choice), not replayed
+    make_source_run(tmp_path)
+    rc, data, out, err = do_rerun(tmp_path, "--from", "g1")
+    assert rc == 0, out + err
+    assert data["from"]["step_index"] == 1
+    assert data["from"]["snapped_to_segment"] is False
+    assert data["replayed_gates"] == []
+    assert data["seeded_results"] == ["a", "b"]
+    state = json.loads((Path(data["run_dir"]) / "run-state.json").read_text())
+    assert "g1" not in state["results"]
+
+
+def test_rerun_integer_from_and_default_zero(tmp_path):
+    make_source_run(tmp_path)
+    rc, data, out, err = do_rerun(tmp_path, "--from", "3")
+    assert rc == 0, out + err
+    assert data["from"] == {"selector": "3", "step_index": 3,
+                            "snapped_to_segment": False}
+    assert data["seeded_results"] == ["a", "b", "c", "g1"]
+    assert data["confirm_steps"] == [
+        {"step_index": 3, "checkpoint_type": "orchestrator_node", "node": "fin"}]
+    # no --from -> full replay from step 0 on the frozen inputs
+    rc2, data2, *_ = run("rerun", "--runs-dir", str(tmp_path / "runs"),
+                         "--manifest", str(tmp_path / "manifest.json"),
+                         "--source-run", "20260610T100000Z-source")
+    assert rc2 == 0
+    assert data2["from"] == {"selector": "0", "step_index": 0,
+                             "snapped_to_segment": False}
+
+
+def test_rerun_requires_manifest_hash_equality(tmp_path):
+    # the recorded run is sha256:h1; the fresh compile is sha256:h2 -> hard
+    # stop, exit 1, and NO new run dir is minted
+    make_source_run(tmp_path)
+    rc, data, out, err = do_rerun(tmp_path, "--from", "c", manifest_hash="sha256:h2")
+    assert rc == 1
+    assert "manifest_hash equality" in data["error"]
+    assert sorted(p.name for p in (tmp_path / "runs").iterdir()) == [
+        "20260610T100000Z-source"]
+
+
+def test_rerun_beyond_recorded_progress_fails(tmp_path):
+    # the source only committed through step 0 (step_index 1) — a from-point
+    # past it has no recorded results to seed
+    make_source_run(tmp_path, step_index=1, results={"a": {"x": 1}, "b": {"y": 2}})
+    rc, data, *_ = do_rerun(tmp_path, "--from", "2")
+    assert rc == 1
+    assert "step_index 1" in data["error"]
+    rc, data, out, err = do_rerun(tmp_path, "--from", "1")
+    assert rc == 0, out + err  # from == recorded progress is legal (resume-like)
+
+
+def test_rerun_missing_recorded_result_fails(tmp_path):
+    # progressed far enough, but a pre-from produced node was never stored
+    results = {k: v for k, v in RERUN_RESULTS.items() if k != "b"}
+    make_source_run(tmp_path, results=results)
+    rc, data, *_ = do_rerun(tmp_path, "--from", "c")
+    assert rc == 1
+    assert "'b'" in data["error"]
+    assert sorted(p.name for p in (tmp_path / "runs").iterdir()) == [
+        "20260610T100000Z-source"]
+
+
+def test_rerun_unknown_from_selector_fails_listing_steps(tmp_path):
+    make_source_run(tmp_path)
+    rc, data, *_ = do_rerun(tmp_path, "--from", "zz")
+    assert rc == 1
+    assert "matches no manifest step" in data["error"]
+    assert "segment[a,b]" in data["error"] and "gate:g1" in data["error"]
+    rc, data, *_ = do_rerun(tmp_path, "--from", "9")
+    assert rc == 1 and "out of range" in data["error"]
+
+
+def test_rerun_pre_shape_source_state_fails(tmp_path):
+    run_dir, _ = init_run(tmp_path, "20260610T100000Z-source")
+    (run_dir / "run-state.json").write_text(json.dumps(
+        {"manifest_hash": "sha256:h1", "step_index": 2, "results": {}}))
+    rc, data, *_ = do_rerun(tmp_path, "--from", "1")
+    assert rc == 1
+    assert "pre-shape" in data["error"]
+
+
+def test_rerun_run_is_resumable_via_latest(tmp_path):
+    # a crashed rerun is offered for RESUME exactly like any other run, while
+    # the finished source stays filtered out by --steps
+    make_source_run(tmp_path)
+    rc, data, *_ = do_rerun(tmp_path, "--from", "c")
+    assert rc == 0
+    rc, data, *_ = run("latest", "--runs-dir", str(tmp_path / "runs"),
+                       "--manifest-hash", "sha256:h1", "--steps", "4")
+    assert rc == 0 and data["found"] is True
+    assert data["run_id"] == "20260610T200000Z-rerun"
+    assert data["step_index"] == 2
+
+
 # --------------------------------------------------------- project / report
 
 def make_played_run(tmp, run_id):

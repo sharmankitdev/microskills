@@ -3060,6 +3060,29 @@ inputs:
     assert "manifest" not in data2
 
 
+def test_plan_explain_combined_is_the_dispatcher_preflight_shape(tmp_path):
+    # 3.5 (dispatcher half) — the dispatcher's preflight (`/workflow <name>
+    # --plan`) compiles with `--plan --explain` and renders EXCLUSIVELY from
+    # the printed summary: the embedded full manifest (steps incl. gate dicts,
+    # inputs) PLUS the per-node executor entries. Pin that the two flags
+    # compose additively and still write nothing.
+    wf = GATED.replace("name: linear-flow", "name: gated-flow")
+    make_flow(tmp_path, "gated-flow", wf)
+    rc, data, out, err = run(tmp_path, "gated-flow", "--plan", "--explain")
+    assert rc == 0, err
+    assert data["plan"] is True
+    # full manifest object: the gate dict a preflight renderer needs
+    gate = [s for s in data["manifest"]["steps"]
+            if s.get("checkpoint_type") == "gate"][0]["gate"]
+    assert gate["id"] == "g1" and gate["options"] == ["approve", "abandon"]
+    # executor identity per node, de-anonymized sequence
+    ex = {c["node"]: c["executor"] for c in data["classification"]}
+    assert ex["a"] == {"profile": None, "agent": "ag", "model": None}
+    assert data["sequence"] == ["segment[a]", "gate:g1", "segment[b]"]
+    # still a dry-run: nothing written
+    assert not (tmp_path / "gated-flow" / ".compiled").exists()
+
+
 # --- {{snippet:NAME}} includes (shared prose from <defs-root>/_snippets/) ---
 # Resolved by the SHARED apply_workflow_vars pre-pass BEFORE ordinary {{var}}
 # substitution, so a snippet body may carry vars. Unresolved snippet → HARD block.

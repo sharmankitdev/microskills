@@ -5,7 +5,10 @@ description: >
   or implicitly via auto-generated per-workflow slash shims under `.claude/commands/<name>.md`
   that delegate here. Reads `.claude/workflow-defs/<name>/WORKFLOW.yaml`, compiles it via
   `.claude/scripts/compile-workflow`, then orchestrates the resulting background segments and
-  human checkpoints per the run manifest.
+  human checkpoints per the run manifest. Also handles `/workflow <name> [profile] --plan`
+  (preflight: render steps/gates/inputs/executors from the dry-run compile summary, no execution)
+  and `/workflow <name> rerun [--from <step|node>]` (deterministic partial re-run of a recorded
+  run on its frozen recorded inputs).
 ---
 
 # workflow
@@ -17,6 +20,14 @@ nodes). This skill is the conductor: it runs each segment on the native Workflow
 checkpoint in the main loop (where `AskUserQuestion` works), and threads outputs forward via `args`.
 
 **The autonomous engine cannot pause for a human** — so all interaction lives here, between segments.
+
+**Three invocation modes, routed on the args before anything runs:**
+- **execute** (default) — Setup → Execute the manifest → Finish, below.
+- **preflight** — `--plan` anywhere in the args → the **Preflight** section: render the compiled
+  plan (steps, gates, inputs, executors) and STOP before input gathering. Writes nothing, mints
+  no run, asks no questions.
+- **rerun** — the literal token `rerun` directly after the name → the **Rerun** section:
+  re-execute a recorded run from a chosen step on its FROZEN recorded inputs.
 
 ## Setup
 
@@ -33,8 +44,9 @@ checkpoint in the main loop (where `AskUserQuestion` works), and threads outputs
    and the written manifest always carry `manifest_hash` (the resume check in step 5 needs it);
    `--explain` is optional diagnostics only. Non-zero exit → stop and surface the JSON `error` /
    `schema_errors` — under a headless signal this includes the fail-loud "hard gate declares no
-   'default'" error: never retry without the flag to sneak past it. (Never pass `--plan` here —
-   that is a dry-run that writes nothing.)
+   'default'" error: never retry without the flag to sneak past it. (Never pass `--plan` on this
+   EXECUTION path — a dry-run writes nothing, so there would be no fresh manifest to run; `--plan`
+   belongs to the Preflight mode only.)
    **`manifest.gate_mode == "auto"` is the authoritative runtime mode** for everything below (a
    def/profile may declare `gate_mode: auto` with no flag at all, and a profile-declared mode wins
    over the flag inside compile). Auto mode means: no human is present — `AskUserQuestion` must
@@ -48,7 +60,8 @@ checkpoint in the main loop (where `AskUserQuestion` works), and threads outputs
    `.claude/scripts/run-journal latest --runs-dir '.claude/workflow-defs/<name>/.compiled/runs' --manifest-hash '<manifest.manifest_hash>' --steps <manifest.steps.length>`
    It scans `runs/*/run-state.json` for the newest unfinished run (greatest run id) whose stored
    `manifest_hash` equals the current one — a mismatched hash means the workflow was recompiled /
-   changed, so stored node outputs no longer line up and that run is simply not offered. **Under auto
+   changed, so stored node outputs no longer line up and that run is simply not offered. (A
+   FINISHED run is never offered here — re-rolling part of one is the Rerun mode.) **Under auto
    mode never ask: skip the offer and start fresh at step 6** (prior run dirs stay as provenance; an
    auto compile has a distinct manifest_hash anyway, so interactive state never matches). Parse the JSON:
    - `found: true` → **offer to resume** via `AskUserQuestion` ("Resume run {run_id} from step
@@ -115,6 +128,97 @@ checkpoint in the main loop (where `AskUserQuestion` works), and threads outputs
    segment's args — including the first — from this committed state, never from memory), journals an
    `inputs_recorded` event with per-input byte sizes, and consumes the scratch file.
 
+## Preflight — `/workflow <name> [profile] --plan`
+
+A dry-run renderer: show what a run WOULD do — steps, gates, inputs, executors — without writing
+artifacts, minting a run, or gathering a single input. Run Setup steps 1-2 (name, profile /
+overrides, headless signal), then:
+
+1. **Compile the plan** — run via Bash: `.claude/scripts/compile-workflow <name> --plan --explain
+   [--profile "<profile>"] [--override <k>=<v> ...] [--gate-mode auto when the headless signal is
+   set]`. `--plan` computes the full plan but writes NOTHING; `--explain` adds the per-node
+   `classification` carrying `executor: {profile, agent, model}`. Non-zero exit → surface the JSON
+   `error` / `schema_errors` and stop — a preflight that fails to compile IS the useful answer.
+2. **Render EXCLUSIVELY from the printed summary.** It embeds the FULL manifest object under
+   `manifest` plus the executor entries under `classification` — never read
+   `.claude/workflow-defs/<name>/.compiled/manifest.json` here (the `--plan` compile wrote nothing;
+   anything on disk is from an earlier compile and may not match these flags). Render, in order:
+   - **Header** — name, `profile_used`, `manifest_hash`, and the run mode:
+     `manifest.gate_mode == "auto"` → "headless — gates take their declared defaults", else
+     "interactive".
+   - **Inputs** — each `manifest.required_inputs` name (marked required — gathered from the caller
+     or interactively at run time), each `manifest.input_defaults` entry with its default, each
+     `manifest.materialize_inputs` name marked "by reference (`materialize: file`)".
+   - **Steps** — walk `manifest.steps` printing `Step {i+1}/{M}: {label}` headers (the same label
+     synthesis as the execution walk), each with detail lines:
+     - segment → the node ids in order, one line per node from the matching
+       `classification[].executor`: `<id> — agent <agent> (model <model>, profile <profile>)`,
+       rendering only non-null fields (an `agent:` node shows the agent type alone — its model
+       rides the agent definition). `is_loop` → append "(loop)" to the header.
+     - gate → severity (`hard` pauses; `warn` renders + continues), the `prompt`, the options
+       (declared `options`, or the implicit `confirm / stop` pair), and the headless behavior:
+       the declared **`default` is the auto-mode choice** — render `auto mode takes '<default>'`;
+       `on_headless: fail` → `auto mode STOPS here (declared hand-off)`; a pausing gate with
+       neither → `interactive-only (an auto compile refuses this gate)`.
+     - orchestrator_node → `main loop: <node id>`, noting `conditional (when)` and a `for_each`
+       fan-out when declared.
+     - nested_workflow → `nested workflow: <workflow>` plus `(profile <profile>)` when carried.
+   - **Output** — `manifest.output.from`, when set.
+3. **STOP.** A preflight ends here, before input gathering: no run dir, no `AskUserQuestion`, no
+   filesystem writes, no segments. To execute, re-invoke without `--plan`.
+
+## Rerun — `/workflow <name> rerun [--from <step|node>] [--run <run-id>]`
+
+Deterministic partial re-execution of a RECORDED run from a chosen step, on the run's FROZEN
+recorded inputs. **Scope honesty: rerun is NOT the fail→fix→re-review loop** — it replays the
+recorded input set verbatim. Re-reviewing a *changed* artifact (a fixed diff, an edited
+requirement) needs a changed input, which is a NEW run, never a rerun.
+
+1. **Locate the recorded run** — `--run <run-id>` names `runs/<run-id>` directly (read its
+   `run-config.json` for the fields below); otherwise run via Bash:
+   `.claude/scripts/run-journal latest --runs-dir '.claude/workflow-defs/<name>/.compiled/runs'`
+   — no `--manifest-hash`, no `--steps`: the newest run with a committed run-state, FINISHED runs
+   included (a finished run is rerun's normal case). `found: false` → stop: nothing recorded to
+   rerun. Note its `run_id`, `manifest_hash`, `profile_used`, and `overrides`.
+2. **Recompile with the RECORDED provenance** — the Setup step 3 compile, but passing
+   `--profile '<profile_used>'` and each recorded override verbatim (never this invocation's own —
+   a rerun reproduces the recorded compile). If the fresh summary's `manifest_hash` differs from
+   the recorded one, retry ONCE adding `--gate-mode auto` (the one compile input `run-config.json`
+   does not record — the recorded run may have been headless); still different → **STOP: rerun
+   REQUIRES manifest_hash equality.** The def, registry, or profile changed since the recorded
+   run, so its stored node outputs no longer line up — start a fresh run instead. Never improvise
+   a partial reuse.
+3. **Seed the rerun in code** — run via Bash:
+   `.claude/scripts/run-journal rerun --runs-dir '.claude/workflow-defs/<name>/.compiled/runs'
+   --manifest '.claude/workflow-defs/<name>/.compiled/manifest.json' --source-run '<run_id>'
+   [--from '<step|node>']`. It re-checks hash equality (the authoritative gate), resolves the
+   from-point — an integer is a 0-based manifest step index; a name matches a gate id, a
+   checkpoint node id, or a node INSIDE a segment, which **snaps to the segment start** (segments
+   are atomic: the whole segment re-runs) — requires the source run to have committed every step
+   before it, and mints a NEW run dir seeded with the recorded `inputs` and every pre-from result
+   (results at/after the from-point are dropped, so a stale later output can never leak forward;
+   the source run dir is provenance — never modified). Non-zero exit → stop and surface its
+   `error`. Parse the JSON: note `run_dir`, `from` (`step_index`; `snapped_to_segment: true` →
+   tell the user their node-level from-point widened to the whole segment), `replayed_gates`, and
+   `confirm_steps`.
+4. **Replay, never re-ask** — print one line per `replayed_gates` entry:
+   `Gate <id>: replaying recorded choice '<choice>'`. Those gates sit BEFORE the from-point; their
+   recorded `{choice}` results are already seeded into the run-state, so downstream branches read
+   them — do not re-present them.
+5. **Skip Setup steps 5-8 entirely** — the inputs are FROZEN from the record and already seeded,
+   including materialized `run-inputs/` paths that point into the SOURCE run's dir (this is why
+   finished run dirs are retained). Adopt `run_dir`, seed in-memory `inputs` / `results` from
+   `<run_dir>/run-state.json`, set `i = from.step_index`.
+6. **Execute the manifest** from `i` exactly as a normal run, with ONE addition: a step listed in
+   `confirm_steps` (an orchestrator_node / nested_workflow checkpoint) **re-executes side
+   effects** — filesystem writes, vendoring, nested child runs that already happened once in the
+   source run. Before executing such a step, confirm via `AskUserQuestion` ("Step {i+1} re-runs
+   '<node>', re-executing its side effects. Re-run it, or stop?"). A "stop" → journal a
+   `run_error` (`--label 'rerun declined at <node>'`) and stop cleanly. Under auto mode there is
+   no human: proceed WITHOUT the confirmation — the explicit `rerun` invocation is the consent —
+   and journal the step normally. Gates at/after the from-point re-present normally (fresh
+   choices).
+
 ## Execute the manifest
 
 Maintain `results = {}` (node id → that node's returned output object). Let `M = manifest.steps.length`
@@ -158,8 +262,11 @@ This is the dispatcher's in-memory `results{}` checkpointed to disk so a run tha
 resume (see the Setup resume check) instead of restarting from step 0 and re-running expensive segments.
 It is dispatcher runtime state, quarantined from the compiled bytes — the compiler never reads `runs/`
 and its stale-clean (which globs only `seg-*.js` and `resolved/*.json`) never deletes it, so determinism
-is untouched. On a clean finish leave the run dir in place — it is the run's provenance record (the
-`latest` scan skips finished runs via `--steps`). Do not let journaling block the run. On a stop
+is untouched. On a clean finish leave the run dir in place — it is the run's provenance record AND a
+rerun's seed: a later `/workflow <name> rerun` freezes this run's recorded inputs, whose
+materialized values reference this dir's `run-inputs/` files by absolute path — deleting a
+finished run dir breaks reruns of it (the `latest` resume scan skips finished runs via `--steps`,
+so retention costs nothing at resume time). Do not let journaling block the run. On a stop
 (segment error, failed IO check, abandoned gate, unresolvable input), record it before stopping:
 `.claude/scripts/run-journal append --run-dir '<run_dir>' --event run_error --step-index <i> --outcome error --label '<short reason>'`.
 
@@ -363,6 +470,16 @@ already covered the play-by-play — don't re-summarize each segment here.
   stop. Never substitute your own args assembly or expression evaluation for the kernel's.
 - **Required input unresolved** — stop, name the input.
 - **Gate abandoned** — stop cleanly, report partial state.
+- **No recorded run (rerun)** — the `run-journal latest` source scan found nothing committed
+  under `runs/`. Stop: there is nothing to rerun.
+- **Rerun hash mismatch** — the fresh compile's `manifest_hash` differs from the recorded run's,
+  even after the one `--gate-mode auto` retry. Stop — rerun requires equality; a changed
+  def/registry/profile means the recorded outputs no longer line up. Start a fresh run.
+- **Rerun seed failed** — `run-journal rerun` exits non-zero (unknown `--from` selector,
+  from-point beyond the recorded progress, a missing recorded result, a pre-shape run-state).
+  Surface its `error`, stop — never hand-assemble the seed.
+- **Rerun re-execution declined** — the human declined a `confirm_steps` re-execution. Journal
+  `run_error` naming the step, stop cleanly.
 - **Headless gate stop** — auto mode reached a gate with `on_headless: fail` (or a pausing gate with
   no usable `default` in a hand-edited manifest). Journal `run_error` naming the gate, stop with a
   nonzero outcome; the run-state stays resumable interactively.

@@ -1126,7 +1126,12 @@ At the end, report `results[manifest.output.from]`.
   (steps incl. gate dicts, `required_inputs`, `input_defaults`, provenance keys) — since no
   `manifest.json` is written, the summary is the only place a preflight renderer can read the
   gate/inputs data from. Mirrors the harness reconcile loops' `--plan`-by-default ergonomics.
-  (The dispatcher never passes `--plan`.)
+  (The dispatcher's **execution path** never passes `--plan` — there would be no fresh manifest to
+  run. Its **preflight mode** — `/workflow <name> [profile] --plan` — is the one dispatcher user:
+  it compiles with `--plan --explain` and renders steps, gates (incl. each gate's auto-mode
+  `default` choice and `on_headless` behavior), inputs (required / defaulted / `materialize:
+  file`), and per-node `executor` identities EXCLUSIVELY from this printed summary, then stops
+  before input gathering — no run dir, no questions, no writes.)
 - **`compile-workflow … --explain`** — **output-only**, never changes any written bytes (the on-disk
   `.compiled/` output is byte-identical with or without it — a **single manifest shape**). Adds to
   the stdout summary: per-node `classification` (id → class + reason + **`executor: {profile, agent,
@@ -1227,6 +1232,29 @@ record). A mismatched hash (the workflow was recompiled / changed, so stored nod
 longer line up), a pre-shape state without an `inputs` map, or no match → mint a fresh run and
 start at step 0; prior run dirs stay in place as provenance. (The legacy single
 `.compiled/.run-state.json` is simply ignored — and, like `runs/`, never deleted.)
+
+**Rerun — `/workflow <name> rerun [--from <step|node>]`.** Deterministic partial re-execution of
+a recorded run (finished or not) on its **frozen recorded inputs**. The dispatcher locates the
+source run (`run-journal latest` with no `--manifest-hash` — newest committed run, any hash,
+finished included), recompiles with the run's recorded `profile_used`/`overrides` from
+`run-config.json`, and `run-journal rerun` then **REQUIRES `manifest_hash` equality** between the
+fresh compile and the recorded run — a mismatch is a hard stop (the def/registry/profile changed;
+the stored node outputs no longer line up), never a partial reuse. It mints a NEW run dir seeded
+with the recorded `inputs` and every pre-from-point result (results at/after the from-point are
+**dropped**, so a stale later output can never leak forward; the source dir is provenance — never
+modified) and reports three things the dispatcher acts on: `replayed_gates` — gates before the
+from-point **replay their recorded `{choice}`**, already seeded for downstream branches, never
+re-asked; `from.snapped_to_segment` — a from-point naming a node **inside** a segment snaps to the
+segment start (segments are atomic; the whole segment re-runs); `confirm_steps` —
+orchestrator_node / nested_workflow checkpoints at/after the from-point **re-execute side effects**
+(filesystem writes, vendoring, nested child runs) and are confirm-gated interactively before each
+re-runs (under auto mode the explicit `rerun` invocation is the consent — no confirmation is
+possible or asked). Clean-finish run-dir **retention is load-bearing** here: the rerun's frozen
+inputs may reference the source run's materialized `run-inputs/` files by absolute path — never
+delete finished run dirs. **Scope honesty: rerun is *not* the fail→fix→re-review loop.** It
+freezes the recorded input set; re-reviewing a *changed* artifact (the fixed diff) needs a changed
+input, which is a NEW run — the engine-level fix→re-review loop remains a roadmap boundary, not a
+built feature.
 
 **Known boundary — `runs/` isolates runtime state, NOT compiled artifacts.** Two concurrent runs
 of the *same def* compiled with *different profiles/overrides* still race on the shared

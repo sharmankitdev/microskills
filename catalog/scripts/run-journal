@@ -40,7 +40,30 @@ Subcommands:
                  committed state
   latest         scan runs/*/run-state.json for the newest run (greatest run_id —
                  minted ids are UTC-timestamp-prefixed, so lexical == chronological)
-                 matching --manifest-hash, for the dispatcher's resume offer
+                 matching --manifest-hash, for the dispatcher's resume offer.
+                 --manifest-hash is optional: omitted (with no --steps), it is the
+                 rerun source scan — newest committed run, any hash, finished
+                 included — and the output surfaces the run's recorded provenance
+                 (manifest_hash, profile_used, overrides)
+  rerun          seed a deterministic partial re-run: REQUIRES manifest_hash
+                 equality between the freshly compiled --manifest and the
+                 --source-run's recorded run-config/run-state (a mismatch means
+                 the def/registry/profile changed — stored node outputs no longer
+                 line up; hard error, never a partial reuse). Resolves --from (a
+                 0-based step index, a gate id, a checkpoint node id, or a node
+                 INSIDE a segment — which SNAPS to the segment start: segments
+                 are atomic, the whole segment re-runs), requires the source run
+                 to have committed every step before the from-point, then mints a
+                 NEW run dir seeded with the recorded inputs and every pre-from
+                 result (results at/after the from-point are DROPPED so a stale
+                 later output can never leak forward). Reports `replayed_gates`
+                 (pre-from gates replay their recorded {choice} — the dispatcher
+                 never re-asks them) and `confirm_steps` (orchestrator_node /
+                 nested_workflow checkpoints at/after the from-point re-execute
+                 SIDE EFFECTS — the dispatcher confirm-gates each interactively).
+                 The rerun FREEZES the recorded input set: the seeded inputs may
+                 reference the source run's run-inputs/ files by absolute path,
+                 which is why finished run dirs are retained, never deleted.
   project        timestamp-free projection of journal.jsonl to stdout (sorted keys,
                  `ts` dropped) so two runs are mechanically diffable
   report         render journal.jsonl human-readably
@@ -135,19 +158,26 @@ def require_run_dir(arg):
     return run_dir
 
 
-# ---------------------------------------------------------------- subcommands
-
-def cmd_init(args):
-    runs_dir = Path(args.runs_dir).resolve()
-    run_id = args.run_id or (
+def mint_run_dir(runs_dir: Path, explicit_id):
+    """Mint a run id (UTC-timestamp-prefixed, lexical == chronological) and its
+    empty run dir (with run-inputs/). Shared by init and rerun."""
+    run_id = explicit_id or (
         time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + secrets.token_hex(3))
     if "/" in run_id or run_id in (".", ".."):
         die(f"invalid run id: {run_id!r}")
     run_dir = runs_dir / run_id
     if run_dir.exists():
         die(f"run dir already exists: {run_dir}", run_id=run_id)
+    run_paths(run_dir)["inputs_dir"].mkdir(parents=True)
+    return run_id, run_dir
+
+
+# ---------------------------------------------------------------- subcommands
+
+def cmd_init(args):
+    runs_dir = Path(args.runs_dir).resolve()
+    run_id, run_dir = mint_run_dir(runs_dir, args.run_id)
     p = run_paths(run_dir)
-    p["inputs_dir"].mkdir(parents=True)
     config = {
         "v": JOURNAL_VERSION,
         "run_id": run_id,
@@ -270,7 +300,12 @@ def cmd_latest(args):
             except (json.JSONDecodeError, OSError):
                 skipped.append(d.name)
                 continue
-            if not isinstance(state, dict) or state.get("manifest_hash") != args.manifest_hash:
+            if not isinstance(state, dict):
+                continue
+            # --manifest-hash given -> resume scan: only that compile's runs.
+            # Omitted -> rerun source scan: newest committed run, any hash.
+            if args.manifest_hash is not None \
+                    and state.get("manifest_hash") != args.manifest_hash:
                 continue
             # A state without an inputs map predates the {manifest_hash,
             # step_index, inputs, results} shape — the run-step kernel cannot
@@ -281,11 +316,20 @@ def cmd_latest(args):
             if args.steps is not None and isinstance(step_index, int) \
                     and step_index >= args.steps:
                 continue  # this run already finished — nothing to resume
-            candidates.append((d, step_index))
+            candidates.append((d, step_index, state.get("manifest_hash")))
     if not candidates:
         print(json.dumps({"found": False, "skipped": skipped}, indent=2))
         return
-    d, step_index = candidates[0]  # greatest run_id == newest minted
+    d, step_index, state_hash = candidates[0]  # greatest run_id == newest minted
+    # Recorded compile provenance (short strings) so a rerun caller can
+    # reproduce the recorded compile without reading run-config itself.
+    cfg = {}
+    if (d / "run-config.json").exists():
+        try:
+            loaded = json.loads((d / "run-config.json").read_text())
+            cfg = loaded if isinstance(loaded, dict) else {}
+        except (json.JSONDecodeError, OSError):
+            cfg = {}
     print(json.dumps({
         "found": True,
         "run_id": d.name,
@@ -293,7 +337,186 @@ def cmd_latest(args):
         "run_state": str(d / "run-state.json"),
         "run_config": str(d / "run-config.json"),
         "step_index": step_index,
+        "manifest_hash": state_hash,
+        "profile_used": cfg.get("profile_used"),
+        "overrides": cfg.get("overrides") or [],
         "skipped": skipped,
+    }, indent=2))
+
+
+# ------------------------------------------------------------------- rerun
+
+def step_produced_ids(step):
+    """The node ids a manifest step stores into results when it completes:
+    a segment's `produces` list; a gate's gate.id (the recorded {choice}); an
+    orchestrator/nested checkpoint's node id."""
+    if step.get("kind") == "segment":
+        return list(step.get("produces") or step.get("nodes") or [])
+    if step.get("checkpoint_type") == "gate":
+        gid = (step.get("gate") or {}).get("id")
+        return [gid] if gid else []
+    nid = step.get("node")
+    return [nid] if nid else []
+
+
+def step_label(i, step):
+    """Short selector-help label for one manifest step."""
+    if step.get("kind") == "segment":
+        return f"{i}: segment[{','.join(step.get('nodes') or [])}]"
+    ctype = step.get("checkpoint_type", "checkpoint")
+    if ctype == "gate":
+        return f"{i}: gate:{(step.get('gate') or {}).get('id', '?')}"
+    return f"{i}: {ctype}:{step.get('node', '?')}"
+
+
+def resolve_from_point(steps, selector):
+    """Resolve --from to (step_index, snapped_to_segment). An integer selector
+    is a 0-based manifest step index. A name matches a gate id, a checkpoint
+    node id, or a node INSIDE a segment — the last SNAPS to the segment start
+    (segments are atomic: the whole segment re-runs). snapped is True only when
+    the from-point actually MOVED (the named node is not the segment's first)."""
+    sel = (selector if selector is not None else "0").strip()
+    if sel.lstrip("-").isdigit():
+        idx = int(sel)
+        if not (0 <= idx < len(steps)):
+            die(f"--from {idx} is out of range (manifest has {len(steps)} steps)", 1)
+        return idx, False
+    for i, step in enumerate(steps):
+        if step.get("kind") == "segment":
+            nodes = step.get("nodes") or []
+            if sel in nodes:
+                return i, sel != nodes[0]
+        elif step.get("checkpoint_type") == "gate":
+            if (step.get("gate") or {}).get("id") == sel:
+                return i, False
+        elif step.get("node") == sel:
+            return i, False
+    die(f"--from {sel!r} matches no manifest step, node, or gate; steps are: "
+        + "; ".join(step_label(i, s) for i, s in enumerate(steps)), 1)
+
+
+def cmd_rerun(args):
+    runs_dir = Path(args.runs_dir).resolve()
+    manifest = load_json(Path(args.manifest), "manifest")
+    steps = manifest.get("steps")
+    if not isinstance(steps, list) or not steps:
+        die("manifest carries no steps list")
+    m_hash = manifest.get("manifest_hash")
+    if not m_hash:
+        die("manifest carries no manifest_hash")
+    source_dir = runs_dir / args.source_run
+    if not source_dir.is_dir():
+        die(f"source run dir not found: {source_dir}")
+    sp = run_paths(source_dir)
+    config = load_json(sp["config"], "source run-config.json")
+    state = load_json(sp["state"], "source run-state.json")
+    # --- HARD GATE: manifest_hash equality with the recorded run ---
+    # A rerun replays recorded node outputs into a recompiled manifest; any
+    # drift (def/registry edit, different profile/overrides, gate mode) means
+    # the stored outputs no longer line up with the steps. Fail loud — never
+    # a partial reuse.
+    for what, rec in (("run-config.json", config.get("manifest_hash")),
+                      ("run-state.json", state.get("manifest_hash"))):
+        if rec != m_hash:
+            die(f"rerun requires manifest_hash equality: the compiled manifest "
+                f"is {m_hash} but the source run's {what} records {rec} — the "
+                f"def, registry, profile/overrides, or gate mode changed since "
+                f"the recorded run, so its stored node outputs no longer line "
+                f"up. Recompile with the run's recorded profile/overrides (and "
+                f"--gate-mode auto if it was headless), or start a fresh run.", 1)
+    if not isinstance(state.get("inputs"), dict) \
+            or not isinstance(state.get("results"), dict):
+        die("source run-state carries no inputs/results objects — a pre-shape "
+            "run-state is not rerunnable (start a fresh run)", 1)
+    from_idx, snapped = resolve_from_point(steps, args.from_)
+    recorded_idx = state.get("step_index")
+    if not isinstance(recorded_idx, int) or recorded_idx < from_idx:
+        die(f"--from resolves to step {from_idx} but the source run only "
+            f"committed progress up to step_index {recorded_idx!r} — every "
+            f"step before the from-point needs a recorded result; choose an "
+            f"earlier from-point", 1)
+    # --- seed: recorded inputs + every pre-from result, nothing after ---
+    # Results at/after the from-point are DROPPED: the rerun re-produces them,
+    # and a stale later output must never leak into an arg or expression.
+    results = state["results"]
+    seed_results, replayed_gates, missing = {}, [], []
+    for i in range(from_idx):
+        step = steps[i]
+        for nid in step_produced_ids(step):
+            if nid in results:
+                seed_results[nid] = results[nid]
+            else:
+                missing.append(f"step {i} result '{nid}'")
+        if step.get("checkpoint_type") == "gate":
+            gid = (step.get("gate") or {}).get("id")
+            rec = results.get(gid)
+            replayed_gates.append({
+                "step_index": i, "gate": gid,
+                "choice": rec.get("choice") if isinstance(rec, dict) else None})
+    if missing:
+        die("the source run-state is missing recorded results for: "
+            + "; ".join(missing) + " — every produced node must be stored in "
+            "results (null for a guarded skip); this run cannot seed a rerun "
+            "from that point", 1)
+    # Orchestrator-world checkpoints at/after the from-point re-execute SIDE
+    # EFFECTS (filesystem writes, vendoring, nested child runs) that already
+    # happened once — the dispatcher confirm-gates each before re-running it.
+    confirm_steps = []
+    for i in range(from_idx, len(steps)):
+        ctype = steps[i].get("checkpoint_type")
+        if ctype in ("orchestrator_node", "nested_workflow"):
+            entry = {"step_index": i, "checkpoint_type": ctype,
+                     "node": steps[i].get("node")}
+            if steps[i].get("workflow"):
+                entry["workflow"] = steps[i]["workflow"]
+            confirm_steps.append(entry)
+    # --- mint the NEW run (the source dir is provenance — never touched) ---
+    run_id, run_dir = mint_run_dir(runs_dir, args.run_id)
+    p = run_paths(run_dir)
+    new_config = {
+        "v": JOURNAL_VERSION,
+        "run_id": run_id,
+        "manifest_hash": m_hash,
+        "profile_used": config.get("profile_used"),
+        "overrides": list(config.get("overrides") or []),
+        # The FROZEN recorded input set (this is what makes rerun deterministic
+        # — and what makes it NOT the fail->fix->re-review loop). Values may be
+        # absolute paths into the SOURCE run's run-inputs/ — retention of
+        # finished run dirs is load-bearing.
+        "inputs": state["inputs"],
+        "rerun_of": args.source_run,
+        "from_step_index": from_idx,
+    }
+    write_json_atomic(p["config"], new_config)
+    write_json_atomic(p["state"], {
+        "manifest_hash": m_hash, "step_index": from_idx,
+        "inputs": state["inputs"], "results": seed_results})
+    journal_append(run_dir, "run_start", {
+        "manifest_hash": m_hash,
+        "profile": new_config["profile_used"],
+        "overrides": len(new_config["overrides"]) or None,
+        "rerun_of": args.source_run,
+        "from_step_index": from_idx,
+    })
+    journal_append(run_dir, "rerun", {
+        "from_step_index": from_idx,
+        "source_run": args.source_run,
+        "snapped_to_segment": True if snapped else None,
+        "replayed_gates": ({g["gate"]: g["choice"] for g in replayed_gates}
+                           or None),
+    })
+    print(json.dumps({
+        "run_id": run_id,
+        "run_dir": str(run_dir),
+        "run_config": str(p["config"]),
+        "run_state": str(p["state"]),
+        "journal": str(p["journal"]),
+        "manifest_hash": m_hash,
+        "from": {"selector": args.from_ if args.from_ is not None else "0",
+                 "step_index": from_idx, "snapped_to_segment": snapped},
+        "replayed_gates": replayed_gates,
+        "confirm_steps": confirm_steps,
+        "seeded_results": sorted(seed_results),
     }, indent=2))
 
 
@@ -395,11 +618,35 @@ def main():
     sp = sub.add_parser("latest",
                         help="newest run under runs/ whose run-state matches --manifest-hash")
     sp.add_argument("--runs-dir", required=True)
-    sp.add_argument("--manifest-hash", required=True)
+    sp.add_argument("--manifest-hash", default=None,
+                    help="only offer runs of this compile (the resume scan); "
+                         "omit for the rerun source scan — newest committed run, "
+                         "any hash, finished included")
     sp.add_argument("--steps", type=int, default=None,
                     help="manifest step count; a run whose step_index >= this has "
                          "finished and is not resumable")
     sp.set_defaults(fn=cmd_latest)
+
+    sp = sub.add_parser("rerun",
+                        help="seed a partial re-run of --source-run from --from "
+                             "(requires manifest_hash equality; mints a NEW run "
+                             "dir seeded with the recorded inputs + pre-from "
+                             "results)")
+    sp.add_argument("--runs-dir", required=True, help="<def-dir>/.compiled/runs")
+    sp.add_argument("--manifest", required=True,
+                    help="path to the freshly compiled .compiled/manifest.json "
+                         "(its manifest_hash must equal the source run's)")
+    sp.add_argument("--source-run", required=True,
+                    help="run id under --runs-dir to seed from (its dir is read, "
+                         "never modified)")
+    sp.add_argument("--from", dest="from_", default=None,
+                    help="from-point: a 0-based manifest step index, a gate id, "
+                         "a checkpoint node id, or a node inside a segment "
+                         "(snaps to the segment start). Default: 0 (full replay "
+                         "on the frozen recorded inputs)")
+    sp.add_argument("--run-id", default=None,
+                    help="explicit new run id (tests); default minted")
+    sp.set_defaults(fn=cmd_rerun)
 
     sp = sub.add_parser("project", help="timestamp-free journal projection (diffable)")
     sp.add_argument("--run-dir", required=True)
