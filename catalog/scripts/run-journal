@@ -1,0 +1,387 @@
+#!/usr/bin/env python3
+"""run-journal — per-run ledger helper for the workflow dispatcher.
+
+All dispatcher runtime state for one workflow run lives under
+`<def-dir>/.compiled/runs/<run-id>/`:
+
+    run-config.json   {v, run_id, manifest_hash, profile_used, overrides[], inputs}
+                      (additively extensible; written via tmp + os.replace)
+    run-state.json    {manifest_hash, step_index, results} — the resume checkpoint,
+                      committed here via tmp + os.replace (the harness-sync protocol)
+    run-inputs/       per-run materialized inputs (normalize-input outputs)
+    journal.jsonl     append-only machine-readable timeline, one JSON object per line
+
+`runs/` sits inside the existing `.compiled/` quarantine: compile-workflow's
+stale-clean globs only `seg-*.js` and `resolved/*.json`, and both reconcile loops
+(initialize-harness / harness-sync) skip `.compiled/` entirely — so run ledgers
+survive recompiles and reconciles.
+
+PATHS-ONLY CONTRACT. Flags carry paths (run dir, a tmp run-state file, an inputs
+file) plus short enumerated/label fields — never large content. The helper records
+its own UTC timestamps and computes byte sizes by reading run-state / run-config
+itself, so node outputs and gathered inputs never ride argv (where they would be
+shell-quoted, truncated, or logged). v1 journal lines carry no exec:{agent,model}
+— the manifest does not record per-node executors, so the dispatcher has nothing
+truthful to pass.
+
+Subcommands:
+  init           mint a run_id, create runs/<run-id>/{run-inputs/}, write
+                 run-config.json, journal `run_start`
+  record-inputs  fold a gathered-inputs JSON file into run-config.json, journal
+                 `inputs_recorded` with per-input byte sizes
+  append         append one event (step_complete | resume | run_complete |
+                 run_error); --commit-state atomically promotes a tmp run-state
+                 file to run-state.json first, then sizes are computed from the
+                 committed state
+  latest         scan runs/*/run-state.json for the newest run (greatest run_id —
+                 minted ids are UTC-timestamp-prefixed, so lexical == chronological)
+                 matching --manifest-hash, for the dispatcher's resume offer
+  project        timestamp-free projection of journal.jsonl to stdout (sorted keys,
+                 `ts` dropped) so two runs are mechanically diffable
+  report         render journal.jsonl human-readably
+
+Known boundary (documented, not fixed): runs/ namespaces *runtime* state only.
+Concurrent runs of the SAME def compiled with different profiles/overrides still
+race on the shared `.compiled/seg-*.js` + `manifest.json` (one compile per def dir
+wins) — see DAG-RULES.md.
+"""
+import argparse
+import json
+import os
+import secrets
+import sys
+import time
+from pathlib import Path
+
+JOURNAL_VERSION = 1
+APPEND_EVENTS = ("step_complete", "resume", "run_complete", "run_error")
+OUTCOMES = ("ok", "skipped", "error")
+
+
+def die(msg, code=2, **extra):
+    payload = {"error": msg}
+    payload.update(extra)
+    print(json.dumps(payload, indent=2))
+    sys.exit(code)
+
+
+def now_ts():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def write_json_atomic(path: Path, obj):
+    """tmp + os.replace — the harness-sync write protocol."""
+    tmp = path.parent / (path.name + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=2, sort_keys=True) + "\n")
+    os.replace(tmp, path)
+
+
+def json_bytes(obj):
+    """Stable serialized byte size of one JSON value."""
+    return len(json.dumps(obj, sort_keys=True, ensure_ascii=False).encode("utf-8"))
+
+
+def load_json(path: Path, what):
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        die(f"{what} not found: {path}")
+    except (json.JSONDecodeError, OSError) as e:
+        die(f"{what} unreadable: {path}: {e}")
+
+
+def run_paths(run_dir: Path):
+    return {
+        "config": run_dir / "run-config.json",
+        "state": run_dir / "run-state.json",
+        "journal": run_dir / "journal.jsonl",
+        "inputs_dir": run_dir / "run-inputs",
+    }
+
+
+def state_sizes(run_dir: Path):
+    """Byte sizes computed BY READING run-state.json (content never rides argv).
+    Returns {} when no state exists yet (e.g. the run_start line)."""
+    state_path = run_paths(run_dir)["state"]
+    if not state_path.exists():
+        return {}
+    state = load_json(state_path, "run-state.json")
+    out = {"state_bytes": state_path.stat().st_size}
+    results = state.get("results")
+    if isinstance(results, dict):
+        out["result_bytes"] = {k: json_bytes(results[k]) for k in sorted(results)}
+    return out
+
+
+def journal_append(run_dir: Path, event: str, fields: dict):
+    """Append one line. Keys with None values are omitted; ts is minted here."""
+    line = {"v": JOURNAL_VERSION, "ts": now_ts(), "event": event}
+    line.update({k: v for k, v in fields.items() if v is not None})
+    path = run_paths(run_dir)["journal"]
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(line, sort_keys=True, ensure_ascii=False) + "\n")
+    return path
+
+
+def require_run_dir(arg):
+    run_dir = Path(arg).resolve()
+    if not run_dir.is_dir():
+        die(f"run dir not found: {run_dir}")
+    return run_dir
+
+
+# ---------------------------------------------------------------- subcommands
+
+def cmd_init(args):
+    runs_dir = Path(args.runs_dir).resolve()
+    run_id = args.run_id or (
+        time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + secrets.token_hex(3))
+    if "/" in run_id or run_id in (".", ".."):
+        die(f"invalid run id: {run_id!r}")
+    run_dir = runs_dir / run_id
+    if run_dir.exists():
+        die(f"run dir already exists: {run_dir}", run_id=run_id)
+    p = run_paths(run_dir)
+    p["inputs_dir"].mkdir(parents=True)
+    config = {
+        "v": JOURNAL_VERSION,
+        "run_id": run_id,
+        "manifest_hash": args.manifest_hash,
+        "profile_used": args.profile,
+        "overrides": list(args.override or []),
+        "inputs": {},
+    }
+    write_json_atomic(p["config"], config)
+    journal_append(run_dir, "run_start", {
+        "manifest_hash": args.manifest_hash,
+        "profile": args.profile,
+        "overrides": len(config["overrides"]) or None,
+    })
+    print(json.dumps({
+        "run_id": run_id,
+        "run_dir": str(run_dir),
+        "run_config": str(p["config"]),
+        "run_inputs": str(p["inputs_dir"]),
+        "journal": str(p["journal"]),
+    }, indent=2))
+
+
+def cmd_record_inputs(args):
+    run_dir = require_run_dir(args.run_dir)
+    p = run_paths(run_dir)
+    inputs_file = Path(args.inputs_file)
+    if not inputs_file.is_absolute():
+        inputs_file = run_dir / inputs_file
+    inputs = load_json(inputs_file, "inputs file")
+    if not isinstance(inputs, dict):
+        die(f"inputs file must hold a JSON object: {inputs_file}")
+    config = load_json(p["config"], "run-config.json")
+    config["inputs"] = inputs
+    write_json_atomic(p["config"], config)
+    # Consume a scratch file that lives inside the run dir; leave outside files alone.
+    try:
+        inputs_file.resolve().relative_to(run_dir)
+        inputs_file.unlink()
+    except ValueError:
+        pass
+    journal_append(run_dir, "inputs_recorded", {
+        "input_bytes": {k: json_bytes(inputs[k]) for k in sorted(inputs)},
+    })
+    print(json.dumps({"ok": True, "inputs": len(inputs),
+                      "run_config": str(p["config"])}, indent=2))
+
+
+def cmd_append(args):
+    run_dir = require_run_dir(args.run_dir)
+    p = run_paths(run_dir)
+    if args.event not in APPEND_EVENTS:
+        die(f"unknown event {args.event!r} (want one of: {', '.join(APPEND_EVENTS)})")
+    if args.outcome is not None and args.outcome not in OUTCOMES:
+        die(f"invalid outcome {args.outcome!r} (want one of: {', '.join(OUTCOMES)})")
+    config = load_json(p["config"], "run-config.json")
+
+    if args.commit_state:
+        tmp = Path(args.commit_state)
+        if not tmp.is_absolute():
+            tmp = run_dir / tmp
+        state = load_json(tmp, "tmp run-state")
+        if not isinstance(state, dict):
+            die(f"tmp run-state must hold a JSON object: {tmp}")
+        # The run dir's state must always target the run's own compiled manifest —
+        # the resume scan depends on this invariant. Fail loud BEFORE replacing.
+        if state.get("manifest_hash") != config.get("manifest_hash"):
+            die("tmp run-state manifest_hash does not match this run's run-config.json "
+                f"({state.get('manifest_hash')!r} != {config.get('manifest_hash')!r})")
+        if not isinstance(state.get("step_index"), int):
+            die("tmp run-state step_index must be an integer")
+        if not isinstance(state.get("results"), dict):
+            die("tmp run-state results must be an object")
+        os.replace(tmp, p["state"])
+
+    fields = {
+        "step_index": args.step_index,
+        "label": args.label,
+        "node": args.node,
+        "gate": args.gate,
+        "choice": args.choice,
+        "outcome": args.outcome,
+    }
+    fields.update(state_sizes(run_dir))
+    journal = journal_append(run_dir, args.event, fields)
+    print(json.dumps({"ok": True, "event": args.event, "journal": str(journal)}, indent=2))
+
+
+def cmd_latest(args):
+    runs_dir = Path(args.runs_dir).resolve()
+    candidates, skipped = [], []
+    if runs_dir.is_dir():
+        for d in sorted((c for c in runs_dir.iterdir() if c.is_dir()),
+                        key=lambda c: c.name, reverse=True):
+            state_path = d / "run-state.json"
+            if not state_path.exists():
+                continue
+            try:
+                state = json.loads(state_path.read_text())
+            except (json.JSONDecodeError, OSError):
+                skipped.append(d.name)
+                continue
+            if not isinstance(state, dict) or state.get("manifest_hash") != args.manifest_hash:
+                continue
+            step_index = state.get("step_index")
+            if args.steps is not None and isinstance(step_index, int) \
+                    and step_index >= args.steps:
+                continue  # this run already finished — nothing to resume
+            candidates.append((d, step_index))
+    if not candidates:
+        print(json.dumps({"found": False, "skipped": skipped}, indent=2))
+        return
+    d, step_index = candidates[0]  # greatest run_id == newest minted
+    print(json.dumps({
+        "found": True,
+        "run_id": d.name,
+        "run_dir": str(d),
+        "run_state": str(d / "run-state.json"),
+        "run_config": str(d / "run-config.json"),
+        "step_index": step_index,
+        "skipped": skipped,
+    }, indent=2))
+
+
+def read_journal(run_dir: Path):
+    path = run_paths(run_dir)["journal"]
+    if not path.exists():
+        die(f"journal not found: {path}")
+    lines = []
+    for n, raw in enumerate(path.read_text().splitlines(), 1):
+        if not raw.strip():
+            continue
+        try:
+            lines.append(json.loads(raw))
+        except json.JSONDecodeError as e:
+            # The journal is code-written; a corrupt line is a real error, not noise.
+            die(f"journal line {n} unparseable: {path}: {e}")
+    return lines
+
+
+def cmd_project(args):
+    run_dir = require_run_dir(args.run_dir)
+    for line in read_journal(run_dir):
+        line.pop("ts", None)
+        print(json.dumps(line, sort_keys=True, ensure_ascii=False))
+
+
+def fmt_bytes(n):
+    if n is None:
+        return "?"
+    if n < 1024:
+        return f"{n}B"
+    return f"{n / 1024:.1f}KB"
+
+
+def cmd_report(args):
+    run_dir = require_run_dir(args.run_dir)
+    p = run_paths(run_dir)
+    config = load_json(p["config"], "run-config.json") if p["config"].exists() else {}
+    print(f"run      {config.get('run_id', run_dir.name)}")
+    print(f"manifest {config.get('manifest_hash', '?')}")
+    print(f"profile  {config.get('profile_used') or '(base)'}")
+    for ov in config.get("overrides") or []:
+        print(f"override {ov}")
+    inputs = config.get("inputs") or {}
+    if inputs:
+        print(f"inputs   {', '.join(sorted(inputs))}")
+    print()
+    for line in read_journal(run_dir):
+        bits = [line.get("ts", "?"), line.get("event", "?")]
+        if line.get("step_index") is not None:
+            bits.append(f"step {line['step_index']}")
+        if line.get("label"):
+            bits.append(line["label"])
+        if line.get("gate"):
+            bits.append(f"gate {line['gate']} -> {line.get('choice', '?')}")
+        if line.get("outcome"):
+            bits.append(f"[{line['outcome']}]")
+        if line.get("state_bytes") is not None:
+            bits.append(f"state {fmt_bytes(line['state_bytes'])}")
+        print("  ".join(bits))
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Per-run ledger helper for the workflow dispatcher (paths-only contract).")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("init", help="mint a run dir under runs/ and write run-config.json")
+    sp.add_argument("--runs-dir", required=True, help="<def-dir>/.compiled/runs")
+    sp.add_argument("--manifest-hash", required=True)
+    sp.add_argument("--profile", default=None)
+    sp.add_argument("--override", action="append", default=[],
+                    help="one applied --override k=v, recorded verbatim. Repeatable.")
+    sp.add_argument("--run-id", default=None, help="explicit run id (tests); default minted")
+    sp.set_defaults(fn=cmd_init)
+
+    sp = sub.add_parser("record-inputs",
+                        help="fold a gathered-inputs JSON file into run-config.json")
+    sp.add_argument("--run-dir", required=True)
+    sp.add_argument("--inputs-file", required=True,
+                    help="path to a JSON object of gathered inputs (a scratch file inside "
+                         "the run dir is consumed after merging)")
+    sp.set_defaults(fn=cmd_record_inputs)
+
+    sp = sub.add_parser("append", help="append one journal event")
+    sp.add_argument("--run-dir", required=True)
+    sp.add_argument("--event", required=True, help="|".join(APPEND_EVENTS))
+    sp.add_argument("--step-index", type=int, default=None)
+    sp.add_argument("--label", default=None, help="short human label for the step")
+    sp.add_argument("--node", default=None)
+    sp.add_argument("--gate", default=None)
+    sp.add_argument("--choice", default=None, help="the recorded gate choice label")
+    sp.add_argument("--outcome", default=None, help="|".join(OUTCOMES))
+    sp.add_argument("--commit-state", default=None,
+                    help="tmp run-state file to promote to run-state.json via os.replace "
+                         "before sizing (relative paths resolve against --run-dir)")
+    sp.set_defaults(fn=cmd_append)
+
+    sp = sub.add_parser("latest",
+                        help="newest run under runs/ whose run-state matches --manifest-hash")
+    sp.add_argument("--runs-dir", required=True)
+    sp.add_argument("--manifest-hash", required=True)
+    sp.add_argument("--steps", type=int, default=None,
+                    help="manifest step count; a run whose step_index >= this has "
+                         "finished and is not resumable")
+    sp.set_defaults(fn=cmd_latest)
+
+    sp = sub.add_parser("project", help="timestamp-free journal projection (diffable)")
+    sp.add_argument("--run-dir", required=True)
+    sp.set_defaults(fn=cmd_project)
+
+    sp = sub.add_parser("report", help="render the journal human-readably")
+    sp.add_argument("--run-dir", required=True)
+    sp.set_defaults(fn=cmd_report)
+
+    args = ap.parse_args()
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()

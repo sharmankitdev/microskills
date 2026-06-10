@@ -400,3 +400,45 @@ def test_schema_rejects_v1_components_shape(tmp_path):
     rc, data, out, err = run(tmp_path, "--plan")
     assert rc == 1
     assert "schema_errors" in data
+
+
+def make_workflow(tmp, name, desc="A demo workflow.", prompt="do a"):
+    d = tmp / "harness" / "workflow-defs" / name
+    (d / "profiles").mkdir(parents=True, exist_ok=True)
+    (d / "WORKFLOW.yaml").write_text(
+        f"version: 1\nname: {name}\ndescription: {desc}\n"
+        f"nodes:\n  - id: a\n    agent: ag\n    prompt: {prompt}\n")
+    (d / "profiles" / "base.yaml").write_text("version: 1\n")
+    return d
+
+
+def test_update_preserves_compiled_runs_ledger(tmp_path):
+    # .compiled/ is generated/transient (VENDOR_IGNORE_PARTS): never vendored, never
+    # hashed, never in installed_paths — so the dispatcher's per-run ledgers under
+    # .claude/workflow-defs/<name>/.compiled/runs/<run-id>/ survive a sync update
+    # (the stale prune unlinks only previously-OWNED paths).
+    d = make_workflow(tmp_path, "demo-flow")
+    write_manifest(tmp_path, [{"name": "demo-flow", "kind": "workflow"}])
+    rc, data, out, err = run(tmp_path, "--apply")
+    assert rc == 0, err
+    st = state_of(tmp_path)["components"]["demo-flow"]
+    assert not any(".compiled" in p for p in st["installed_paths"])
+
+    # Plant a per-run ledger exactly as run-journal lays it out.
+    run_dir = (tmp_path / ".claude" / "workflow-defs" / "demo-flow"
+               / ".compiled" / "runs" / "20260610T120000Z-abc123")
+    (run_dir / "run-inputs").mkdir(parents=True)
+    (run_dir / "run-config.json").write_text('{"v": 1, "run_id": "20260610T120000Z-abc123"}')
+    (run_dir / "run-state.json").write_text('{"manifest_hash": "sha256:h", "step_index": 1, "results": {}}')
+    (run_dir / "journal.jsonl").write_text('{"v":1,"event":"run_start"}\n')
+    (run_dir / "run-inputs" / "x.cat").write_text("materialized")
+
+    # Edit the source -> the next apply is an UPDATE (stale prune + re-vendor).
+    make_workflow(tmp_path, "demo-flow", prompt="do a differently")
+    rc, data, out, err = run(tmp_path, "--apply")
+    assert rc == 0, err
+    assert [a["action"] for a in data["actions"]] == ["update"]
+    for f in ("run-config.json", "run-state.json", "journal.jsonl", "run-inputs/x.cat"):
+        assert (run_dir / f).exists(), f"{f} clobbered by sync update"
+    st = state_of(tmp_path)["components"]["demo-flow"]
+    assert not any(".compiled" in p for p in st["installed_paths"])

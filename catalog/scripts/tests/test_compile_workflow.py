@@ -3441,3 +3441,43 @@ loop:
     assert rc == 0, err
     text = (d / ".compiled" / "PARTITION.md").read_text()
     assert "segment[x,y] (loop body)" in text
+
+
+# ---------------------------------------------------------------------------
+# Run-ledger quarantine: .compiled/runs/ is dispatcher RUNTIME state (run-journal)
+# and must survive a recompile — stale-clean globs only seg-*.js, resolved/*.json
+# (and the PARTITION.md sidecar), never the runs/ tree or the legacy .run-state.json.
+
+
+def test_recompile_preserves_runs_tree_and_legacy_run_state(tmp_path):
+    d = make_flow(tmp_path, "linear-flow", LINEAR)
+    rc, data, *_ = run(tmp_path, "linear-flow")
+    assert rc == 0
+    compiled = d / ".compiled"
+    assert (compiled / "seg-1.js").exists()
+
+    # Plant a per-run ledger exactly as the dispatcher + run-journal lay it out.
+    run_dir = compiled / "runs" / "20260610T120000Z-abc123"
+    (run_dir / "run-inputs").mkdir(parents=True)
+    (run_dir / "run-config.json").write_text(json.dumps(
+        {"v": 1, "run_id": "20260610T120000Z-abc123",
+         "manifest_hash": data["manifest_hash"], "profile_used": None,
+         "overrides": [], "inputs": {"x": "/abs/x.cat"}}))
+    (run_dir / "run-state.json").write_text(json.dumps(
+        {"manifest_hash": data["manifest_hash"], "step_index": 1,
+         "results": {"a": {"x": 1}}}))
+    (run_dir / "journal.jsonl").write_text('{"v":1,"event":"run_start"}\n')
+    (run_dir / "run-inputs" / "x.cat").write_text("materialized")
+    legacy = compiled / ".run-state.json"
+    legacy.write_text(json.dumps(
+        {"manifest_hash": data["manifest_hash"], "step_index": 1, "results": {}}))
+
+    rc2, data2, *_ = run(tmp_path, "linear-flow")
+    assert rc2 == 0
+    assert data2["manifest_hash"] == data["manifest_hash"]  # byte-identical recompile
+    # the whole per-run tree survived the stale-clean
+    assert (run_dir / "run-config.json").exists()
+    assert (run_dir / "run-state.json").exists()
+    assert (run_dir / "journal.jsonl").exists()
+    assert (run_dir / "run-inputs" / "x.cat").exists()
+    assert legacy.exists()

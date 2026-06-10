@@ -198,3 +198,42 @@ def test_init_compiles_snippet_consuming_def_in_fresh_project(tmp_path):
     fin = [s for s in data["manifest"]["steps"] if s.get("node") == "finalize"][0]
     assert "vendoring the approved microskill" in fin["prompt"]
     assert "{{snippet:" not in fin["prompt"]
+
+
+def test_reinit_preserves_compiled_runs_ledger(tmp_path):
+    # The dispatcher's per-run ledgers live under
+    # .claude/workflow-defs/<name>/.compiled/runs/<run-id>/ (run-journal). .compiled/
+    # is generated/transient (VENDOR_IGNORE_PARTS): init never vendors, hashes, or
+    # ledger-tracks it, so a re-reconcile must leave run ledgers untouched.
+    init_project(tmp_path)
+    run_dir = (tmp_path / ".claude" / "workflow-defs" / "microskill-create"
+               / ".compiled" / "runs" / "20260610T120000Z-abc123")
+    (run_dir / "run-inputs").mkdir(parents=True)
+    (run_dir / "run-config.json").write_text('{"v": 1, "run_id": "20260610T120000Z-abc123"}')
+    (run_dir / "run-state.json").write_text(
+        '{"manifest_hash": "sha256:h", "step_index": 1, "results": {}}')
+    (run_dir / "journal.jsonl").write_text('{"v":1,"event":"run_start"}\n')
+    (run_dir / "run-inputs" / "x.cat").write_text("materialized")
+
+    init_project(tmp_path)  # re-reconcile (refresh path)
+    for f in ("run-config.json", "run-state.json", "journal.jsonl", "run-inputs/x.cat"):
+        assert (run_dir / f).exists(), f"{f} clobbered by re-init"
+    state = json.loads((tmp_path / ".claude" / ".harness-state.json").read_text())
+    comp = state["components"]["microskill-create"]
+    assert not any(".compiled" in p for p in comp["installed_paths"])
+    assert not any(".compiled" in p for p in state["engine"]["installed_paths"])
+
+
+def test_init_materializes_run_journal_executable(tmp_path):
+    # run-journal is engine (catalog/scripts/*): init must vendor it with its exec
+    # bit so the dispatcher can call .claude/scripts/run-journal.
+    init_project(tmp_path)
+    rj = tmp_path / ".claude" / "scripts" / "run-journal"
+    assert rj.exists(), "run-journal not materialized into .claude/scripts/"
+    assert os.access(rj, os.X_OK), "run-journal lost its exec bit"
+    rc, out, err = run_materialized(
+        tmp_path, "run-journal", "init",
+        "--runs-dir", str(tmp_path / "runs"),
+        "--manifest-hash", "sha256:h1", "--run-id", "r1")
+    assert rc == 0, out + err
+    assert json.loads(out)["run_id"] == "r1"

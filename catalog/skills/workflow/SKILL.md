@@ -26,12 +26,40 @@ checkpoint in the main loop (where `AskUserQuestion` works), and threads outputs
    any `override workflow-config: <field>=<value>` clauses.
 3. **Compile** — run via Bash: `.claude/scripts/compile-workflow <name> [--profile "<profile>"]
    [--override <k>=<v> ...]`. The compile summary and the written manifest always carry
-   `manifest_hash` (the resume check in step 6 needs it); `--explain` is optional diagnostics only.
+   `manifest_hash` (the resume check in step 5 needs it); `--explain` is optional diagnostics only.
    Non-zero exit → stop and surface the JSON `error` / `schema_errors`. (Never pass `--plan` here —
    that is a dry-run that writes nothing.)
 4. **Read the manifest** — read the `manifest_path` from the compile summary
    (`.claude/workflow-defs/<name>/.compiled/manifest.json`). Note `manifest.manifest_hash`.
-5. **Gather inputs** — initialize `inputs = {}`. For each name in `manifest.required_inputs`: if the
+5. **Resume check** — all runtime state is namespaced per run under
+   `.claude/workflow-defs/<name>/.compiled/runs/<run-id>/` (dispatcher runtime state, NOT a compiled
+   artifact; the compiler's stale-clean only globs `seg-*.js` and `resolved/*.json` and never touches
+   `runs/`). Run via Bash:
+   `.claude/scripts/run-journal latest --runs-dir '.claude/workflow-defs/<name>/.compiled/runs' --manifest-hash '<manifest.manifest_hash>' --steps <manifest.steps.length>`
+   It scans `runs/*/run-state.json` for the newest unfinished run (greatest run id) whose stored
+   `manifest_hash` equals the current one — a mismatched hash means the workflow was recompiled /
+   changed, so stored node outputs no longer line up and that run is simply not offered. Parse the JSON:
+   - `found: true` → **offer to resume** via `AskUserQuestion` ("Resume run {run_id} from step
+     {step_index+1}, or start fresh?"). On resume: adopt that `run_dir` as this run's directory, seed
+     `inputs` from the `inputs` map in `<run_dir>/run-config.json` (skip Setup steps 6-8 — the run's
+     inputs were already gathered and recorded; re-using completed work avoids re-running expensive
+     opus planner segments), seed `results` from the `results` map in `<run_dir>/run-state.json`, set
+     the start position `i = step_index`, and journal the pickup:
+     `.claude/scripts/run-journal append --run-dir '<run_dir>' --event resume --step-index <i>`.
+   - `found: false`, or the user picks "start fresh" → continue with Setup step 6 (start at `i = 0`;
+     any prior run dirs are left in place as provenance).
+6. **Mint the run** — run via Bash:
+   `.claude/scripts/run-journal init --runs-dir '.claude/workflow-defs/<name>/.compiled/runs' --manifest-hash '<manifest.manifest_hash>' [--profile '<profile>'] [--override '<k>=<v>' ...]`
+   (pass `--profile` / each `--override` exactly as passed to compile in step 3, so the run's
+   provenance is recorded verbatim). It mints a fresh `run_id`, creates
+   `<run_dir>/` + `<run_dir>/run-inputs/`, writes `<run_dir>/run-config.json`
+   (`{run_id, manifest_hash, profile_used, overrides, inputs}`), and opens `<run_dir>/journal.jsonl`
+   with a `run_start` event. Parse the JSON output and note `run_dir` — every runtime file below
+   (run-state, run-inputs, journal) lives under it. (`run-journal report --run-dir '<run_dir>'`
+   renders the journal human-readably for a post-mortem; `runs/` isolates *runtime* state only — two
+   concurrent runs of the same def compiled with different profiles/overrides still race on the shared
+   `.compiled/seg-*.js` + `manifest.json`, so never run those concurrently.)
+7. **Gather inputs** — initialize `inputs = {}`. For each name in `manifest.required_inputs`: if the
    caller's prompt supplies a literal value, use it; otherwise gather via `AskUserQuestion`. Apply
    `manifest.input_defaults` for any non-required input not supplied. (Do not fall back to a default
    for a required input.)
@@ -47,7 +75,7 @@ checkpoint in the main loop (where `AskUserQuestion` works), and threads outputs
    `printf`/`echo` pipe, or even a `test -e "<content>"` shape check) is a command-injection vector.
    Therefore decide the shape by the value's **provenance**, and never shell its bytes:
    - **`v` is a literal string / inline content** (a requirement, a pasted diff — e.g. the provision
-     case) → use the **Write tool** (NOT Bash) to write `v` verbatim to `<compiled_dir>/run-inputs/<name>`;
+     case) → use the **Write tool** (NOT Bash) to write `v` verbatim to `<run_dir>/run-inputs/<name>`;
      the content is a structured tool parameter, never a shell argument. That file's path is `<path>`.
    - **`v` is a filesystem path the caller supplied** (a file or directory) → that path is `<path>`
      (short and caller-chosen).
@@ -55,23 +83,20 @@ checkpoint in the main loop (where `AskUserQuestion` works), and threads outputs
    and `$var` expansion that double quotes do NOT — and first **reject any path containing a shell
    metacharacter** (`$`, backtick, `"`, `'`, `\`, or a newline): refuse it rather than interpolate, so
    even a trusted-but-odd path can never expand. (Dispatcher-written run-inputs paths never contain these.)
-   Then run `.claude/scripts/normalize-input --value '<path>' --out '<compiled_dir>/run-inputs/<name>.cat'`
+   Then run `.claude/scripts/normalize-input --value '<path>' --out '<run_dir>/run-inputs/<name>.cat'`
    via Bash (it `mkdir -p`s as needed). It receives only PATHS, never content: a **directory** → a
    byte-stable concatenation (codepoint-sorted relpaths under `=== <relpath> ===` headers, self-excluding
    `--out`); a **file** → its absolute path (pass-through, no copy). Parse the JSON `{path, shape, bytes,
    warning}`: set `inputs[name] = .path`; if `.warning` is non-null surface it (a file beyond the consuming
    node's context window needs upstream distillation — warn and proceed, never truncate). The file CONTENTS
    remain untrusted data for the consuming microskill — normalization only relocates them.
-6. **Resume check** — look for `.claude/workflow-defs/<name>/.compiled/.run-state.json` (the dispatcher's
-   own runtime state, written by "Execute the manifest" below — NOT a compiled artifact; the compiler's
-   stale-clean only globs `seg-*.js` and `resolved/*.json` and never deletes it). If it exists AND its `manifest_hash` equals
-   `manifest.manifest_hash`, the stored run targets the same compiled workflow: **offer to resume** via
-   `AskUserQuestion` ("Resume from step {step_index+1}, or start fresh?"). On resume, seed `results` from
-   the stored `results` map and set the start position `i = step_index` (re-using completed work — this
-   avoids re-running expensive opus planner segments). On "start fresh", begin at `i = 0`. If the file is
-   absent, or its `manifest_hash` DIFFERS from `manifest.manifest_hash` (the workflow was recompiled /
-   changed, so stored node outputs no longer line up), **ignore the stale run-state** and start fresh at
-   `i = 0`.
+8. **Record the gathered inputs** — use the **Write tool** to write the final `inputs` object as JSON
+   to `<run_dir>/inputs.tmp.json` (a structured tool parameter — input values never ride a shell
+   command), then run via Bash:
+   `.claude/scripts/run-journal record-inputs --run-dir '<run_dir>' --inputs-file inputs.tmp.json`.
+   It folds the inputs into `run-config.json` (so the run's full provenance — profile, overrides, and
+   the exact input set — is one record), journals an `inputs_recorded` event with per-input byte sizes,
+   and consumes the scratch file.
 
 ## Execute the manifest
 
@@ -85,15 +110,28 @@ and track the 0-based position `i` as you walk. **Before running each step, prin
 A skipped step (a `warn` gate, or an orchestrator node whose `when` is false) still gets a header, marked skipped.
 Walk `manifest.steps` in order (starting at the resume position `i` from the Setup resume check, default 0):
 
-**Persist run-state after each step.** After a step completes (and its output is stored into `results`),
-write `.claude/workflow-defs/<name>/.compiled/.run-state.json` as
-`{ "manifest_hash": manifest.manifest_hash, "step_index": <the index of the NEXT step to run>, "results": results }`.
-This is purely the dispatcher's in-memory `results{}` checkpointed to disk so a run that dies mid-way can
+**Persist run-state + journal after each step.** After a step completes (and its output is stored into
+`results`), checkpoint in two moves:
+1. Use the **Write tool** to write
+   `{ "manifest_hash": manifest.manifest_hash, "step_index": <the index of the NEXT step to run>, "results": results }`
+   to `<run_dir>/run-state.json.tmp` (a structured tool parameter — node outputs never ride a shell
+   command).
+2. Run ONE Bash call:
+   `.claude/scripts/run-journal append --run-dir '<run_dir>' --event step_complete --step-index <i> --label '<the step header label>' --commit-state run-state.json.tmp`
+   — for a gate step also pass `--gate '<gate.id>' --choice '<the recorded choice label>'`; for a
+   skipped step (a false `when`, or a warn gate passed through) add `--outcome skipped`. The helper
+   atomically promotes the tmp file to `<run_dir>/run-state.json` (tmp + `os.replace` — a crash never
+   leaves a half-written state) and appends one machine-readable line to `<run_dir>/journal.jsonl`,
+   recording its own timestamp and computing byte sizes by reading the committed state itself — content
+   never rides argv.
+This is the dispatcher's in-memory `results{}` checkpointed to disk so a run that dies mid-way can
 resume (see the Setup resume check) instead of restarting from step 0 and re-running expensive segments.
-It is dispatcher runtime state, quarantined from the compiled bytes — the compiler never reads it and its
-stale-clean (which globs only `seg-*.js` and `resolved/*.json`) never deletes it, so determinism is untouched. On a clean finish
-the file may be left in place (a later run with a matching `manifest_hash` whose `step_index` is past the
-last step simply has nothing to resume) or removed — do not let writing it block the run.
+It is dispatcher runtime state, quarantined from the compiled bytes — the compiler never reads `runs/`
+and its stale-clean (which globs only `seg-*.js` and `resolved/*.json`) never deletes it, so determinism
+is untouched. On a clean finish leave the run dir in place — it is the run's provenance record (the
+`latest` scan skips finished runs via `--steps`). Do not let journaling block the run. On a stop
+(segment error, abandoned gate, unresolvable input), record it before stopping:
+`.claude/scripts/run-journal append --run-dir '<run_dir>' --event run_error --step-index <i> --outcome error --label '<short reason>'`.
 
 ### `kind: "segment"`
 1. Build the `args` object the segment expects — **every needed key must be PRESENT; use `null`,
@@ -188,8 +226,9 @@ collecting an array into `results[node]`). Then:
    checkpoint carries a `profile`** (a `customize: {profile}` on the `workflow:` node — e.g. `provision`
    runs `microskill-create` with the `autonomous` profile so its plan gate never pauses; omit the flag
    when absent), and run its manifest, supplying the resolved map as the child's gathered `inputs`
-   (skip the interactive input-gathering step — the inputs are already provided by the parent). **Still
-   run the normalization pass (Setup step 5) over the child's `manifest.materialize_inputs`** before its
+   (skip the interactive gathering — the inputs are already provided by the parent; the child still
+   mints its OWN run dir under its own def's `.compiled/runs/` and records them, Setup steps 6-8). **Still
+   run the normalization pass (Setup step 7) over the child's `manifest.materialize_inputs`** before its
    first segment: a parent may pass a raw string into the child's `materialize: file` input (e.g.
    `provision` hands `microskill-create` a `requirement_path` whose value is the per-microskill
    requirement *string* from the plan), and that string must be written to a file so only a path reaches
@@ -201,8 +240,10 @@ collecting an array into `results[node]`). Then:
    success.
 
 ## Finish
-If `manifest.output.from` is set, report `results[<that node>]` as the workflow's result. Then print a
-one-line wrap-up: workflow name + final outcome and where the output landed. The per-segment recaps
+Close the journal: `.claude/scripts/run-journal append --run-dir '<run_dir>' --event run_complete
+--outcome ok`. If `manifest.output.from` is set, report `results[<that node>]` as the workflow's
+result. Then print a one-line wrap-up: workflow name + final outcome and where the output landed
+(mention `run-journal report --run-dir '<run_dir>'` as the run's timeline). The per-segment recaps
 already covered the play-by-play — don't re-summarize each segment here.
 
 ## Gate / delegation semantics (authoritative)
