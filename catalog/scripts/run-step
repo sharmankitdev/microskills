@@ -491,7 +491,10 @@ def cmd_eval(a):
     # Presence guard — the checkpoint twin of the compiled segment's args
     # guard: every node this step's expressions reference must be PRESENT in
     # results (null is legal — a guarded skip is stored as null). The step's
-    # `as` var is excluded: a per-item binding is not a node ref.
+    # `as` var is excluded ONLY when for_each is present: a per-item binding
+    # exists only in a fan-out — without for_each a node literally named
+    # 'item' (the `as` default) is an ordinary node ref and an absent
+    # recorded result must fail loud, never render `undefined`.
     needs = Needs()
     scope = set()
     needs.scan(step.get("when"), scope)
@@ -502,7 +505,8 @@ def cmd_eval(a):
         for expr in (step.get("inputs") or {}).values():
             needs.scan(expr, scope)
     as_var = step.get("as") or "item"
-    missing = sorted(n for n in needs.nodes - {as_var} if n not in results)
+    excluded = {as_var} if step.get("for_each") else set()
+    missing = sorted(n for n in needs.nodes - excluded if n not in results)
     if missing:
         payload["errors"] = [
             f"no recorded result for node '{nid}' — every produced node must "
@@ -532,7 +536,7 @@ def cmd_eval(a):
     spills = manifest_spill_map(manifest)
     spilled = {}
     results_view = dict(results)
-    for s_nid in sorted(needs.nodes - {as_var}):
+    for s_nid in sorted(needs.nodes - excluded):
         if s_nid in spills and s_nid in results_view:
             results_view[s_nid] = spill_node_result(
                 s_nid, results_view[s_nid], spills[s_nid],

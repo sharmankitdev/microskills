@@ -294,6 +294,46 @@ def test_eval_orchestrator_for_each_resolves_prompt_per_item(tmp_path):
         "Create a: ra", "Create b: rb"]
 
 
+def test_eval_node_named_item_without_for_each_missing_result_fails_loud(tmp_path):
+    # REGRESSION: the presence guard excludes the step's `as` var from needed
+    # nodes ONLY when for_each is present (a per-item binding exists only in a
+    # fan-out). Without for_each, a node literally named 'item' (the `as`
+    # default) is an ordinary node ref — an absent recorded result must FAIL
+    # LOUD, never render `undefined` with exit 0.
+    man, st = world(tmp_path, [orch_step("Use ${item.output.value}")],
+                    results={"plan": {"name": "x"}})
+    rc, data, out, err = run("eval", "--manifest", str(man),
+                             "--run-state", str(st), "--step", "0")
+    assert rc == 1, out + err
+    assert any("no recorded result for node 'item'" in e for e in data["errors"])
+
+
+@needs_node
+def test_eval_node_named_item_without_for_each_resolves_recorded_result(tmp_path):
+    # The positive twin: with a recorded result, a node named 'item' resolves
+    # like any other node ref when no for_each is in play.
+    man, st = world(tmp_path, [orch_step("Use ${item.output.value}")],
+                    results={"item": {"value": "V"}})
+    rc, data, out, err = run("eval", "--manifest", str(man),
+                             "--run-state", str(st), "--step", "0")
+    assert rc == 0, out + err
+    assert data["prompt"] == "Use V"
+
+
+@needs_node
+def test_eval_for_each_as_var_still_excluded_from_presence_guard(tmp_path):
+    # With for_each present, the `as` binding (default 'item') is NOT a node
+    # ref — no recorded result is required for it.
+    man, st = world(
+        tmp_path,
+        [orch_step("Per ${item.name}", for_each="${plan.output.missing}")],
+        results={"plan": {"missing": [{"name": "a"}]}})
+    rc, data, out, err = run("eval", "--manifest", str(man),
+                             "--run-state", str(st), "--step", "0")
+    assert rc == 0, out + err
+    assert [it["prompt"] for it in data["iterations"]] == ["Per a"]
+
+
 @needs_node
 def test_eval_for_each_empty_collection_yields_empty_iterations(tmp_path):
     man, st = world(tmp_path,
@@ -696,6 +736,24 @@ def test_eval_nested_child_input_receives_spilled_path(tmp_path):
     assert rc == 0, out + err
     hpath = str(tmp_path / "handoff" / "review.report")
     assert data["child_inputs"] == {"report_path": hpath}
+
+
+@needs_node
+def test_eval_spilled_node_named_item_without_for_each_substitutes_path(tmp_path):
+    # REGRESSION twin of the presence-guard fix: the spilled-view substitution
+    # loop must also treat a node named 'item' as an ordinary node ref when no
+    # for_each is present — its spilled field resolves to the handoff path.
+    man, st = world(
+        tmp_path,
+        [spill_producer_step({"item": ["report"]}),
+         orch_step("post ${item.output.report}")],
+        results={"item": {"report": "w" * 2048}})
+    rc, data, out, err = run("eval", "--manifest", str(man),
+                             "--run-state", str(st), "--step", "1")
+    assert rc == 0, out + err
+    hpath = str(tmp_path / "handoff" / "item.report")
+    assert data["prompt"] == f"post {hpath}"
+    assert data["spilled"] == {"item": {"report": hpath}}
 
 
 @needs_node
