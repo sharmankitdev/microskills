@@ -5,16 +5,35 @@ validate-workflow — structural + schema + DAG validation for a WORKFLOW.yaml.
 Mirrors validate-microskill. Validates the deep-merge of WORKFLOW.yaml + any
 profile overlays against workflow-schema.json, then runs DAG checks (node
 shape, unique ids, depends_on completeness, ${ref} declaration, cycles, gate
-and loop anchoring).
+and loop anchoring), resolves every use: target through the SAME
+resolve-microskill subprocess the compiler uses (typed-ref checks fall back to
+the resolved output_schema; inline-schema redundancy is linted), materializes
+`wire: auto` pass-through forwards via the SAME shared helper as compile (an
+unresolvable wire: auto target is always a block; auto-wiring a REQUIRED
+target input warns), and lints redundant depends_on entries + undeclared
+${workflow.inputs.x} refs.
+
+TWO-MODE unresolvable-use: handling (intentional — stricter than the original
+WARN+--strict spec):
+  - WITH --defs-root (full-registry validation): an unresolvable / failed
+    use: target is an UNCONDITIONAL BLOCK — fail-loud parity with
+    compile-workflow's hard die. The caller explicitly named the registry, so
+    a missing target is a real error, never an environment artifact.
+  - STANDALONE (no --defs-root; the skill root is derived from the file's
+    layout): it is a WARN, so hermetic single-file validation keeps passing
+    when no microskill registry is reachable; --strict escalates it to a
+    block. (--strict is the STANDALONE escalation knob only — with
+    --defs-root the block is already unconditional.)
 
 Usage:
-  validate-workflow <WORKFLOW.yaml> [<profile.yaml> ...]
+  validate-workflow <WORKFLOW.yaml> [<profile.yaml> ...] [--defs-root <dir>] [--strict]
 
 Stdout: {"pass": bool, "issues": [{"severity","location","message"}]}
 Exit codes: 0 pass (no block) · 1 at least one block · 2 script/env error.
 """
 
 import argparse
+import copy
 import importlib.machinery
 import importlib.util
 import json
@@ -85,12 +104,43 @@ loop_while_until_error = _cw.loop_while_until_error
 desugar_loop_until = _cw.desugar_loop_until
 loop_max_parallel_errors = _cw.loop_max_parallel_errors
 apply_workflow_vars = _cw.apply_workflow_vars
+expand_static_fanout = _cw.expand_static_fanout
+scoped_ref_ids = _cw.scoped_ref_ids
+resolve_microskill_directives = _cw.resolve_microskill_directives
+wire_auto_placement_error = _cw.wire_auto_placement_error
+auto_wire_node_inputs = _cw.auto_wire_node_inputs
+gate_effective_options = _cw.gate_effective_options
+gate_policy_errors = _cw.gate_policy_errors
+gate_headless_errors = _cw.gate_headless_errors
+spill_placement_errors = _cw.spill_placement_errors
+spill_schema_errors = _cw.spill_schema_errors
+spill_guard_ref_errors = _cw.spill_guard_ref_errors
+load_child_doc = _cw.load_child_doc
+workflow_node_targets = _cw.workflow_node_targets
+nested_workflow_depth_cycle_errors = _cw.nested_workflow_depth_cycle_errors
 NODE_OUTPUT_FIELD_RE = _cw.NODE_OUTPUT_FIELD_RE
 NODE_ITEMS_RE = _cw.NODE_ITEMS_RE
 
 REF_RE = re.compile(r"\$\{([^}]*)\}")
 NODE_OUTPUT_RE = re.compile(r"\b([a-z][a-z0-9_-]*)\.output\b")
 AS_RE = re.compile(r"^[a-z][a-z0-9_]*$")  # safe JS identifier for for_each `as`
+# A ${workflow.inputs.<name>} ref names a top-level workflow input — pure set
+# membership against the declared inputs map (a misspelled name used to pass
+# both tools and die at runtime as undefined).
+WF_INPUT_RE = re.compile(r"\bworkflow\.inputs\.([A-Za-z_][A-Za-z0-9_]*)")
+# Gate-choice comparisons: <gate-id>.output.choice ==/!= '<literal>' (and the
+# JS ===/!== spellings, and the reversed literal-first order). The extracted
+# literal is membership-checked against the gate's EFFECTIVE options — a
+# casing/typo literal silently dead-ends both branches at run time.
+GATE_CHOICE_CMP_RE = re.compile(
+    r"\b([a-z][a-z0-9_-]*)\.output\.choice\s*(?:===|!==|==|!=)\s*"
+    r"(?:'([^']*)'|\"([^\"]*)\")")
+GATE_CHOICE_CMP_REV_RE = re.compile(
+    r"(?:'([^']*)'|\"([^\"]*)\")\s*(?:===|!==|==|!=)\s*"
+    r"([a-z][a-z0-9_-]*)\.output\.choice\b")
+# Any reference to a gate's recorded choice (comparison or not) — used to FORCE
+# a declared default on a warn gate whose choice is branched on.
+GATE_CHOICE_REF_RE = re.compile(r"\b([a-z][a-z0-9_-]*)\.output\.choice\b")
 
 
 def add(issues, severity, location, message):
@@ -117,29 +167,6 @@ def refs_in(obj):
     return out
 
 
-def load_child_doc(defs_root, name):
-    """PURE child read: load <defs-root>/<name>/WORKFLOW.yaml as a dict.
-    Never touches the child's .compiled/manifest.json (compile/validate must stay
-    byte-identical-deterministic w.r.t. a single source — the WORKFLOW.yaml).
-    Returns (doc, error_message): doc is None when the file is missing/unparseable."""
-    wf = Path(defs_root) / name / "WORKFLOW.yaml"
-    if not wf.exists():
-        return None, f"does not resolve to {wf}"
-    try:
-        return (yaml.safe_load(wf.read_text()) or {}), None
-    except yaml.YAMLError as e:
-        return None, f"child '{name}' WORKFLOW.yaml parse error: {e}"
-
-
-def workflow_node_targets(doc):
-    """The child-workflow names referenced by this doc's workflow: nodes (in order)."""
-    out = []
-    for n in (doc.get("nodes") or []):
-        if isinstance(n, dict) and n.get("workflow"):
-            out.append(n["workflow"])
-    return out
-
-
 def required_inputs_of(doc):
     """Names of inputs marked required:true in a (parent or child) doc."""
     return {name for name, spec in (doc.get("inputs") or {}).items()
@@ -153,7 +180,16 @@ def main():
     ap.add_argument("--defs-root", default=None,
                     help="Workflow-defs root enabling nested-workflow (workflow:) resolution checks "
                          "(import allowlist, target resolution, import-cycle, depth=1, required-child-input). "
-                         "Absent → those checks are skipped (backward-compatible single-file validation).")
+                         "Also makes an unresolvable use: target an UNCONDITIONAL block — fail-loud "
+                         "parity with compile-workflow's hard die (you named the registry, so a missing "
+                         "target is a real error). Absent → the nested checks are skipped and an "
+                         "unresolvable use: is a WARN (backward-compatible single-file validation).")
+    ap.add_argument("--strict", action="store_true",
+                    help="STANDALONE-mode escalation only: raise an unresolvable use: target from "
+                         "WARN to a block when validating without --defs-root. Default keeps "
+                         "hermetic standalone validation passing when no microskill registry is "
+                         "reachable. With --defs-root the block is already unconditional, so this "
+                         "flag adds nothing there.")
     args = ap.parse_args()
 
     issues = []
@@ -192,16 +228,49 @@ def main():
 
     merged = strip_nulls(merged)
 
-    # --- INTRA-DEF VARS: double-brace {{key}} pre-pass (Phase 5b) ---
-    # Mirror compile-workflow EXACTLY (shared apply_workflow_vars): substitute {{key}}
-    # tokens throughout the merged doc from the top-level vars: map AFTER deep-merge +
-    # strip_nulls (so a profile may override a var) and BEFORE schema validation. An
-    # unresolved {{key}} is left intact and surfaced as a WARN (never a crash/block),
-    # consistent with resolve-microskill. A doc with no {{...}} tokens is unchanged.
+    # --- INTRA-DEF VARS: {{snippet:NAME}} includes, then {{key}} vars (Phase 5b) ---
+    # Mirror compile-workflow EXACTLY (shared apply_workflow_vars): substitute
+    # {{snippet:NAME}} tokens from <defs-root>/_snippets/NAME.md FIRST (so a snippet
+    # may carry vars), then {{key}} tokens from the top-level vars: map, AFTER
+    # deep-merge + strip_nulls (so a profile may override a var) and BEFORE schema
+    # validation. The snippets root is --defs-root when given, else derived from the
+    # standard <defs-root>/<name>/WORKFLOW.yaml layout. An unresolved {{key}} is left
+    # intact and surfaced as a WARN (never a crash/block), consistent with
+    # resolve-microskill; an unresolvable SNIPPET is a HARD block (mirrors compile's
+    # die — a missing include must never ship a literal token).
     if isinstance(merged, dict):
-        merged, unresolved_vars = apply_workflow_vars(merged)
+        snip_root = Path(args.defs_root) if args.defs_root else wf_path.resolve().parent.parent
+        merged, unresolved_vars, snippet_errors = apply_workflow_vars(
+            merged, snippets_dir=snip_root / "_snippets")
+        for se in snippet_errors:
+            add(issues, "block", "snippets", se)
+        if snippet_errors:
+            print(json.dumps({"pass": False, "issues": issues}, indent=2))
+            sys.exit(1)
         for uk in unresolved_vars:
             add(issues, "warn", "vars", f"unresolved variable '{{{{{uk}}}}}' left intact")
+
+    # --- COMPILE-TIME EXPAND: static fan-out templates (shared desugar) ---
+    # Mirror compile-workflow EXACTLY: desugar expand:/inputs_each: immediately after
+    # the vars pre-pass and BEFORE schema validation (the closed node schema never
+    # sees the sugar; generated nodes are ordinary nodes validated below). A desugar
+    # error is a HARD block — the half-desugared doc is structurally unusable, so
+    # report and stop (mirrors the list-verb error path).
+    # SNAPSHOT the hand-authored node list first (deep copy: the desugar mutates
+    # inputs_each fan-in nodes in place): the redundant-depends_on lint below runs
+    # against what the AUTHOR wrote — inputs_each desugars to inputs + an explicit
+    # depends_on per generated sibling BY CONSTRUCTION, so generated nodes must
+    # never trip the lint.
+    pre_expand_nodes = []
+    if isinstance(merged, dict):
+        pre_expand_nodes = copy.deepcopy(
+            [n for n in (merged.get("nodes") or []) if isinstance(n, dict)])
+        merged, expand_errors = expand_static_fanout(merged)
+        for ee in expand_errors:
+            add(issues, "block", "expand", ee)
+        if expand_errors:
+            print(json.dumps({"pass": False, "issues": issues}, indent=2))
+            sys.exit(1)
 
     # An OMITTED version defaults to 1 BEFORE schema validation (mirrors
     # compile-workflow / resolve-microskill). The const:1 check stays intact, so an
@@ -234,6 +303,18 @@ def main():
             continue
         if nid in node_by_id:
             add(issues, "block", f"nodes/{nid}", f"duplicate node id '{nid}'")
+        # Reserved wf_ prefix: ${workflow.inputs.<x>} rides as _args.wf_<x> in
+        # compiled segments and the run-step context, so a node id matching
+        # ^wf_ silently clobbers (or is clobbered by) a workflow input in the
+        # threaded args. Mirrors compile's hard die (defense in depth with the
+        # schema id pattern). Runs post-expansion, so a desugar-generated
+        # `<id>_<item>` collision (template id `wf` + item `x`) is caught too.
+        if isinstance(nid, str) and nid.startswith("wf_"):
+            add(issues, "block", f"nodes/{nid}",
+                f"node id '{nid}' uses the reserved 'wf_' prefix — it collides "
+                f"with the workflow-input args namespace "
+                f"(${{workflow.inputs.<x>}} rides as _args.wf_<x> in compiled "
+                f"segments and the run-step context); rename the node")
         node_ids.append(nid)
         node_by_id[nid] = n
 
@@ -250,6 +331,151 @@ def main():
     # gate-id ref contributes no edge and cannot perturb topo_sort.
     gate_id_set = {g.get("id") for g in (merged.get("gates") or [])
                    if isinstance(g, dict) and g.get("id")}
+
+    # --- I-DECL: every ${workflow.inputs.<x>} ref must name a DECLARED input ---
+    # Pure set membership over the whole merged doc (node fields, gate prompts,
+    # loop, output — anywhere a ref can ride). A misspelled input name used to
+    # pass both tools and surface at run time as `undefined`; now it blocks.
+    declared_inputs = set((merged.get("inputs") or {}).keys()) \
+        if isinstance(merged.get("inputs"), dict) else set()
+    _reported_inputs = set()
+    for inner in refs_in(merged):
+        for in_name in WF_INPUT_RE.findall(inner):
+            if in_name not in declared_inputs and in_name not in _reported_inputs:
+                _reported_inputs.add(in_name)
+                add(issues, "block", "inputs",
+                    f"${{workflow.inputs.{in_name}}} is referenced but '{in_name}' is "
+                    f"not declared in the workflow inputs map; at run time it would "
+                    f"be undefined")
+
+    # --- LINT: redundant depends_on (a ref already implies the edge) ---
+    # Runs on the HAND-AUTHORED (pre-expand) nodes via the SHARED scoped_ref_ids
+    # helper, so the lint and the union edge model can never disagree — and the
+    # inputs_each-generated fan-in (explicit depends_on by construction) is
+    # exempt. Warn-only: the union dedupes, so a restated edge is harmless noise.
+    pre_ids = {n.get("id") for n in pre_expand_nodes if n.get("id")}
+    for n in pre_expand_nodes:
+        nid = n.get("id")
+        if not nid:
+            continue
+        implied = {r for r in scoped_ref_ids(n) if r in pre_ids and r != nid}
+        for d in (n.get("depends_on") or []):
+            if d in implied:
+                add(issues, "warn", f"nodes/{nid}/depends_on",
+                    f"entry '{d}' is redundant — a ${{{d}.output...}}/${{{d}.items}} "
+                    f"ref already implies the edge; drop it (depends_on is for pure "
+                    f"ordering edges that carry no ref)")
+
+    # --- VALIDATOR-SIDE SCHEMA INHERITANCE: resolve use: targets like compile ---
+    # Each background use: node resolves through the SAME resolve-microskill
+    # subprocess (and the same sibling-`microskills/` skill-root derivation)
+    # compile-workflow uses, so the two tools read identical resolved
+    # output_schemas. The resolved schema (a) feeds the typed-ref S-FIELD check
+    # below as the fallback for a node with no inline schema, and (b) drives the
+    # two-tier inline-schema redundancy lint (deep-equal → 'omit it'; divergent →
+    # 'reconcile or document the narrowing').
+    # Failure handling: with --defs-root (full-registry validation) an
+    # unresolvable/failed use: is a BLOCK — fail-loud parity with compile's hard
+    # die. Standalone (defs root derived from the WORKFLOW.yaml layout) it is a
+    # WARN so hermetic single-file validation keeps passing; --strict escalates
+    # it to a block. Explicit delegation: orchestrator (incl. the side_effect
+    # alias) skips resolution in compile, so it skips all of this here too.
+    resolve_defs_root = (Path(args.defs_root) if args.defs_root
+                         else wf_path.parent.parent).resolve()
+    skill_root = resolve_defs_root.parent / "microskills"
+    unres_sev = "block" if (args.defs_root or args.strict) else "warn"
+    resolved_schemas = {}
+    resolved_payloads = {}
+    _res_cache = {}
+    for nid, n in node_by_id.items():
+        use_name = n.get("use")
+        if (not use_name or n.get("delegation") == "orchestrator"
+                or n.get("side_effect") is True):
+            continue
+        # A wire: auto node's auto-wire set is computed FROM the resolution —
+        # an unresolvable target makes it uncomputable, so the failure is a
+        # BLOCK even in standalone (no --defs-root) validation, never the
+        # hermetic-friendly warn (BLOCK, not fail-safe — verifier guardrail).
+        node_unres_sev = "block" if n.get("wire") == "auto" else unres_sev
+        ms_path = skill_root / str(use_name) / "MICROSKILL.md"
+        if not ms_path.exists():
+            # Cheap stat short-circuit — no subprocess when the target is absent.
+            add(issues, node_unres_sev, f"nodes/{nid}",
+                f"use: '{use_name}' does not resolve to {ms_path} (compile fails "
+                f"loud on an unresolvable use: target; mark the node "
+                f"delegation: orchestrator if a checkpoint is intended)")
+            continue
+        cust = n.get("customize") if isinstance(n.get("customize"), dict) else None
+        key = (str(use_name), (cust or {}).get("profile"),
+               json.dumps((cust or {}).get("overrides") or {}, sort_keys=True))
+        if key not in _res_cache:
+            _res_cache[key] = resolve_microskill_directives(
+                use_name, cust, resolve_defs_root)
+        resolved = _res_cache[key]
+        if resolved["directives"] is None:
+            add(issues, node_unres_sev, f"nodes/{nid}",
+                f"use: '{use_name}' failed to resolve "
+                f"({resolved.get('error') or 'resolution failed'})")
+            continue
+        rsch = resolved.get("output_schema")
+        resolved_schemas[nid] = rsch
+        resolved_payloads[nid] = resolved.get("payload")
+        inline = n.get("output_schema")
+        if isinstance(inline, dict) and rsch is not None:
+            if inline == rsch:
+                add(issues, "warn", f"nodes/{nid}/output_schema",
+                    f"inline output_schema is identical to use: '{use_name}' "
+                    f"resolved output_schema — omit it (a use: node inherits the "
+                    f"resolved schema)")
+            else:
+                add(issues, "warn", f"nodes/{nid}/output_schema",
+                    f"inline output_schema diverges from use: '{use_name}' "
+                    f"resolved output_schema — reconcile them, or keep the "
+                    f"override and document the narrowing")
+
+    # --- wire: auto — materialize declared pass-through forwards (shared helper) ---
+    # Mirrors compile EXACTLY (same auto_wire_node_inputs / wire_auto_placement_error
+    # helpers, so the two tools can never disagree on the wired set): for an
+    # opted-in node, every TARGET-declared, unsupplied input whose name matches a
+    # declared workflow input gains inputs.<name>: ${workflow.inputs.<name>} —
+    # explicit wins; wired pairs append sorted after the authored entries.
+    # Materialized HERE: after the use: resolution pass above (the wire set needs
+    # the target's declared inputs) and BEFORE the per-node ref checks and the
+    # nested-workflow required-child-input check, so a wired input counts as
+    # supplied exactly like a hand-written forward. Guardrails: a placement
+    # violation is a BLOCK; an unresolvable use: target was escalated to a BLOCK
+    # in the pass above (the wired set is uncomputable); an unreadable workflow:
+    # child is a BLOCK here; auto-satisfying a REQUIRED target input is a WARN
+    # (collision risk on generic names like 'name', where the right value is
+    # often an upstream output, not the same-named workflow input).
+    wf_inputs_map = merged.get("inputs") if isinstance(merged.get("inputs"), dict) else {}
+    for nid, n in node_by_id.items():
+        if n.get("wire") != "auto":
+            continue
+        perr = wire_auto_placement_error(n)
+        if perr:
+            add(issues, "block", f"nodes/{nid}", perr)
+            continue
+        if n.get("workflow"):
+            doc, err = load_child_doc(resolve_defs_root, n["workflow"])
+            if doc is None:
+                add(issues, "block", f"nodes/{nid}",
+                    f"wire: auto needs the child workflow's declared inputs, but "
+                    f"workflow: '{n['workflow']}' {err}")
+                continue
+            target_inputs = doc.get("inputs") if isinstance(doc.get("inputs"), dict) else {}
+        else:
+            payload = resolved_payloads.get(nid)
+            if payload is None:
+                continue  # unresolvable use: — already a BLOCK above
+            cfg = payload.get("config") if isinstance(payload.get("config"), dict) else {}
+            target_inputs = cfg.get("inputs") if isinstance(cfg.get("inputs"), dict) else {}
+        wired, required_wired = auto_wire_node_inputs(n, target_inputs, wf_inputs_map)
+        for rname in required_wired:
+            add(issues, "warn", f"nodes/{nid}",
+                f"wire: auto satisfied REQUIRED target input '{rname}' from "
+                f"${{workflow.inputs.{rname}}} — verify the same-named workflow "
+                f"input is really the intended source")
 
     # phase_group is a cosmetic /workflows progress-group label (emit-only). A
     # phase_group equal to a DIFFERENT node's id would merge that group's box with
@@ -283,6 +509,54 @@ def main():
             add(issues, "block", f"nodes/{nid}",
                 "node has neither 'use' nor 'agent'; only allowed for an orchestrator-native step (delegation: orchestrator)")
 
+        # FAIL-LOUD delegation contradictions (mirror compile's hard die):
+        # delegation: auto cannot force a workflow: node into a background segment
+        # (segments cannot re-enter the dispatcher), and side_effect: true (alias
+        # for delegation: orchestrator) contradicts delegation: auto outright.
+        if n.get("delegation") == "auto" and has_wf:
+            add(issues, "block", f"nodes/{nid}",
+                "delegation: auto on a workflow: node is invalid — a nested workflow "
+                "always runs as an orchestrator checkpoint")
+        if n.get("delegation") == "auto" and n.get("side_effect") is True:
+            add(issues, "block", f"nodes/{nid}",
+                "side_effect: true contradicts delegation: auto — a side-effect node "
+                "must run as an orchestrator checkpoint; remove one of the two fields")
+
+        # customize.overrides override the microskill's RESOLUTION — meaningful
+        # ONLY on a use: node that actually resolves. Anywhere else they would
+        # be silently ignored (mirror compile's hard die): a workflow:/agent:/
+        # orchestrator-native node has no resolution, and explicit
+        # delegation: orchestrator (incl. its side_effect alias) SKIPS it.
+        cust = n.get("customize")
+        cust_overrides = (cust or {}).get("overrides") if isinstance(cust, dict) else None
+        if cust_overrides:
+            if not has_use:
+                add(issues, "block", f"nodes/{nid}",
+                    "customize.overrides is only valid on a use: microskill node; "
+                    "on a workflow:/agent:/orchestrator node it would be silently "
+                    "ignored")
+            elif is_orch:
+                add(issues, "block", f"nodes/{nid}",
+                    "customize.overrides cannot take effect under explicit "
+                    "delegation: orchestrator (resolution is skipped, so the "
+                    "overrides would be silently ignored); remove one of the two")
+
+        # retry lives in compiled segment JS — valid on a background use:/agent:
+        # node only. Block the statically-detectable orchestrator placements
+        # (compile also dies when resolution-driven classification, e.g. an
+        # AskUserQuestion microskill, makes a retry node a checkpoint).
+        if n.get("retry"):
+            if has_wf or (not has_use and not has_agent):
+                add(issues, "block", f"nodes/{nid}",
+                    "retry is only valid on a background use:/agent: node; a "
+                    "workflow:/orchestrator node never runs inside a compiled "
+                    "segment, so its retry would be silently dropped")
+            elif is_orch:
+                add(issues, "block", f"nodes/{nid}",
+                    "retry is only honored in a background segment, but this node "
+                    "is an explicit orchestrator checkpoint "
+                    "(delegation: orchestrator / side_effect: true)")
+
         depends = n.get("depends_on") or []
         for d in depends:
             if d not in id_set:
@@ -292,8 +566,11 @@ def main():
         # requires an explicit depends_on entry). We still guard genuine typos:
         # the referenced id must be a real node. S-FIELD: when the referenced
         # producer carries an object output_schema with declared properties, the
-        # FIRST field after .output must be one of them (a schema-less producer is
-        # treated as 'any' and never flagged).
+        # FIRST field after .output must be one of them. A producer with NO
+        # inline schema falls back to its RESOLVED microskill output_schema
+        # (validator-side inheritance — same precedence as compile: explicit
+        # wins, resolution fills absence). A producer with neither (agent node,
+        # unresolvable use:, schema-less microskill) is 'any' and never flagged.
         scoped = {k: n.get(k) for k in ("inputs", "prompt", "when", "for_each") if k in n}
         for s in collect_strings(scoped):
             for inner in REF_RE.findall(s):
@@ -309,6 +586,8 @@ def main():
                     if prod_id not in id_set:
                         continue  # already reported by the unknown-node guard above
                     osch = node_by_id[prod_id].get("output_schema")
+                    if osch is None:
+                        osch = resolved_schemas.get(prod_id)
                     if not (isinstance(osch, dict)
                             and osch.get("type") == "object"
                             and isinstance(osch.get("properties"), dict)):
@@ -346,38 +625,197 @@ def main():
         if as_var and not has_for_each:
             add(issues, "warn", f"nodes/{nid}", "'as' declared without 'for_each'; it has no effect")
 
-    # --- Branch-exclusivity lint (rank12): WARN-only, never a block ---
-    # Catches the malformed-fork footgun: two+ sibling nodes that form an advisory
-    # fork which is NOT provably mutually exclusive, so more than one branch fires.
-    # SOUND + CONSERVATIVE heuristic — fires ONLY on the clearest case: two sibling
-    # nodes whose effective dependency set is IDENTICAL and whose `when` conditions
-    # are TEXTUALLY IDENTICAL (after whitespace normalization). Both guards on the
-    # same condition off the same producers => both always run together. Deliberately
-    # NO general expression analysis: an opposite-when fork (cond vs !(cond)) has
-    # DIFFERENT when-text and is therefore never flagged, and a node with no `when`
-    # (unconditional) is never a fork branch. This composes with gate-choice branching
-    # (forks guarded on ${gate.output.choice} are exclusive only if their texts differ).
+    # --- spill_outputs: declared node-output-by-reference (shared checks) ---
+    # Mirrors compile EXACTLY (same shared helpers — the two tools can never
+    # disagree): (a) placement — spill_outputs on a for_each fan-out node is a
+    # block (the result is an ARRAY; no single <node>.<field> value to spill);
+    # (b) schema coherence — every spilled field must exist in the producer's
+    # EFFECTIVE output schema (inline wins, else the resolved microskill schema
+    # — validator-side inheritance; a schema-less producer is 'any', never
+    # flagged); (c) HARD-BLOCK — a spilled field referenced in a when /
+    # for_each guard or the loop while/until: across a checkpoint the
+    # dispatcher threads that field as a handoff file PATH, and a path is not
+    # the value (always truthy, never equal to the value's literals, not an
+    # array), so the guard would silently mis-branch every run.
+    spill_nodes = [n for n in nodes if isinstance(n, dict) and n.get("id")]
+    for sp_nid, sp_msg in spill_placement_errors(spill_nodes):
+        add(issues, "block", f"nodes/{sp_nid}/spill_outputs", sp_msg)
+    for nid, n in node_by_id.items():
+        spill = n.get("spill_outputs")
+        if not spill:
+            continue
+        eff_schema = n.get("output_schema")
+        if eff_schema is None:
+            eff_schema = resolved_schemas.get(nid)
+        for ss_msg in spill_schema_errors(nid, spill, eff_schema):
+            add(issues, "block", f"nodes/{nid}/spill_outputs", ss_msg)
+    sg_loop = merged.get("loop") if isinstance(merged.get("loop"), dict) else None
+    for sg_loc, sg_msg in spill_guard_ref_errors(spill_nodes, sg_loop):
+        add(issues, "block", sg_loc, sg_msg)
+
+    # --- Branch-exclusivity lint (rank12, STRENGTHENED): bounded comparison analysis ---
+    # Catches the malformed-fork footgun: sibling nodes (identical effective
+    # dependency set) that form an advisory fork which is NOT mutually exclusive.
+    # Within the locked design (branch = exclusivity-lint only — no forks:
+    # construct), the lint now runs a BOUNDED comparison-pattern analysis on each
+    # when-guard pair:
+    #   - PROVABLY BOTH FIRE (textually identical guards, or guards whose bounded
+    #     parse yields the same canonical comparison, e.g. `x != 1` vs `!(x == 1)`)
+    #     → BLOCK: a deterministic guard pair that always fires together can never
+    #     be an exclusive fork.
+    #   - same-field guards that are neither identical nor provably disjoint
+    #     (e.g. `x > 0` vs `x > 1` — overlapping ranges) → WARN: both branches may
+    #     fire together for some values.
+    #   - provably disjoint (`x == null` vs `x != null`, `x > 0` vs `x == 0`,
+    #     truthy vs falsy, distinct == literals, non-overlapping numeric ranges)
+    #     → clean.
+    # The grammar is deliberately bounded — one field, one comparison operator, one
+    # null/bool/number/string literal, any !-parity and balanced parens; anything
+    # else parses to None and falls back to the textual-identity check only. This
+    # composes with gate-choice branching (forks guarded on ${gate.output.choice}
+    # literals parse as string comparisons and prove disjoint when literals differ).
     def _norm_when(w):
         return re.sub(r"\s+", "", str(w)) if w else None
 
+    def _strip_outer_parens(s):
+        while s.startswith("(") and s.endswith(")"):
+            depth = 0
+            whole = True
+            for i, ch in enumerate(s):
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0 and i < len(s) - 1:
+                        whole = False  # closes before the end → not one wrapper
+                        break
+            if not whole or depth != 0:
+                break
+            s = s[1:-1].strip()
+        return s
+
+    _GUARD_CMP_RE = re.compile(
+        r"^(?P<field>[A-Za-z_][\w.]*)\s*"
+        r"(?:(?P<op>===|!==|==|!=|>=|<=|>|<)\s*"
+        r"(?P<lit>null|true|false|-?\d+(?:\.\d+)?|'[^']*'|\"[^\"]*\"))?$")
+    _NEG_OP = {"==": "!=", "!=": "==", ">": "<=", "<=": ">", "<": ">=", ">=": "<",
+               "truthy": "falsy", "falsy": "truthy"}
+
+    def _parse_guard(when):
+        """Bounded parse of a when-guard → canonical (field, op, value) or None.
+        op ∈ {==,!=,>,>=,<,<=,truthy,falsy}; value is a (kind, payload) literal
+        tuple (None for truthy/falsy). Negation folds into the operator."""
+        if not isinstance(when, str):
+            return None
+        s = when.strip()
+        m = re.fullmatch(r"\$\{(.*)\}", s, flags=re.S)
+        if m:
+            s = m.group(1).strip()
+        if "${" in s:
+            return None  # embedded refs beyond one whole-value wrapper → unknown
+        neg = False
+        while True:
+            stripped = _strip_outer_parens(s)
+            if stripped != s:
+                s = stripped
+                continue
+            if s.startswith("!"):
+                rest = s[1:].strip()
+                # JS precedence: unary ! binds tighter than any comparison, so
+                # a bare `!<field> <op> <literal>` means `(!<field>) <op>
+                # <literal>` — folding the negation across the operator would
+                # invert the wrong thing. Folding is sound only for
+                # `!(<comparison>)`, `!<field>` (truthiness) and chained unary
+                # `!`; anything else falls out of the bounded grammar (None).
+                if not (rest.startswith("(") or rest.startswith("!")
+                        or re.fullmatch(r"[A-Za-z_][\w.]*", rest)):
+                    return None
+                neg = not neg
+                s = rest
+                continue
+            break
+        m = _GUARD_CMP_RE.match(s)
+        if not m:
+            return None
+        field, op, lit = m.group("field"), m.group("op"), m.group("lit")
+        if op is None:
+            return (field, "falsy" if neg else "truthy", None)
+        op = {"===": "==", "!==": "!="}.get(op, op)
+        if neg:
+            op = _NEG_OP[op]
+        if lit == "null":
+            value = ("null", None)
+        elif lit in ("true", "false"):
+            value = ("bool", lit == "true")
+        elif lit[0] in "'\"":
+            value = ("str", lit[1:-1])
+        else:
+            value = ("num", float(lit))
+        return (field, op, value)
+
+    def _interval(op, x):
+        """Numeric comparison as (lo, hi, lo_closed, hi_closed), or None for !=."""
+        inf = float("inf")
+        return {"==": (x, x, True, True), ">": (x, inf, False, True),
+                ">=": (x, inf, True, True), "<": (-inf, x, True, False),
+                "<=": (-inf, x, True, True)}.get(op)
+
+    def _provably_disjoint(p1, p2):
+        """True only when the two same-field comparisons can NEVER both hold."""
+        (_, op1, v1), (_, op2, v2) = p1, p2
+        ops = {op1, op2}
+        if ops == {"truthy", "falsy"}:
+            return True
+        if "truthy" in ops or "falsy" in ops:
+            return False
+        if op1 == "==" and op2 == "==":
+            return v1 != v2
+        if ops == {"==", "!="}:
+            return v1 == v2
+        if v1 is not None and v2 is not None and v1[0] == "num" and v2[0] == "num":
+            i1, i2 = _interval(op1, v1[1]), _interval(op2, v2[1])
+            if i1 and i2:
+                (alo, ahi, aloc, ahic), (blo, bhi, bloc, bhic) = i1, i2
+                if ahi < blo or bhi < alo:
+                    return True
+                if ahi == blo and not (ahic and bloc):
+                    return True
+                if bhi == alo and not (bhic and aloc):
+                    return True
+        return False
+
     # Effective sibling key = the UNION edge set (explicit depends_on + ref-implied),
-    # so siblings are compared on what actually gates them, not just literal depends_on.
+    # so siblings are compared on what actually gates them, not just literal
+    # depends_on. A node with no `when` (unconditional) is never a fork branch.
     fork_edges = union_edges([n for n in nodes if isinstance(n, dict) and n.get("id")])
     fork_groups = {}
     for nid in node_ids:
-        w = _norm_when(node_by_id[nid].get("when"))
-        if not w:
-            continue  # an unconditional node is not a guarded fork branch
-        key = (frozenset(fork_edges.get(nid, set())), w)
-        fork_groups.setdefault(key, []).append(nid)
-    for (dep_set, _w), members in fork_groups.items():
-        if len(members) > 1:
-            sib = ", ".join(sorted(members))
-            dep_desc = ("{" + ", ".join(sorted(dep_set)) + "}") if dep_set else "{}"
-            add(issues, "warn", "nodes",
-                f"sibling nodes [{sib}] share dependencies {dep_desc} and have "
-                f"textually identical 'when' conditions; this advisory fork is not "
-                f"mutually exclusive (all branches fire). Did you mean to negate one?")
+        if not node_by_id[nid].get("when"):
+            continue
+        fork_groups.setdefault(frozenset(fork_edges.get(nid, set())), []).append(nid)
+    for dep_set, members in fork_groups.items():
+        if len(members) < 2:
+            continue
+        dep_desc = ("{" + ", ".join(sorted(dep_set)) + "}") if dep_set else "{}"
+        members = sorted(members)
+        for i in range(len(members)):
+            for j in range(i + 1, len(members)):
+                a, b = members[i], members[j]
+                wa, wb = node_by_id[a].get("when"), node_by_id[b].get("when")
+                pa, pb = _parse_guard(wa), _parse_guard(wb)
+                if _norm_when(wa) == _norm_when(wb) or (pa is not None and pa == pb):
+                    add(issues, "block", "nodes",
+                        f"sibling nodes [{a}, {b}] share dependencies {dep_desc} and "
+                        f"their 'when' guards provably BOTH fire (equivalent "
+                        f"conditions); this fork is not mutually exclusive — negate "
+                        f"or change one")
+                elif pa is not None and pb is not None and pa[0] == pb[0] \
+                        and not _provably_disjoint(pa, pb):
+                    add(issues, "warn", "nodes",
+                        f"sibling nodes [{a}, {b}] share dependencies {dep_desc} and "
+                        f"guard the same field '{pa[0]}' with conditions that are "
+                        f"neither identical nor provably disjoint; both branches may "
+                        f"fire together — verify the fork is exclusive")
 
     # --- Cycle detection over the UNION edge set (refs + depends_on) ---
     # CRITICAL: a ref-only cycle (A reads ${B.output}, B reads ${A.output}, neither
@@ -430,6 +868,163 @@ def main():
         if after:
             gates_after.setdefault(after, []).append(g)
 
+    # --- Declared gate policy: defaults + headless coherence (shared helpers) ---
+    # Same gate_policy_errors / gate_headless_errors compile-workflow dies on, so
+    # the two tools can never disagree: a declared `default` must be one of the
+    # gate's EFFECTIVE options (declared options, or the implicit confirm/stop
+    # pair of an options-less gate); on_headless: take_default needs a default;
+    # and a merged doc that DECLARES gate_mode: auto (e.g. an autonomous profile
+    # overlay) must leave no pausing gate without a default or an explicit
+    # on_headless: fail.
+    gates_list = [g for g in (merged.get("gates") or []) if isinstance(g, dict)]
+    gate_by_id = {g.get("id"): g for g in gates_list if g.get("id")}
+    for p_gid, p_msg in gate_policy_errors(gates_list):
+        add(issues, "block", f"gates/{p_gid}", p_msg)
+    if merged.get("gate_mode") == "auto":
+        for h_gid, h_msg in gate_headless_errors(gates_list):
+            add(issues, "block", f"gates/{h_gid}", h_msg)
+
+    # --- present: declared gate presentation — checked, then rendered MECHANICALLY ---
+    # A gate's `present` is an ordered list of field paths the dispatcher renders
+    # verbatim (the model output-rubric is only the fallback), so the approver
+    # sees the SAME evidence every run. Checks: (a) the leading id must be a known
+    # node (or an EARLIER gate — only `choice` is ever recorded for a gate);
+    # (b) a typed producer's first field after .output must be declared (same
+    # machinery as the node-ref S-FIELD check, resolved-schema inheritance
+    # included); (c) the producer must already have RUN when the gate fires — the
+    # gate fires immediately after its `after` node, so a path may only name a
+    # node at-or-before that anchor in the shared topo order (a later node's
+    # result would render undefined on every run).
+    order_pos = ({o_nid: i for i, o_nid in enumerate(topo_sort(well_formed_nodes))}
+                 if not cycle_found[0] else None)
+    gate_decl_pos = {g.get("id"): i for i, g in enumerate(gates_list) if g.get("id")}
+
+    def present_paths(g):
+        for entry in (g.get("present") or []):
+            if isinstance(entry, str):
+                yield entry
+            elif isinstance(entry, dict) and isinstance(entry.get("read_file"), str):
+                yield entry["read_file"]
+
+    for g in gates_list:
+        gid = g.get("id", "?")
+        after = g.get("after")
+        loc = f"gates/{gid}/present"
+        for path in present_paths(g):
+            parts = path.split(".")
+            lead, field = parts[0], (parts[2] if len(parts) > 2 else None)
+            if lead in gate_id_set:
+                if lead == gid:
+                    add(issues, "block", loc,
+                        f"path '{path}' references this gate's own choice — not yet "
+                        f"recorded when the gate fires")
+                    continue
+                src = gate_by_id.get(lead) or {}
+                if (order_pos is not None and after in order_pos
+                        and src.get("after") in order_pos):
+                    fires_before = (
+                        order_pos[src["after"]] < order_pos[after]
+                        or (src["after"] == after
+                            and gate_decl_pos.get(lead, 0) < gate_decl_pos.get(gid, 0)))
+                    if not fires_before:
+                        add(issues, "block", loc,
+                            f"path '{path}' references gate '{lead}', which fires at or "
+                            f"after this gate — its choice is not yet recorded")
+                        continue
+                if field is not None and field != "choice":
+                    add(issues, "block", loc,
+                        f"path '{path}': a gate records only {{choice}} — field "
+                        f"'{field}' is never recorded")
+                continue
+            if lead not in id_set:
+                add(issues, "block", loc,
+                    f"path '{path}' references unknown node '{lead}'")
+                continue
+            if (order_pos is not None and after in order_pos and lead in order_pos
+                    and order_pos[lead] > order_pos[after]):
+                add(issues, "block", loc,
+                    f"path '{path}' references node '{lead}', which runs after this "
+                    f"gate's anchor '{after}' — not yet produced when the gate fires")
+                continue
+            if field is not None:
+                p_osch = node_by_id[lead].get("output_schema")
+                if p_osch is None:
+                    p_osch = resolved_schemas.get(lead)
+                if (isinstance(p_osch, dict) and p_osch.get("type") == "object"
+                        and isinstance(p_osch.get("properties"), dict)
+                        and field not in p_osch["properties"]):
+                    add(issues, "block", loc,
+                        f"path '{path}' names field '{field}' but node '{lead}' "
+                        f"output_schema does not declare property '{field}'")
+
+    # --- Gate-choice literal cross-check ---
+    # Every string literal compared against ${<gate-id>.output.choice} must be a
+    # member of that gate's EFFECTIVE options: the dispatcher only ever records
+    # one of the offered labels (or the declared default, verbatim), so a literal
+    # outside the set makes the comparison CONSTANT — a casing typo silently
+    # dead-ends both branches of a fork. Bounded extraction in the same spirit as
+    # the exclusivity lint's comparison grammar: ==/!= (and the JS ===/!==
+    # spellings), one quoted literal, either operand order; anything more complex
+    # is out of grammar and skipped.
+    choice_scan = [(f"nodes/{s_nid}",
+                    {k: s_n.get(k) for k in ("inputs", "prompt", "when", "for_each")
+                     if k in s_n})
+                   for s_nid, s_n in node_by_id.items()]
+    if isinstance(merged.get("loop"), dict):
+        choice_scan.append(
+            ("loop", {k: merged["loop"].get(k) for k in ("while", "carry")}))
+
+    def choice_literal_hits(obj):
+        for s in collect_strings(obj):
+            for m in GATE_CHOICE_CMP_RE.finditer(s):
+                yield m.group(1), (m.group(2) if m.group(2) is not None else m.group(3))
+            for m in GATE_CHOICE_CMP_REV_RE.finditer(s):
+                yield m.group(3), (m.group(1) if m.group(1) is not None else m.group(2))
+
+    for c_loc, scoped_obj in choice_scan:
+        for ref_gid, lit in choice_literal_hits(scoped_obj):
+            cg = gate_by_id.get(ref_gid)
+            if cg is None:
+                continue  # not a gate id — a node's own output is 'any', out of scope
+            c_opts = gate_effective_options(cg)
+            if lit not in c_opts:
+                c_suffix = ("" if cg.get("options")
+                            else " (an options-less gate offers the implicit "
+                                 "confirm/stop pair)")
+                add(issues, "block", c_loc,
+                    f"compares ${{{ref_gid}.output.choice}} against '{lit}', which is "
+                    f"not one of gate '{ref_gid}' options {c_opts}{c_suffix} — the "
+                    f"recorded choice is always one of the gate's offered labels, so "
+                    f"this comparison is constant and the branch is dead")
+
+    # --- FORCE a default on a warn gate whose choice is branched on ---
+    # The dispatcher no longer fabricates a pick at a non-pausing gate: a warn
+    # human_approval gate records its DECLARED default verbatim, or {choice: null}
+    # when none is declared — so branching on a defaultless warn gate's choice
+    # could never fire. And a warn gate of any non-human_approval type emits NO
+    # checkpoint at all (dropped at compile), so its choice is NEVER recorded.
+    referenced_gids = set()
+    for _c_loc, scoped_obj in choice_scan:
+        for s in collect_strings(scoped_obj):
+            referenced_gids.update(GATE_CHOICE_REF_RE.findall(s))
+    for g in gates_list:
+        gid = g.get("id")
+        if not gid or gid not in referenced_gids:
+            continue
+        if g.get("severity", "hard") != "warn":
+            continue  # a hard gate pauses — the human's pick is always recorded
+        if g.get("type") != "human_approval":
+            add(issues, "block", f"gates/{gid}",
+                f"${{{gid}.output.choice}} is branched on, but a warn gate of type "
+                f"'{g.get('type')}' emits no checkpoint at all (dropped at compile) — "
+                f"its choice is never recorded; make it human_approval or severity: hard")
+        elif g.get("default") is None:
+            add(issues, "block", f"gates/{gid}",
+                f"${{{gid}.output.choice}} is branched on, but this warn gate declares "
+                f"no 'default' — a warn gate never pauses, and the dispatcher records "
+                f"the DECLARED default verbatim (or {{choice: null}} when none; never a "
+                f"fabricated pick), so the branch could never fire; declare default:")
+
     # --- max_parallel placement: only valid on a for_each node (shared with compile) ---
     for mp_id, mp_msg in loop_max_parallel_errors(well_formed_nodes):
         add(issues, "block", f"nodes/{mp_id}/max_parallel", mp_msg)
@@ -446,9 +1041,26 @@ def main():
         for b in loop.get("body") or []:
             if b not in id_set:
                 add(issues, "block", "loop/body", f"references unknown node '{b}'")
-            elif node_by_id.get(b, {}).get("for_each"):
+                continue
+            bn = node_by_id.get(b, {})
+            if bn.get("for_each"):
                 add(issues, "block", "loop/body",
                     f"node '{b}' uses for_each; fan-out inside a loop body is unsupported")
+            # FAIL-LOUD (statically-detectable subset; mirrors compile's hard die):
+            # an orchestrator-classified body member splits the body across steps
+            # and silently drops the do/while scaffold. Block the cases visible
+            # without microskill resolution: explicit delegation: orchestrator /
+            # side_effect: true, a workflow: node, and an orchestrator-native step
+            # (neither use nor agent). A use: node that auto-classifies orchestrator
+            # via resolution (AskUserQuestion / hard gate) is caught by compile.
+            if (bn.get("delegation") == "orchestrator" or bn.get("side_effect") is True
+                    or bn.get("workflow")
+                    or not (bn.get("use") or bn.get("agent") or bn.get("workflow"))):
+                add(issues, "block", "loop/body",
+                    f"node '{b}' is an orchestrator checkpoint (explicit "
+                    f"delegation/side_effect, a workflow: node, or no use/agent); a "
+                    f"loop body must be entirely background — an orchestrator member "
+                    f"breaks the do/while scaffold")
         if "max_iters" not in loop:
             add(issues, "block", "loop", "missing required 'max_iters' cap")
         for inner in refs_in({"while": loop.get("while"), "carry": loop.get("carry")}):
@@ -475,6 +1087,10 @@ def main():
     out = merged.get("output")
     if isinstance(out, dict) and out.get("from") and out["from"] not in id_set:
         add(issues, "block", "output", f"'from' references unknown node '{out['from']}'")
+
+    # (use: target existence/resolution now runs unconditionally in the
+    # validator-side schema-inheritance pass above: block with --defs-root,
+    # warn standalone, --strict escalates.)
 
     # --- Nested-workflow (workflow:) resolution — only with --defs-root ---
     # LOCKED: when --defs-root is ABSENT these checks are skipped, so existing
@@ -505,13 +1121,9 @@ def main():
                 add(issues, "block", f"nodes/{nid}",
                     f"workflow: '{target}' {err}")
                 continue
-            # (c) DEPTH=1: a child that itself contains a workflow: node is a
-            # grandchild nesting — hard-blocked (no dispatcher re-entrancy guard).
-            gtargets = workflow_node_targets(doc)
-            if gtargets:
-                add(issues, "block", f"nodes/{nid}",
-                    f"workflow: '{target}' itself contains a nested workflow: node "
-                    f"({', '.join(sorted(set(gtargets)))}); nesting depth > 1 is not allowed")
+            # (c) DEPTH=1 now runs via the SHARED
+            # nested_workflow_depth_cycle_errors helper below (compile dies on
+            # the same findings — the two tools can never disagree).
             # (d) N4 child contract (PURE, from child WORKFLOW.yaml): every
             # required child input must be supplied by this node's inputs.
             supplied = set((n.get("inputs") or {}).keys())
@@ -552,34 +1164,12 @@ def main():
                                     f"references ${{{nid}.output.{fld}}} but child workflow "
                                     f"'{target}' output does not declare field '{fld}'")
 
-        # (f) Import-cycle DFS over the IMPORT graph reachable from this workflow.
-        # 3-color: a GRAY back-edge is a cycle. Adjacency = a doc's workflow: targets
-        # restricted to its own imports allowlist (only resolvable children).
-        root_name = merged.get("name")
-        IWHITE, IGRAY, IBLACK = 0, 1, 2
-        icolor = {}
-
-        def doc_imports(doc):
-            return {imp for imp in (doc.get("imports") or []) if isinstance(imp, str)}
-
-        def ivisit(name, doc, stack):
-            icolor[name] = IGRAY
-            allow = doc_imports(doc)
-            for tgt in workflow_node_targets(doc):
-                if tgt not in allow:
-                    continue  # already reported as not-in-imports for the root
-                if icolor.get(tgt) == IGRAY:
-                    add(issues, "block", "imports",
-                        f"workflow import cycle: {' -> '.join(stack + [name, tgt])}")
-                    continue
-                if icolor.get(tgt, IWHITE) == IWHITE:
-                    cdoc, _ = child_doc(tgt)
-                    if cdoc is not None:
-                        ivisit(tgt, cdoc, stack + [name])
-            icolor[name] = IBLACK
-
-        if root_name:
-            ivisit(root_name, merged, [])
+        # (c)+(f) DEPTH=1 + import-cycle DFS: the SHARED helper compile-workflow
+        # also hard-dies on (same adjacency — each doc's workflow: targets
+        # restricted to its own imports allowlist; un-allowlisted/unresolvable
+        # targets are reported by the blocks above, never walked).
+        for nw_loc, nw_msg in nested_workflow_depth_cycle_errors(defs_root, merged):
+            add(issues, "block", nw_loc, nw_msg)
 
     passed = not any(i["severity"] == "block" for i in issues)
     print(json.dumps({"pass": passed, "issues": issues}, indent=2))

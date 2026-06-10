@@ -55,7 +55,10 @@ def test_valid_passes(tmp_path):
     rc, data, _ = run(write_wf(tmp_path, VALID))
     assert rc == 0
     assert data["pass"] is True
-    assert data["issues"] == []
+    # b restates the ref-implied edge a->b in depends_on, so the redundancy lint
+    # warns (2.2) — the only issue, and never a block.
+    assert all(i["severity"] == "warn" for i in data["issues"])
+    assert [i["location"] for i in data["issues"]] == ["nodes/b/depends_on"]
 
 
 def test_undeclared_output_ref_now_passes(tmp_path):
@@ -436,6 +439,10 @@ def test_real_flow_passes():
     rc, data, _ = run(REAL_FLOW / "WORKFLOW.yaml", REAL_FLOW / "profiles" / "base.yaml")
     assert rc == 0, data
     assert data["pass"] is True
+    # The shipped def is lint-clean: no redundant depends_on, no inline schema
+    # restating the resolved one (2.1/2.2 catalog cleanup).
+    assert not any("redundant" in i["message"] or "output_schema" in i["location"]
+                   for i in data["issues"]), data["issues"]
 
 
 def test_real_workflow_create_passes():
@@ -987,12 +994,47 @@ gates:
     assert not any("cycle" in i["message"] for i in data["issues"])
 
 
-# --- Phase 4b: branch-exclusivity lint (WARN-only, never a block) ---
+# --- Reserved wf_ node-id prefix (workflow-input args namespace) ---
 
-def test_identical_when_siblings_warn(tmp_path):
-    # Two sibling nodes with the SAME depends_on set and TEXTUALLY IDENTICAL when
-    # conditions form a malformed advisory fork (both fire). Emit a WARN; pass stays true.
-    body = """\
+def test_wf_prefixed_node_id_blocks(tmp_path):
+    # `${workflow.inputs.<x>}` rides as `_args.wf_<x>` in compiled segments and
+    # the run-step context — a node id matching ^wf_ silently clobbers (or is
+    # clobbered by) a workflow input. Fail loud at validate.
+    body = VALID.replace("id: b", "id: wf_b")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    assert any("reserved 'wf_' prefix" in i["message"] for i in data["issues"]
+               if i["severity"] == "block"), data["issues"]
+
+
+def test_schema_id_pattern_rejects_wf_prefix():
+    # Defense in depth at the schema layer too: the closed node-id pattern
+    # itself excludes the reserved prefix (negative lookahead), so a consumer
+    # validating against the raw schema is covered even without the tools.
+    import re as _re
+    schema = json.loads(
+        (REPO / "templates" / "references" / "workflow-schema.json").read_text())
+    pat = schema["properties"]["nodes"]["items"]["properties"]["id"]["pattern"]
+    assert _re.match(pat, "wf_x") is None
+    assert _re.match(pat, "wfx") is not None
+    assert _re.match(pat, "plan_2") is not None
+
+
+def test_wf_prefix_without_underscore_is_legal(tmp_path):
+    # Only the `wf_` prefix is reserved — ids like `wf` or `wfx` collide with
+    # nothing (workflow inputs ride as wf_<name>).
+    body = VALID.replace("id: b", "id: wfb")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 0 and data["pass"] is True, data["issues"]
+
+
+# --- Branch-exclusivity lint (rank12, STRENGTHENED): bounded comparison analysis ---
+# Inside the locked design (branch = exclusivity-lint only): provably-both-fire
+# guard pairs are now a BLOCK; same-field pairs neither identical nor provably
+# disjoint WARN; provably disjoint pairs stay clean.
+
+def _fork(when_x, when_y):
+    return f"""\
 version: 1
 name: fork
 nodes:
@@ -1002,46 +1044,134 @@ nodes:
   - id: x
     agent: ag
     depends_on: [p]
-    when: ${p.output.ok}
+    when: {when_x}
     prompt: branch x
   - id: y
     agent: ag
     depends_on: [p]
-    when: ${p.output.ok}
+    when: {when_y}
     prompt: branch y
 """
-    rc, data, _ = run(write_wf(tmp_path, body))
-    assert rc == 0 and data["pass"] is True
-    warns = [i for i in data["issues"] if i["severity"] == "warn"]
-    assert any("mutually exclusive" in i["message"] or "fork" in i["message"].lower()
-               for i in warns), data["issues"]
+
+
+def test_identical_when_siblings_block(tmp_path):
+    # Two sibling nodes with the SAME depends_on set and TEXTUALLY IDENTICAL when
+    # conditions PROVABLY both fire — escalated from the old WARN to a BLOCK.
+    rc, data, _ = run(write_wf(tmp_path, _fork("${p.output.ok}", "${p.output.ok}")))
+    assert rc == 1 and data["pass"] is False
+    blocks = [i for i in data["issues"] if i["severity"] == "block"]
+    assert any("BOTH fire" in i["message"] for i in blocks), data["issues"]
 
 
 def test_opposite_when_fork_no_warn(tmp_path):
-    # A proper opposite-when fork (cond vs !(cond)) is provably exclusive — NO warn.
-    body = """\
-version: 1
-name: fork
-nodes:
-  - id: p
-    agent: ag
-    prompt: plan
-  - id: x
-    agent: ag
-    depends_on: [p]
-    when: ${p.output.ok}
-    prompt: branch x
-  - id: y
-    agent: ag
-    depends_on: [p]
-    when: ${!(p.output.ok)}
-    prompt: branch y
-"""
-    rc, data, _ = run(write_wf(tmp_path, body))
+    # A proper opposite-when fork (cond vs !(cond)) is provably exclusive
+    # (truthy vs falsy on the same field) — NO warn, NO block.
+    rc, data, _ = run(write_wf(tmp_path, _fork("${p.output.ok}", "${!(p.output.ok)}")))
+    assert rc == 0 and data["pass"] is True
+    assert not any("fire" in i["message"] or "disjoint" in i["message"]
+                   for i in data["issues"]), data["issues"]
+
+
+def test_equivalent_guards_via_negation_block(tmp_path):
+    # `x != 1` vs `!(x == 1)` — textually different, canonically EQUAL: the bounded
+    # comparison parse folds the negation, so the pair provably both fires → block.
+    rc, data, _ = run(write_wf(tmp_path,
+                               _fork("${p.output.n != 1}", "${!(p.output.n == 1)}")))
+    assert rc == 1 and data["pass"] is False
+    assert any("BOTH fire" in i["message"] for i in data["issues"]
+               if i["severity"] == "block"), data["issues"]
+
+
+def test_bare_negated_comparison_outside_grammar_no_false_block(tmp_path):
+    # REGRESSION: JS precedence — unary ! binds tighter than any comparison,
+    # so `!a.output.f == 'y'` means `(!a.output.f) == 'y'`, NOT
+    # `a.output.f != 'y'`. Folding the negation across the operator is only
+    # sound for `!(<comparison>)`; the bare form parses to None (outside the
+    # bounded grammar). This pair must NOT be reported provably-both-fire and
+    # must not block.
+    rc, data, _ = run(write_wf(tmp_path,
+                               _fork("${!p.output.f == 'y'}",
+                                     "${p.output.f != 'y'}")))
+    assert rc == 0 and data["pass"] is True, data["issues"]
+    assert not any("BOTH fire" in i["message"] or "disjoint" in i["message"]
+                   for i in data["issues"]), data["issues"]
+
+
+def test_bare_negated_field_truthiness_still_folds(tmp_path):
+    # `!<field>` with NO comparison stays inside the grammar (JS `!x` is the
+    # truthiness negation): vs the bare `x` guard it is provably disjoint.
+    rc, data, _ = run(write_wf(tmp_path,
+                               _fork("${p.output.ok}", "${!p.output.ok}")))
+    assert rc == 0 and data["pass"] is True, data["issues"]
+    assert not any("fire" in i["message"] or "disjoint" in i["message"]
+                   for i in data["issues"]), data["issues"]
+
+
+def test_identical_bare_negated_comparisons_still_block_textually(tmp_path):
+    # The bare-negated form is outside the bounded grammar, but two textually
+    # identical copies still provably both fire via the identity fallback.
+    w = "${!p.output.f == 'y'}"
+    rc, data, _ = run(write_wf(tmp_path, _fork(w, w)))
+    assert rc == 1 and data["pass"] is False
+    assert any("BOTH fire" in i["message"] for i in data["issues"]
+               if i["severity"] == "block"), data["issues"]
+
+
+def test_disjoint_comparison_forks_stay_clean(tmp_path):
+    # Provably disjoint same-field pairs raise NOTHING: == null vs != null,
+    # > 0 vs == 0 (touching open/closed interval bounds), distinct == literals.
+    cases = [
+        ("${p.output.adv == null}", "${p.output.adv != null}"),
+        ("${p.output.gaps > 0}", "${p.output.gaps == 0}"),
+        ("${p.output.choice == 'approve'}", "${p.output.choice == 'revise'}"),
+        ("${p.output.n >= 5}", "${p.output.n < 5}"),
+    ]
+    for wx, wy in cases:
+        rc, data, _ = run(write_wf(tmp_path, _fork(wx, wy)))
+        assert rc == 0 and data["pass"] is True, (wx, wy, data["issues"])
+        assert not any("fire" in i["message"] or "disjoint" in i["message"]
+                       for i in data["issues"]), (wx, wy, data["issues"])
+
+
+def test_same_field_overlapping_guards_warn(tmp_path):
+    # Same-field guards that are neither identical nor provably disjoint — e.g.
+    # overlapping numeric ranges — WARN (both branches may fire); pass stays true.
+    rc, data, _ = run(write_wf(tmp_path,
+                               _fork("${p.output.n > 0}", "${p.output.n > 1}")))
     assert rc == 0 and data["pass"] is True
     warns = [i for i in data["issues"] if i["severity"] == "warn"]
-    assert not any("mutually exclusive" in i["message"] or "fork" in i["message"].lower()
-                   for i in warns), data["issues"]
+    assert any("neither identical nor provably disjoint" in i["message"]
+               for i in warns), data["issues"]
+
+
+def test_different_field_guards_stay_clean(tmp_path):
+    # Guards on DIFFERENT fields are outside the bounded analysis — no warn/block
+    # (unchanged behavior; only textual identity or same-field analysis fires).
+    rc, data, _ = run(write_wf(tmp_path,
+                               _fork("${p.output.a}", "${p.output.b}")))
+    assert rc == 0 and data["pass"] is True
+    assert not any("fire" in i["message"] or "disjoint" in i["message"]
+                   for i in data["issues"]), data["issues"]
+
+
+def test_unparseable_identical_text_still_blocks(tmp_path):
+    # Guards beyond the bounded grammar (compound expressions) fall back to the
+    # textual-identity check: identical compound guards still provably both fire.
+    w = "${p.output.a && p.output.b}"
+    rc, data, _ = run(write_wf(tmp_path, _fork(w, w)))
+    assert rc == 1 and data["pass"] is False
+    assert any("BOTH fire" in i["message"] for i in data["issues"]
+               if i["severity"] == "block"), data["issues"]
+
+
+def test_unparseable_different_text_stays_clean(tmp_path):
+    # Different unparseable guards: no analysis possible → unchanged (clean).
+    rc, data, _ = run(write_wf(tmp_path,
+                               _fork("${p.output.a && p.output.b}",
+                                     "${p.output.a || p.output.b}")))
+    assert rc == 0 and data["pass"] is True
+    assert not any("fire" in i["message"] or "disjoint" in i["message"]
+                   for i in data["issues"]), data["issues"]
 
 
 # --- PHASE 5b FEATURE A: ${<id>.items} the per-item-results array ref form ---
@@ -1238,10 +1368,11 @@ nodes:
 
 
 def test_no_vars_validate_unchanged(tmp_path):
-    # A workflow with no vars: validates exactly as before.
+    # A workflow with no vars: validates exactly as before (the only issue is
+    # VALID's redundant-depends_on warn — no vars-related issue appears).
     rc, data, _ = run(write_wf(tmp_path, VALID))
     assert rc == 0 and data["pass"] is True
-    assert data["issues"] == []
+    assert not any(i["location"] == "vars" for i in data["issues"])
 
 
 PHASE_GROUP = """\
@@ -1254,12 +1385,10 @@ nodes:
   - id: rb
     agent: some-agent
     phase_group: review
-    depends_on: [a]
     prompt: use ${a.output.x}
   - id: rc
     agent: some-agent
     phase_group: review
-    depends_on: [a]
     prompt: also ${a.output.x}
 """
 
@@ -1295,3 +1424,1224 @@ nodes:
     rc, data, _ = run(write_wf(tmp_path, body))
     assert rc == 0 and data["pass"] is True
     assert not any("collides with node id" in i["message"] for i in data["issues"])
+
+
+# --- FAIL-LOUD CLASSIFICATION (validate-side static checks) ---
+# Mirrors compile-workflow's hard die paths: use:-target existence (behind
+# --defs-root), delegation: auto contradictions, and the statically-detectable
+# orchestrator loop-body members.
+
+USE_MS_MD = """\
+---
+name: real-ms
+description: minimal microskill for use:-existence tests
+---
+
+# real-ms
+
+## Purpose
+
+Do the thing.
+
+## Steps
+
+1. Return the result.
+"""
+
+USE_WF = """\
+version: 1
+name: use-flow
+nodes:
+  - id: u
+    use: real-ms
+"""
+
+
+def make_use_world(tmp_path, wf_body, with_ms=True):
+    """<tmp>/workflow-defs/use-flow + (optionally) <tmp>/microskills/real-ms —
+    the sibling-skill-root layout compile derives from --defs-root."""
+    defs_root = tmp_path / "workflow-defs"
+    if with_ms:
+        mdir = tmp_path / "microskills" / "real-ms" / "profiles"
+        mdir.mkdir(parents=True)
+        (tmp_path / "microskills" / "real-ms" / "MICROSKILL.md").write_text(USE_MS_MD)
+        (mdir / "base.yaml").write_text("version: 1\n")
+    return make_def(defs_root, "use-flow", wf_body), defs_root
+
+
+def test_use_target_present_passes_with_defs_root(tmp_path):
+    wf, defs_root = make_use_world(tmp_path, USE_WF, with_ms=True)
+    rc, data, _ = run_defs(defs_root, wf)
+    assert rc == 0, data
+    assert data["pass"] is True
+
+
+def test_use_target_missing_blocks_with_defs_root(tmp_path):
+    # The target microskill does not exist under the sibling microskills/ root →
+    # block (compile fails loud on the same condition).
+    wf, defs_root = make_use_world(tmp_path, USE_WF, with_ms=False)
+    rc, data, _ = run_defs(defs_root, wf)
+    assert rc == 1 and data["pass"] is False
+    assert any("use: 'real-ms' does not resolve" in i["message"] for i in data["issues"])
+
+
+def test_use_target_missing_without_defs_root_passes(tmp_path):
+    # Without --defs-root the existence check is skipped — hermetic single-file
+    # validation stays backward-compatible.
+    wf, _ = make_use_world(tmp_path, USE_WF, with_ms=False)
+    rc, data, _ = run(wf)
+    assert rc == 0, data
+    assert data["pass"] is True
+
+
+def test_use_target_missing_orchestrator_escape_hatch_passes(tmp_path):
+    # Explicit delegation: orchestrator skips resolution in compile, so the
+    # existence check skips it too.
+    body = USE_WF + "    delegation: orchestrator\n    prompt: by hand\n"
+    wf, defs_root = make_use_world(tmp_path, body, with_ms=False)
+    rc, data, _ = run_defs(defs_root, wf)
+    assert rc == 0, data
+    assert data["pass"] is True
+
+
+def test_delegation_auto_on_workflow_node_blocks(tmp_path):
+    make_def(tmp_path, "child-flow", CHILD)
+    body = PARENT.replace("    workflow: child-flow\n",
+                          "    workflow: child-flow\n    delegation: auto\n")
+    parent = make_def(tmp_path, "parent-flow", body)
+    rc, data, _ = run_defs(tmp_path, parent)
+    assert rc == 1 and data["pass"] is False
+    assert any("delegation: auto on a workflow: node" in i["message"]
+               for i in data["issues"])
+
+
+def test_side_effect_with_delegation_auto_blocks(tmp_path):
+    body = """\
+version: 1
+name: contra-flow
+nodes:
+  - id: s
+    agent: ag
+    prompt: do it
+    side_effect: true
+    delegation: auto
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    assert any("contradicts delegation: auto" in i["message"] for i in data["issues"])
+
+
+LOOP_ORCH_BODY = """\
+version: 1
+name: loop-orch-flow
+nodes:
+  - id: p
+    agent: ag
+    prompt: plan
+  - id: impl
+    delegation: orchestrator
+    depends_on: [p]
+    prompt: impl by hand
+  - id: ev
+    agent: ag
+    depends_on: [impl]
+    prompt: ev
+loop:
+  while: ${!ev.output.pass}
+  max_iters: 2
+  body: [impl, ev]
+"""
+
+
+def test_loop_body_explicit_orchestrator_member_blocks(tmp_path):
+    # Statically-detectable subset of compile's loop-body fail-loud: an explicit
+    # delegation: orchestrator member blocks (no resolution needed).
+    rc, data, _ = run(write_wf(tmp_path, LOOP_ORCH_BODY))
+    assert rc == 1 and data["pass"] is False
+    assert any(i["location"] == "loop/body" and "do/while" in i["message"]
+               for i in data["issues"])
+
+
+def test_loop_body_side_effect_member_blocks(tmp_path):
+    body = LOOP_ORCH_BODY.replace("    delegation: orchestrator\n",
+                                  "    agent: ag\n    side_effect: true\n")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    assert any(i["location"] == "loop/body" and "orchestrator" in i["message"]
+               for i in data["issues"])
+
+
+def test_loop_body_background_members_pass(tmp_path):
+    # Control: an all-background body (use/agent, no orchestrator markers) passes.
+    body = LOOP_ORCH_BODY.replace("    delegation: orchestrator\n", "    agent: ag\n")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 0, data
+    assert data["pass"] is True
+
+
+# =============================================================================
+# 3.2 / 3.6 — customize closed to {profile?, overrides?}; overrides + retry
+# placement blocks (mirror compile's hard dies, statically-detectable subset).
+# =============================================================================
+
+USE_OVERRIDES = """\
+version: 1
+name: ov-flow
+nodes:
+  - id: e
+    use: some-ms
+    customize:
+      profile: fast
+      overrides:
+        runtime.model: haiku
+"""
+
+
+def test_customize_profile_and_overrides_on_use_node_pass(tmp_path):
+    rc, data, _ = run(write_wf(tmp_path, USE_OVERRIDES))
+    assert rc == 0, data
+    assert data["pass"] is True
+
+
+def test_customize_unknown_key_blocks_schema(tmp_path):
+    body = USE_OVERRIDES.replace("      profile: fast\n", "      profilee: oops\n")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert any("profilee" in i["message"] for i in data["issues"]
+               if i["severity"] == "block")
+
+
+def test_customize_overrides_on_agent_node_blocks(tmp_path):
+    body = """\
+version: 1
+name: ov-flow
+nodes:
+  - id: a
+    agent: ag
+    customize:
+      overrides:
+        runtime.model: haiku
+    prompt: do a
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert any("customize.overrides is only valid on a use:" in i["message"]
+               for i in data["issues"])
+
+
+def test_customize_overrides_on_workflow_node_blocks(tmp_path):
+    body = """\
+version: 1
+name: ov-flow
+imports: [child-flow]
+nodes:
+  - id: w
+    workflow: child-flow
+    customize:
+      overrides:
+        runtime.model: haiku
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert any("customize.overrides is only valid on a use:" in i["message"]
+               for i in data["issues"])
+
+
+def test_customize_overrides_under_delegation_orchestrator_blocks(tmp_path):
+    body = USE_OVERRIDES.replace("    use: some-ms\n",
+                                 "    use: some-ms\n    delegation: orchestrator\n")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert any("resolution is skipped" in i["message"] for i in data["issues"])
+
+
+def test_customize_overrides_under_side_effect_alias_blocks(tmp_path):
+    body = USE_OVERRIDES.replace("    use: some-ms\n",
+                                 "    use: some-ms\n    side_effect: true\n")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert any("resolution is skipped" in i["message"] for i in data["issues"])
+
+
+RETRY_OK = """\
+version: 1
+name: rt-flow
+nodes:
+  - id: a
+    agent: ag
+    retry: { max_attempts: 3 }
+    prompt: do a
+  - id: e
+    use: some-ms
+    retry: { max_attempts: 2 }
+    depends_on: [a]
+"""
+
+
+def test_retry_on_use_and_agent_nodes_passes(tmp_path):
+    rc, data, _ = run(write_wf(tmp_path, RETRY_OK))
+    assert rc == 0, data
+    assert data["pass"] is True
+
+
+def test_retry_max_attempts_below_two_blocks_schema(tmp_path):
+    body = RETRY_OK.replace("max_attempts: 2", "max_attempts: 1")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert any("minimum" in i["message"] or "less than" in i["message"]
+               for i in data["issues"] if i["severity"] == "block")
+
+
+def test_retry_on_workflow_node_blocks(tmp_path):
+    body = """\
+version: 1
+name: rt-flow
+imports: [child-flow]
+nodes:
+  - id: w
+    workflow: child-flow
+    retry: { max_attempts: 2 }
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert any("retry is only valid on a background use:/agent: node" in i["message"]
+               for i in data["issues"])
+
+
+def test_retry_on_orchestrator_native_node_blocks(tmp_path):
+    body = """\
+version: 1
+name: rt-flow
+nodes:
+  - id: fin
+    delegation: orchestrator
+    retry: { max_attempts: 2 }
+    prompt: finalize
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert any("retry is only valid on a background use:/agent: node" in i["message"]
+               for i in data["issues"])
+
+
+def test_retry_under_explicit_delegation_orchestrator_blocks(tmp_path):
+    body = """\
+version: 1
+name: rt-flow
+nodes:
+  - id: a
+    agent: ag
+    delegation: orchestrator
+    retry: { max_attempts: 2 }
+    prompt: do a
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert any("explicit orchestrator checkpoint" in i["message"]
+               for i in data["issues"])
+
+
+# --- {{snippet:NAME}} includes (validate mirrors compile's pre-pass) ---
+
+SNIP_WF = """\
+version: 1
+name: snip-flow
+vars:
+  topic: kubernetes
+nodes:
+  - id: a
+    agent: ag
+    prompt: "{{snippet:greet}} now"
+"""
+
+
+def _snip_world(tmp_path, snippet_text=None):
+    """Standard <defs-root>/<name>/WORKFLOW.yaml layout + optional _snippets/greet.md."""
+    defs = tmp_path / "defs"
+    d = defs / "snip-flow"
+    d.mkdir(parents=True)
+    (d / "WORKFLOW.yaml").write_text(SNIP_WF)
+    if snippet_text is not None:
+        (defs / "_snippets").mkdir()
+        (defs / "_snippets" / "greet.md").write_text(snippet_text)
+    return d / "WORKFLOW.yaml", defs
+
+
+def test_snippet_resolves_via_derived_defs_root(tmp_path):
+    # Without --defs-root, the snippets root derives from the standard
+    # <defs-root>/<name>/WORKFLOW.yaml layout (parent of the def dir).
+    wf, _ = _snip_world(tmp_path, "research {{topic}} thoroughly\n")
+    rc, data, _ = run(wf)
+    assert rc == 0, data
+    assert data["pass"] is True
+    # the snippet's {{topic}} var resolved (no unresolved-var warn for it)
+    assert not any("topic" in i["message"] for i in data["issues"]), data["issues"]
+
+
+def test_snippet_resolves_via_explicit_defs_root(tmp_path):
+    wf, defs = _snip_world(tmp_path, "research {{topic}} thoroughly\n")
+    rc, data, _ = run(wf, "--defs-root", str(defs))
+    assert rc == 0, data
+    assert data["pass"] is True
+
+
+def test_missing_snippet_blocks_validate(tmp_path):
+    # Unresolvable snippet → HARD block (mirrors compile's die), never a warn.
+    wf, _ = _snip_world(tmp_path, snippet_text=None)
+    rc, data, _ = run(wf)
+    assert rc == 1 and data["pass"] is False
+    assert any(i["location"] == "snippets" and "greet" in i["message"]
+               for i in data["issues"] if i["severity"] == "block"), data["issues"]
+
+
+# --- compile-time expand: (validate mirrors compile's shared desugar) ---
+
+EXPAND_WF = """\
+version: 1
+name: fan-flow
+nodes:
+  - id: seed
+    agent: ag
+    prompt: seed
+  - id: scan
+    agent: ag
+    expand:
+      over: [alpha, beta]
+    prompt: scan {{each.item}} with ${seed.output.x}
+  - id: gather
+    agent: ag
+    inputs_each: scan
+    prompt: gather everything
+"""
+
+
+def test_expand_desugars_and_validates(tmp_path):
+    # The sugar never reaches the closed node schema: the template is replaced by
+    # ordinary generated siblings pre-validation, the fan-in wires real node ids,
+    # and the result passes clean.
+    rc, data, _ = run(write_wf(tmp_path, EXPAND_WF))
+    assert rc == 0, data
+    assert data["pass"] is True
+    assert data["issues"] == []
+
+
+def test_expand_bad_shape_blocks_validate(tmp_path):
+    body = EXPAND_WF.replace("over: [alpha, beta]", "over: []")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    assert any(i["location"] == "expand" and "non-empty" in i["message"]
+               for i in data["issues"]), data["issues"]
+
+
+def test_inputs_each_unknown_template_blocks_validate(tmp_path):
+    body = EXPAND_WF.replace("inputs_each: scan", "inputs_each: seed")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    assert any(i["location"] == "expand" and "inputs_each" in i["message"]
+               for i in data["issues"]), data["issues"]
+
+
+def test_expand_leftover_each_token_blocks_validate(tmp_path):
+    body = EXPAND_WF.replace("{{each.item}}", "{{each.profile}}")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    assert any(i["location"] == "expand" and "each" in i["message"]
+               for i in data["issues"]), data["issues"]
+
+
+def test_real_review_changes_validates_with_expand():
+    # The flagship adoption validates clean under all three profiles.
+    rc_dir = REPO / "catalog" / "workflow-defs" / "review-changes"
+    base = rc_dir / "profiles" / "base.yaml"
+    for overlays in ([], ["comprehensive.yaml"], ["lite.yaml"]):
+        paths = [rc_dir / "WORKFLOW.yaml", base] + [rc_dir / "profiles" / o for o in overlays]
+        rc, data, _ = run(*paths)
+        assert rc == 0, (overlays, data)
+        assert data["pass"] is True, (overlays, data["issues"])
+
+
+# =============================================================================
+# 2.1 — validator-side schema inheritance: the typed-ref (S-FIELD) check falls
+# back to the use: target's RESOLVED output_schema (same resolve-microskill
+# subprocess compile uses); two-tier inline-schema redundancy lint; unresolvable
+# use: is WARN by default (hermetic standalone validation keeps passing) and
+# escalates to a block under --strict.
+# =============================================================================
+
+SCHEMA_MS_MD = """\
+---
+name: schema-ms
+description: minimal microskill with a resolved output_schema
+---
+
+# Schema MS
+
+## Purpose
+
+Emit a typed result.
+
+## Steps
+
+1. Return the result.
+"""
+
+SCHEMA_MS_BASE = """\
+version: 1
+output_schema:
+  type: object
+  required: [echoed]
+  properties:
+    echoed: { type: string }
+    score: { type: number }
+"""
+
+
+def make_schema_world(tmp_path, wf_body, ms_base=SCHEMA_MS_BASE, with_ms=True):
+    """<tmp>/workflow-defs/sch-flow + <tmp>/microskills/schema-ms — the
+    sibling-skill-root layout both tools derive from the defs root."""
+    defs_root = tmp_path / "workflow-defs"
+    if with_ms:
+        mdir = tmp_path / "microskills" / "schema-ms" / "profiles"
+        mdir.mkdir(parents=True)
+        (tmp_path / "microskills" / "schema-ms" / "MICROSKILL.md").write_text(SCHEMA_MS_MD)
+        (mdir / "base.yaml").write_text(ms_base)
+    return make_def(defs_root, "sch-flow", wf_body), defs_root
+
+
+SFIELD_FALLBACK_WF = """\
+version: 1
+name: sch-flow
+nodes:
+  - id: u
+    use: schema-ms
+  - id: c
+    agent: ag
+    prompt: use ${u.output.%s}
+"""
+
+
+def test_sfield_falls_back_to_resolved_schema_blocks_unknown_field(tmp_path):
+    # `u` declares NO inline output_schema; the field check must fall back to the
+    # RESOLVED microskill schema and block the undeclared field.
+    wf, defs_root = make_schema_world(tmp_path, SFIELD_FALLBACK_WF % "ghost")
+    rc, data, _ = run_defs(defs_root, wf)
+    assert rc == 1 and data["pass"] is False
+    assert any("ghost" in i["message"] and "does not declare" in i["message"]
+               for i in data["issues"]), data["issues"]
+
+
+def test_sfield_fallback_known_field_passes(tmp_path):
+    wf, defs_root = make_schema_world(tmp_path, SFIELD_FALLBACK_WF % "echoed")
+    rc, data, _ = run_defs(defs_root, wf)
+    assert rc == 0, data
+    assert data["pass"] is True
+
+
+def test_sfield_fallback_engages_without_defs_root(tmp_path):
+    # Standalone validation derives the defs root from the standard
+    # <defs-root>/<name>/WORKFLOW.yaml layout, so resolution still engages.
+    wf, _ = make_schema_world(tmp_path, SFIELD_FALLBACK_WF % "ghost")
+    rc, data, _ = run(wf)
+    assert rc == 1 and data["pass"] is False
+    assert any("ghost" in i["message"] and "does not declare" in i["message"]
+               for i in data["issues"]), data["issues"]
+
+
+def test_inline_schema_deep_equal_resolved_warns_omit(tmp_path):
+    # Inline schema deep-equal to the resolved one → redundancy lint tier 1: warn
+    # 'omit it' (never a block).
+    body = """\
+version: 1
+name: sch-flow
+nodes:
+  - id: u
+    use: schema-ms
+    output_schema:
+      type: object
+      required: [echoed]
+      properties:
+        echoed: { type: string }
+        score: { type: number }
+"""
+    wf, defs_root = make_schema_world(tmp_path, body)
+    rc, data, _ = run_defs(defs_root, wf)
+    assert rc == 0, data
+    assert data["pass"] is True
+    assert any(i["severity"] == "warn" and "omit" in i["message"]
+               and i["location"] == "nodes/u/output_schema"
+               for i in data["issues"]), data["issues"]
+
+
+def test_inline_schema_divergent_warns_reconcile(tmp_path):
+    # Inline schema diverging from the resolved one → tier 2: warn 'reconcile or
+    # document the narrowing'.
+    body = """\
+version: 1
+name: sch-flow
+nodes:
+  - id: u
+    use: schema-ms
+    output_schema:
+      type: object
+      required: [echoed]
+      properties:
+        echoed: { type: string }
+        extra_field: { type: string }
+"""
+    wf, defs_root = make_schema_world(tmp_path, body)
+    rc, data, _ = run_defs(defs_root, wf)
+    assert rc == 0, data
+    assert data["pass"] is True
+    assert any(i["severity"] == "warn" and "reconcile" in i["message"]
+               and i["location"] == "nodes/u/output_schema"
+               for i in data["issues"]), data["issues"]
+
+
+def test_unresolvable_use_warns_by_default_standalone(tmp_path):
+    # No microskills/ sibling at all and no --defs-root: hermetic standalone
+    # validation must keep passing — unresolvable use: is a WARN.
+    wf, _ = make_schema_world(tmp_path, SFIELD_FALLBACK_WF % "anything", with_ms=False)
+    rc, data, _ = run(wf)
+    assert rc == 0, data
+    assert data["pass"] is True
+    assert any(i["severity"] == "warn" and "does not resolve" in i["message"]
+               for i in data["issues"]), data["issues"]
+
+
+def test_strict_escalates_unresolvable_use_to_block(tmp_path):
+    wf, _ = make_schema_world(tmp_path, SFIELD_FALLBACK_WF % "anything", with_ms=False)
+    rc, data, _ = run(wf, "--strict")
+    assert rc == 1 and data["pass"] is False
+    assert any(i["severity"] == "block" and "does not resolve" in i["message"]
+               for i in data["issues"]), data["issues"]
+
+
+def test_resolution_failure_with_defs_root_blocks(tmp_path):
+    # MICROSKILL.md exists but its base.yaml is unparseable: with --defs-root
+    # (full-registry validation) a failed resolution is a block, mirroring
+    # compile's hard die. (A missing customize.profile is NOT a failure — the
+    # resolver falls back to base with a warning.)
+    wf, defs_root = make_schema_world(
+        tmp_path, SFIELD_FALLBACK_WF % "echoed",
+        ms_base="version: 1\n  bad_indent: [\n")
+    rc, data, _ = run_defs(defs_root, wf)
+    assert rc == 1 and data["pass"] is False
+    assert any("failed to resolve" in i["message"] for i in data["issues"]
+               if i["severity"] == "block"), data["issues"]
+
+
+def test_explicit_delegation_orchestrator_skips_resolution_lints(tmp_path):
+    # The escape hatch skips resolution in compile, so validate skips the
+    # resolution-driven lints too — no unresolvable warn even though the target
+    # is missing.
+    body = """\
+version: 1
+name: sch-flow
+nodes:
+  - id: u
+    use: schema-ms
+    delegation: orchestrator
+"""
+    wf, _ = make_schema_world(tmp_path, body, with_ms=False)
+    rc, data, _ = run(wf)
+    assert rc == 0, data
+    assert data["pass"] is True
+    assert not any("does not resolve" in i["message"] for i in data["issues"])
+
+
+# =============================================================================
+# 2.2 — lint pack: redundant depends_on (refs already imply the edge) with fix
+# text; every ${workflow.inputs.x} ref must appear in the declared inputs map.
+# =============================================================================
+
+def test_redundant_depends_on_warns_with_fix_text(tmp_path):
+    # VALID's node b restates the ref-implied edge a->b in depends_on → warn.
+    rc, data, _ = run(write_wf(tmp_path, VALID))
+    assert rc == 0 and data["pass"] is True
+    w = [i for i in data["issues"]
+         if i["severity"] == "warn" and i["location"] == "nodes/b/depends_on"]
+    assert len(w) == 1, data["issues"]
+    assert "redundant" in w[0]["message"] and "drop" in w[0]["message"]
+
+
+def test_pure_ordering_depends_on_does_not_warn(tmp_path):
+    # An explicit edge with NO matching ref is the legitimate use of depends_on.
+    body = """\
+version: 1
+name: tiny-flow
+nodes:
+  - id: a
+    agent: some-agent
+    prompt: do a
+  - id: b
+    agent: some-agent
+    depends_on: [a]
+    prompt: do b after a
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 0 and data["pass"] is True
+    assert not any("redundant" in i["message"] for i in data["issues"])
+
+
+def test_items_ref_redundant_depends_on_warns(tmp_path):
+    # A ${id.items} ref implies the edge exactly like ${id.output}.
+    body = """\
+version: 1
+name: items-flow
+nodes:
+  - id: fan
+    agent: ag
+    for_each: ${workflow.inputs.xs}
+    as: x
+    prompt: do ${x}
+  - id: join
+    agent: ag
+    depends_on: [fan]
+    prompt: join ${fan.items}
+inputs:
+  xs: { type: array }
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 0 and data["pass"] is True
+    assert any("redundant" in i["message"] and i["location"] == "nodes/join/depends_on"
+               for i in data["issues"]), data["issues"]
+
+
+def test_inputs_each_generated_fanin_not_linted(tmp_path):
+    # inputs_each desugars to inputs + an explicit depends_on per generated
+    # sibling BY CONSTRUCTION — the lint runs on the hand-authored (pre-expand)
+    # shape only, so the generated fan-in never warns.
+    body = """\
+version: 1
+name: fan-flow
+nodes:
+  - id: seed
+    agent: ag
+    prompt: seed
+  - id: scan
+    agent: ag
+    expand:
+      over: [alpha, beta]
+    prompt: scan {{each.item}} with ${seed.output.x}
+  - id: gather
+    agent: ag
+    inputs_each: scan
+    prompt: gather everything
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 0, data
+    assert data["pass"] is True
+    assert not any("redundant" in i["message"] for i in data["issues"]), data["issues"]
+
+
+def test_hand_authored_template_redundant_depends_on_warns(tmp_path):
+    # ...but a hand-authored redundant depends_on ON the template itself warns.
+    body = """\
+version: 1
+name: fan-flow
+nodes:
+  - id: seed
+    agent: ag
+    prompt: seed
+  - id: scan
+    agent: ag
+    depends_on: [seed]
+    expand:
+      over: [alpha, beta]
+    prompt: scan {{each.item}} with ${seed.output.x}
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 0, data
+    assert any("redundant" in i["message"] and i["location"] == "nodes/scan/depends_on"
+               for i in data["issues"]), data["issues"]
+
+
+def test_undeclared_workflow_input_ref_blocks(tmp_path):
+    body = """\
+version: 1
+name: wf-in
+inputs:
+  diff_path: { type: string }
+nodes:
+  - id: a
+    agent: ag
+    prompt: read ${workflow.inputs.dif_path}
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    assert any("dif_path" in i["message"] and "not declared" in i["message"]
+               for i in data["issues"] if i["severity"] == "block"), data["issues"]
+
+
+def test_declared_workflow_input_ref_passes(tmp_path):
+    body = """\
+version: 1
+name: wf-in
+inputs:
+  diff_path: { type: string }
+nodes:
+  - id: a
+    agent: ag
+    prompt: read ${workflow.inputs.diff_path}
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 0, data
+    assert data["pass"] is True
+
+
+def test_undeclared_input_with_no_inputs_map_blocks(tmp_path):
+    body = """\
+version: 1
+name: wf-in
+nodes:
+  - id: a
+    agent: ag
+    prompt: read ${workflow.inputs.anything}
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    assert any("anything" in i["message"] and "not declared" in i["message"]
+               for i in data["issues"]), data["issues"]
+
+
+def test_input_declared_by_profile_overlay_passes(tmp_path):
+    # comprehensive.yaml pattern: the overlay declares the input the patched
+    # node references — membership is checked on the MERGED doc.
+    wf = write_wf(tmp_path, """\
+version: 1
+name: wf-in
+inputs:
+  base_in: { type: string }
+nodes:
+  - id: a
+    agent: ag
+    prompt: read ${workflow.inputs.base_in} and ${workflow.inputs.extra_in}
+""")
+    overlay = tmp_path / "extra.yaml"
+    overlay.write_text("version: 1\ninputs:\n  extra_in: { type: string }\n")
+    rc, data, _ = run(wf, overlay)
+    assert rc == 0, data
+    assert data["pass"] is True
+
+
+def test_undeclared_input_in_gate_prompt_blocks(tmp_path):
+    body = VALID + """\
+gates:
+  - id: g1
+    after: a
+    type: human_approval
+    prompt: approve ${workflow.inputs.nope}?
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    assert any("nope" in i["message"] and "not declared" in i["message"]
+               for i in data["issues"]), data["issues"]
+
+
+# ---------------------------------------------------------------------------
+# Declared gate policy (default / on_headless / gate_mode), present:, and the
+# gate-choice literal cross-check
+# ---------------------------------------------------------------------------
+
+CHOICE_FLOW = """\
+version: 1
+name: choice-flow
+nodes:
+  - id: plan
+    agent: ag
+    prompt: do plan
+    output_schema:
+      type: object
+      properties:
+        name: { type: string }
+        plan_path: { type: string }
+      required: [name]
+  - id: deep
+    agent: ag
+    when: ${review.output.choice == 'deep_review'}
+    prompt: deep using ${plan.output.name}
+gates:
+  - id: review
+    after: plan
+    type: human_approval
+    prompt: Approve, or send to deep review?
+    options: [approve, deep_review]
+"""
+
+
+def test_choice_literal_in_options_passes(tmp_path):
+    rc, data, _ = run(write_wf(tmp_path, CHOICE_FLOW))
+    assert rc == 0, data
+    assert data["pass"] is True
+
+
+def test_choice_literal_typo_blocks(tmp_path):
+    body = CHOICE_FLOW.replace("== 'deep_review'", "== 'Deep_Review'")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert any("'Deep_Review'" in i["message"] and "review" in i["message"]
+               for i in data["issues"]), data["issues"]
+
+
+def test_choice_literal_neq_nonoption_blocks(tmp_path):
+    # != against a label the gate never offers is ALWAYS true — equally dead.
+    body = CHOICE_FLOW.replace("== 'deep_review'", "!= 'nope'")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert any("'nope'" in i["message"] for i in data["issues"])
+
+
+def test_choice_literal_reversed_operands_checked(tmp_path):
+    body = CHOICE_FLOW.replace(
+        "${review.output.choice == 'deep_review'}",
+        "${'Deep_Review' == review.output.choice}")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert any("'Deep_Review'" in i["message"] for i in data["issues"])
+
+
+def test_choice_literal_optionless_gate_uses_confirm_stop(tmp_path):
+    # An options-less gate offers the implicit confirm/stop pair.
+    base = CHOICE_FLOW.replace("    options: [approve, deep_review]\n", "")
+    ok = base.replace("== 'deep_review'", "== 'confirm'")
+    rc, data, _ = run(write_wf(tmp_path, ok))
+    assert rc == 0, data
+    bad = base.replace("== 'deep_review'", "== 'approve'")
+    rc2, data2, _ = run(write_wf(tmp_path, bad))
+    assert rc2 == 1
+    assert any("confirm/stop" in i["message"] for i in data2["issues"])
+
+
+def test_gate_default_member_checked(tmp_path):
+    ok = CHOICE_FLOW + "    default: approve\n"
+    rc, data, _ = run(write_wf(tmp_path, ok))
+    assert rc == 0, data
+    bad = CHOICE_FLOW + "    default: yes-do-it\n"
+    rc2, data2, _ = run(write_wf(tmp_path, bad))
+    assert rc2 == 1
+    assert any("yes-do-it" in i["message"] and i["location"] == "gates/review"
+               for i in data2["issues"]), data2["issues"]
+
+
+def test_on_headless_take_default_requires_default(tmp_path):
+    body = CHOICE_FLOW + "    on_headless: take_default\n"
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert any("take_default" in i["message"] for i in data["issues"])
+
+
+def test_gate_mode_auto_blocks_defaultless_hard_gate(tmp_path):
+    body = "gate_mode: auto\n" + CHOICE_FLOW
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert any("headless" in i["message"] and i["location"] == "gates/review"
+               for i in data["issues"]), data["issues"]
+    # A declared default clears it; so does an explicit on_headless: fail.
+    rc2, data2, _ = run(write_wf(tmp_path, body + "    default: approve\n"))
+    assert rc2 == 0, data2
+    rc3, data3, _ = run(write_wf(tmp_path, body + "    on_headless: fail\n"))
+    assert rc3 == 0, data3
+
+
+def test_gate_mode_bad_value_fails_schema(tmp_path):
+    rc, data, _ = run(write_wf(tmp_path, "gate_mode: yolo\n" + CHOICE_FLOW))
+    assert rc == 1
+    assert any(i["location"].startswith("schema:gate_mode") for i in data["issues"])
+
+
+def test_warn_gate_branched_on_forces_default(tmp_path):
+    # The dispatcher records a warn gate's DECLARED default (or {choice: null}) —
+    # never a fabricated pick — so a branched-on warn gate must declare one.
+    body = CHOICE_FLOW.replace("    prompt: Approve, or send to deep review?\n",
+                               "    severity: warn\n"
+                               "    prompt: Approve, or send to deep review?\n")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert any("default" in i["message"] and i["location"] == "gates/review"
+               for i in data["issues"]), data["issues"]
+    rc2, data2, _ = run(write_wf(tmp_path, body + "    default: approve\n"))
+    assert rc2 == 0, data2
+
+
+def test_warn_gate_not_branched_on_needs_no_default(tmp_path):
+    # Without any ${review.output.choice} ref, a defaultless warn gate is fine.
+    body = CHOICE_FLOW.replace("    when: ${review.output.choice == 'deep_review'}\n", "") \
+                      .replace("    prompt: Approve, or send to deep review?\n",
+                               "    severity: warn\n"
+                               "    prompt: Approve, or send to deep review?\n")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 0, data
+
+
+def test_warn_nonapproval_gate_branched_on_blocks(tmp_path):
+    # A warn verification gate emits NO checkpoint at all — its choice is never
+    # recorded, so branching on it is always broken.
+    body = CHOICE_FLOW.replace("    type: human_approval\n",
+                               "    type: verification\n    severity: warn\n") \
+                      .replace("    prompt: Approve, or send to deep review?\n", "") \
+                      .replace("    options: [approve, deep_review]\n", "") \
+                      .replace("== 'deep_review'", "== 'confirm'")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert any("no checkpoint" in i["message"] for i in data["issues"]), data["issues"]
+
+
+PRESENT_FLOW = CHOICE_FLOW.replace("    options: [approve, deep_review]\n", """\
+    options: [approve, deep_review]
+    present:
+      - plan.output.name
+      - read_file: plan.output.plan_path
+""")
+
+
+def test_present_valid_paths_pass(tmp_path):
+    rc, data, _ = run(write_wf(tmp_path, PRESENT_FLOW))
+    assert rc == 0, data
+    assert data["pass"] is True
+
+
+def test_present_unknown_node_blocks(tmp_path):
+    body = PRESENT_FLOW.replace("- plan.output.name", "- ghost.output.name")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert any(i["location"] == "gates/review/present"
+               and "unknown node 'ghost'" in i["message"] for i in data["issues"])
+
+
+def test_present_undeclared_field_blocks(tmp_path):
+    body = PRESENT_FLOW.replace("- plan.output.name", "- plan.output.bogus")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert any("does not declare property 'bogus'" in i["message"]
+               for i in data["issues"]), data["issues"]
+
+
+def test_present_later_node_blocks(tmp_path):
+    # 'deep' runs after the gate's anchor 'plan' — not yet produced when the
+    # gate fires.
+    body = PRESENT_FLOW.replace("- plan.output.name", "- deep.output.name")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert any("not yet produced" in i["message"] for i in data["issues"]), data["issues"]
+
+
+def test_present_malformed_entry_fails_schema(tmp_path):
+    body = PRESENT_FLOW.replace("- plan.output.name", "- Plan Output Name")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert any(i["location"].startswith("schema:gates") for i in data["issues"])
+
+
+def test_present_gate_self_and_field_rules(tmp_path):
+    # A gate may present an EARLIER gate's recorded choice; its own (not yet
+    # recorded) and any non-choice field are blocks.
+    body = PRESENT_FLOW.replace("- plan.output.name", "- review.output.choice")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert any("own choice" in i["message"] for i in data["issues"]), data["issues"]
+    two_gates = PRESENT_FLOW.replace("- plan.output.name", "- review.output.choice") + """\
+  - id: early
+    after: plan
+    type: human_approval
+    prompt: early check?
+"""
+    # 'early' is declared AFTER 'review' on the same anchor, so review still
+    # cannot present it; flip the reference to the earlier-declared gate instead.
+    body2 = two_gates.replace("- review.output.choice", "- early.output.choice")
+    rc2, data2, _ = run(write_wf(tmp_path, body2))
+    assert rc2 == 1
+    assert any("not yet recorded" in i["message"] for i in data2["issues"]), data2["issues"]
+
+
+# ---------------------------------------------------------------------------
+# spill_outputs — declared node-output-by-reference (shared helpers with
+# compile-workflow, so the two tools can never disagree): placement (no
+# for_each fan-out producer), schema coherence (spilled fields must exist in
+# the producer's EFFECTIVE output schema — inline wins, else the resolved
+# microskill schema), and the HARD-BLOCK on guards (when / for_each / loop
+# while/until) referencing a spilled field — across a checkpoint the
+# dispatcher threads it as a handoff file PATH, and a path is not the value.
+
+
+SPILL_VWF = """\
+version: 1
+name: spill-flow
+nodes:
+  - id: review
+    agent: some-agent
+    prompt: review it
+    output_schema:
+      type: object
+      required: [report, count]
+      properties:
+        report: { type: string }
+        count: { type: integer }
+    spill_outputs: [report]
+  - id: post
+    agent: some-agent
+    prompt: post ${review.output.report} (${review.output.count} findings)
+gates:
+  - id: g1
+    after: review
+    type: human_approval
+    prompt: ok?
+"""
+
+
+def test_spill_clean_def_passes(tmp_path):
+    rc, data, _ = run(write_wf(tmp_path, SPILL_VWF))
+    assert rc == 0, data
+    assert data["pass"] is True
+
+
+def test_spill_field_in_when_guard_blocks(tmp_path):
+    body = SPILL_VWF.replace(
+        "    prompt: post ${review.output.report} (${review.output.count} findings)\n",
+        "    when: ${review.output.report == 'ok'}\n"
+        "    prompt: post it\n")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert "nodes/post/when" in locs(data)
+    assert any("spill_outputs" in i["message"] and "PATH" in i["message"]
+               for i in data["issues"])
+
+
+def test_spill_unspilled_field_in_when_guard_passes(tmp_path):
+    # Branching on a small UNSPILLED field of the same producer is the
+    # documented pattern — never flagged.
+    body = SPILL_VWF.replace(
+        "    prompt: post ${review.output.report} (${review.output.count} findings)\n",
+        "    when: ${review.output.count > 0}\n"
+        "    prompt: post ${review.output.report}\n")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 0, data
+    assert data["pass"] is True
+
+
+def test_spill_field_in_for_each_blocks(tmp_path):
+    body = """\
+version: 1
+name: sp-fe
+nodes:
+  - id: collect
+    agent: some-agent
+    prompt: collect
+    output_schema:
+      type: object
+      properties:
+        findings: { type: array }
+    spill_outputs: [findings]
+  - id: verify
+    agent: some-agent
+    for_each: ${collect.output.findings}
+    as: f
+    prompt: verify ${f}
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert "nodes/verify/for_each" in locs(data)
+
+
+def test_spill_field_in_loop_until_blocks(tmp_path):
+    # The helper scans `until` as well as `while`, so the block is
+    # desugar-order-independent.
+    body = """\
+version: 1
+name: sp-loop
+nodes:
+  - id: impl
+    agent: some-agent
+    prompt: impl
+  - id: ev
+    agent: some-agent
+    depends_on: [impl]
+    prompt: ev
+    output_schema:
+      type: object
+      properties:
+        report: { type: string }
+    spill_outputs: [report]
+loop:
+  until: ${ev.output.report == 'done'}
+  max_iters: 2
+  body: [impl, ev]
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert "loop/until" in locs(data)
+
+
+def test_spill_on_for_each_fan_out_node_blocks(tmp_path):
+    body = """\
+version: 1
+name: sp-fan
+inputs:
+  items:
+    type: array
+    required: true
+nodes:
+  - id: scan
+    agent: some-agent
+    for_each: ${workflow.inputs.items}
+    as: item
+    prompt: scan ${item}
+    spill_outputs: [report]
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert "nodes/scan/spill_outputs" in locs(data)
+    assert any("ARRAY" in i["message"] for i in data["issues"])
+
+
+def test_spill_field_not_in_inline_schema_blocks(tmp_path):
+    body = SPILL_VWF.replace("spill_outputs: [report]",
+                             "spill_outputs: [reprot]")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert "nodes/review/spill_outputs" in locs(data)
+    assert any("reprot" in i["message"] for i in data["issues"])
+
+
+def test_spill_schema_less_producer_is_any_and_passes(tmp_path):
+    body = SPILL_VWF.replace("""\
+    output_schema:
+      type: object
+      required: [report, count]
+      properties:
+        report: { type: string }
+        count: { type: integer }
+""", "")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 0, data
+    assert data["pass"] is True
+
+
+SPILL_RESOLVED_WF = """\
+version: 1
+name: sch-flow
+nodes:
+  - id: u
+    use: schema-ms
+    spill_outputs: [%s]
+  - id: c
+    agent: ag
+    prompt: use ${u.output.echoed}
+"""
+
+
+def test_spill_field_checked_against_resolved_microskill_schema(tmp_path):
+    # Validator-side schema inheritance: a use: node with no inline schema
+    # falls back to the RESOLVED microskill output_schema for the spill
+    # coherence check — a spilled field the microskill never produces blocks.
+    wf, defs_root = make_schema_world(tmp_path, SPILL_RESOLVED_WF % "transcript")
+    rc, data, _ = run_defs(defs_root, wf)
+    assert rc == 1 and data["pass"] is False
+    assert "nodes/u/spill_outputs" in locs(data)
+    assert any("transcript" in i["message"] for i in data["issues"])
+
+
+def test_spill_field_in_resolved_microskill_schema_passes(tmp_path):
+    wf, defs_root = make_schema_world(tmp_path, SPILL_RESOLVED_WF % "echoed")
+    rc, data, _ = run_defs(defs_root, wf)
+    assert rc == 0, data
+    assert data["pass"] is True

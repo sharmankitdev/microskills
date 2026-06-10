@@ -5,11 +5,9 @@ version: 1
 vars:
   contract_doc: .claude/workflow-defs/microskill-create/references/planner.md
 
-# `requirement_path` carries the requirement BY REFERENCE: `materialize: file` tells
-# the dispatcher to normalize the caller's string/file/dir into one canonical file and
-# supply only the short path (the body Reads it), dodging the args-size truncation. No
-# allowed_tools confinement here — the planner Reads the contract/requirement AND Writes
-# the plan file, so it must stay tool-unrestricted.
+# `requirement_path` is passed by reference (`materialize: file`; the body Reads it).
+# No allowed_tools confinement here — the planner Reads the contract/requirement AND
+# Writes the plan file, so it must stay tool-unrestricted.
 inputs:
   requirement_path:
     required: true
@@ -25,9 +23,12 @@ runtime:
 
 # Default plan-output contract (microskill-domain shape). A profile overlay may
 # override this wholesale — the resolver REPLACES output_schema across layers.
+# This resolved schema is what a use: node INHERITS (callers no longer restate
+# it inline), so it must carry every field a caller references.
 output_schema:
   type: object
   required: [plan_path, scope_advisory]
   properties:
-    plan_path: { type: ["string", "null"] }
+    plan_path: { type: ["string", "null"], description: Path to the written plan YAML file under staging_dir, or null when a scope advisory applies. }
+    name: { type: ["string", "null"], description: Proposed kebab-case name for the artifact (echoes name_override when supplied). }
     scope_advisory: { type: ["object", "null"] }

@@ -27,12 +27,16 @@ Run before any other step. Execute exactly once per invocation.
    - Exit `0` or `1` → continue (`1` only means conflicts/errors are present to show).
 2. **Present.** Report `_plan.seeded_harness_yaml` (whether a fresh `harness.yaml` will be
    written from the base set), `_plan.engine` (action + file count), the `_plan.summary`
-   counts, then list each `_plan.actions` (action · name), each `_plan.conflicts`
-   (name · path · reason), and each `_plan.errors` (name · reason). Also list
+   counts, then list each `_plan.actions` (action · name — `update` actions carry a
+   `transition` like `0.8.0 -> 0.9.0` when the plugin version moved; `hold` actions are
+   version-pinned components whose pending change is withheld: show name · `pinned` →
+   `available`, and note the pin in `harness.yaml` must move before they reconcile), each
+   `_plan.conflicts` (name · path · reason), and each `_plan.errors` (name · reason). Also list
    `_plan.available_base` (name · kind) — base components released in the catalog but not yet
    in this project's `harness.yaml` (e.g. after a plugin update). If there is nothing to do
-   (engine `noop`, no actions, no fresh seed, **no `available_base`**, no conflicts/errors),
-   report "already initialized — nothing to do" and stop.
+   (engine `noop`, no actions other than `hold`, no fresh seed, **no `available_base`**, no
+   conflicts/errors), report "already initialized — nothing to do" (mentioning any held
+   components) and stop.
 3. **Confirm.** If there is anything to do, use `AskUserQuestion`. When `_plan.available_base`
    is non-empty, offer three choices: `apply` (materialize the listed actions only),
    `apply + adopt base` (also add the `available_base` components to `harness.yaml` as

@@ -2,9 +2,12 @@ version: 1
 
 # Comprehensive review: every dimension a thorough code verification needs — base's
 # correctness / security / performance PLUS style, documentation, and test-coverage.
-# Adds an optional `min_coverage` input (the acceptable coverage %, default 80) threaded
-# into the test-coverage review as its `threshold`. The three added reviews share
-# phase_group: review, so all six render under one "review" group; collect fans in all six.
+# ONE patch on the expand template's `over` list (lists replace wholesale on merge);
+# the generated review_* siblings, their phase_group: review grouping, and collect's
+# fan-in inputs/depends_on all follow from the expansion — no collect rewiring.
+# Per-item variation rides as map extras in the over entry: test-coverage threads an
+# optional `min_coverage` input (acceptable coverage %, default 80) in as its
+# `threshold`.
 inputs:
   min_coverage:
     type: integer
@@ -12,36 +15,15 @@ inputs:
     default: 80
 
 nodes:
-  add:
-    - id: review_style
-      use: review-dimension
-      customize: { profile: style }
-      phase_group: review
-      depends_on: [summarize]
-      inputs:
-        diff_path: ${workflow.inputs.diff_path}
-        change_summary: ${summarize.output}
-    - id: review_documentation
-      use: review-dimension
-      customize: { profile: documentation }
-      phase_group: review
-      depends_on: [summarize]
-      inputs:
-        diff_path: ${workflow.inputs.diff_path}
-        change_summary: ${summarize.output}
-    - id: review_test_coverage
-      use: review-dimension
-      customize: { profile: test-coverage }
-      phase_group: review
-      depends_on: [summarize]
-      inputs:
-        diff_path: ${workflow.inputs.diff_path}
-        change_summary: ${summarize.output}
-        threshold: ${workflow.inputs.min_coverage}
   patch:
-    - id: collect
-      depends_on: [review_correctness, review_security, review_performance, review_style, review_documentation, review_test_coverage]
-      inputs:
-        style: ${review_style.output}
-        documentation: ${review_documentation.output}
-        test_coverage: ${review_test_coverage.output}
+    - id: review
+      expand:
+        over:
+          - correctness
+          - security
+          - performance
+          - style
+          - documentation
+          - item: test-coverage
+            inputs:
+              threshold: ${workflow.inputs.min_coverage}

@@ -1,0 +1,10 @@
+{
+  "manifest_hash": "f595f88d0ad9edb8dfc6bb47b327977ab6e8e323a289792b3d4b0d33c1c722a2",
+  "name": "build-workflow-from-plan",
+  "node_fingerprints": {
+    "evaluate": "1464fbaedcd67d714edb4556968382145b693d7ae7e8e3e463ac73d5ac7fc38b",
+    "finalize": "051449eaac1a313607a1d402adfbcb87c1bd106bd18e003c37663ac2a2045686",
+    "implement": "ac75a98b031bc89753954aaa15c3c0e2beb50c40efa70b103a3f0a3dd53e5c87"
+  },
+  "profile_used": "base"
+}

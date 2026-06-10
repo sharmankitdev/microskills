@@ -1,0 +1,7 @@
+version: 1
+
+# Correctness IS the base configuration (base.yaml ships dimension=correctness plus
+# the correctness rubric), so this overlay is intentionally empty. It exists so the
+# dimension fan-out can address every dimension by ONE uniform profile name — the
+# review-changes expand template selects `customize: { profile: {{each.item}} }`,
+# and `correctness` resolves here instead of special-casing `base`.

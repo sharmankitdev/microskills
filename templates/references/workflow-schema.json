@@ -10,6 +10,7 @@
     "version": { "const": 1, "description": "Schema version. Only 1 is recognized. Omitting it defaults to 1 (set by compile/validate before validation); an explicit value other than 1 still blocks." },
     "name": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$", "description": "Bare workflow identifier (kebab-case)." },
     "description": { "type": "string", "description": "One-line description of the workflow." },
+    "gate_mode": { "enum": ["auto", "interactive"], "description": "Declared gate policy for runs of this (profile-merged) def. `auto` = headless: the dispatcher takes each gate's declared `default` and records it verbatim, never AskUserQuestion at a gate; compile dies when a pausing (hard) gate has neither a `default` nor `on_headless: fail`. Profile-declarable (the autonomous profiles set it), and the merged doc's value WINS over the compile-workflow `--gate-mode` flag — so a child workflow's profile-declared mode beats parent inheritance. Stamped into the manifest (inside manifest_hash) ONLY when the effective mode is `auto`, so existing interactive defs compile byte-identically. `interactive` (the default when absent) pins the def to interactive even under an inherited `--gate-mode auto`." },
     "base": { "type": "boolean", "description": "Catalog curation hint: true marks this as a base component that initialize-harness seeds into a new project's harness.yaml. Ignored by the compiler." },
     "profile": {
       "type": "object",
@@ -20,7 +21,7 @@
     "vars": {
       "type": "object",
       "additionalProperties": { "type": ["string", "number", "boolean"] },
-      "description": "Intra-def variable map. Double-brace {{key}} tokens anywhere in the merged doc are substituted from this map by compile/validate AFTER deep-merge (so a profile may override a var) and BEFORE schema validation. Pure textual pre-compile transform — no file include / cross-file mechanism. An unresolved {{key}} is left intact (warns)."
+      "description": "Intra-def variable map. Double-brace {{key}} tokens anywhere in the merged doc are substituted from this map by compile/validate AFTER deep-merge (so a profile may override a var) and BEFORE schema validation. Pure textual pre-compile transform. An unresolved {{key}} is left intact (warns). Cross-file shared prose rides the separate {{snippet:NAME}} token, replaced (BEFORE var substitution, so snippets may carry vars) with the bytes of <defs-root>/_snippets/NAME.md — an unresolved snippet is a HARD block. V1: _snippets/ is plugin/engine-owned, vendored by initialize-harness only."
     },
     "imports": {
       "type": "array",
@@ -45,17 +46,17 @@
     "nodes": {
       "type": "array",
       "minItems": 1,
-      "description": "DAG nodes. Each is a leaf microskill (use:) or an agent invocation (agent:).",
+      "description": "DAG nodes. Each is a leaf microskill (use:) or an agent invocation (agent:). NOTE: the static fan-out sugar — a template node's `expand: {over: [...]}` and a consumer's `inputs_each: <template-id>` — is desugared by compile/validate BEFORE this schema runs (generating ordinary <id>_<item> sibling nodes and the fan-in inputs/depends_on), so it is intentionally NOT part of this closed grammar; the schema only ever sees the generated nodes.",
       "items": {
         "type": "object",
         "additionalProperties": false,
         "required": ["id"],
         "properties": {
-          "id": { "type": "string", "pattern": "^[a-z][a-z0-9_-]*$", "description": "Unique node id within the workflow." },
+          "id": { "type": "string", "pattern": "^(?!wf_)[a-z][a-z0-9_-]*$", "description": "Unique node id within the workflow. The `wf_` prefix is RESERVED: ${workflow.inputs.<x>} rides as _args.wf_<x> in compiled segments and the run-step context, so a wf_-prefixed node id would silently clobber (or be clobbered by) a workflow input — compile-workflow hard-dies and validate-workflow blocks on it." },
           "use": { "type": "string", "description": "Bare microskill name (resolved via resolve-microskill)." },
           "agent": { "type": "string", "description": "Agent type to invoke for this node (e.g. microskill-planner)." },
           "workflow": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$", "description": "Bare child-workflow name (kebab-case) invoked as an orchestrator checkpoint. Must be listed in the top-level `imports` allowlist. Mutually exclusive with use:/agent:; carries inputs/depends_on/when/for_each/as." },
-          "depends_on": { "type": "array", "items": { "type": "string" }, "description": "Upstream node ids. Every ${<id>.output...} reference MUST be declared here." },
+          "depends_on": { "type": "array", "items": { "type": "string" }, "description": "Upstream node ids for PURE ORDERING edges that carry no ref. A ${<id>.output...} / ${<id>.items} reference already implies its dependency edge (the DAG is the union of both), so do NOT restate ref-implied edges here — validate-workflow lints a redundant entry." },
           "when": { "type": "string", "description": "Deterministic JS condition (inner of ${...}); false → node skipped." },
           "for_each": { "type": "string", "description": "Expression resolving to a collection → fan-out one instance per item." },
           "as": { "type": "string", "description": "Loop-variable name bound to each for_each item; referenced as ${<as>}." },
@@ -64,14 +65,38 @@
             "additionalProperties": { "type": "string" },
             "description": "Wiring: input field → ${...} expression (workflow inputs, upstream outputs, loop carry, for_each item)."
           },
+          "wire": { "enum": ["auto"], "description": "Opt-in declared pass-through forwarding, desugared at compile/validate pre-emit time: every input the node's TARGET declares (the resolved microskill profile config's inputs for a use: node; the child WORKFLOW.yaml's declared inputs for a workflow: node) that the node does not explicitly supply, and whose name exactly matches a declared workflow input, materializes as inputs.<name>: ${workflow.inputs.<name>} — byte-identical to the hand-written forward. Explicit entries always win; wired pairs append after them in sorted name order; `compile-workflow --explain` lists every auto-wired pair. Only valid on a use: node that actually resolves (a hard error under delegation: orchestrator, which skips resolution) or a workflow: node; a hard error on agent:/orchestrator-native nodes (no declared input contract) and when the target won't resolve (the wire set would be uncomputable). Auto-satisfying a REQUIRED target input warns — collision risk on generic names like 'name', where the right value is often an upstream output." },
           "prompt": { "type": "string", "description": "For agent nodes: the task prompt template (may contain ${...} references)." },
-          "output_schema": { "type": "object", "description": "JSON Schema fragment forcing structured node output (passed to agent() schema). For a use: node, OMITTING this inherits the resolved microskill's output_schema; an explicit value here wins." },
+          "output_schema": { "type": "object", "description": "JSON Schema fragment forcing structured node output (passed to agent() schema). For a use: node, OMITTING this inherits the resolved microskill's output_schema; an explicit value here wins (validate-workflow lints an inline schema that merely restates the resolved one — omit it, and document a deliberate narrowing). On an ORCHESTRATOR-classified node (delegation: orchestrator / side_effect / workflow:) it is the checkpoint's declared RETURN CONTRACT — no longer prose-only: compile-workflow records every node's effective schema (with guarded/fan_out) in the manifest step's per-node io block, and the dispatcher validates the stored result after each step via check-step-io (an unguarded null/{} against required props is a hard probable-truncation/fabrication stop)." },
           "max_parallel": { "type": "integer", "minimum": 1, "description": "Only valid on a for_each node: bound the fan-out to batches of this size (parallelChunked) instead of one unbounded parallel()." },
+          "spill_outputs": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+            "description": "Declared output-by-reference for NODE outputs (the materialize:file twin): each listed output field is threaded across checkpoint boundaries as a handoff FILE PATH instead of its inline value — the dispatcher's run-step kernel writes the field's value to runs/<run-id>/handoff/<node>.<field> (a string field verbatim, anything else as canonical JSON) and substitutes the file's absolute path before building a later segment's args or resolving a checkpoint's ${...} refs, so a large output never trips the native engine's ~37KB args truncation. Downstream consumers must READ BY REFERENCE (*_path convention). Recorded in the manifest as a `spill` map on the PRODUCING step only when present — spill-free defs compile byte-identically (segment JS never changes). Hard blocks: a spilled field referenced in a when/for_each guard or the loop while/until (a path is not the value); spill_outputs on a for_each fan-out node (the result is an ARRAY — no single field to spill); a field the node's effective output schema does not declare. A SAME-segment consumer still receives the in-memory VALUE (no boundary is crossed) — compile warns on that two-world read. Stored run-state results keep the full value; only the threaded view carries paths." },
           "phase_group": { "type": "string", "pattern": "^[a-z][a-z0-9_-]*$", "description": "Cosmetic /workflows progress-group label: nodes sharing a phase_group render under one group box. Emit-only — changes the segment's phase markers / meta.phases, never the manifest or manifest_hash." },
-          "customize": { "type": "object", "additionalProperties": true, "description": "Per-node knobs: on a use: microskill, the profile and/or dotted overrides; on a workflow: node, `profile` selects the child workflow's profile (passed through to the nested-workflow checkpoint)." },
+          "customize": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Per-node knobs, CLOSED to {profile?, overrides?} — an unknown key fails schema validation (it used to be silently ignored).",
+            "properties": {
+              "profile": { "type": "string", "minLength": 1, "description": "On a use: node, selects which profile of the microskill the node runs; on a workflow: node, selects the child workflow's profile (passed through to the nested-workflow checkpoint)." },
+              "overrides": { "type": "object", "additionalProperties": true, "description": "use: nodes ONLY (a hard error on workflow:/agent:/orchestrator nodes, where it could never apply). Flat map of dotted resolver-config path -> value (e.g. 'runtime.model': haiku), applied to the microskill's resolution exactly like `resolve-microskill --override` (SET at the path — not a deep-merge). Plumbed through BOTH resolution paths so they cannot diverge: the classify-time resolution (an override exposing AskUserQuestion deterministically reclassifies the node to an orchestrator checkpoint) and the frozen payload the baked runMicroskill reads (plus the execution-time --inject-only command line, shell-escaped). Recorded in the manifest as node_overrides only when non-empty, so override-free compiles stay byte-identical. CLI twin: `compile-workflow --node-override <node-id>:<dotted>=<value>`." }
+            }
+          },
+          "retry": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["max_attempts"],
+            "description": "Bounded retry for a BACKGROUND use:/agent: node only (a block anywhere else — retry lives in compiled segment JS and cannot wrap an orchestrator checkpoint). The node's call is wrapped in withRetry(...): a thrown rejection AND a null/undefined return both count as a failed attempt (OBSERVED host behavior, 2026-06-10: terminal subagent API errors surfaced as null results in the parallel() results array, not catchable throws; throws are also possible per the host docs); after exhausting max_attempts the FINAL attempt's native failure shape is reproduced exactly (return null / rethrow) — never re-rolled, never fabricated. The helper is emitted only into segments that contain a retry node, so retry-free defs compile byte-identically.",
+            "properties": {
+              "max_attempts": { "type": "integer", "minimum": 2, "description": "Total attempt cap, first try included (boundedness mirrors loop.max_iters)." }
+            }
+          },
           "grant_tools": { "type": "array", "items": { "type": "string" }, "description": "Extra tools granted to this node's subagent." },
-          "delegation": { "enum": ["auto", "orchestrator"], "description": "Override the auto-derived delegation classification." },
-          "side_effect": { "type": "boolean", "description": "Readable alias for delegation: orchestrator. true normalizes to delegation: orchestrator before classification, so the node runs as an orchestrator checkpoint (where filesystem side effects and human interaction are allowed)." }
+          "delegation": { "enum": ["auto", "orchestrator"], "description": "Override the auto-derived delegation classification. `orchestrator` forces a checkpoint (on a use: node it also skips resolution — the escape hatch for an unresolvable target). `auto` forces background only for a node that can actually run there: a use: node still resolves (executor identity is stashed) and the compile dies if the resolved microskill exposes AskUserQuestion or carries a hard gate; `auto` on a workflow: node or an orchestrator-native step is a hard error." },
+          "side_effect": { "type": "boolean", "description": "Readable alias for delegation: orchestrator. true normalizes to delegation: orchestrator before classification, so the node runs as an orchestrator checkpoint (where filesystem side effects and human interaction are allowed). Pairing it with delegation: auto is a contradiction — hard error in compile and validate." }
         }
       }
     },
@@ -88,7 +113,20 @@
           "type": { "enum": ["human_approval", "verification", "tool_check"] },
           "severity": { "enum": ["warn", "hard"], "default": "hard" },
           "prompt": { "type": "string" },
-          "options": { "type": "array", "items": { "type": "string" }, "description": "Choices for a human_approval gate (e.g. approve/revise/abandon)." }
+          "options": { "type": "array", "items": { "type": "string" }, "description": "Choices for a human_approval gate (e.g. approve/revise/abandon). When OMITTED the dispatcher offers the implicit confirm/stop pair — every membership check (a declared `default`, a ${<gate-id>.output.choice} comparison literal) runs against that effective set." },
+          "default": { "type": "string", "description": "The author-declared choice: taken VERBATIM (and recorded as results[<gate-id>].choice) when the run's gate mode is auto (headless), and recorded at a severity:warn pass-through in interactive runs too — the dispatcher never records an option nobody selected. Must be a member of the gate's effective options (declared `options`, or the implicit confirm/stop pair) — compile dies / validate blocks otherwise. validate FORCES a default on a warn gate whose choice is branched on (a defaultless warn gate records {choice: null})." },
+          "on_headless": { "enum": ["take_default", "fail"], "description": "Behavior under gate mode auto (headless). `take_default` (the implied behavior when a `default` is declared) requires a declared `default`. `fail` = this gate refuses headless: the run executes up to the gate, then stops with a nonzero outcome naming it (run-state stays resumable interactively). A pausing (hard) gate with NEITHER a default NOR on_headless: fail makes a gate-mode=auto compile die loud." },
+          "present": {
+            "type": "array",
+            "minItems": 1,
+            "description": "Declarative gate presentation, rendered MECHANICALLY by the dispatcher in declared order (the model output-rubric is the fallback when absent — so the approver sees the SAME evidence every run). Entries are field paths into upstream results: a string path renders the resolved value; {read_file: <path>} resolves the path to a file path and shows that file's contents. A path may only name a producer that has already run when the gate fires (validate blocks a later one).",
+            "items": {
+              "oneOf": [
+                { "type": "string", "pattern": "^[a-z][a-z0-9_-]*\\.output(\\.[A-Za-z_][A-Za-z0-9_]*)*$", "description": "Field path into a produced result, e.g. plan.output.name (or plan.output for the whole object)." },
+                { "type": "object", "additionalProperties": false, "required": ["read_file"], "properties": { "read_file": { "type": "string", "pattern": "^[a-z][a-z0-9_-]*\\.output(\\.[A-Za-z_][A-Za-z0-9_]*)+$", "description": "Field path that resolves to a FILE PATH; the dispatcher Reads that file and shows its contents in a fenced block." } } }
+              ]
+            }
+          }
         },
         "allOf": [
           {

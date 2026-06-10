@@ -1,12 +1,9 @@
 version: 1
 
 # `diff_path` is Required=yes in the MICROSKILL.md table, so the resolver needs
-# inputs.diff_path.required: true to gather it at runtime. `materialize: file`
-# marks it a large/multi-shape input passed BY REFERENCE: the dispatcher
-# normalizes the caller's string/file/dir into one canonical file and supplies
-# only the short path (the body Reads it), so a large diff never rides inline and
-# trips the native-engine args-size truncation. `context` is optional with a null
-# default, so it needs no entry. No input declares a non-null default.
+# inputs.diff_path.required: true to gather it at runtime; it is passed by
+# reference (`materialize: file`; the body Reads it). `context` is optional with a
+# null default, so it needs no entry. No input declares a non-null default.
 inputs:
   diff_path:
     required: true

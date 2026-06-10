@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+"""check-step-io — the workflow dispatcher's post-step IO validator.
+
+After each manifest step completes, the dispatcher writes the CANDIDATE
+run-state (the four-key {manifest_hash, step_index, inputs, results} shape,
+step_index already advanced) to `<run_dir>/run-state.json.tmp` and runs this
+checker against THAT file — BEFORE `run-journal append --commit-state`
+promotes it. A hard failure here means the candidate is never committed: the
+run's resumable record still points at the failed step (the dispatcher stamps
+`failed_step` via `run-journal append --mark-failed-step`), so a resume
+re-runs the failed step instead of silently threading the corrupt value into
+downstream segments. The checker validates every value the step PRODUCED
+against the per-node `io` contract compile-workflow records on the manifest
+step:
+
+    io: { <node-id>: { schema, guarded, fan_out } }
+
+  schema   — the node's EFFECTIVE output schema at compile time (an explicit
+             node-level output_schema, else the resolved microskill's; null
+             when neither exists). An orchestrator checkpoint's declared
+             output_schema is its RETURN CONTRACT — no longer prose-only.
+  guarded  — the node carries a `when` guard, so a stored null is a LEGAL skip.
+  fan_out  — the node fans out over for_each: the stored value is an ARRAY of
+             schema-shaped items ([] for an empty collection — never null).
+
+Per-node verdicts:
+  ok                    the value validates against the effective schema
+                        (or nothing was declared to validate against).
+  guarded_null          null from a guarded node — a legal skip, never an error.
+  truncation_suspected  an UNGUARDED null/{} (null for a fan_out node) where the
+                        schema declares required props — the signature of the
+                        native engine truncating an oversized args payload or a
+                        background subagent failing/fabricating silently. HARD
+                        "probable truncation/fabrication" error.
+  schema_violation      any other mismatch (incl. a fan_out value that is not an
+                        array). HARD error.
+  missing               the node id is absent from run-state results entirely —
+                        the dispatcher must store EVERY produced node (null for
+                        a skip). HARD error.
+
+Look-ahead size WARNING (exit 0, never an error): a produced value that a LATER
+segment's needs.nodes will thread back through args is measured (compact-JSON
+UTF-8 bytes); past --budget (default 32768 — headroom under the ~37KB native
+args truncation observed live) it WARNS, naming the producing node. A field the
+producing step's recorded `spill` map declares is threaded BY REFERENCE
+(run-step substitutes a short handoff file path), so it is sized as a short
+placeholder, not its inline value — a declared spill silences the warning it
+exists to fix. ENFORCEMENT lives in the compiled segment's fail-loud args guard
+(throw on unparseable args / absent needed key) — this checker never duplicates
+it.
+
+PATHS-ONLY CONTRACT (injection doctrine). Flags carry the manifest path, the
+run-state path (normally the CANDIDATE `run-state.json.tmp`), and a step index
+— node output CONTENT never rides argv (where it would be shell-quoted,
+truncated, or logged). The checker reads both files itself. Integrity gate:
+when both files carry manifest_hash and they differ, the run-state belongs to
+a different compile — environment error, not a pass.
+
+Usage:
+  check-step-io --manifest <path> --run-state <path> --step <index> [--budget N]
+
+Stdout: one JSON object {step, kind, verdict, checked[], warnings[], errors[]}.
+Exit codes: 0 OK (warnings allowed) · 1 IO-contract violation · 2 environment/
+usage error (unreadable input, bad index, run-state/manifest mismatch).
+"""
+import argparse
+import json
+import sys
+from pathlib import Path
+
+try:
+    from jsonschema import Draft202012Validator
+except ImportError:
+    print(json.dumps({"error": "jsonschema not installed. pip3 install jsonschema"}))
+    sys.exit(2)
+
+# Default threaded-value budget (bytes of compact JSON). The native engine was
+# observed live to truncate a ~37KB args payload (and pass ~6.6KB); 32 KiB warns
+# with headroom. Tunable per call via --budget; enforcement stays in the
+# compiled args guard.
+DEFAULT_BUDGET = 32768
+
+
+def die(msg, code=2, **extra):
+    payload = {"error": msg}
+    payload.update(extra)
+    print(json.dumps(payload, indent=2))
+    sys.exit(code)
+
+
+def load_json(path, label):
+    p = Path(path)
+    try:
+        return json.loads(p.read_text())
+    except OSError as e:
+        die(f"{label} unreadable: {e}")
+    except json.JSONDecodeError as e:
+        die(f"{label} is not valid JSON: {e}")
+
+
+def has_required_props(schema):
+    """True when the (item) schema declares a non-empty required list — the
+    precondition for the truncation/fabrication signature on null/{}."""
+    return isinstance(schema, dict) and bool(schema.get("required"))
+
+
+def compact_bytes(value):
+    """Byte size of the value as compact JSON — the closest deterministic proxy
+    for what the dispatcher threads through the native engine's args string."""
+    return len(json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+
+
+def schema_error_messages(value, schema):
+    """Validate value against a JSON-Schema fragment; return sorted messages."""
+    try:
+        validator = Draft202012Validator(schema)
+    except Exception as e:  # an unloadable schema must fail loud, not pass
+        return [f"effective output_schema is not a valid JSON Schema: {e}"]
+    errs = sorted(validator.iter_errors(value), key=lambda e: list(e.path))
+    out = []
+    for e in errs:
+        loc = "/".join(str(x) for x in e.path) or "<root>"
+        out.append(f"{loc}: {e.message}")
+    return out
+
+
+def produced_ids(step):
+    """Node ids whose results this step stores. Gates are not nodes — the
+    dispatcher records {choice} under the gate id, out of scope here."""
+    if step.get("kind") == "segment":
+        return list(step.get("produces") or step.get("nodes") or [])
+    if step.get("checkpoint_type") in ("orchestrator_node", "nested_workflow"):
+        return [step["node"]] if step.get("node") else []
+    return []
+
+
+def check_node(nid, spec, results):
+    """Validate one produced node's stored result against its io contract.
+    Returns {"node", "result", "errors"?}."""
+    schema = spec.get("schema")
+    guarded = bool(spec.get("guarded"))
+    fan_out = bool(spec.get("fan_out"))
+
+    if nid not in results:
+        return {"node": nid, "result": "missing", "errors": [
+            f"node '{nid}': no recorded result in run-state — the dispatcher "
+            f"must store every produced node (null for a guarded skip)"]}
+
+    value = results[nid]
+
+    if value is None and guarded:
+        # A when-guarded node legally skips to null (segments emit the
+        # `(cond) ? ... : null` form; the dispatcher stores null for a skipped
+        # orchestrator node).
+        return {"node": nid, "result": "guarded_null"}
+
+    # The truncation/fabrication signature: an UNGUARDED null (or {} on a
+    # non-fan_out node) where the effective schema demands required props. A
+    # healthy unguarded node can never legally produce these — the likeliest
+    # causes are the native engine truncating an oversized payload or a
+    # background subagent failing/fabricating silently.
+    is_empty_obj = isinstance(value, dict) and not value
+    if (not guarded and has_required_props(schema)
+            and (value is None or (is_empty_obj and not fan_out))):
+        shape = "null" if value is None else "{}"
+        return {"node": nid, "result": "truncation_suspected", "errors": [
+            f"node '{nid}': probable truncation/fabrication — unguarded {shape} "
+            f"where the effective output_schema requires "
+            f"{sorted(schema['required'])}. Likely causes: the native engine "
+            f"truncated an oversized args payload upstream, or a background "
+            f"subagent failed/fabricated. Stop the run; do not synthesize a "
+            f"replacement value."]}
+
+    if fan_out:
+        if not isinstance(value, list):
+            got = "null" if value is None else type(value).__name__
+            return {"node": nid, "result": "schema_violation", "errors": [
+                f"node '{nid}': fan_out result must be an array of per-item "
+                f"results ([] for an empty collection), got {got}"]}
+        if schema is not None:
+            msgs = schema_error_messages(value, {"type": "array", "items": schema})
+            if msgs:
+                return {"node": nid, "result": "schema_violation",
+                        "errors": [f"node '{nid}': {m}" for m in msgs]}
+        return {"node": nid, "result": "ok"}
+
+    if schema is not None and value is not None:
+        msgs = schema_error_messages(value, schema)
+        if msgs:
+            return {"node": nid, "result": "schema_violation",
+                    "errors": [f"node '{nid}': {m}" for m in msgs]}
+    return {"node": nid, "result": "ok"}
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Validate one manifest step's produced results against the "
+                    "per-node io contracts (paths-only: --manifest --run-state "
+                    "--step; content never rides argv).")
+    ap.add_argument("--manifest", required=True,
+                    help="Path to the compiled .compiled/manifest.json.")
+    ap.add_argument("--run-state", required=True,
+                    help="Path to the run's committed run-state.json.")
+    ap.add_argument("--step", required=True, type=int,
+                    help="0-based index of the step that just completed.")
+    ap.add_argument("--budget", type=int, default=DEFAULT_BUDGET,
+                    help=f"Threaded-value warning budget in compact-JSON bytes "
+                         f"(default {DEFAULT_BUDGET}). Warning only — "
+                         f"enforcement lives in the compiled args guard.")
+    args = ap.parse_args()
+
+    manifest = load_json(args.manifest, "manifest")
+    run_state = load_json(args.run_state, "run-state")
+    steps = manifest.get("steps")
+    if not isinstance(steps, list) or not steps:
+        die("manifest carries no steps list")
+    if not (0 <= args.step < len(steps)):
+        die(f"--step {args.step} out of range (manifest has {len(steps)} steps)")
+    m_hash = manifest.get("manifest_hash")
+    s_hash = run_state.get("manifest_hash")
+    if m_hash and s_hash and m_hash != s_hash:
+        die("run-state manifest_hash does not match the manifest — this "
+            "run-state belongs to a different compile; recompile/resume "
+            "handling must reconcile them before checking")
+
+    step = steps[args.step]
+    io = step.get("io") or {}
+    results = run_state.get("results") or {}
+    if not isinstance(results, dict):
+        die("run-state results is not an object")
+
+    # Node ids a LATER segment threads back through args (the only place the
+    # native engine's size truncation can bite a stored result).
+    threaded = set()
+    for later in steps[args.step + 1:]:
+        if later.get("kind") == "segment":
+            threaded.update((later.get("needs") or {}).get("nodes") or [])
+
+    # This step's recorded spill map (compile records the producing node's
+    # declared spill_outputs here, omitted when absent): a spilled field is
+    # threaded BY REFERENCE — run-step substitutes a short handoff path — so
+    # the look-ahead sizes the view that will actually ride args (a short
+    # placeholder per spilled field), never the inline value.
+    step_spill = step.get("spill") if isinstance(step.get("spill"), dict) else {}
+
+    checked, errors, warnings = [], [], []
+    for nid in produced_ids(step):
+        entry = check_node(nid, io.get(nid) or {}, results)
+        if nid in results and nid in threaded:
+            sized = results[nid]
+            sp_fields = step_spill.get(nid)
+            if sp_fields and isinstance(sized, dict):
+                sized = dict(sized)
+                for f in sp_fields:
+                    if sized.get(f) is not None:
+                        sized[f] = "<spilled: handoff path>"
+            size = compact_bytes(sized)
+            entry["threaded_bytes"] = size
+            if size > args.budget:
+                warnings.append(
+                    f"node '{nid}': threaded result is {size} bytes "
+                    f"(budget {args.budget}) — a later segment reads it through "
+                    f"args, where the native engine truncates oversized "
+                    f"payloads; the compiled args guard will fail loud there. "
+                    f"Declare the oversized field(s) in the producing node's "
+                    f"spill_outputs (threaded as handoff file paths) or move "
+                    f"the value by `materialize: file`.")
+        checked.append(entry)
+        errors.extend(entry.get("errors") or [])
+
+    verdict = "ok" if not errors else "error"
+    out = {"step": args.step, "kind": step.get("kind"), "verdict": verdict,
+           "checked": checked, "warnings": warnings, "errors": errors}
+    if step.get("checkpoint_type"):
+        out["checkpoint_type"] = step["checkpoint_type"]
+    print(json.dumps(out, indent=2))
+    sys.exit(0 if verdict == "ok" else 1)
+
+
+if __name__ == "__main__":
+    main()

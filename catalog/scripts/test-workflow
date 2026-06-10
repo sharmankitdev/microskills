@@ -1,0 +1,557 @@
+#!/usr/bin/env python3
+"""test-workflow — golden-run harness driver: compile a workflow def into a
+throwaway world, walk its manifest steps EXACTLY as the dispatcher contract
+specifies, execute every background segment under the mocked engine
+(run-segment-host), take gate choices / orchestrator outputs from a SCENARIO
+file, and diff the final results + the mock call journal against committed
+GOLDENS.
+
+The walk is the dispatcher's own (workflow SKILL.md), driven by the SAME
+kernels the dispatcher shells — nothing is re-implemented in the driver's
+head:
+
+  - compile-workflow compiles the def (copied with its _snippets and the
+    microskills registry into <workdir>/world/ so .compiled/ writes never
+    touch the source registry);
+  - run-journal init / record-inputs mints the run dir and seeds run-state;
+  - materialize: file inputs are written to <run_dir>/run-inputs/<name> and
+    normalized by reference via normalize-input (Setup step 7);
+  - run-step args builds every segment's args from the committed run-state;
+    the segment then runs on run-segment-host with args passed as the raw
+    JSON string (the documented native-engine shape);
+  - run-step eval evaluates every checkpoint's when/for_each/${...}
+    expressions as the compiler's own JS; the scenario supplies the
+    orchestrator/nested-workflow RESULT (the harness has no model to execute
+    a resolved prompt — that is the mocked seam);
+  - gates: under manifest.gate_mode == "auto" the declared default is taken
+    and recorded VERBATIM; interactively the scenario's gates.<id> choice is
+    recorded (must be a member of the gate's effective options). A
+    stop/abandon choice stops the run cleanly. A revise-style choice is NOT
+    supported (the revise loop folds human notes into an input — there is no
+    human here): fail loud.
+  - after every step: the CANDIDATE run-state (run-state.json.tmp) is
+    validated via check-step-io BEFORE run-journal append --commit-state
+    promotes it — the dispatcher's pre-commit IO gate runs for real (a
+    failed check stamps failed_step into the committed state and stops;
+    the candidate is never committed).
+
+SCENARIO file (JSON; sibling paths resolve against its directory):
+    {
+      "workflow":  "<def name>",
+      "profile":   "<profile>",            // optional
+      "inputs":    { "<name>": <value> },  // a materialize input: a string is
+                                           // literal CONTENT (written to
+                                           // run-inputs + normalized);
+                                           // {"path": "<p>"} is a caller path
+      "fixtures":  "fixtures.json",        // run-segment-host queues
+      "gates":     { "<gate-id>": "<choice>" },   // interactive picks
+      "checkpoints": { "<node>": <result> },      // orchestrator/nested
+                                           // results; an ARRAY (one entry
+                                           // per item) for a for_each node
+      "goldens":   { "results": "golden-results.json",
+                     "journal": "golden-journal.jsonl" }
+    }
+
+GOLDENS. golden-results.json is the final {workflow, profile_used,
+gate_mode, stopped_at, results, output} payload; golden-journal.jsonl is the
+chronological event journal — the host's agent/phase/log lines plus the
+driver's gate/checkpoint lines. Both are PATH-NORMALIZED before compare:
+every occurrence of the run dir becomes <RUN_DIR> and of the world root
+becomes <WORLD>, so goldens are stable across checkouts and tmp dirs.
+--update-goldens regenerates them instead of diffing.
+
+DOCUMENTED LIMIT: this harness verifies the compiled artifacts and the
+dispatcher kernels against the DOCUMENTED host contract (workflow SKILL.md +
+the segment spike templates), NOT against the live native Workflow engine —
+true subagent behavior, engine truncation, and real concurrency stay
+live-run-only. A nested_workflow checkpoint is NOT recursed into: run-step
+eval still cross-checks the resolved child inputs, but the child's result
+comes from the scenario. The harness also cannot detect a prompt that
+"requires a human" (the auto-mode stop rule) — scenarios own that judgment.
+
+Usage:
+  test-workflow --scenario <scenario.json>
+                [--workdir <dir>]            # default: a fresh temp dir
+                [--defs-source <dir>]        # default: <root>/.claude/workflow-defs
+                [--skills-source <dir>]      # default: <root>/.claude/microskills
+                [--templates-root <dir>]     # default: <root>/templates if present
+                [--update-goldens]
+
+Stdout: one JSON summary {ok, scenario, workflow, profile, workdir,
+manifest_hash, steps_run, mismatches[]}.
+Exit codes: 0 OK (goldens match / updated) · 1 golden mismatch or run
+contract violation · 2 environment/usage error (missing node, bad scenario).
+"""
+import argparse
+import difflib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+SCRIPT = Path(__file__).resolve()
+SCRIPTS_DIR = SCRIPT.parent
+PROJECT_ROOT = SCRIPT.parents[2]
+
+COMPILE = SCRIPTS_DIR / "compile-workflow"
+RUN_STEP = SCRIPTS_DIR / "run-step"
+RUN_JOURNAL = SCRIPTS_DIR / "run-journal"
+CHECK_STEP_IO = SCRIPTS_DIR / "check-step-io"
+NORMALIZE_INPUT = SCRIPTS_DIR / "normalize-input"
+SEGMENT_HOST = SCRIPTS_DIR / "run-segment-host"
+
+RUN_ID = "golden"  # explicit, so run paths are deterministic under <WORLD>
+
+
+def die(msg, code=2, **extra):
+    payload = {"ok": False, "error": msg}
+    payload.update(extra)
+    print(json.dumps(payload, indent=2))
+    sys.exit(code)
+
+
+def run_py(script, *args, env=None):
+    """Run a sibling Python kernel; return (rc, parsed-or-None, stdout, stderr)."""
+    proc = subprocess.run([sys.executable, str(script), *map(str, args)],
+                          capture_output=True, text=True, env=env)
+    data = None
+    if proc.stdout.strip().startswith("{"):
+        try:
+            data = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            data = None
+    return proc.returncode, data, proc.stdout, proc.stderr
+
+
+def kernel(label, script, *args, env=None, ok_codes=(0,)):
+    rc, data, out, err = run_py(script, *args, env=env)
+    if rc not in ok_codes:
+        die(f"{label} failed (exit {rc}): "
+            f"{json.dumps(data) if data is not None else (out or err).strip()[:1000]}",
+            1 if rc == 1 else 2)
+    if data is None:
+        die(f"{label} produced no parseable JSON: {out[:500]!r}")
+    return data
+
+
+def copy_tree(src, dst, label):
+    if not Path(src).is_dir():
+        die(f"{label} not found: {src}")
+    shutil.copytree(src, dst, ignore=shutil.ignore_patterns(".compiled", "__pycache__"))
+
+
+def gate_pauses(gate):
+    return gate.get("severity", "hard") == "hard"
+
+
+def gate_options(gate):
+    opts = gate.get("options")
+    return list(opts) if opts else ["confirm", "stop"]
+
+
+def step_label(step):
+    if step.get("kind") == "segment":
+        label = "segment[" + ",".join(step.get("nodes") or []) + "]"
+        return label + " (loop)" if step.get("is_loop") else label
+    ctype = step.get("checkpoint_type")
+    if ctype == "gate":
+        return f"gate:{step.get('gate', {}).get('id', '?')}"
+    if ctype == "nested_workflow":
+        return f"nested:{step.get('node', '?')}->{step.get('workflow', '?')}"
+    return f"node:{step.get('node', '?')}"
+
+
+class Harness:
+    def __init__(self, a):
+        self.scenario_path = Path(a.scenario).resolve()
+        try:
+            self.scen = json.loads(self.scenario_path.read_text())
+        except (OSError, json.JSONDecodeError) as e:
+            die(f"scenario unreadable: {e}")
+        if not isinstance(self.scen, dict) or not self.scen.get("workflow"):
+            die("scenario must be a JSON object carrying at least 'workflow'")
+        self.name = self.scen["workflow"]
+        self.profile = self.scen.get("profile")
+        self.update = a.update_goldens
+
+        self.workdir = Path(a.workdir).resolve() if a.workdir else \
+            Path(tempfile.mkdtemp(prefix="test-workflow-")).resolve()
+        self.workdir.mkdir(parents=True, exist_ok=True)
+        self.world = self.workdir / "world"
+        self.defs_root = self.world / "workflow-defs"
+
+        defs_source = Path(a.defs_source).resolve() if a.defs_source else \
+            PROJECT_ROOT / ".claude" / "workflow-defs"
+        skills_source = Path(a.skills_source).resolve() if a.skills_source else \
+            PROJECT_ROOT / ".claude" / "microskills"
+        self.defs_root.mkdir(parents=True)
+        copy_tree(defs_source / self.name, self.defs_root / self.name,
+                  f"workflow def '{self.name}'")
+        if (defs_source / "_snippets").is_dir():
+            copy_tree(defs_source / "_snippets", self.defs_root / "_snippets",
+                      "_snippets")
+        copy_tree(skills_source, self.world / "microskills", "microskills registry")
+
+        self.env = dict(os.environ)
+        templates = Path(a.templates_root).resolve() if a.templates_root else \
+            (PROJECT_ROOT / "templates")
+        if templates.is_dir():
+            self.env["MICROSKILLS_TEMPLATES_ROOT"] = str(templates)
+
+        fixtures = self.scen.get("fixtures") or "fixtures.json"
+        self.fixtures_path = (self.scenario_path.parent / fixtures).resolve()
+        if not self.fixtures_path.is_file():
+            die(f"fixtures file not found: {self.fixtures_path}")
+        self.journal_path = self.workdir / "calls.jsonl"
+        self.journal_path.write_text("")
+
+        self.def_dir = self.defs_root / self.name
+        self.results = {}
+        self.inputs = {}
+        self.stopped_at = None
+        self.steps_run = 0
+
+    # ----------------------------------------------------------- setup
+    def compile(self):
+        args = [self.name, "--defs-root", str(self.defs_root)]
+        if self.profile:
+            args += ["--profile", self.profile]
+        kernel("compile-workflow", COMPILE, *args, env=self.env)
+        self.manifest_path = self.def_dir / ".compiled" / "manifest.json"
+        self.manifest = json.loads(self.manifest_path.read_text())
+        self.auto = self.manifest.get("gate_mode") == "auto"
+
+    def mint_run(self):
+        args = ["init", "--runs-dir", str(self.def_dir / ".compiled" / "runs"),
+                "--manifest-hash", self.manifest["manifest_hash"],
+                "--run-id", RUN_ID]
+        if self.profile:
+            args += ["--profile", self.profile]
+        # Mirror the dispatcher's Setup step 6: the effective gate mode is
+        # recorded into run-config.json as compile provenance.
+        if self.auto:
+            args += ["--gate-mode", "auto"]
+        data = kernel("run-journal init", RUN_JOURNAL, *args)
+        self.run_dir = Path(data["run_dir"]).resolve()
+        self.run_state = self.run_dir / "run-state.json"
+
+    def gather_inputs(self):
+        supplied = self.scen.get("inputs") or {}
+        for name in self.manifest.get("required_inputs") or []:
+            if name not in supplied:
+                die(f"scenario supplies no value for required input '{name}'", 1)
+        materialize = set(self.manifest.get("materialize_inputs") or [])
+        # A {"path": ...} value is only the caller-path marker for a
+        # materialize input; everywhere else a dict is an ordinary JSON value.
+        self.inputs = {k: v for k, v in supplied.items()
+                       if not (k in materialize and isinstance(v, dict)
+                               and "path" in v)}
+        # Defaults for non-required inputs not supplied (dispatcher Setup 7).
+        for name, default in (self.manifest.get("input_defaults") or {}).items():
+            self.inputs.setdefault(name, default)
+        # materialize: file inputs ride by reference (Setup step 7): literal
+        # CONTENT (a plain string in the scenario) is written to
+        # run-inputs/<name>; a {"path": ...} value is a caller-supplied path
+        # resolved against the scenario dir. Both then pass normalize-input.
+        for name in self.manifest.get("materialize_inputs") or []:
+            if name not in supplied:
+                continue
+            value = supplied[name]
+            if isinstance(value, dict) and "path" in value:
+                src = (self.scenario_path.parent / value["path"]).resolve()
+            elif isinstance(value, str):
+                src = self.run_dir / "run-inputs" / name
+                src.parent.mkdir(parents=True, exist_ok=True)
+                src.write_text(value)
+            else:
+                die(f"materialize input '{name}' must be literal string content "
+                    f"or {{\"path\": ...}}, got {type(value).__name__}", 1)
+            out = self.run_dir / "run-inputs" / f"{name}.cat"
+            data = kernel(f"normalize-input ({name})", NORMALIZE_INPUT,
+                          "--value", str(src), "--out", str(out))
+            self.inputs[name] = data["path"]
+
+    def record_inputs(self):
+        tmp = self.run_dir / "inputs.tmp.json"
+        tmp.write_text(json.dumps(self.inputs, indent=2, sort_keys=True) + "\n")
+        kernel("run-journal record-inputs", RUN_JOURNAL, "record-inputs",
+               "--run-dir", str(self.run_dir), "--inputs-file", "inputs.tmp.json")
+
+    # ----------------------------------------------------------- journal
+    def journal(self, line):
+        with self.journal_path.open("a") as f:
+            f.write(json.dumps(line, sort_keys=True) + "\n")
+
+    def commit_step(self, i, label, gate=None, choice=None, outcome=None):
+        """The dispatcher's three-move post-step checkpoint: write the
+        CANDIDATE run-state, gate it via check-step-io BEFORE committing,
+        then commit via run-journal append --commit-state. A failed check
+        never commits the candidate — it stamps failed_step into the
+        still-committed previous state and stops."""
+        tmp = self.run_dir / "run-state.json.tmp"
+        tmp.write_text(json.dumps({
+            "manifest_hash": self.manifest["manifest_hash"],
+            "step_index": i + 1,
+            "inputs": self.inputs,
+            "results": self.results,
+        }, indent=2, sort_keys=True) + "\n")
+        rc, data, out, err = run_py(CHECK_STEP_IO,
+                                    "--manifest", str(self.manifest_path),
+                                    "--run-state", str(tmp),
+                                    "--step", str(i))
+        if rc != 0:
+            run_py(RUN_JOURNAL, "append", "--run-dir", str(self.run_dir),
+                   "--event", "run_error", "--step-index", str(i),
+                   "--outcome", "error", "--label", f"IO check failed: {label}",
+                   "--mark-failed-step", str(i))
+            die(f"check-step-io failed after step {i} ({label}) — candidate "
+                f"state not committed: "
+                f"{json.dumps((data or {}).get('errors') or out[:800])}",
+                1 if rc == 1 else 2)
+        args = ["append", "--run-dir", str(self.run_dir),
+                "--event", "step_complete", "--step-index", str(i),
+                "--label", label, "--commit-state", "run-state.json.tmp"]
+        if gate is not None:
+            args += ["--gate", gate]
+        if choice is not None:
+            args += ["--choice", str(choice)]
+        if outcome is not None:
+            args += ["--outcome", outcome]
+        kernel("run-journal append", RUN_JOURNAL, *args)
+
+    # ----------------------------------------------------------- steps
+    def run_segment(self, i, step):
+        data = kernel(f"run-step args (step {i})", RUN_STEP, "args",
+                      "--manifest", str(self.manifest_path),
+                      "--run-state", str(self.run_state), "--step", str(i))
+        args_file = self.workdir / f"args-step-{i}.json"
+        args_file.write_text(json.dumps(data["args"], sort_keys=True,
+                                        separators=(",", ":")))
+        script = self.def_dir / step["script"]
+        proc = subprocess.run(
+            ["node", str(SEGMENT_HOST), "--script", str(script),
+             "--fixtures", str(self.fixtures_path),
+             "--args-file", str(args_file), "--journal", str(self.journal_path)],
+            capture_output=True, text=True)
+        try:
+            out = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            die(f"run-segment-host produced no parseable JSON (exit "
+                f"{proc.returncode}): {(proc.stdout or proc.stderr)[:800]!r}")
+        if proc.returncode != 0 or not out.get("ok"):
+            die(f"segment step {i} failed under the mock host: "
+                f"{out.get('error')}", 1)
+        returned = out.get("result") or {}
+        for nid in step.get("produces") or []:
+            if nid in returned:
+                self.results[nid] = returned[nid]
+            # an absent produced node stays unstored — check-step-io fails loud
+
+    def run_gate(self, i, step):
+        gate = step["gate"]
+        gid = gate.get("id", "?")
+        outcome = None
+        if not gate_pauses(gate):
+            # warn gate: render + continue; record the declared default or null
+            # — never an option nobody selected.
+            choice = gate.get("default")
+            outcome = "skipped"
+        elif self.auto:
+            if gate.get("on_headless") == "fail":
+                self.journal({"event": "gate", "gate": gid, "choice": None,
+                              "mode": "auto", "stopped": True})
+                kernel("run-journal append", RUN_JOURNAL, "append",
+                       "--run-dir", str(self.run_dir), "--event", "run_error",
+                       "--step-index", str(i), "--outcome", "error",
+                       "--label", f"gate {gid} declares on_headless: fail")
+                self.stopped_at = {"step": i,
+                                   "reason": f"gate {gid}: on_headless fail"}
+                return
+            choice = gate.get("default")
+            if choice is None:
+                die(f"gate '{gid}': auto mode with no declared default — "
+                    f"compile never emits this; the manifest was hand-edited", 1)
+        else:
+            picks = self.scen.get("gates") or {}
+            if gid not in picks:
+                die(f"scenario supplies no choice for interactive gate '{gid}'", 1)
+            choice = picks[gid]
+            if choice not in gate_options(gate):
+                die(f"scenario gate '{gid}' choice {choice!r} is not one of the "
+                    f"gate's effective options {gate_options(gate)}", 1)
+            if choice == "revise" or str(choice).startswith("revise"):
+                die(f"gate '{gid}': a revise-style choice folds human notes "
+                    f"into a re-run — not supported by the golden harness; "
+                    f"pick approve/abandon in the scenario", 1)
+        self.results[gid] = {"choice": choice}
+        self.journal({"event": "gate", "gate": gid, "choice": choice,
+                      "mode": "auto" if self.auto else
+                              ("warn" if outcome == "skipped" else "interactive")})
+        self.commit_step(i, step_label(step), gate=gid, choice=choice,
+                         outcome=outcome)
+        if gate_pauses(gate) and choice in ("stop", "abandon"):
+            self.stopped_at = {"step": i, "reason": f"gate {gid}: {choice}"}
+
+    def run_checkpoint(self, i, step):
+        ctype = step["checkpoint_type"]
+        node = step["node"]
+        data = kernel(f"run-step eval (step {i})", RUN_STEP, "eval",
+                      "--manifest", str(self.manifest_path),
+                      "--run-state", str(self.run_state), "--step", str(i))
+        if data.get("skipped"):
+            self.results[node] = None
+            self.journal({"event": "checkpoint", "node": node,
+                          "checkpoint_type": ctype, "skipped": True})
+            self.commit_step(i, step_label(step), outcome="skipped")
+            return
+        provided = self.scen.get("checkpoints") or {}
+        if node not in provided:
+            die(f"scenario supplies no result for {ctype} checkpoint "
+                f"'{node}' (its resolved prompt/inputs need a model or a "
+                f"child run — the harness mocks that seam)", 1)
+        value = provided[node]
+        line = {"event": "checkpoint", "node": node, "checkpoint_type": ctype,
+                "skipped": False}
+        if data.get("for_each"):
+            iterations = data.get("iterations") or []
+            if not isinstance(value, list) or len(value) != len(iterations):
+                die(f"checkpoint '{node}' fans out over {len(iterations)} "
+                    f"item(s); the scenario must supply a result ARRAY of "
+                    f"that length", 1)
+            if ctype == "orchestrator_node":
+                line["prompts"] = [it.get("prompt") for it in iterations]
+            else:
+                line["child_inputs"] = [it.get("child_inputs") for it in iterations]
+        else:
+            if ctype == "orchestrator_node":
+                line["prompt"] = data.get("prompt")
+            else:
+                line["workflow"] = step.get("workflow")
+                line["child_inputs"] = data.get("child_inputs")
+        self.results[node] = value
+        self.journal(line)
+        self.commit_step(i, step_label(step))
+
+    # ----------------------------------------------------------- walk
+    def execute(self):
+        for i, step in enumerate(self.manifest["steps"]):
+            if step.get("kind") == "segment":
+                self.run_segment(i, step)
+                self.commit_step(i, step_label(step))
+            elif step.get("checkpoint_type") == "gate":
+                self.run_gate(i, step)
+            else:
+                self.run_checkpoint(i, step)
+            self.steps_run += 1
+            if self.stopped_at:
+                break
+        if not self.stopped_at:
+            kernel("run-journal append", RUN_JOURNAL, "append",
+                   "--run-dir", str(self.run_dir),
+                   "--event", "run_complete", "--outcome", "ok")
+
+    # ----------------------------------------------------------- goldens
+    def normalize(self, text):
+        """Path-stable goldens: the run dir (under the world) first, then the
+        world root. Both resolved, so macOS /var vs /private/var cannot fork."""
+        return (text.replace(str(self.run_dir), "<RUN_DIR>")
+                    .replace(str(self.world), "<WORLD>"))
+
+    def final_payload(self):
+        out_from = (self.manifest.get("output") or {}).get("from")
+        return {
+            "workflow": self.name,
+            "profile_used": self.manifest.get("profile_used"),
+            "gate_mode": self.manifest.get("gate_mode"),
+            "stopped_at": self.stopped_at,
+            "results": self.results,
+            "output": self.results.get(out_from) if out_from else None,
+        }
+
+    def diff_goldens(self):
+        goldens = self.scen.get("goldens") or {}
+        results_path = (self.scenario_path.parent /
+                        (goldens.get("results") or "golden-results.json"))
+        journal_path = (self.scenario_path.parent /
+                        (goldens.get("journal") or "golden-journal.jsonl"))
+        got_results = self.normalize(
+            json.dumps(self.final_payload(), indent=2, sort_keys=True)) + "\n"
+        got_journal = self.normalize(self.journal_path.read_text())
+        if self.update:
+            results_path.write_text(got_results)
+            journal_path.write_text(got_journal)
+            return []
+        mismatches = []
+        for label, path, got in (("results", results_path, got_results),
+                                 ("journal", journal_path, got_journal)):
+            if not path.is_file():
+                mismatches.append({"golden": label, "path": str(path),
+                                   "error": "golden file missing — generate "
+                                            "with --update-goldens and review"})
+                continue
+            want = path.read_text()
+            if want != got:
+                diff = "".join(difflib.unified_diff(
+                    want.splitlines(keepends=True), got.splitlines(keepends=True),
+                    fromfile=f"golden/{path.name}", tofile="run", n=2))
+                mismatches.append({"golden": label, "path": str(path),
+                                   "diff": diff[:8000]})
+        return mismatches
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Golden-run harness: compile a def into a throwaway world, "
+                    "walk the manifest per the dispatcher contract with mocked "
+                    "agents, diff results + call journal against goldens.")
+    ap.add_argument("--scenario", required=True)
+    ap.add_argument("--workdir", default=None,
+                    help="Working dir (default: fresh temp dir). The copied "
+                         "world, run dir, and call journal live under it.")
+    ap.add_argument("--defs-source", default=None,
+                    help="Workflow-defs registry to copy the def from "
+                         "(default: <root>/.claude/workflow-defs).")
+    ap.add_argument("--skills-source", default=None,
+                    help="Microskills registry to copy (default: "
+                         "<root>/.claude/microskills).")
+    ap.add_argument("--templates-root", default=None,
+                    help="templates/ root pinned via MICROSKILLS_TEMPLATES_ROOT "
+                         "for the compile (default: <root>/templates when present).")
+    ap.add_argument("--update-goldens", action="store_true",
+                    help="Write the goldens from this run instead of diffing.")
+    a = ap.parse_args()
+
+    if shutil.which("node") is None:
+        die("node not found on PATH — run-segment-host executes compiled "
+            "segments under Node (and run-step eval requires it too). Install "
+            "Node.js and re-run.")
+
+    h = Harness(a)
+    h.compile()
+    h.mint_run()
+    h.gather_inputs()
+    h.record_inputs()
+    h.execute()
+    mismatches = h.diff_goldens()
+
+    summary = {
+        "ok": not mismatches,
+        "scenario": str(h.scenario_path),
+        "workflow": h.name,
+        "profile": h.manifest.get("profile_used"),
+        "workdir": str(h.workdir),
+        "manifest_hash": h.manifest.get("manifest_hash"),
+        "steps_run": h.steps_run,
+        "stopped_at": h.stopped_at,
+        "updated": bool(a.update_goldens),
+        "mismatches": mismatches,
+    }
+    print(json.dumps(summary, indent=2))
+    sys.exit(0 if not mismatches else 1)
+
+
+if __name__ == "__main__":
+    main()

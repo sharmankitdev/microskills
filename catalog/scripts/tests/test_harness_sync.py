@@ -271,6 +271,69 @@ def test_plugin_ledger_entry_and_engine_preserved(tmp_path):
     assert st2["engine"]["source_hash"] == "sha256:cafe"          # preserved
 
 
+def test_custom_add_cannot_clobber_plugin_owned_ledger_entry(tmp_path):
+    # The latent ownership hole: harness.yaml lists a name as source:custom while the
+    # ledger records it as plugin-owned (initialize-harness's entry). Pre-fix, the add
+    # reconciled as fresh and `--resolve overwrite` clobbered the plugin-owned ledger
+    # entry + deployed bytes. Now it is a hard error pointing at the eject path.
+    make_microskill(tmp_path, "stolen")
+    write_manifest(tmp_path, [{"name": "stolen"}])   # source: custom
+    deployed = tmp_path / ".claude" / "microskills" / "stolen" / "MICROSKILL.md"
+    deployed.parent.mkdir(parents=True)
+    deployed.write_text("PLUGIN BYTES")
+    sp = tmp_path / ".claude" / ".harness-state.json"
+    sp.write_text(json.dumps({"version": 2, "components": {"stolen": {
+        "kind": "microskill", "source": "plugin", "profiles": "*",
+        "deploy_path": ".claude/microskills/stolen",
+        "installed_paths": [".claude/microskills/stolen/MICROSKILL.md"],
+        "source_hash": "sha256:pluginhash", "plugin_version": "0.9.0"}}}))
+    # plan: hard error, no action planned for the plugin-owned name
+    rc, data, out, err = run(tmp_path, "--plan")
+    assert rc == 1, out
+    assert data["errors"] and data["errors"][0]["name"] == "stolen"
+    assert "initialize-harness" in data["errors"][0]["reason"]
+    assert "--eject" in data["errors"][0]["reason"]
+    assert not [a for a in data["actions"] if a["name"] == "stolen"]
+    # even an explicit overwrite resolve cannot steal the entry
+    rc, data, out, err = run(tmp_path, "--apply", "--resolve", "stolen=overwrite")
+    assert rc == 1, out
+    assert data["errors"] and data["errors"][0]["name"] == "stolen"
+    st = json.loads(sp.read_text())["components"]["stolen"]
+    assert st["source"] == "plugin"                       # ledger entry untouched
+    assert st["plugin_version"] == "0.9.0"
+    assert st["source_hash"] == "sha256:pluginhash"
+    assert deployed.read_text() == "PLUGIN BYTES"         # deployed bytes untouched
+
+
+def test_ejected_entry_syncs_as_noop(tmp_path):
+    # After initialize-harness --eject: harness.yaml + ledger both say custom, bytes
+    # vendored under harness/ match the deployed copy. tree_hash is location-independent,
+    # so sync must plan a noop (no rewrite, no conflict).
+    hs = load_harness_sync()
+    src = make_microskill(tmp_path, "ejected")
+    write_manifest(tmp_path, [{"name": "ejected"}])
+    # simulate the ejected state: deployed copy + custom-owned ledger entry whose
+    # source_hash was computed from the (identical) catalog bytes pre-eject
+    dep = tmp_path / ".claude" / "microskills" / "ejected"
+    (dep / "profiles").mkdir(parents=True)
+    for rel in ("MICROSKILL.md", "profiles/base.yaml"):
+        (dep / rel).write_bytes((src / rel).read_bytes())
+    shim = tmp_path / ".claude" / "commands" / "ejected.md"
+    shim.parent.mkdir(parents=True, exist_ok=True)
+    shim.write_text("shim")
+    (tmp_path / ".claude" / ".harness-state.json").write_text(json.dumps(
+        {"version": 2, "components": {"ejected": {
+            "kind": "microskill", "source": "custom", "profiles": "*",
+            "deploy_path": ".claude/microskills/ejected",
+            "installed_paths": [".claude/microskills/ejected/MICROSKILL.md",
+                                ".claude/microskills/ejected/profiles/base.yaml",
+                                ".claude/commands/ejected.md"],
+            "source_hash": hs.tree_hash(src)}}}))
+    rc, data, out, err = run(tmp_path, "--plan")
+    assert rc == 0, out
+    assert [a["action"] for a in data["actions"]] == ["noop"]
+
+
 def test_missing_harness_yaml_exits_2(tmp_path):
     rc, data, out, err = run(tmp_path, "--plan")
     assert rc == 2
@@ -400,3 +463,45 @@ def test_schema_rejects_v1_components_shape(tmp_path):
     rc, data, out, err = run(tmp_path, "--plan")
     assert rc == 1
     assert "schema_errors" in data
+
+
+def make_workflow(tmp, name, desc="A demo workflow.", prompt="do a"):
+    d = tmp / "harness" / "workflow-defs" / name
+    (d / "profiles").mkdir(parents=True, exist_ok=True)
+    (d / "WORKFLOW.yaml").write_text(
+        f"version: 1\nname: {name}\ndescription: {desc}\n"
+        f"nodes:\n  - id: a\n    agent: ag\n    prompt: {prompt}\n")
+    (d / "profiles" / "base.yaml").write_text("version: 1\n")
+    return d
+
+
+def test_update_preserves_compiled_runs_ledger(tmp_path):
+    # .compiled/ is generated/transient (VENDOR_IGNORE_PARTS): never vendored, never
+    # hashed, never in installed_paths — so the dispatcher's per-run ledgers under
+    # .claude/workflow-defs/<name>/.compiled/runs/<run-id>/ survive a sync update
+    # (the stale prune unlinks only previously-OWNED paths).
+    d = make_workflow(tmp_path, "demo-flow")
+    write_manifest(tmp_path, [{"name": "demo-flow", "kind": "workflow"}])
+    rc, data, out, err = run(tmp_path, "--apply")
+    assert rc == 0, err
+    st = state_of(tmp_path)["components"]["demo-flow"]
+    assert not any(".compiled" in p for p in st["installed_paths"])
+
+    # Plant a per-run ledger exactly as run-journal lays it out.
+    run_dir = (tmp_path / ".claude" / "workflow-defs" / "demo-flow"
+               / ".compiled" / "runs" / "20260610T120000Z-abc123")
+    (run_dir / "run-inputs").mkdir(parents=True)
+    (run_dir / "run-config.json").write_text('{"v": 1, "run_id": "20260610T120000Z-abc123"}')
+    (run_dir / "run-state.json").write_text('{"manifest_hash": "sha256:h", "step_index": 1, "results": {}}')
+    (run_dir / "journal.jsonl").write_text('{"v":1,"event":"run_start"}\n')
+    (run_dir / "run-inputs" / "x.cat").write_text("materialized")
+
+    # Edit the source -> the next apply is an UPDATE (stale prune + re-vendor).
+    make_workflow(tmp_path, "demo-flow", prompt="do a differently")
+    rc, data, out, err = run(tmp_path, "--apply")
+    assert rc == 0, err
+    assert [a["action"] for a in data["actions"]] == ["update"]
+    for f in ("run-config.json", "run-state.json", "journal.jsonl", "run-inputs/x.cat"):
+        assert (run_dir / f).exists(), f"{f} clobbered by sync update"
+    st = state_of(tmp_path)["components"]["demo-flow"]
+    assert not any(".compiled" in p for p in st["installed_paths"])

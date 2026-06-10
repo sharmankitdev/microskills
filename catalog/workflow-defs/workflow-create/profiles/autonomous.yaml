@@ -2,22 +2,27 @@
 # of another workflow (e.g. decompose-monolith-orchestrator's `provision` node
 # building a missing nested workflow), where no human is present to approve the plan.
 #
-# It `patch`es the approve_plan gate by id (gates:{patch:[...]}) to soften its
-# severity from `hard` to `warn` and swap in an autonomous prompt — after/type/options
-# are inherited from the base gate, not restated. A human_approval gate ALWAYS flushes
-# the segment (compile-workflow), so the `build` orchestrator node stays after its own
-# boundary; but on `warn` the dispatcher emits the prompt and continues WITHOUT pausing.
-# Net effect: same compiled shape, no human pause.
+# Pure flip to the declared gate-policy mechanism: `gate_mode: auto` makes the
+# dispatcher take each gate's declared default and record it VERBATIM (never a
+# fabricated pick), and the `patch` declares that default on the approve_plan
+# gate by id — after/type/severity/options/prompt are inherited from the base
+# gate, not restated. The gate stays hard + human_approval, so the compiled
+# shape is unchanged (a human_approval gate ALWAYS flushes the segment; the
+# `build` orchestrator node stays after its own boundary); under gate_mode: auto
+# the dispatcher records {choice: approve} and continues WITHOUT pausing. Net
+# effect: same partition, no human pause, an author-declared recorded choice.
 #
-# The build half (the implement ↔ evaluate loop + finalize) runs inside
-# build-workflow-from-plan, which `build` invokes; it stays non-interactive as long as the
-# caller supplies a fresh, collision-free workflow name (a collision would escalate).
+# The doc-declared gate_mode also WINS over a parent's inherited `--gate-mode`
+# flag, so this profile is headless regardless of how the parent runs. The build
+# half (the implement ↔ evaluate loop + finalize) runs inside
+# build-workflow-from-plan, which `build` invokes; it stays non-interactive as
+# long as the caller supplies a fresh, collision-free workflow name (a collision
+# would escalate).
 version: 1
+
+gate_mode: auto
 
 gates:
   patch:
     - id: approve_plan
-      severity: warn
-      prompt: >
-        (autonomous) Plan generated. Running without human approval — review the
-        created workflow afterward.
+      default: approve

@@ -2,21 +2,25 @@
 # sub-step of another workflow (e.g. workflow-create's `provision` node), where
 # no human is present to approve the plan.
 #
-# It `patch`es the approve_plan gate by id (gates:{patch:[...]}) to soften its
-# severity from `hard` to `warn` and swap in an autonomous prompt — after/type/options
-# are inherited from the base gate, not restated. A human_approval gate ALWAYS
-# flushes the segment (compile-workflow), so the implement/evaluate loop stays in
-# its own segment; but on `warn` the dispatcher emits the prompt and continues
-# WITHOUT pausing. Net effect: same compiled shape, no human pause.
+# Pure flip to the declared gate-policy mechanism: `gate_mode: auto` makes the
+# dispatcher take each gate's declared default and record it VERBATIM (never a
+# fabricated pick), and the `patch` declares that default on the approve_plan
+# gate by id — after/type/severity/options/prompt are inherited from the base
+# gate, not restated. The gate stays hard + human_approval, so the compiled
+# shape is unchanged (a human_approval gate ALWAYS flushes the segment and the
+# implement/evaluate loop stays in its own segment); under gate_mode: auto the
+# dispatcher records {choice: approve} and continues WITHOUT pausing. Net
+# effect: same partition, no human pause, an author-declared recorded choice.
 #
-# finalize stays non-interactive as long as the caller supplies a fresh,
-# collision-free microskill name (a collision would escalate).
+# The doc-declared gate_mode also WINS over a parent's inherited `--gate-mode`
+# flag, so this profile is headless regardless of how the parent runs. finalize
+# stays non-interactive as long as the caller supplies a fresh, collision-free
+# microskill name (a collision would escalate).
 version: 1
+
+gate_mode: auto
 
 gates:
   patch:
     - id: approve_plan
-      severity: warn
-      prompt: >
-        (autonomous) Plan generated. Running without human approval — review the
-        created microskill afterward.
+      default: approve

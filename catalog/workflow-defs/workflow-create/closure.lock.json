@@ -1,0 +1,11 @@
+{
+  "manifest_hash": "79b297f03746463310bd868aff1cbe9cf3764cdf81000660de95cf05469047ba",
+  "name": "workflow-create",
+  "node_fingerprints": {
+    "advise": "cfb1393008cb82f3bfdaca49314b4be2cdd5df6101a23672b3ba7e0a2a26f982",
+    "build": "277f4a1b94ab531530fc05adde2f2b6e8d1cfc3b052b31135c3ba6a81dc5639c",
+    "plan": "eabb5b513fe554ac8d0ce30a81f47f6cb6b08b2c1f836ef06495097b20a5bb6d",
+    "provision": "1af50352a7a13433d8dd330ebab36fa1c4766e970d14be9d915a59e1df6d0f76"
+  },
+  "profile_used": "base"
+}

@@ -1,0 +1,759 @@
+#!/usr/bin/env python3
+"""run-journal — per-run ledger helper for the workflow dispatcher.
+
+All dispatcher runtime state for one workflow run lives under
+`<def-dir>/.compiled/runs/<run-id>/`:
+
+    run-config.json   {v, run_id, manifest_hash, profile_used, overrides[],
+                      gate_mode, inputs} (additively extensible — gate_mode is
+                      the v1 additive extension recording the EFFECTIVE compile
+                      gate mode, "interactive"|"auto", so a rerun can reproduce
+                      the recorded compile without guessing; written via
+                      tmp + os.replace)
+    run-state.json    {manifest_hash, step_index, inputs, results} — the resume
+                      checkpoint, committed here via tmp + os.replace (the
+                      harness-sync protocol). `record-inputs` SEEDS it
+                      ({step_index: 0, results: {}}) so the run-step kernel can
+                      build the first segment's args from a committed state;
+                      every later commit re-carries the inputs map.
+    run-inputs/       per-run materialized inputs (normalize-input outputs)
+    journal.jsonl     append-only machine-readable timeline, one JSON object per line
+
+`runs/` sits inside the existing `.compiled/` quarantine: compile-workflow's
+stale-clean globs only `seg-*.js` and `resolved/*.json`, and both reconcile loops
+(initialize-harness / harness-sync) skip `.compiled/` entirely — so run ledgers
+survive recompiles and reconciles.
+
+PATHS-ONLY CONTRACT. Flags carry paths (run dir, a tmp run-state file, an inputs
+file) plus short enumerated/label fields — never large content. The helper records
+its own UTC timestamps and computes byte sizes by reading run-state / run-config
+itself, so node outputs and gathered inputs never ride argv (where they would be
+shell-quoted, truncated, or logged). v1 journal lines carry no exec:{agent,model}
+— the manifest does not record per-node executors, so the dispatcher has nothing
+truthful to pass.
+
+Subcommands:
+  init           mint a run_id, create runs/<run-id>/{run-inputs/}, write
+                 run-config.json, journal `run_start`
+  record-inputs  fold a gathered-inputs JSON file into run-config.json, seed (or
+                 refresh the `inputs` of) run-state.json, journal
+                 `inputs_recorded` with per-input byte sizes
+  append         append one event (step_complete | resume | run_complete |
+                 run_error); --commit-state atomically promotes a tmp run-state
+                 file to run-state.json first, then sizes are computed from the
+                 committed state. --mark-failed-step N (run_error after a failed
+                 post-step IO check; never combinable with --commit-state — a
+                 failed check must NOT commit the candidate state) stamps
+                 `failed_step: N` into the STILL-COMMITTED previous run-state,
+                 so the failure is visible to `latest`/`rerun` instead of the
+                 run dir looking like an ordinary mid-run crash. A later
+                 successful --commit-state of the re-run step promotes the
+                 four-key candidate wholesale, clearing the stamp.
+  latest         scan runs/*/run-state.json for the newest run (greatest run_id —
+                 minted ids are UTC-timestamp-prefixed, so lexical == chronological)
+                 matching --manifest-hash, for the dispatcher's resume offer.
+                 --manifest-hash is optional: omitted (with no --steps), it is the
+                 rerun source scan — newest committed run, any hash, finished
+                 included — and the output surfaces the run's recorded provenance
+                 (manifest_hash, profile_used, overrides, gate_mode). A state
+                 carrying
+                 `failed_step` is surfaced in the output (the offer must say the
+                 step's last attempt failed its IO contract; resuming re-runs it);
+                 a POISONED record whose step_index advanced PAST its failed_step
+                 (no valid protocol commits past a failed IO check) is never
+                 offered at all
+  rerun          seed a deterministic partial re-run: REQUIRES manifest_hash
+                 equality between the freshly compiled --manifest and the
+                 --source-run's recorded run-config/run-state (a mismatch means
+                 the def/registry/profile changed — stored node outputs no longer
+                 line up; hard error, never a partial reuse). Resolves --from (a
+                 0-based step index, a gate id, a checkpoint node id, or a node
+                 INSIDE a segment — which SNAPS to the segment start: segments
+                 are atomic, the whole segment re-runs), requires the source run
+                 to have committed every step before the from-point, then mints a
+                 NEW run dir seeded with the recorded inputs and every pre-from
+                 result (results at/after the from-point are DROPPED so a stale
+                 later output can never leak forward). Reports `replayed_gates`
+                 (pre-from gates replay their recorded {choice} — the dispatcher
+                 never re-asks them) and `confirm_steps` (orchestrator_node /
+                 nested_workflow checkpoints at/after the from-point re-execute
+                 SIDE EFFECTS — the dispatcher confirm-gates each interactively).
+                 A source run-state carrying `failed_step` CAPS the from-point:
+                 a step that failed its post-step IO contract has no trustworthy
+                 result, so seeding from beyond it is refused (--from at/before
+                 the failed step re-runs it and is legal).
+                 The rerun FREEZES the recorded input set: the seeded inputs may
+                 reference the source run's run-inputs/ files by absolute path,
+                 which is why finished run dirs are retained, never deleted.
+  project        timestamp-free projection of journal.jsonl to stdout (sorted keys,
+                 `ts` dropped) so two runs are mechanically diffable
+  report         render journal.jsonl human-readably
+
+Known boundary (documented, not fixed): runs/ namespaces *runtime* state only.
+Concurrent runs of the SAME def compiled with different profiles/overrides still
+race on the shared `.compiled/seg-*.js` + `manifest.json` (one compile per def dir
+wins) — see DAG-RULES.md.
+"""
+import argparse
+import json
+import os
+import secrets
+import sys
+import time
+from pathlib import Path
+
+JOURNAL_VERSION = 1
+APPEND_EVENTS = ("step_complete", "resume", "run_complete", "run_error")
+OUTCOMES = ("ok", "skipped", "error")
+
+
+def die(msg, code=2, **extra):
+    payload = {"error": msg}
+    payload.update(extra)
+    print(json.dumps(payload, indent=2))
+    sys.exit(code)
+
+
+def now_ts():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def write_json_atomic(path: Path, obj):
+    """tmp + os.replace — the harness-sync write protocol."""
+    tmp = path.parent / (path.name + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=2, sort_keys=True) + "\n")
+    os.replace(tmp, path)
+
+
+def json_bytes(obj):
+    """Stable serialized byte size of one JSON value."""
+    return len(json.dumps(obj, sort_keys=True, ensure_ascii=False).encode("utf-8"))
+
+
+def load_json(path: Path, what):
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        die(f"{what} not found: {path}")
+    except (json.JSONDecodeError, OSError) as e:
+        die(f"{what} unreadable: {path}: {e}")
+
+
+def run_paths(run_dir: Path):
+    return {
+        "config": run_dir / "run-config.json",
+        "state": run_dir / "run-state.json",
+        "journal": run_dir / "journal.jsonl",
+        "inputs_dir": run_dir / "run-inputs",
+    }
+
+
+def state_sizes(run_dir: Path):
+    """Byte sizes computed BY READING run-state.json (content never rides argv).
+    Returns {} when no state exists yet (e.g. the run_start line)."""
+    state_path = run_paths(run_dir)["state"]
+    if not state_path.exists():
+        return {}
+    state = load_json(state_path, "run-state.json")
+    out = {"state_bytes": state_path.stat().st_size}
+    results = state.get("results")
+    if isinstance(results, dict):
+        out["result_bytes"] = {k: json_bytes(results[k]) for k in sorted(results)}
+    return out
+
+
+def journal_append(run_dir: Path, event: str, fields: dict):
+    """Append one line. Keys with None values are omitted; ts is minted here."""
+    line = {"v": JOURNAL_VERSION, "ts": now_ts(), "event": event}
+    line.update({k: v for k, v in fields.items() if v is not None})
+    path = run_paths(run_dir)["journal"]
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(line, sort_keys=True, ensure_ascii=False) + "\n")
+    return path
+
+
+def require_run_dir(arg):
+    run_dir = Path(arg).resolve()
+    if not run_dir.is_dir():
+        die(f"run dir not found: {run_dir}")
+    return run_dir
+
+
+def mint_run_dir(runs_dir: Path, explicit_id):
+    """Mint a run id (UTC-timestamp-prefixed, lexical == chronological) and its
+    empty run dir (with run-inputs/). Shared by init and rerun."""
+    run_id = explicit_id or (
+        time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + secrets.token_hex(3))
+    if "/" in run_id or run_id in (".", ".."):
+        die(f"invalid run id: {run_id!r}")
+    run_dir = runs_dir / run_id
+    if run_dir.exists():
+        die(f"run dir already exists: {run_dir}", run_id=run_id)
+    run_paths(run_dir)["inputs_dir"].mkdir(parents=True)
+    return run_id, run_dir
+
+
+# ---------------------------------------------------------------- subcommands
+
+def cmd_init(args):
+    runs_dir = Path(args.runs_dir).resolve()
+    run_id, run_dir = mint_run_dir(runs_dir, args.run_id)
+    p = run_paths(run_dir)
+    config = {
+        "v": JOURNAL_VERSION,
+        "run_id": run_id,
+        "manifest_hash": args.manifest_hash,
+        "profile_used": args.profile,
+        "overrides": list(args.override or []),
+        # The EFFECTIVE compile gate mode — provenance, recorded verbatim so a
+        # rerun recompiles with it directly (no recompile-retry guessing).
+        "gate_mode": args.gate_mode,
+        "inputs": {},
+    }
+    write_json_atomic(p["config"], config)
+    journal_append(run_dir, "run_start", {
+        "manifest_hash": args.manifest_hash,
+        "profile": args.profile,
+        "overrides": len(config["overrides"]) or None,
+        # journaled only when headless (None fields are dropped)
+        "gate_mode": args.gate_mode if args.gate_mode == "auto" else None,
+    })
+    print(json.dumps({
+        "run_id": run_id,
+        "run_dir": str(run_dir),
+        "run_config": str(p["config"]),
+        "run_inputs": str(p["inputs_dir"]),
+        "journal": str(p["journal"]),
+    }, indent=2))
+
+
+def cmd_record_inputs(args):
+    run_dir = require_run_dir(args.run_dir)
+    p = run_paths(run_dir)
+    inputs_file = Path(args.inputs_file)
+    if not inputs_file.is_absolute():
+        inputs_file = run_dir / inputs_file
+    inputs = load_json(inputs_file, "inputs file")
+    if not isinstance(inputs, dict):
+        die(f"inputs file must hold a JSON object: {inputs_file}")
+    config = load_json(p["config"], "run-config.json")
+    config["inputs"] = inputs
+    write_json_atomic(p["config"], config)
+    # Seed (or refresh) the resume checkpoint: the run-step kernel reads args
+    # and checkpoint expressions from the COMMITTED run-state, so it must exist
+    # with the full {manifest_hash, step_index, inputs, results} shape before
+    # the first step runs. An existing state (re-recording) keeps its
+    # step_index/results and only refreshes the inputs map.
+    if p["state"].exists():
+        state = load_json(p["state"], "run-state.json")
+        if not isinstance(state, dict):
+            die(f"run-state.json is not a JSON object: {p['state']}")
+        state["inputs"] = inputs
+    else:
+        state = {"manifest_hash": config.get("manifest_hash"),
+                 "step_index": 0, "inputs": inputs, "results": {}}
+    write_json_atomic(p["state"], state)
+    # Consume a scratch file that lives inside the run dir; leave outside files alone.
+    try:
+        inputs_file.resolve().relative_to(run_dir)
+        inputs_file.unlink()
+    except ValueError:
+        pass
+    journal_append(run_dir, "inputs_recorded", {
+        "input_bytes": {k: json_bytes(inputs[k]) for k in sorted(inputs)},
+    })
+    print(json.dumps({"ok": True, "inputs": len(inputs),
+                      "run_config": str(p["config"]),
+                      "run_state": str(p["state"])}, indent=2))
+
+
+def cmd_append(args):
+    run_dir = require_run_dir(args.run_dir)
+    p = run_paths(run_dir)
+    if args.event not in APPEND_EVENTS:
+        die(f"unknown event {args.event!r} (want one of: {', '.join(APPEND_EVENTS)})")
+    if args.outcome is not None and args.outcome not in OUTCOMES:
+        die(f"invalid outcome {args.outcome!r} (want one of: {', '.join(OUTCOMES)})")
+    config = load_json(p["config"], "run-config.json")
+
+    if args.mark_failed_step is not None:
+        # A failed post-step IO check: the candidate state must NEVER be
+        # committed (that would make the failure silently resumable past the
+        # failed check) — instead stamp `failed_step` into the still-committed
+        # previous run-state so `latest` surfaces it and `rerun` refuses to
+        # seed past it. The stamp clears when the re-run step's passing
+        # candidate is later committed (a four-key wholesale promote).
+        if args.commit_state:
+            die("--mark-failed-step cannot ride with --commit-state — a step "
+                "that failed its IO check must never commit the candidate "
+                "run-state (the failure would become silently resumable)")
+        if not p["state"].exists():
+            die(f"no committed run-state.json to mark: {p['state']}")
+        state = load_json(p["state"], "run-state.json")
+        if not isinstance(state, dict):
+            die(f"run-state.json is not a JSON object: {p['state']}")
+        state["failed_step"] = args.mark_failed_step
+        write_json_atomic(p["state"], state)
+
+    if args.commit_state:
+        tmp = Path(args.commit_state)
+        if not tmp.is_absolute():
+            tmp = run_dir / tmp
+        state = load_json(tmp, "tmp run-state")
+        if not isinstance(state, dict):
+            die(f"tmp run-state must hold a JSON object: {tmp}")
+        # The run dir's state must always target the run's own compiled manifest —
+        # the resume scan depends on this invariant. Fail loud BEFORE replacing.
+        if state.get("manifest_hash") != config.get("manifest_hash"):
+            die("tmp run-state manifest_hash does not match this run's run-config.json "
+                f"({state.get('manifest_hash')!r} != {config.get('manifest_hash')!r})")
+        if not isinstance(state.get("step_index"), int):
+            die("tmp run-state step_index must be an integer")
+        if not isinstance(state.get("inputs"), dict):
+            die("tmp run-state inputs must be an object — the persisted "
+                "run-state shape is {manifest_hash, step_index, inputs, "
+                "results} (the run-step kernel reads args and checkpoint "
+                "expressions from it)")
+        if not isinstance(state.get("results"), dict):
+            die("tmp run-state results must be an object")
+        os.replace(tmp, p["state"])
+
+    fields = {
+        "step_index": args.step_index,
+        "label": args.label,
+        "node": args.node,
+        "gate": args.gate,
+        "choice": args.choice,
+        "outcome": args.outcome,
+        "failed_step": args.mark_failed_step,
+    }
+    fields.update(state_sizes(run_dir))
+    journal = journal_append(run_dir, args.event, fields)
+    print(json.dumps({"ok": True, "event": args.event, "journal": str(journal)}, indent=2))
+
+
+def cmd_latest(args):
+    runs_dir = Path(args.runs_dir).resolve()
+    candidates, skipped = [], []
+    if runs_dir.is_dir():
+        for d in sorted((c for c in runs_dir.iterdir() if c.is_dir()),
+                        key=lambda c: c.name, reverse=True):
+            state_path = d / "run-state.json"
+            if not state_path.exists():
+                continue
+            try:
+                state = json.loads(state_path.read_text())
+            except (json.JSONDecodeError, OSError):
+                skipped.append(d.name)
+                continue
+            if not isinstance(state, dict):
+                continue
+            # --manifest-hash given -> resume scan: only that compile's runs.
+            # Omitted -> rerun source scan: newest committed run, any hash.
+            if args.manifest_hash is not None \
+                    and state.get("manifest_hash") != args.manifest_hash:
+                continue
+            # A state without an inputs map predates the {manifest_hash,
+            # step_index, inputs, results} shape — the run-step kernel cannot
+            # resume it, so never offer it (start fresh instead).
+            if not isinstance(state.get("inputs"), dict):
+                continue
+            step_index = state.get("step_index")
+            failed_step = state.get("failed_step")
+            # POISONED record: progress committed PAST a step recorded as
+            # having failed its IO contract. No valid protocol produces this
+            # shape (a failed check never commits the candidate state) — the
+            # stored results beyond failed_step are untrustworthy, so never
+            # offer it for resume or as a rerun source.
+            if isinstance(failed_step, int) and isinstance(step_index, int) \
+                    and step_index > failed_step:
+                skipped.append(d.name)
+                continue
+            if args.steps is not None and isinstance(step_index, int) \
+                    and step_index >= args.steps:
+                continue  # this run already finished — nothing to resume
+            candidates.append((d, step_index, state.get("manifest_hash"),
+                               failed_step))
+    if not candidates:
+        print(json.dumps({"found": False, "skipped": skipped}, indent=2))
+        return
+    # greatest run_id == newest minted
+    d, step_index, state_hash, failed_step = candidates[0]
+    # Recorded compile provenance (short strings) so a rerun caller can
+    # reproduce the recorded compile without reading run-config itself.
+    cfg = {}
+    if (d / "run-config.json").exists():
+        try:
+            loaded = json.loads((d / "run-config.json").read_text())
+            cfg = loaded if isinstance(loaded, dict) else {}
+        except (json.JSONDecodeError, OSError):
+            cfg = {}
+    print(json.dumps({
+        "found": True,
+        "run_id": d.name,
+        "run_dir": str(d),
+        "run_state": str(d / "run-state.json"),
+        "run_config": str(d / "run-config.json"),
+        "step_index": step_index,
+        # Non-null: the run's last attempt at this step FAILED its post-step IO
+        # check (its result was never committed) — the dispatcher's offer must
+        # say so; resuming re-runs that step.
+        "failed_step": failed_step,
+        "manifest_hash": state_hash,
+        "profile_used": cfg.get("profile_used"),
+        "overrides": cfg.get("overrides") or [],
+        # Recorded effective gate mode (a pre-gate_mode run-config defaults to
+        # interactive) — the rerun caller recompiles with it DIRECTLY.
+        "gate_mode": cfg.get("gate_mode") or "interactive",
+        "skipped": skipped,
+    }, indent=2))
+
+
+# ------------------------------------------------------------------- rerun
+
+def step_produced_ids(step):
+    """The node ids a manifest step stores into results when it completes:
+    a segment's `produces` list; a gate's gate.id (the recorded {choice}); an
+    orchestrator/nested checkpoint's node id."""
+    if step.get("kind") == "segment":
+        return list(step.get("produces") or step.get("nodes") or [])
+    if step.get("checkpoint_type") == "gate":
+        gid = (step.get("gate") or {}).get("id")
+        return [gid] if gid else []
+    nid = step.get("node")
+    return [nid] if nid else []
+
+
+def step_label(i, step):
+    """Short selector-help label for one manifest step."""
+    if step.get("kind") == "segment":
+        return f"{i}: segment[{','.join(step.get('nodes') or [])}]"
+    ctype = step.get("checkpoint_type", "checkpoint")
+    if ctype == "gate":
+        return f"{i}: gate:{(step.get('gate') or {}).get('id', '?')}"
+    return f"{i}: {ctype}:{step.get('node', '?')}"
+
+
+def resolve_from_point(steps, selector):
+    """Resolve --from to (step_index, snapped_to_segment). An integer selector
+    is a 0-based manifest step index. A name matches a gate id, a checkpoint
+    node id, or a node INSIDE a segment — the last SNAPS to the segment start
+    (segments are atomic: the whole segment re-runs). snapped is True only when
+    the from-point actually MOVED (the named node is not the segment's first)."""
+    sel = (selector if selector is not None else "0").strip()
+    if sel.lstrip("-").isdigit():
+        idx = int(sel)
+        if not (0 <= idx < len(steps)):
+            die(f"--from {idx} is out of range (manifest has {len(steps)} steps)", 1)
+        return idx, False
+    for i, step in enumerate(steps):
+        if step.get("kind") == "segment":
+            nodes = step.get("nodes") or []
+            if sel in nodes:
+                return i, sel != nodes[0]
+        elif step.get("checkpoint_type") == "gate":
+            if (step.get("gate") or {}).get("id") == sel:
+                return i, False
+        elif step.get("node") == sel:
+            return i, False
+    die(f"--from {sel!r} matches no manifest step, node, or gate; steps are: "
+        + "; ".join(step_label(i, s) for i, s in enumerate(steps)), 1)
+
+
+def cmd_rerun(args):
+    runs_dir = Path(args.runs_dir).resolve()
+    manifest = load_json(Path(args.manifest), "manifest")
+    steps = manifest.get("steps")
+    if not isinstance(steps, list) or not steps:
+        die("manifest carries no steps list")
+    m_hash = manifest.get("manifest_hash")
+    if not m_hash:
+        die("manifest carries no manifest_hash")
+    source_dir = runs_dir / args.source_run
+    if not source_dir.is_dir():
+        die(f"source run dir not found: {source_dir}")
+    sp = run_paths(source_dir)
+    config = load_json(sp["config"], "source run-config.json")
+    state = load_json(sp["state"], "source run-state.json")
+    # --- HARD GATE: manifest_hash equality with the recorded run ---
+    # A rerun replays recorded node outputs into a recompiled manifest; any
+    # drift (def/registry edit, different profile/overrides, gate mode) means
+    # the stored outputs no longer line up with the steps. Fail loud — never
+    # a partial reuse.
+    for what, rec in (("run-config.json", config.get("manifest_hash")),
+                      ("run-state.json", state.get("manifest_hash"))):
+        if rec != m_hash:
+            die(f"rerun requires manifest_hash equality: the compiled manifest "
+                f"is {m_hash} but the source run's {what} records {rec} — the "
+                f"def, registry, profile/overrides, or gate mode changed since "
+                f"the recorded run, so its stored node outputs no longer line "
+                f"up. Recompile with the run's recorded profile/overrides/"
+                f"gate_mode (all in its run-config.json, surfaced by `latest`), "
+                f"or start a fresh run.", 1)
+    if not isinstance(state.get("inputs"), dict) \
+            or not isinstance(state.get("results"), dict):
+        die("source run-state carries no inputs/results objects — a pre-shape "
+            "run-state is not rerunnable (start a fresh run)", 1)
+    from_idx, snapped = resolve_from_point(steps, args.from_)
+    # --- failed_step CAPS the from-point ---
+    # A step that failed its post-step IO contract has no trustworthy result
+    # (the failing candidate state was never committed; in a poisoned record
+    # the stored value is exactly the corruption the check caught) — nothing
+    # at/after it may seed a rerun. --from at/before the failed step re-runs
+    # it and is legal.
+    failed_step = state.get("failed_step")
+    if isinstance(failed_step, int) and from_idx > failed_step:
+        die(f"the source run's step {failed_step} failed its post-step IO "
+            f"contract (run-state records failed_step: {failed_step}) — "
+            f"results at/after it cannot seed a rerun; choose "
+            f"--from {failed_step} or earlier so the failed step re-runs", 1)
+    recorded_idx = state.get("step_index")
+    if not isinstance(recorded_idx, int) or recorded_idx < from_idx:
+        die(f"--from resolves to step {from_idx} but the source run only "
+            f"committed progress up to step_index {recorded_idx!r} — every "
+            f"step before the from-point needs a recorded result; choose an "
+            f"earlier from-point", 1)
+    # --- seed: recorded inputs + every pre-from result, nothing after ---
+    # Results at/after the from-point are DROPPED: the rerun re-produces them,
+    # and a stale later output must never leak into an arg or expression.
+    results = state["results"]
+    seed_results, replayed_gates, missing = {}, [], []
+    for i in range(from_idx):
+        step = steps[i]
+        for nid in step_produced_ids(step):
+            if nid in results:
+                seed_results[nid] = results[nid]
+            else:
+                missing.append(f"step {i} result '{nid}'")
+        if step.get("checkpoint_type") == "gate":
+            gid = (step.get("gate") or {}).get("id")
+            rec = results.get(gid)
+            replayed_gates.append({
+                "step_index": i, "gate": gid,
+                "choice": rec.get("choice") if isinstance(rec, dict) else None})
+    if missing:
+        die("the source run-state is missing recorded results for: "
+            + "; ".join(missing) + " — every produced node must be stored in "
+            "results (null for a guarded skip); this run cannot seed a rerun "
+            "from that point", 1)
+    # Orchestrator-world checkpoints at/after the from-point re-execute SIDE
+    # EFFECTS (filesystem writes, vendoring, nested child runs) that already
+    # happened once — the dispatcher confirm-gates each before re-running it.
+    confirm_steps = []
+    for i in range(from_idx, len(steps)):
+        ctype = steps[i].get("checkpoint_type")
+        if ctype in ("orchestrator_node", "nested_workflow"):
+            entry = {"step_index": i, "checkpoint_type": ctype,
+                     "node": steps[i].get("node")}
+            if steps[i].get("workflow"):
+                entry["workflow"] = steps[i]["workflow"]
+            confirm_steps.append(entry)
+    # --- mint the NEW run (the source dir is provenance — never touched) ---
+    run_id, run_dir = mint_run_dir(runs_dir, args.run_id)
+    p = run_paths(run_dir)
+    new_config = {
+        "v": JOURNAL_VERSION,
+        "run_id": run_id,
+        "manifest_hash": m_hash,
+        "profile_used": config.get("profile_used"),
+        "overrides": list(config.get("overrides") or []),
+        # Gate mode rides the copied provenance verbatim (a pre-gate_mode
+        # source defaults to interactive) — the rerun's own record is complete.
+        "gate_mode": config.get("gate_mode") or "interactive",
+        # The FROZEN recorded input set (this is what makes rerun deterministic
+        # — and what makes it NOT the fail->fix->re-review loop). Values may be
+        # absolute paths into the SOURCE run's run-inputs/ — retention of
+        # finished run dirs is load-bearing.
+        "inputs": state["inputs"],
+        "rerun_of": args.source_run,
+        "from_step_index": from_idx,
+    }
+    write_json_atomic(p["config"], new_config)
+    write_json_atomic(p["state"], {
+        "manifest_hash": m_hash, "step_index": from_idx,
+        "inputs": state["inputs"], "results": seed_results})
+    journal_append(run_dir, "run_start", {
+        "manifest_hash": m_hash,
+        "profile": new_config["profile_used"],
+        "overrides": len(new_config["overrides"]) or None,
+        "rerun_of": args.source_run,
+        "from_step_index": from_idx,
+    })
+    journal_append(run_dir, "rerun", {
+        "from_step_index": from_idx,
+        "source_run": args.source_run,
+        "snapped_to_segment": True if snapped else None,
+        "replayed_gates": ({g["gate"]: g["choice"] for g in replayed_gates}
+                           or None),
+    })
+    print(json.dumps({
+        "run_id": run_id,
+        "run_dir": str(run_dir),
+        "run_config": str(p["config"]),
+        "run_state": str(p["state"]),
+        "journal": str(p["journal"]),
+        "manifest_hash": m_hash,
+        "from": {"selector": args.from_ if args.from_ is not None else "0",
+                 "step_index": from_idx, "snapped_to_segment": snapped},
+        "replayed_gates": replayed_gates,
+        "confirm_steps": confirm_steps,
+        "seeded_results": sorted(seed_results),
+    }, indent=2))
+
+
+def read_journal(run_dir: Path):
+    path = run_paths(run_dir)["journal"]
+    if not path.exists():
+        die(f"journal not found: {path}")
+    lines = []
+    for n, raw in enumerate(path.read_text().splitlines(), 1):
+        if not raw.strip():
+            continue
+        try:
+            lines.append(json.loads(raw))
+        except json.JSONDecodeError as e:
+            # The journal is code-written; a corrupt line is a real error, not noise.
+            die(f"journal line {n} unparseable: {path}: {e}")
+    return lines
+
+
+def cmd_project(args):
+    run_dir = require_run_dir(args.run_dir)
+    for line in read_journal(run_dir):
+        line.pop("ts", None)
+        print(json.dumps(line, sort_keys=True, ensure_ascii=False))
+
+
+def fmt_bytes(n):
+    if n is None:
+        return "?"
+    if n < 1024:
+        return f"{n}B"
+    return f"{n / 1024:.1f}KB"
+
+
+def cmd_report(args):
+    run_dir = require_run_dir(args.run_dir)
+    p = run_paths(run_dir)
+    config = load_json(p["config"], "run-config.json") if p["config"].exists() else {}
+    print(f"run      {config.get('run_id', run_dir.name)}")
+    print(f"manifest {config.get('manifest_hash', '?')}")
+    print(f"profile  {config.get('profile_used') or '(base)'}")
+    if config.get("gate_mode") == "auto":
+        print("gates    auto (headless)")
+    for ov in config.get("overrides") or []:
+        print(f"override {ov}")
+    inputs = config.get("inputs") or {}
+    if inputs:
+        print(f"inputs   {', '.join(sorted(inputs))}")
+    print()
+    for line in read_journal(run_dir):
+        bits = [line.get("ts", "?"), line.get("event", "?")]
+        if line.get("step_index") is not None:
+            bits.append(f"step {line['step_index']}")
+        if line.get("label"):
+            bits.append(line["label"])
+        if line.get("gate"):
+            bits.append(f"gate {line['gate']} -> {line.get('choice', '?')}")
+        if line.get("outcome"):
+            bits.append(f"[{line['outcome']}]")
+        if line.get("state_bytes") is not None:
+            bits.append(f"state {fmt_bytes(line['state_bytes'])}")
+        print("  ".join(bits))
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Per-run ledger helper for the workflow dispatcher (paths-only contract).")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("init", help="mint a run dir under runs/ and write run-config.json")
+    sp.add_argument("--runs-dir", required=True, help="<def-dir>/.compiled/runs")
+    sp.add_argument("--manifest-hash", required=True)
+    sp.add_argument("--profile", default=None)
+    sp.add_argument("--override", action="append", default=[],
+                    help="one applied --override k=v, recorded verbatim. Repeatable.")
+    sp.add_argument("--gate-mode", choices=["interactive", "auto"],
+                    default="interactive",
+                    help="the EFFECTIVE compile gate mode (manifest.gate_mode "
+                         "== 'auto' -> pass auto), recorded into run-config.json "
+                         "as provenance so a rerun reproduces the recorded "
+                         "compile directly — never a recompile-retry guess.")
+    sp.add_argument("--run-id", default=None, help="explicit run id (tests); default minted")
+    sp.set_defaults(fn=cmd_init)
+
+    sp = sub.add_parser("record-inputs",
+                        help="fold a gathered-inputs JSON file into run-config.json")
+    sp.add_argument("--run-dir", required=True)
+    sp.add_argument("--inputs-file", required=True,
+                    help="path to a JSON object of gathered inputs (a scratch file inside "
+                         "the run dir is consumed after merging)")
+    sp.set_defaults(fn=cmd_record_inputs)
+
+    sp = sub.add_parser("append", help="append one journal event")
+    sp.add_argument("--run-dir", required=True)
+    sp.add_argument("--event", required=True, help="|".join(APPEND_EVENTS))
+    sp.add_argument("--step-index", type=int, default=None)
+    sp.add_argument("--label", default=None, help="short human label for the step")
+    sp.add_argument("--node", default=None)
+    sp.add_argument("--gate", default=None)
+    sp.add_argument("--choice", default=None, help="the recorded gate choice label")
+    sp.add_argument("--outcome", default=None, help="|".join(OUTCOMES))
+    sp.add_argument("--commit-state", default=None,
+                    help="tmp run-state file to promote to run-state.json via os.replace "
+                         "before sizing (relative paths resolve against --run-dir)")
+    sp.add_argument("--mark-failed-step", type=int, default=None,
+                    help="stamp failed_step: N into the COMMITTED run-state.json "
+                         "(a failed post-step IO check — the candidate state is "
+                         "never committed; latest surfaces the failure, rerun "
+                         "refuses to seed past it). Never combinable with "
+                         "--commit-state.")
+    sp.set_defaults(fn=cmd_append)
+
+    sp = sub.add_parser("latest",
+                        help="newest run under runs/ whose run-state matches --manifest-hash")
+    sp.add_argument("--runs-dir", required=True)
+    sp.add_argument("--manifest-hash", default=None,
+                    help="only offer runs of this compile (the resume scan); "
+                         "omit for the rerun source scan — newest committed run, "
+                         "any hash, finished included")
+    sp.add_argument("--steps", type=int, default=None,
+                    help="manifest step count; a run whose step_index >= this has "
+                         "finished and is not resumable")
+    sp.set_defaults(fn=cmd_latest)
+
+    sp = sub.add_parser("rerun",
+                        help="seed a partial re-run of --source-run from --from "
+                             "(requires manifest_hash equality; mints a NEW run "
+                             "dir seeded with the recorded inputs + pre-from "
+                             "results)")
+    sp.add_argument("--runs-dir", required=True, help="<def-dir>/.compiled/runs")
+    sp.add_argument("--manifest", required=True,
+                    help="path to the freshly compiled .compiled/manifest.json "
+                         "(its manifest_hash must equal the source run's)")
+    sp.add_argument("--source-run", required=True,
+                    help="run id under --runs-dir to seed from (its dir is read, "
+                         "never modified)")
+    sp.add_argument("--from", dest="from_", default=None,
+                    help="from-point: a 0-based manifest step index, a gate id, "
+                         "a checkpoint node id, or a node inside a segment "
+                         "(snaps to the segment start). Default: 0 (full replay "
+                         "on the frozen recorded inputs)")
+    sp.add_argument("--run-id", default=None,
+                    help="explicit new run id (tests); default minted")
+    sp.set_defaults(fn=cmd_rerun)
+
+    sp = sub.add_parser("project", help="timestamp-free journal projection (diffable)")
+    sp.add_argument("--run-dir", required=True)
+    sp.set_defaults(fn=cmd_project)
+
+    sp = sub.add_parser("report", help="render the journal human-readably")
+    sp.add_argument("--run-dir", required=True)
+    sp.set_defaults(fn=cmd_report)
+
+    args = ap.parse_args()
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()

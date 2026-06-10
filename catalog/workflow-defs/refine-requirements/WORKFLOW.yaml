@@ -12,10 +12,8 @@ inputs:
     required: true
     materialize: file
     description: >-
-      The requirement material to assimilate, passed BY REFERENCE. `materialize: file` lets the
-      dispatcher accept a raw string (a CLI brain-dump), a single file, or a directory of notes and
-      normalize them into one canonical file, threading only the short path into the run (dodging the
-      args-size truncation). assimilate-requirements Reads it.
+      The requirement material to assimilate — a raw brain-dump, a single file, or a
+      directory of notes. assimilate-requirements Reads the path.
   output_dir:
     type: string
     required: false
@@ -29,11 +27,9 @@ inputs:
     required: false
     materialize: file
     description: >-
-      Optional custom SE requirements template (a different section skeleton), passed BY REFERENCE like
-      sources_path — `materialize: file` lets a caller hand a template file OR inline template content,
-      normalized to one canonical path. Absent → the
-      microskill's built-in template. Threaded to the first pass and every refinement re-pass so the
-      section set stays identical across rounds.
+      Optional custom SE requirements template (a different section skeleton). Absent → the
+      microskill's built-in template. Threaded to the first pass and every refinement re-pass
+      so the section set stays identical across rounds.
   prior_answers_path:
     type: string
     required: false
@@ -56,10 +52,11 @@ imports:
   - microskills/assimilate-requirements
 
 nodes:
-  # Seg 1 (BACKGROUND): the heavy first pass. assimilate-requirements Reads the normalized sources
+  # The heavy first pass. assimilate-requirements Reads the normalized sources
   # (+ optional template + optional seed answers), assimilates them into the SE requirements document
   # at output_dir/document_name, and returns the gaps array + gaps_count — the convergence signal. It
-  # Reads/Writes only (no AskUserQuestion) → classifies BACKGROUND.
+  # Reads/Writes only (no AskUserQuestion) → classifies background. Node output shape: the resolved
+  # assimilate-requirements output_schema (inherited).
   - id: assemble
     use: assimilate-requirements
     depends_on: []
@@ -69,23 +66,14 @@ nodes:
       document_name: ${workflow.inputs.document_name}
       template_path: ${workflow.inputs.template_path}
       prior_answers_path: ${workflow.inputs.prior_answers_path}
-    output_schema:
-      type: object
-      required: [document_path, gaps, gaps_count, summary]
-      properties:
-        document_path: { type: string }
-        gaps: { type: array, items: { type: object } }
-        gaps_count: { type: integer }
-        summary: { type: string }
 
-  # Checkpoint A (ORCHESTRATOR): gaps remain. Runs in the main loop, so AskUserQuestion + the
+  # Branch A: gaps remain. Runs in the main loop, so AskUserQuestion + the
   # microskill re-invocation are legal here. Owns the bounded human-in-the-loop refinement loop —
   # NOT a declarative loop: block (a loop body can't hold an orchestrator node / can't pause for a
   # human). Mutually exclusive with `approve` via the opposite gaps_count guard (advisory-fork).
   - id: clarify
     delegation: orchestrator
     when: ${assemble.output.gaps_count > 0}
-    depends_on: [assemble]
     prompt: >
       The assembled requirements document is at ${assemble.output.document_path}; it has
       ${assemble.output.gaps_count} open gap(s): ${assemble.output.gaps}. Refine it WITH the user.
@@ -116,13 +104,25 @@ nodes:
       document as-is; revise → gather change notes, append them to the ledger, re-invoke
       /assimilate-requirements once more, then re-present. RETURN
       {choice, final_document_path, rounds, converged, remaining_gaps}.
+    # The DECLARED return contract for the prose RETURN above: compile records it in the
+    # checkpoint's per-node io and check-step-io validates the stored result after the step
+    # (so a prose-shaped summary or a fabricated null fails loud instead of riding forward).
+    # Holds for the autonomous profile too — its patched prompt returns the same field set.
+    output_schema:
+      type: object
+      required: [choice, final_document_path, rounds, converged, remaining_gaps]
+      properties:
+        choice: { type: string, description: "approve | reject | revise outcome (autonomous: auto-accepted)." }
+        final_document_path: { type: string, description: Path of the finished requirements document. }
+        rounds: { type: integer, description: Refinement rounds actually run. }
+        converged: { type: boolean, description: True when the final re-assimilation reported gaps_count 0. }
+        remaining_gaps: { type: array, description: Gaps still open at stop (empty when converged). }
 
-  # Checkpoint B (ORCHESTRATOR): no gaps from the first pass. Mutually exclusive with `clarify`
+  # Branch B: no gaps from the first pass. Mutually exclusive with `clarify`
   # (opposite gaps_count guard), so neither depends on the other — no skipped-dependency edge.
   - id: approve
     delegation: orchestrator
     when: ${assemble.output.gaps_count == 0}
-    depends_on: [assemble]
     prompt: >
       The assembled requirements document at ${assemble.output.document_path} has no open gaps —
       every template section is filled with no ambiguity or contradiction (summary:
@@ -133,6 +133,14 @@ nodes:
       output_dir=${workflow.inputs.output_dir}, document_name=${workflow.inputs.document_name},
       template_path=${workflow.inputs.template_path}, and prior_answers_path set to that ledger, then
       re-present. RETURN {choice, final_document_path, remaining_gaps}.
+    # Declared return contract for the prose RETURN (validated post-step by check-step-io).
+    output_schema:
+      type: object
+      required: [choice, final_document_path, remaining_gaps]
+      properties:
+        choice: { type: string, description: "approve | reject | revise outcome (autonomous: auto-accepted)." }
+        final_document_path: { type: string, description: Path of the finished requirements document. }
+        remaining_gaps: { type: array, description: Always empty on this no-gaps branch. }
 
 # The refinement path is the primary result; like microskill-create's guarded `finalize`, output.from
 # may name a when-guarded node — it is null when the clean-first-pass `approve` branch ran instead.

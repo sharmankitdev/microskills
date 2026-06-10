@@ -1,0 +1,39 @@
+{
+  "gate_mode": "auto",
+  "output": {
+    "manifest_updated": true,
+    "name": "slugify-title",
+    "synced": true,
+    "vendored_to": "harness/microskills/slugify-title"
+  },
+  "profile_used": "autonomous",
+  "results": {
+    "advise": null,
+    "approve_plan": {
+      "choice": "approve"
+    },
+    "evaluate": {
+      "issues": [],
+      "pass": true
+    },
+    "finalize": {
+      "manifest_updated": true,
+      "name": "slugify-title",
+      "synced": true,
+      "vendored_to": "harness/microskills/slugify-title"
+    },
+    "implement": {
+      "staging_paths": [
+        ".claude/.workflow-staging/current/slugify-title/MICROSKILL.md",
+        ".claude/.workflow-staging/current/slugify-title/profiles/base.yaml"
+      ]
+    },
+    "plan": {
+      "name": "slugify-title",
+      "plan_path": ".claude/.workflow-staging/current/plan.yaml",
+      "scope_advisory": null
+    }
+  },
+  "stopped_at": null,
+  "workflow": "microskill-create"
+}

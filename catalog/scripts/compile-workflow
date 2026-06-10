@@ -8,32 +8,72 @@ Pipeline:
      overrides, strip nulls (helpers reused from resolve-microskill).
   2. Validate the merged doc against workflow-schema.json.
   3. Classify each node background|orchestrator per the delegation governance:
-     - explicit `delegation` wins;
+     - explicit `delegation` wins (but `delegation: auto` on a use: node still
+       runs resolution, and dies if the resolved microskill is interactive);
      - a node with neither use nor agent is an orchestrator-native step;
      - a `use:` microskill whose resolved allowed_tools contains AskUserQuestion,
-       or that carries a hard gate, is orchestrator (fail-safe: resolution
-       failure → orchestrator);
+       or that carries a hard gate, is orchestrator (FAIL-LOUD: resolution
+       failure is a hard compile error — escape hatch: explicit
+       `delegation: orchestrator`);
      - agent nodes are background (autonomous) unless a gate/override says otherwise;
      - a hard / human_approval gate anchored `after: X` is an orchestrator checkpoint.
+     An orchestrator-classified loop.body member is a hard error (it would
+     silently drop the do/while scaffold).
   4. Partition the topologically-sorted DAG into maximal background segments
      separated by orchestrator nodes/gates. loop.body stays inside one segment.
-  5. Emit one Workflow-JS per background segment + manifest.json to
+  5. Freeze each resolved use: node's resolver payload (minus the env-dependent
+     injected_inputs/warnings) to <def-dir>/.compiled/resolved/<node-id>.json —
+     the emitted runMicroskill READS that file at run time instead of
+     re-shelling the resolver against a possibly-drifted registry.
+  6. Emit one Workflow-JS per background segment + manifest.json to
      <def-dir>/.compiled/. Deterministic: same inputs → byte-identical output.
 
 Usage:
-  compile-workflow <name> [--profile <p>] [--override a.b=c]... [--defs-root <dir>]
+  compile-workflow <name> [--profile <p>] [--override a.b=c]...
+                   [--node-override <node-id>:<dotted>=<value>]...
+                   [--defs-root <dir>] [--plan] [--explain] [--lock] [--check]
+                   [--annotate]
 
-Stdout: JSON summary { name, profile_used, compiled_dir, manifest_path, segments, checkpoints }.
-Exit codes: 0 OK · 1 block (schema/DAG error) · 2 environment/script error.
+Stdout: JSON summary { name, profile_used, compiled_dir, manifest_path, segments,
+checkpoints, manifest_hash, sequence }. The written manifest always carries
+manifest_hash plus schema_sha256 + schema_source (provenance of the validating
+schema — its exact bytes and WHICH templates-root fallback tier selected it —
+both excluded from the hash), and stores segment script paths RELATIVE to the
+def dir so manifest bytes are portable across checkouts. Every step that produces node
+results (segments + orchestrator/nested-workflow checkpoints) records a per-node
+"io": {schema, guarded, fan_out} contract — the dispatcher's post-step
+check-step-io validates stored results against it — plus, ONLY when a produced
+node declares spill_outputs, a "spill" map (node id -> declared field list;
+omitted when absent, so spill-free manifests are byte-identical): the
+dispatcher's run-step kernel writes those fields to runs/<run-id>/handoff/ and
+threads their file paths instead of the values. manifest_hash folds in per-node
+SEMANTIC fingerprints (substituted prompt, inputs, effective schema, executor
+identity, when/for_each/as, frozen-resolution sha256 — phase_group excluded), so
+a registry edit or prompt change is hash-visible even though those bytes live
+only in seg JS.
+
+`--lock` additionally writes <def-dir>/closure.lock.json (hash-only: name,
+profile_used, manifest_hash, node_fingerprints) — the COMMITTED drift baseline.
+`--check` recompiles in memory (writes NOTHING) and dies with a drift report
+when the computed closure no longer matches the committed lockfile; this is the
+CI registry-drift gate (a fresh checkout has no .compiled/ baseline — the
+lockfile IS the baseline).
+`--annotate` additionally writes <def-dir>/.compiled/PARTITION.md — a generated
+partition sidecar (step sequence + per-node classification, the same data
+--explain prints) replacing hand-maintained Seg/Checkpoint assertion comments;
+a plain compile removes a stale sidecar. Never changes manifest/segment bytes.
+Exit codes: 0 OK · 1 block (schema/DAG error/closure drift) · 2 environment/script error.
 """
 
 import argparse
+import copy
 import hashlib
 import importlib.machinery
 import importlib.util
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -55,26 +95,40 @@ PROJECT_ROOT = SCRIPT.parents[2]
 DEFAULT_DEFS_ROOT = PROJECT_ROOT / ".claude" / "workflow-defs"
 
 
-def _templates_root(script):
-    """Locate templates/ (schemas + component templates): an explicit
-    MICROSKILLS_TEMPLATES_ROOT override wins (used by hermetic tests to pin the
-    in-repo source schema before a reconcile materializes .claude/), then prefer
-    the materialized runtime copy under .claude/, then ${CLAUDE_PLUGIN_ROOT},
-    then the in-repo dogfood source."""
+def _templates_candidates(script):
+    """Ordered (path, source-label) candidates for templates/ (schemas +
+    component templates): an explicit MICROSKILLS_TEMPLATES_ROOT override wins
+    (used by hermetic tests to pin the in-repo source schema before a
+    reconcile materializes .claude/), then the materialized runtime copy under
+    .claude/, then ${CLAUDE_PLUGIN_ROOT}, then the in-repo dogfood source.
+    The label of the SELECTED tier is recorded into the manifest as
+    `schema_source` (provenance, outside manifest_hash) — the compile input
+    closure includes the env-selected schema file, so cross-host byte-identity
+    of manifest.json assumes consistent template provenance."""
     proj = script.parents[2]
     cands = []
     override = os.environ.get("MICROSKILLS_TEMPLATES_ROOT")
     if override:
-        cands.append(Path(override))
-    cands.append(proj / ".claude" / "templates")
+        cands.append((Path(override), "env:MICROSKILLS_TEMPLATES_ROOT"))
+    cands.append((proj / ".claude" / "templates", "runtime:.claude/templates"))
     env = os.environ.get("CLAUDE_PLUGIN_ROOT")
     if env:
-        cands.append(Path(env) / "templates")
-    cands.append(proj / "templates")
-    return next((c for c in cands if c.is_dir()), cands[0])
+        cands.append((Path(env) / "templates", "env:CLAUDE_PLUGIN_ROOT"))
+    cands.append((proj / "templates", "repo"))
+    return cands
 
 
-SCHEMA_PATH = _templates_root(SCRIPT) / "references" / "workflow-schema.json"
+def _templates_root(script):
+    cands = _templates_candidates(script)
+    return next((p for p, _ in cands if p.is_dir()), cands[0][0])
+
+
+# One selection, both facts: the chosen root AND the tier label that chose it
+# (computed together so the two can never disagree).
+_TPL_ROOT, SCHEMA_SOURCE = next(
+    ((p, label) for p, label in _templates_candidates(SCRIPT) if p.is_dir()),
+    _templates_candidates(SCRIPT)[0])
+SCHEMA_PATH = _TPL_ROOT / "references" / "workflow-schema.json"
 RESOLVE_SCRIPT = SCRIPT.parent / "resolve-microskill"
 
 # Reuse resolver helpers (extension-less file → SourceFileLoader).
@@ -84,6 +138,7 @@ _rm = importlib.util.module_from_spec(_spec)
 _loader.exec_module(_rm)
 deep_merge = _rm.deep_merge
 apply_override = _rm.apply_override
+parse_override_value = _rm.parse_override_value
 strip_nulls = _rm.strip_nulls
 substitute_vars = _rm.substitute_vars
 
@@ -100,6 +155,20 @@ NODE_ITEMS_RE = re.compile(r"(?<!\.)\b([a-z][a-z0-9_-]*)\.items\b")
 NODE_OUTPUT_FIELD_RE = re.compile(r"\b([a-z][a-z0-9_-]*)\.output\.([a-zA-Z0-9_]+)")
 # Fields that may carry ${id.output} / ${id.items} refs that imply a dependency edge.
 SCOPED_REF_FIELDS = ("inputs", "prompt", "when", "for_each")
+# {{snippet:NAME}} include token — resolved from <defs-root>/_snippets/NAME.md by the
+# SHARED apply_workflow_vars pre-pass BEFORE ordinary {{var}} substitution (so a snippet
+# body may carry {{var}} tokens). The colon keeps it out of resolve-microskill's
+# PLACEHOLDER_RE ([\w-]+ only), so the two token namespaces can never collide.
+SNIPPET_RE = re.compile(r"\{\{snippet:([a-z][a-z0-9_-]*)\}\}")
+# {{each.item}} — the expand: template's per-item substitution token (resolved by
+# expand_static_fanout below, AFTER the vars pre-pass). Dotted, so PLACEHOLDER_RE
+# never matches it either. EACH_ANY_RE catches any leftover {{each.*}} token after
+# expansion — an unsupported key or a stray token outside a template is fail-loud.
+EACH_ITEM_RE = re.compile(r"\{\{each\.item\}\}")
+EACH_ANY_RE = re.compile(r"\{\{each\.[^}]*\}\}")
+# Legal expand.over item name: lowercase identifier; '-' is normalized to '_' when the
+# item is used as a generated-node-id suffix / fan-in input key.
+EXPAND_ITEM_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
 
 
 def substitute_vars_deep(obj, vars_map, unresolved):
@@ -116,20 +185,221 @@ def substitute_vars_deep(obj, vars_map, unresolved):
     return obj
 
 
-def apply_workflow_vars(wf):
-    """SHARED intra-def vars pre-pass used by BOTH compile and validate. Substitute
-    double-brace {{key}} tokens throughout the merged doc from the top-level vars:
-    map (reusing resolve-microskill's substitute_vars). Returns (new_doc, unresolved).
+def apply_snippets_deep(obj, snippets_dir, cache, errors):
+    """Recursively replace every {{snippet:NAME}} token in a nested structure with the
+    text of <snippets_dir>/NAME.md (minus ONE trailing newline — the POSIX file
+    convention — so a snippet embeds cleanly mid-string). Dict keys are walked too,
+    mirroring substitute_vars_deep. An unresolvable snippet (no snippets dir, missing
+    file, or a snippet that itself carries a {{snippet:...}} token — nesting is
+    unsupported) records a message in `errors` and leaves the token intact; the
+    CALLER turns a non-empty `errors` into a HARD block (compile die / validate
+    block) — never a warn, never silent. `cache` memoizes per-name reads so one
+    snippet referenced twice is read once (and reported once)."""
+    if isinstance(obj, str):
+        def repl(m):
+            name = m.group(1)
+            if name not in cache:
+                path = (Path(snippets_dir) / f"{name}.md") if snippets_dir else None
+                if path is None or not path.is_file():
+                    errors.append(
+                        f"snippet '{name}' does not resolve to "
+                        f"{path if path is not None else '<no _snippets dir>'}")
+                    cache[name] = None
+                else:
+                    text = path.read_text()
+                    if SNIPPET_RE.search(text):
+                        errors.append(
+                            f"snippet '{name}' itself contains a {{{{snippet:...}}}} "
+                            f"token; nested includes are not supported")
+                        cache[name] = None
+                    else:
+                        cache[name] = text[:-1] if text.endswith("\n") else text
+            return m.group(0) if cache[name] is None else cache[name]
+        return SNIPPET_RE.sub(repl, obj)
+    if isinstance(obj, dict):
+        return {apply_snippets_deep(k, snippets_dir, cache, errors):
+                apply_snippets_deep(v, snippets_dir, cache, errors)
+                for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [apply_snippets_deep(v, snippets_dir, cache, errors) for v in obj]
+    return obj
 
-    vars values are coerced to str by substitute_vars at substitution time. A doc
-    with no vars: (empty/absent map) still walks the tree but replaces nothing — a
-    {{key}} with no matching var is left intact and recorded in `unresolved`. With
-    NO {{...}} tokens at all the output is byte-identical to the input doc."""
+
+def apply_workflow_vars(wf, snippets_dir=None):
+    """SHARED intra-def vars pre-pass used by BOTH compile and validate. TWO ordered
+    textual passes over the merged doc:
+
+      1. {{snippet:NAME}} include — replaced with the text of
+         <snippets_dir>/NAME.md (snippets_dir is <defs-root>/_snippets). Runs FIRST
+         so a snippet body may itself carry {{var}} tokens. An unresolved snippet is
+         a HARD error (returned in snippet_errors; the caller blocks) — a missing
+         include must never ship a literal token into a compiled prompt. Snippet
+         files join the compile input set exactly like profile overlays: same
+         bytes, same output.
+      2. ordinary {{key}} substitution from the top-level vars: map (reusing
+         resolve-microskill's substitute_vars).
+
+    Returns (new_doc, unresolved, snippet_errors). vars values are coerced to str by
+    substitute_vars at substitution time. A doc with no vars: (empty/absent map)
+    still walks the tree but replaces nothing — a {{key}} with no matching var is
+    left intact and recorded in `unresolved`. With NO {{...}} tokens at all the
+    output is byte-identical to the input doc (the _snippets dir is never read)."""
     if not isinstance(wf, dict):
-        return wf, []
+        return wf, [], []
+    snippet_errors = []
+    wf = apply_snippets_deep(wf, snippets_dir, {}, snippet_errors)
     vars_map = wf.get("vars") or {}
     unresolved = []
-    return substitute_vars_deep(wf, vars_map, unresolved), unresolved
+    return substitute_vars_deep(wf, vars_map, unresolved), unresolved, snippet_errors
+
+
+def _each_item_deep(obj, item):
+    """Recursively replace {{each.item}} tokens with the raw item name (strings AND
+    dict keys, mirroring substitute_vars_deep). Pure textual transform."""
+    if isinstance(obj, str):
+        return EACH_ITEM_RE.sub(item, obj)
+    if isinstance(obj, dict):
+        return {_each_item_deep(k, item): _each_item_deep(v, item) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_each_item_deep(v, item) for v in obj]
+    return obj
+
+
+def _expand_suffix(item):
+    """An over item's id-safe suffix / fan-in key: '-' normalized to '_' (so item
+    `test-coverage` yields node `<id>_test_coverage` and input key `test_coverage`)."""
+    return item.replace("-", "_")
+
+
+def expand_static_fanout(wf):
+    """SHARED compile-time `expand:` desugar used by BOTH compile and validate.
+    Runs immediately AFTER apply_workflow_vars and BEFORE schema validation —
+    placement is load-bearing: the sugar (`expand:` / `inputs_each:` node keys) is
+    consumed here, so the CLOSED node schema needs zero changes and never sees it.
+
+    A node carrying `expand: {over: [...]}` is a TEMPLATE for static fan-out: it is
+    replaced IN PLACE (preserving position, hence definition/topo order) by one
+    concrete sibling per over entry, id `<template-id>_<suffix>`. Each over entry is
+    an item-name string, or a map carrying `item` plus EXTRAS deep-merged onto the
+    generated node (per-item variation, e.g. one dimension's extra input). The
+    template's {{each.item}} tokens resolve to the raw item name (e.g. its
+    customize.profile). Because profile merge precedes this pass, an overlay
+    customizes the fan-out by patching the template's `over` list only.
+
+    A node carrying `inputs_each: <template-id>` is the paired FAN-IN: for each over
+    item (in over order) it gains `inputs[<suffix>] = ${<template-id>_<suffix>.output}`
+    plus an explicit depends_on edge on the generated node.
+
+    Pure function of the merged static doc — deterministic; a doc with neither key
+    is returned unchanged. Returns (wf, errors); non-empty errors are a HARD block
+    in both tools (the sugar must never half-desugar silently)."""
+    errors = []
+    if not isinstance(wf, dict) or not isinstance(wf.get("nodes"), list):
+        return wf, errors
+    nodes = wf["nodes"]
+
+    # Pass 1: validate every template and collect its (item, extras) list.
+    templates = {}
+    for n in nodes:
+        if not (isinstance(n, dict) and "expand" in n):
+            continue
+        nid = n.get("id") or "?"
+        exp = n.get("expand")
+        if not (isinstance(exp, dict) and set(exp.keys()) == {"over"}):
+            errors.append(f"node '{nid}': expand must be a mapping with exactly one "
+                          f"key, 'over' (a static list)")
+            continue
+        over = exp["over"]
+        if not isinstance(over, list) or not over:
+            errors.append(f"node '{nid}': expand.over must be a non-empty list")
+            continue
+        items, seen, bad = [], set(), False
+        for ent in over:
+            if isinstance(ent, str):
+                item, extras = ent, {}
+            elif isinstance(ent, dict) and isinstance(ent.get("item"), str):
+                item = ent["item"]
+                extras = {k: v for k, v in ent.items() if k != "item"}
+            else:
+                errors.append(f"node '{nid}': expand.over entries must be item-name "
+                              f"strings or maps carrying 'item'")
+                bad = True
+                break
+            if not EXPAND_ITEM_RE.match(item):
+                errors.append(f"node '{nid}': expand.over item '{item}' must match "
+                              f"{EXPAND_ITEM_RE.pattern}")
+                bad = True
+                break
+            if item in seen:
+                errors.append(f"node '{nid}': duplicate expand.over item '{item}'")
+                bad = True
+                break
+            illegal = {"id", "expand", "inputs_each"} & set(extras)
+            if illegal:
+                errors.append(f"node '{nid}': expand.over item '{item}' extras may "
+                              f"not carry {sorted(illegal)} (the generated id is "
+                              f"derived; sugar cannot nest)")
+                bad = True
+                break
+            seen.add(item)
+            items.append((item, extras))
+        if bad:
+            continue
+        templates[nid] = items
+    if errors:
+        return wf, errors
+
+    # Pass 2: replace each template in place with its generated siblings.
+    new_nodes = []
+    for n in nodes:
+        if not (isinstance(n, dict) and "expand" in n):
+            new_nodes.append(n)
+            continue
+        nid = n["id"]
+        for item, extras in templates[nid]:
+            gen = copy.deepcopy(n)
+            gen.pop("expand", None)
+            gen = _each_item_deep(gen, item)
+            gen = deep_merge(gen, copy.deepcopy(extras))
+            gen["id"] = f"{nid}_{_expand_suffix(item)}"
+            new_nodes.append(gen)
+
+    # Pass 3: desugar every inputs_each fan-in against the collected templates.
+    for n in new_nodes:
+        if not (isinstance(n, dict) and "inputs_each" in n):
+            continue
+        nid = n.get("id") or "?"
+        src = n.pop("inputs_each")
+        if not (isinstance(src, str) and src in templates):
+            errors.append(f"node '{nid}': inputs_each must name an expand template "
+                          f"node id; {src!r} is not one")
+            continue
+        inputs = n.setdefault("inputs", {})
+        deps = n.setdefault("depends_on", [])
+        for item, _extras in templates[src]:
+            key = _expand_suffix(item)
+            gen_id = f"{src}_{key}"
+            if key in inputs:
+                errors.append(f"node '{nid}': inputs_each key '{key}' collides with "
+                              f"an explicit inputs entry; remove one")
+                continue
+            inputs[key] = "${" + gen_id + ".output}"
+            if gen_id not in deps:
+                deps.append(gen_id)
+
+    # Fail-loud: any surviving {{each.*}} token is an unsupported key inside a
+    # template, or a stray token outside one — it would otherwise ship verbatim.
+    for n in new_nodes:
+        for s in collect_strings(n):
+            m = EACH_ANY_RE.search(s)
+            if m:
+                errors.append(f"node '{n.get('id', '?') if isinstance(n, dict) else '?'}': "
+                              f"unresolved {m.group(0)} token (only {{{{each.item}}}} is "
+                              f"substituted, and only inside an expand template)")
+                break
+
+    wf["nodes"] = new_nodes
+    return wf, errors
 
 
 def collect_strings(obj):
@@ -258,6 +528,358 @@ def loop_max_parallel_errors(nodes):
     return out
 
 
+# --- Output-by-reference: node-level spill_outputs, SHARED by compile and validate ---
+# A node's `spill_outputs: [field, ...]` declares output fields threaded BY
+# REFERENCE across checkpoint boundaries: the dispatcher's run-step kernel
+# writes each listed field's value to the per-run ledger
+# (runs/<run-id>/handoff/<node>.<field>) and substitutes the file's absolute
+# path before threading the result into a later segment's args (or a
+# checkpoint's resolved expressions) — the materialize:file / *_path
+# convention for NODE outputs. The compiler only RECORDS the declaration (a
+# `spill` map on the producing manifest step, omitted when absent so
+# spill-free defs compile byte-identically); the handoff files are dispatcher
+# runtime state the compiler never reads or writes.
+
+def spill_placement_errors(nodes):
+    """SHARED placement check (compile dies, validate blocks): spill_outputs on
+    a for_each fan-out node is unsupported — the node's stored result is an
+    ARRAY of per-item objects, so a flat <node>.<field> handoff substitution
+    has no single field to spill (per-item spill is not a v1 feature). Letting
+    it through would silently thread the full array inline — the exact hole
+    spill closes. Returns [(node_id, message), ...] in declaration order."""
+    out = []
+    for n in nodes:
+        if not isinstance(n, dict) or not n.get("id"):
+            continue
+        if n.get("spill_outputs") and n.get("for_each"):
+            out.append((n["id"],
+                        "spill_outputs is not supported on a for_each fan-out node — "
+                        "its result is an ARRAY of per-item objects, so there is no "
+                        "single <node>.<field> value to spill (per-item spill is not "
+                        "a v1 feature); aggregate the fan-out first and spill the "
+                        "aggregator's field instead"))
+    return out
+
+
+def spill_schema_errors(nid, spill, schema):
+    """SHARED spill_outputs/schema coherence check (compile dies, validate
+    blocks): when the producing node's EFFECTIVE output schema is an object
+    with declared properties, every spilled field must be one of them — a
+    typo'd field name would silently never spill (and the oversized value
+    would ride inline anyway). A schema-less / non-object producer is 'any'
+    and never flagged (mirrors the typed-ref field check). Returns [messages]."""
+    if not (isinstance(schema, dict) and schema.get("type") == "object"
+            and isinstance(schema.get("properties"), dict)):
+        return []
+    return [f"spill_outputs names field '{f}', but the node's effective output "
+            f"schema does not declare property '{f}' — the spill would silently "
+            f"never fire; fix the field name or the schema"
+            for f in spill if f not in schema["properties"]]
+
+
+def spill_guard_ref_errors(nodes, loop):
+    """SHARED HARD-BLOCK (compile dies, validate blocks): a field listed in a
+    producer's spill_outputs must never be referenced in a `when` / `for_each`
+    guard or the loop `while`/`until` — across a checkpoint the dispatcher
+    substitutes that field's value with its handoff FILE PATH, so the guard
+    would branch on (or fan out over) a path string. A PATH IS NOT THE VALUE:
+    a path is always truthy, never equals the value's literals, and is not an
+    array. Branch on a small unspilled field instead. Scans `until` as well as
+    `while` so the check is desugar-order-independent. Returns
+    [(location, message), ...] in declaration order."""
+    spill_map = {n["id"]: set(n["spill_outputs"]) for n in nodes
+                 if isinstance(n, dict) and n.get("id") and n.get("spill_outputs")}
+    errs = []
+    if not spill_map:
+        return errs
+
+    def scan(loc, text):
+        if not isinstance(text, str):
+            return
+        for inner in REF_RE.findall(text):
+            for prod, field in NODE_OUTPUT_FIELD_RE.findall(inner):
+                if field in spill_map.get(prod, ()):
+                    errs.append((loc,
+                                 f"references ${{{prod}.output.{field}}}, but "
+                                 f"'{field}' is listed in node '{prod}' "
+                                 f"spill_outputs — across a checkpoint the "
+                                 f"dispatcher threads that field as a handoff "
+                                 f"file PATH, not the value, so this guard "
+                                 f"would branch on a path string; branch on a "
+                                 f"small unspilled field instead"))
+
+    for n in nodes:
+        if not isinstance(n, dict) or not n.get("id"):
+            continue
+        scan(f"nodes/{n['id']}/when", n.get("when"))
+        scan(f"nodes/{n['id']}/for_each", n.get("for_each"))
+    if isinstance(loop, dict):
+        scan("loop/while", loop.get("while"))
+        scan("loop/until", loop.get("until"))
+    return errs
+
+
+# --- Declared gate policy (defaults + headless), SHARED by compile and validate ---
+# An options-less human_approval gate is presented by the dispatcher with the
+# implicit confirm/stop pair, so that pair IS the gate's effective option set
+# for every membership check (a declared `default`, a ${<gate-id>.output.choice}
+# comparison literal).
+GATE_FALLBACK_OPTIONS = ("confirm", "stop")
+
+
+def gate_effective_options(gate):
+    """The option labels a gate actually offers: declared `options`, or the
+    dispatcher's implicit confirm/stop pair when none are declared."""
+    opts = gate.get("options")
+    return list(opts) if opts else list(GATE_FALLBACK_OPTIONS)
+
+
+def gate_pauses(gate):
+    """A hard-severity gate (hard is the default) pauses the dispatcher; a warn
+    human_approval gate renders + continues without pausing."""
+    return gate.get("severity", "hard") == "hard"
+
+
+def gate_policy_errors(gates):
+    """SHARED mode-independent declared-gate-policy checks (compile dies, validate
+    blocks — the two tools can never disagree):
+      - a declared `default` must be a member of the gate's EFFECTIVE options
+        (declared `options`, or the implicit confirm/stop pair when none) — the
+        recorded auto/warn choice must be a label the gate actually offers;
+      - `on_headless: take_default` requires a declared `default` (there is
+        nothing to take otherwise).
+    Returns [(gate_id, message), ...] in declaration order."""
+    errs = []
+    for g in gates or []:
+        if not isinstance(g, dict):
+            continue
+        gid = g.get("id", "?")
+        default = g.get("default")
+        opts = gate_effective_options(g)
+        if default is not None and default not in opts:
+            suffix = ("" if g.get("options")
+                      else " (an options-less gate offers the implicit confirm/stop pair)")
+            errs.append((gid, f"default '{default}' is not one of the gate's "
+                              f"options {opts}{suffix}"))
+        if g.get("on_headless") == "take_default" and default is None:
+            errs.append((gid, "on_headless: take_default requires a declared "
+                              "'default' option to take"))
+    return errs
+
+
+def gate_headless_errors(gates):
+    """SHARED gate-mode=auto feasibility check: a PAUSING gate (severity hard —
+    the default) with no declared `default` and no explicit `on_headless: fail`
+    makes a headless run impossible — the dispatcher could neither take an
+    author-declared choice nor legitimately stop. Failing at compile time (and
+    as a validate block when the merged doc declares gate_mode: auto) is the
+    fail-loud guarantee that a headless run never sits waiting on
+    AskUserQuestion and never fabricates a pick. `on_headless: fail` is legal:
+    the run executes up to that gate, then stops with a nonzero outcome
+    (run-state stays resumable interactively). Warn gates never pause, so they
+    are always headless-safe (they record their declared default, or
+    {choice: null} when none is declared). Returns [(gate_id, message), ...]."""
+    errs = []
+    for g in gates or []:
+        if not isinstance(g, dict) or not gate_pauses(g):
+            continue
+        if g.get("on_headless") == "fail" or g.get("default") is not None:
+            continue
+        errs.append((g.get("id", "?"),
+                     "hard gate declares no 'default' — a gate-mode=auto (headless) "
+                     "run cannot take a choice; declare `default:` (optionally with "
+                     "on_headless: take_default), declare `on_headless: fail` to stop "
+                     "the run at this gate, or run interactively"))
+    return errs
+
+
+def wire_auto_placement_error(node):
+    """SHARED `wire: auto` placement check used by BOTH compile and validate.
+    The auto-wire set is computed from the TARGET's DECLARED inputs, so the
+    sugar is only meaningful where such a declaration exists AND resolution
+    actually runs: a use: microskill node (but not under the explicit
+    delegation: orchestrator escape hatch — that SKIPS resolution, so the
+    declared inputs are unknowable) or a workflow: node (the child
+    WORKFLOW.yaml declares its inputs). Anywhere else it would silently wire
+    nothing — fail loud instead (BLOCK, not fail-safe). Returns a message
+    string, or None when placement is legal (or the node carries no wire)."""
+    if node.get("wire") != "auto":
+        return None
+    if node.get("workflow"):
+        return None
+    if node.get("use"):
+        if node.get("delegation") == "orchestrator" or node.get("side_effect") is True:
+            return ("wire: auto cannot take effect under explicit "
+                    "delegation: orchestrator — that escape hatch skips microskill "
+                    "resolution, so the target's declared inputs are unknown; "
+                    "remove one of the two")
+        return None
+    return ("wire: auto is only valid on a use: microskill node or a workflow: "
+            "node — the auto-wire set comes from the target's DECLARED inputs, "
+            "which an agent:/orchestrator-native node does not have")
+
+
+def auto_wire_node_inputs(node, target_inputs, workflow_inputs):
+    """SHARED `wire: auto` materialization used by BOTH compile and validate
+    (one helper so the two tools can never disagree on the wired set).
+
+    For a node carrying `wire: auto`: every input name the TARGET declares
+    (`target_inputs` — the resolved microskill profile config's `inputs` map
+    for a use: node, the child WORKFLOW.yaml's declared `inputs` map for a
+    workflow: node) that the node does NOT explicitly supply, and that exactly
+    matches a declared workflow input name, materializes as
+    `inputs.<name>: ${workflow.inputs.<name>}` — byte-identical to the
+    hand-written pass-through forward. EXPLICIT ALWAYS WINS: a supplied key is
+    never touched. Wired pairs append AFTER the explicit pairs, in sorted name
+    order, so the authored entries keep their emitted order (and a wire-free
+    node's emit is byte-for-byte untouched).
+
+    Mutates node['inputs'] in place. Returns (wired, required_wired):
+    `wired` = the auto-wired names (sorted); `required_wired` ⊆ wired = those
+    the target declares required:true — the CALLER warns on these
+    (auto-satisfying a REQUIRED input is a real collision risk on generic
+    names like 'name', where the right value is often an upstream node output,
+    not the same-named workflow input)."""
+    if node.get("wire") != "auto":
+        return [], []
+    explicit = node.get("inputs") or {}
+    wired = sorted(
+        name for name in (target_inputs or {})
+        if name not in explicit and name in (workflow_inputs or {}))
+    required_wired = [
+        name for name in wired
+        if isinstance(target_inputs.get(name), dict)
+        and target_inputs[name].get("required")]
+    if wired:
+        inputs = node.setdefault("inputs", {})
+        for name in wired:
+            inputs[name] = "${workflow.inputs." + name + "}"
+    return wired, required_wired
+
+
+def load_child_doc(defs_root, name):
+    """PURE child read: load <defs-root>/<name>/WORKFLOW.yaml as a dict.
+    Never touches the child's .compiled/manifest.json (compile/validate must stay
+    byte-identical-deterministic w.r.t. a single source — the WORKFLOW.yaml).
+    Returns (doc, error_message): doc is None when the file is missing/unparseable.
+    SHARED with validate-workflow (one reader so the two tools can never disagree
+    on what a resolvable child is)."""
+    wf = Path(defs_root) / name / "WORKFLOW.yaml"
+    if not wf.exists():
+        return None, f"does not resolve to {wf}"
+    try:
+        return (yaml.safe_load(wf.read_text()) or {}), None
+    except yaml.YAMLError as e:
+        return None, f"child '{name}' WORKFLOW.yaml parse error: {e}"
+
+
+def workflow_node_targets(doc):
+    """The child-workflow names referenced by this doc's workflow: nodes (in order).
+    SHARED with validate-workflow."""
+    out = []
+    for n in (doc.get("nodes") or []):
+        if isinstance(n, dict) and n.get("workflow"):
+            out.append(n["workflow"])
+    return out
+
+
+def nested_workflow_depth_cycle_errors(defs_root, merged):
+    """SHARED nested-workflow static governance used by BOTH compile (hard die
+    pre-emit) and validate (--defs-root blocks) — the dispatcher's bounded-
+    recursion contract ("the child contains no further nested call") rests on
+    it, so it cannot live only in an optional validation pass:
+
+      (a) DEPTH=1 — a workflow: node's child that itself contains a workflow:
+          node is a grandchild nesting; the dispatcher has no re-entrancy
+          guard for it.
+      (b) IMPORT-CYCLE — 3-color DFS over the IMPORT graph reachable from the
+          merged doc (a GRAY back-edge is a cycle). Adjacency = a doc's
+          workflow: targets restricted to its OWN imports allowlist.
+
+    Only resolvable, allowlisted children are walked: a missing or
+    un-allowlisted target is skipped here (validate reports those through its
+    own allowlist/resolution blocks; compile leaves allowlist enforcement to
+    validate — the CI gate runs validate --defs-root over every catalog def).
+    Returns [(location, message), ...] in deterministic order."""
+    errors = []
+    wf_nodes = [(n.get("id"), n) for n in (merged.get("nodes") or [])
+                if isinstance(n, dict) and n.get("workflow")]
+    if not wf_nodes:
+        return errors
+    imports_set = {imp for imp in (merged.get("imports") or [])
+                   if isinstance(imp, str)}
+    child_cache = {}
+
+    def child_doc(name):
+        if name not in child_cache:
+            child_cache[name] = load_child_doc(defs_root, name)
+        return child_cache[name]
+
+    for nid, n in wf_nodes:
+        target = n["workflow"]
+        if target not in imports_set:
+            continue
+        doc, _err = child_doc(target)
+        if doc is None:
+            continue
+        gtargets = workflow_node_targets(doc)
+        if gtargets:
+            errors.append((
+                f"nodes/{nid}",
+                f"workflow: '{target}' itself contains a nested workflow: node "
+                f"({', '.join(sorted(set(gtargets)))}); nesting depth > 1 is "
+                f"not allowed"))
+
+    root_name = merged.get("name")
+    IWHITE, IGRAY, IBLACK = 0, 1, 2
+    icolor = {}
+
+    def doc_imports(doc):
+        return {imp for imp in (doc.get("imports") or []) if isinstance(imp, str)}
+
+    def ivisit(name, doc, stack):
+        icolor[name] = IGRAY
+        allow = doc_imports(doc)
+        for tgt in workflow_node_targets(doc):
+            if tgt not in allow:
+                continue  # un-allowlisted: validate's own block, never walked
+            if icolor.get(tgt) == IGRAY:
+                errors.append((
+                    "imports",
+                    f"workflow import cycle: {' -> '.join(stack + [name, tgt])}"))
+                continue
+            if icolor.get(tgt, IWHITE) == IWHITE:
+                cdoc, _ = child_doc(tgt)
+                if cdoc is not None:
+                    ivisit(tgt, cdoc, stack + [name])
+        icolor[name] = IBLACK
+
+    if root_name:
+        ivisit(root_name, merged, [])
+    return errors
+
+
+def node_io(node):
+    """Per-node IO contract recorded on the manifest step it is produced by
+    (consumed by check-step-io, the dispatcher's post-step validator):
+      - schema  — the node's EFFECTIVE output schema: an explicit node-level
+        output_schema wins, else a use: node's resolved microskill schema
+        stashed on _exec_schema by classify() (the SAME rule node_call_js
+        bakes into the agent()/runMicroskill call); null when neither exists.
+      - guarded — the node carries a `when` guard, so a stored null result is
+        a LEGAL skip (an UNGUARDED null/{} against a required-props schema is
+        the truncation/fabrication signature check-step-io hard-fails on).
+      - fan_out — the node fans out over for_each, so the stored result is an
+        ARRAY of schema-shaped items.
+    Pure function of the merged doc + resolution → deterministic; rides inside
+    the manifest dict, hence inside manifest_hash."""
+    return {
+        "schema": node.get("output_schema") or node.get("_exec_schema"),
+        "guarded": bool(node.get("when")),
+        "fan_out": bool(node.get("for_each")),
+    }
+
+
 def rel(p):
     """Display path relative to project root when possible, else absolute."""
     try:
@@ -323,12 +945,74 @@ def rank_partition(seg_nodes):
     return [layers[k] for k in sorted(layers)]
 
 
+def partition_md(name, profile_used, manifest_steps, classification, manifest_hash):
+    """Render .compiled/PARTITION.md (--annotate): a generated, human-readable
+    partition sidecar derived ONLY from data the compile already computed (the
+    same step sequence + per-node classification --explain prints). It replaces
+    the hand-maintained 'Seg N / Checkpoint' assertion comments in WORKFLOW.yaml
+    that nothing machine-checked. Pure function of its arguments → deterministic;
+    the embedded manifest_hash makes a stale sidecar detectable."""
+    lines = [
+        f"# Partition — {name} (profile: {profile_used})",
+        "",
+        "> GENERATED by `compile-workflow --annotate` from the compiled plan (the",
+        "> same data `--explain` prints). Do not edit — recompile with `--annotate`",
+        "> after any def change. A plain compile removes a stale copy.",
+        "",
+        f"manifest_hash: `{manifest_hash}`",
+        "",
+        "## Step sequence",
+        "",
+    ]
+    for i, s in enumerate(manifest_steps, 1):
+        if s["kind"] == "segment":
+            label = f"segment[{','.join(s['nodes'])}]"
+            if s.get("is_loop"):
+                label += " (loop body)"
+        else:
+            ctype = s.get("checkpoint_type", "checkpoint")
+            if ctype == "gate":
+                g = s.get("gate", {})
+                label = (f"gate:{g.get('id', '?')} ({g.get('type', '?')}, "
+                         f"severity {g.get('severity', 'hard')})")
+            elif ctype == "nested_workflow":
+                label = f"nested_workflow:{s.get('node', '?')} -> {s.get('workflow', '?')}"
+            else:
+                label = f"{ctype}:{s.get('node', '?')}"
+        lines.append(f"{i}. {label}")
+    lines += ["", "## Node classification", "",
+              "| node | class | reason | executor |",
+              "|---|---|---|---|"]
+    for c in classification:
+        ex = c.get("executor") or {}
+        exs = ", ".join(f"{k}={ex[k]}" for k in ("profile", "agent", "model")
+                        if ex.get(k)) or "-"
+        lines.append(f"| {c['node']} | {c['class']} | {c['reason']} | {exs} |")
+    return "\n".join(lines) + "\n"
+
+
+def node_override_pairs(customize):
+    """Canonical `<dotted>=<value>` override pairs for a node's customize.overrides
+    map, sorted by path for determinism. Values are serialized via json.dumps —
+    JSON is yaml.safe_load-round-trippable, so the resolver's --override parser
+    reconstructs the EXACT typed value (a string 'yes' stays a string, never the
+    YAML 1.1 boolean). ONE serialization feeds BOTH resolution paths: the
+    classify-time resolver subprocess (whose stdout becomes the frozen payload)
+    and the baked execution-time --inject-only command line — identical by
+    construction."""
+    overrides = (customize or {}).get("overrides") or {}
+    return [f"{k}={json.dumps(overrides[k])}" for k in sorted(overrides)]
+
+
 def resolve_microskill_directives(use_name, customize, defs_root):
     """Run resolve-microskill to read a use: node's allowed_tools + gates AND its
     fully-resolved (profile-merged, strip_nulls'd) output_schema. Returns a dict
-    {"directives": <dict|None>, "output_schema": <dict|None>}. Fail-safe: on any
-    failure return {"directives": None, "output_schema": None} (caller treats a
-    None directives as orchestrator).
+    {"directives": <dict|None>, "output_schema": <dict|None>,
+     "payload": <the FULL parsed resolver stdout|None>, "error": <str|None>}.
+    `payload` feeds the compile-closure freeze (.compiled/resolved/<node-id>.json).
+    On any failure `directives` is None and `error` carries the diagnostic — the
+    caller (classify) turns that into a HARD compile error (fail-loud: a typo'd
+    use: target must never silently mutate the partition).
 
     skill-root is derived as the sibling `microskills/` of the defs root so a
     hermetic tmp world resolves its own microskills; for the real runtime this is
@@ -337,45 +1021,101 @@ def resolve_microskill_directives(use_name, customize, defs_root):
     cmd = [str(RESOLVE_SCRIPT), use_name]
     if profile:
         cmd += ["--profile", str(profile)]
+    # customize.overrides ride into the SAME resolution classify consumes and the
+    # freeze records: an override exposing AskUserQuestion deterministically
+    # reclassifies the node to orchestrator, and the frozen payload (this
+    # subprocess's stdout) carries the overridden config/body — the classify path
+    # and the baked runMicroskill path cannot diverge.
+    for pair in node_override_pairs(customize):
+        cmd += ["--override", pair]
     skill_root = Path(defs_root).parent / "microskills"
     cmd += ["--skill-root", str(skill_root)]
-    fail = {"directives": None, "output_schema": None}
+    # COMPILE-TIME resolution never EXECUTES inject_from sources (env reads,
+    # git config, arbitrary `command:` shell are execution-time concerns —
+    # the baked `--inject-only` call applies them in the segment). This keeps
+    # the compile path side-effect-free AND the frozen payload a pure function
+    # of registry bytes + profile: the resolver computes its required-input
+    # ledger and Inputs-table rewrite from DECLARED inject_from presence, so
+    # the same def compiles byte-identically whether or not the compile
+    # machine's env could satisfy the sources.
+    cmd += ["--skip-inject"]
+    fail = {"directives": None, "output_schema": None, "payload": None, "error": None}
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, cwd=str(PROJECT_ROOT))
-    except Exception:
+    except Exception as e:
+        fail["error"] = f"resolver invocation failed: {e}"
         return fail
+    # rc 1 is accepted only to read the resolver's structured diagnostics:
+    # under --skip-inject a rc-1 payload never carries directives (inject
+    # failure — the one rc-1-with-full-payload case — cannot occur at compile
+    # time), so it always dies at the directives-None check below.
     if proc.returncode not in (0, 1):
+        try:
+            msg = (json.loads(proc.stdout) or {}).get("error")
+        except Exception:
+            msg = None
+        fail["error"] = msg or f"resolver exited {proc.returncode}"
         return fail
     try:
         data = json.loads(proc.stdout)
     except Exception:
+        fail["error"] = "resolver produced unparseable output"
+        return fail
+    if data.get("directives") is None:
+        fail["error"] = data.get("error") or "resolver returned no directives"
         return fail
     return {"directives": data.get("directives"),
-            "output_schema": data.get("output_schema")}
+            "output_schema": data.get("output_schema"),
+            "payload": data,
+            "error": None}
 
 
 def classify(node, gates_after, defs_root):
     """Return (class, reason) where class is 'orchestrator' or 'background' and
     reason is a short human string explaining WHY. The reason is surfaced only
     under --explain; the class drives partitioning exactly as before. (side_effect
-    is already normalized to delegation: orchestrator before this is called.)"""
+    is already normalized to delegation: orchestrator before this is called.)
+
+    FAIL-LOUD governance — no silent partition mutation:
+    - a use: node whose microskill fails to resolve is a HARD compile error
+      (the old fail-safe silently became an orchestrator checkpoint that DROPPED
+      the use: field). Escape hatch: explicit `delegation: orchestrator` — it
+      returns before resolution, so the author owns the checkpoint.
+    - `delegation: auto` on a use: node still RUNS resolution (the emit needs the
+      stashed _exec_* executor identity and the inherited schema) and DIES when
+      the resolved microskill exposes AskUserQuestion or carries a hard gate —
+      auto can keep a clean microskill in a background segment, never force an
+      interactive one there.
+    - `delegation: auto` on a workflow: node or an orchestrator-native step
+      (neither use nor agent) is a HARD error: neither can run in a segment."""
+    nid = node.get("id", "?")
     deleg = node.get("delegation")
     if deleg == "orchestrator":
         return "orchestrator", "explicit delegation:orchestrator"
-    if deleg == "auto":
-        return "background", "explicit delegation:auto"
     # A nested-workflow node is always an orchestrator checkpoint (background
     # segments can't re-enter the dispatcher). Classify it BEFORE use/agent so it
-    # never reaches microskill resolution.
+    # never reaches microskill resolution. delegation: auto cannot override this.
     if node.get("workflow"):
+        if deleg == "auto":
+            die(f"node '{nid}': delegation: auto on a workflow: node is invalid — "
+                f"a nested workflow always runs as an orchestrator checkpoint "
+                f"(background segments cannot re-enter the dispatcher)", 1)
         return "orchestrator", f"nested workflow: {node['workflow']}"
     has_use = bool(node.get("use"))
     has_agent = bool(node.get("agent"))
     if not has_use and not has_agent:
+        if deleg == "auto":
+            die(f"node '{nid}': delegation: auto on a node with neither use nor "
+                f"agent is invalid — an orchestrator-native step has no "
+                f"background executor", 1)
         return "orchestrator", "orchestrator-native step (neither use nor agent)"
     if has_agent:
+        if deleg == "auto":
+            return "background", "explicit delegation:auto"
         return "background", "agent node -> background (autonomous)"
-    # use: microskill — inspect resolved directives (fail-safe → orchestrator)
+    # use: microskill — ALWAYS resolve (even under delegation: auto): the emit
+    # needs the executor identity, and an interactive microskill must never end
+    # up inside a background segment.
     resolved = resolve_microskill_directives(node["use"], node.get("customize"), defs_root)
     directives = resolved["directives"]
     # Stash the executor identity so node_call_js can bake it into the runMicroskill
@@ -387,13 +1127,33 @@ def classify(node, gates_after, defs_root):
     # deleted the schema (output_schema: null) resolves to None here, so the
     # deleted schema is NOT resurrected — inheritance is a default-for-ABSENT only.
     node["_exec_schema"] = resolved["output_schema"]
+    # Stash the FULL resolver payload so the emit can FREEZE it to
+    # .compiled/resolved/<node-id>.json (the compile closure: the emitted
+    # runMicroskill Reads the frozen bytes at run time instead of re-shelling
+    # the resolver against a possibly-drifted registry).
+    node["_resolved_payload"] = resolved.get("payload")
     if directives is None:
-        return "orchestrator", f"use: {node['use']} resolution failed (fail-safe -> orchestrator)"
+        die(f"node '{nid}': use: '{node['use']}' failed to resolve "
+            f"({resolved.get('error') or 'resolution failed'}). Fix the microskill "
+            f"name/registry, or mark the node `delegation: orchestrator` explicitly "
+            f"if an orchestrator checkpoint is intended.", 1)
     if "AskUserQuestion" in (directives.get("allowed_tools") or []):
+        if deleg == "auto":
+            die(f"node '{nid}': delegation: auto would force use: '{node['use']}' "
+                f"into a background segment, but its resolved allowed_tools "
+                f"exposes AskUserQuestion — a background subagent cannot ask a "
+                f"human and will silently fabricate. Remove delegation: auto.", 1)
         return "orchestrator", f"use: {node['use']} exposes AskUserQuestion"
     for g in directives.get("gates") or []:
         if g.get("severity", "hard") == "hard":
+            if deleg == "auto":
+                die(f"node '{nid}': delegation: auto would force use: '{node['use']}' "
+                    f"into a background segment, but it carries hard gate "
+                    f"'{g.get('id', '?')}' — a background segment cannot pause for "
+                    f"approval. Remove delegation: auto.", 1)
             return "orchestrator", f"use: {node['use']} carries a hard gate forces checkpoint"
+    if deleg == "auto":
+        return "background", "explicit delegation:auto"
     return "background", f"use: {node['use']} -> background (autonomous)"
 
 
@@ -507,9 +1267,36 @@ def node_call_js(node, seg_var_ids, indent="  ", declare=True, track_ran=False, 
             exec_extra += f', agentType: {json.dumps(node["_exec_agent"])}'
         if node.get("_exec_model"):
             exec_extra += f', model: {json.dumps(node["_exec_model"])}'
+        # Frozen-resolution reference (compile closure): the project-root-relative
+        # path runMicroskill READS at run time — no runtime resolver shell-out, so
+        # a registry edit mid-run can never change the executed body.
+        if node.get("_resolved_path"):
+            exec_extra += f', resolved: {json.dumps(node["_resolved_path"])}'
+        # inject: true only when the resolved config carries inject_from inputs —
+        # the segment then runs `resolve-microskill --inject-only` at execution
+        # time (env-dependent values are excluded from the frozen payload).
+        if node.get("_inject"):
+            exec_extra += ', inject: true'
+            # The execution-time --inject-only command must carry the SAME
+            # customize.overrides the compile-time resolution carried (an override
+            # can retarget inject_from). Baked as ONE pre-escaped string —
+            # shlex.quote, because the subagent pastes it into a Bash line.
+            pairs = node_override_pairs(node.get("customize"))
+            if pairs:
+                flags = "".join(" --override " + shlex.quote(p) for p in pairs)
+                exec_extra += f', overrideFlags: {json.dumps(flags)}'
         raw = (f'runMicroskill({json.dumps(node["use"])}, {{ '
                f'profile: {json.dumps(profile)}, inputs: {inputs_js}, '
                f'schema: {schema_js}, phase: {json.dumps(phase)}{exec_extra} }})')
+
+    # Bounded node retry: wrap the raw call in withRetry(..., N) — the helper is
+    # emitted into the segment only when a retry: node is present. Wrapping the
+    # PER-CALL expression means a for_each fan-out retries per ITEM, and a
+    # when-guard still short-circuits OUTSIDE the retry (a skipped node is never
+    # retried). Boundedness mirrors loop.max_iters.
+    retry = node.get("retry")
+    if retry:
+        raw = f"withRetry(() => {raw}, {int(retry['max_attempts'])})"
 
     # for_each → fan out over a collection; `as` names the per-item var, which
     # ${<as>} refs resolve to (translate_ref leaves bare identifiers untouched).
@@ -555,12 +1342,20 @@ def node_call_js(node, seg_var_ids, indent="  ", declare=True, track_ran=False, 
 
 HELPERS_JS = r"""
 // --- node runtimes (identical to the proven spike templates) ---
-async function runMicroskill(name, { profile = 'base', inputs = {}, schema, phase, agentType, model } = {}) {
+// runMicroskill READS the compile-frozen resolver payload (resolved) instead of
+// shelling the resolver — the executed body is pinned at compile time, so a
+// registry edit mid-run can never change it. Only the env-dependent inject_from
+// values (inject: true) are resolved at execution time via --inject-only.
+async function runMicroskill(name, { profile = 'base', inputs = {}, schema, phase, agentType, model, resolved, inject } = {}) {
   const lines = Object.entries(inputs).map(([k, v]) => `- ${k}: ${JSON.stringify(v)}`).join('\n')
+  const injectLine = inject
+    ? `\n   First run via Bash from the project root: .claude/scripts/resolve-microskill ${name} --profile ${profile} --inject-only — parse its stdout JSON and treat injected_inputs as additional caller inputs.`
+    : ''
   return agent(
     `Execute the microskill "${name}".
-1. Run via Bash from the project root: .claude/scripts/resolve-microskill ${name} --profile ${profile}
-2. Parse stdout JSON. Execute rendered_skill_body, honoring directives.allowed_tools and gates.
+1. Read the FROZEN resolver payload at this project-root-relative path: ${resolved}
+   (frozen at compile time — do NOT shell the resolver for it). Parse it as JSON.
+2. Execute rendered_skill_body, honoring directives.allowed_tools and gates.${injectLine}
 3. Caller inputs:\n${lines}
 4. If a required input or decision is missing, FAIL with an error — do NOT invent an answer.
 5. Return ONLY the structured object matching the required schema. No prose.`,
@@ -572,6 +1367,21 @@ async function runAgent(agentType, prompt, schema, phase, label) {
 }
 function __ref(v) { return typeof v === 'string' ? v : JSON.stringify(v) }
 """.strip("\n")
+
+# Variant of HELPERS_JS used ONLY by a segment that contains an inject-carrying
+# use: node WITH customize.overrides: the execution-time `--inject-only` resolver
+# call must carry the same overrides the compile-time resolution (and frozen
+# payload) carried. DERIVED from HELPERS_JS by exact string surgery so the two
+# texts can never drift; override-free segments keep the base text byte-identical.
+HELPERS_JS_WITH_OVERRIDE_FLAGS = HELPERS_JS.replace(
+    "model, resolved, inject } = {}",
+    "model, resolved, inject, overrideFlags = '' } = {}",
+).replace(
+    "--profile ${profile} --inject-only",
+    "--profile ${profile}${overrideFlags} --inject-only",
+)
+assert "overrideFlags = ''" in HELPERS_JS_WITH_OVERRIDE_FLAGS, "HELPERS_JS drifted: overrideFlags surgery missed"
+assert "${overrideFlags} --inject-only" in HELPERS_JS_WITH_OVERRIDE_FLAGS, "HELPERS_JS drifted: inject-line surgery missed"
 
 # Emitted ONLY into a segment that has a max_parallel for_each node. Built solely
 # on the host `parallel()` global + Array.slice — no Promise.allSettled, no timers.
@@ -585,6 +1395,33 @@ async function parallelChunked(thunks, k) {
     for (const r of batch) out.push(r)
   }
   return out
+}
+""".strip("\n")
+
+# Emitted ONLY into a segment that has a retry: node (PARALLEL_CHUNKED_JS
+# precedent), so retry-free defs compile byte-identically. HOST CONTRACT
+# (observed behavior, pinned by tests — see DAG-RULES §12 'Host-contract
+# evidence'): terminal subagent API errors surfaced live (2026-06-10) as NULL
+# RETURNS in the parallel() results, not catchable throws; throws are also
+# possible per the host docs — so BOTH a thrown rejection AND a null/undefined
+# return count as a failed attempt. After exhausting max_attempts the FINAL
+# attempt's native failure shape is reproduced exactly — return the
+# null/undefined, or rethrow the error — never re-rolled, never fabricated
+# into valid output.
+WITH_RETRY_JS = r"""
+async function withRetry(thunk, maxAttempts) {
+  // Retry on a thrown rejection AND on a null/undefined return (the native
+  // engine's usual failure shape for a failed agent() call). On exhaustion,
+  // reproduce the final attempt's failure exactly: rethrow / return as-is.
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const result = await thunk()
+      if (result !== null && result !== undefined) return result
+      if (attempt >= maxAttempts) return result
+    } catch (e) {
+      if (attempt >= maxAttempts) throw e
+    }
+  }
 }
 """.strip("\n")
 
@@ -625,9 +1462,34 @@ def emit_segment_js(seg_nodes, wf, loop, seg_index):
             f"  description: {json.dumps('Compiled segment ' + str(seg_index) + ' of ' + wf['name'])},\n"
             f"  phases: [{phases}],\n}}\n\n")
 
-    guard = ("// Workflow args arrives as a JSON string — parse it.\n"
+    # FAIL-LOUD args guard. The native engine passes args as a JSON string and
+    # silently TRUNCATES oversized payloads (~37KB observed live); the old guard
+    # swallowed the wreckage into `_args = {}`, letting every downstream deref
+    # read `undefined` and fabricate. Now: a parse failure THROWS, and every
+    # per-segment needed key must be PRESENT — presence, not truthiness: a `null`
+    # from a guarded-skip upstream node (or a carry seed) is legal; an ABSENT key
+    # means truncation or a caller omission.
+    needs_dict = {
+        "wf_inputs": sorted(needs.wf_inputs),
+        "nodes": sorted(needs.nodes),
+        "carry": sorted(needs.carry),
+    }
+    need_keys = ([f"wf_{n}" for n in needs_dict["wf_inputs"]]
+                 + list(needs_dict["nodes"])
+                 + [f"carry_{v}" for v in needs_dict["carry"]])
+    guard = ("// Workflow args arrives as a JSON string — parse it. FAIL LOUD: never\n"
+             "// degrade a malformed/truncated payload to {} (silent downstream fabrication).\n"
              "let _args = args\n"
-             "if (typeof _args === 'string') { try { _args = JSON.parse(_args) } catch (e) { _args = {} } }\n\n")
+             "if (typeof _args === 'string') {\n"
+             "  try { _args = JSON.parse(_args) } catch (e) {\n"
+             "    throw new Error('workflow args is not valid JSON (truncated payload?): ' + e.message)\n"
+             "  }\n"
+             "}\n")
+    if need_keys:
+        guard += ("// Every needed key must be DEFINED (null is legal — presence, not truthiness).\n"
+                  f"const __missing = {json.dumps(need_keys)}.filter((k) => !_args || typeof _args !== 'object' || !(k in _args))\n"
+                  "if (__missing.length) throw new Error('workflow args is missing required key(s): ' + __missing.join(', '))\n")
+    guard += "\n"
 
     body = ""
     produces = list(seg_ids)
@@ -685,17 +1547,20 @@ def emit_segment_js(seg_nodes, wf, loop, seg_index):
         ret = "{ " + ", ".join(f"{json.dumps(i)}: {jsvar(i)}" for i in seg_ids) + " }"
         body = calls + f"\nreturn {ret}\n"
 
-    # The parallelChunked helper is appended ONLY when this segment has a
-    # max_parallel for_each node, so a segment without one stays byte-identical.
+    # Helper selection is strictly CONDITIONAL so segments that use none of the
+    # optional machinery stay byte-identical: the overrideFlags-aware runMicroskill
+    # variant only when an inject-carrying node has customize.overrides; the
+    # parallelChunked helper only for a max_parallel for_each node; the withRetry
+    # helper only for a retry: node. Fixed append order keeps output deterministic.
     helpers = HELPERS_JS
+    if any(n.get("_inject") and ((n.get("customize") or {}).get("overrides"))
+           for n in seg_nodes):
+        helpers = HELPERS_JS_WITH_OVERRIDE_FLAGS
     if any(n.get("max_parallel") is not None and n.get("for_each") for n in seg_nodes):
-        helpers = HELPERS_JS + "\n" + PARALLEL_CHUNKED_JS
+        helpers = helpers + "\n" + PARALLEL_CHUNKED_JS
+    if any(n.get("retry") for n in seg_nodes):
+        helpers = helpers + "\n" + WITH_RETRY_JS
     js = head + helpers + "\n\n" + guard + body
-    needs_dict = {
-        "wf_inputs": sorted(needs.wf_inputs),
-        "nodes": sorted(needs.nodes),
-        "carry": sorted(needs.carry),
-    }
     return js, needs_dict, produces
 
 
@@ -704,15 +1569,63 @@ def main():
     ap.add_argument("name", help="Workflow name (subdir under --defs-root).")
     ap.add_argument("--profile", default=None)
     ap.add_argument("--override", action="append", default=[])
+    ap.add_argument("--node-override", action="append", default=[],
+                    help="Node-addressable per-run override "
+                         "'<node-id>:<dotted.path>=<value>' merged into that node's "
+                         "customize.overrides (use: nodes only) post-merge / "
+                         "pre-validation — the CLI twin of customize.overrides. "
+                         "Value parses exactly like --override (YAML; leading-'#' "
+                         "stays a literal string). Repeatable; later flags win on "
+                         "the same node+path.")
+    ap.add_argument("--gate-mode", choices=["auto", "interactive"], default=None,
+                    help="Gate policy for this compile. 'auto' (headless) stamps "
+                         "gate_mode: auto into the manifest (inside manifest_hash) "
+                         "so the dispatcher takes each gate's declared default and "
+                         "records it verbatim — and the compile dies loud when a "
+                         "pausing gate has neither a default nor on_headless: fail. "
+                         "The merged doc's own gate_mode (profile-declarable) WINS "
+                         "over this flag, so a child profile-declared mode beats "
+                         "parent inheritance. Omitted/'interactive' → nothing is "
+                         "stamped (existing defs stay byte-identical). The "
+                         "MICROSKILLS_HEADLESS=1 env signal is read by the "
+                         "DISPATCHER (which passes this flag), never here — compile "
+                         "output stays a pure function of argv + files.")
     ap.add_argument("--defs-root", default=str(DEFAULT_DEFS_ROOT))
     ap.add_argument("--plan", action="store_true",
                     help="Dry-run: compute and print the full plan but write NOTHING to "
-                         ".compiled/ (no mkdir, no stale-clean, no seg files, no manifest).")
+                         ".compiled/ (no mkdir, no stale-clean, no seg files, no manifest). "
+                         "The printed summary embeds the FULL manifest object (steps, "
+                         "gates, inputs, provenance) since no manifest.json is written.")
     ap.add_argument("--explain", action="store_true",
-                    help="Add per-node classification reasons, de-anonymize the sequence "
-                         "summary, and surface manifest_hash. Output-only — never changes "
-                         "the emitted segment bytes.")
+                    help="Add per-node classification reasons + executor identity "
+                         "{profile, agent, model}, per-node semantic fingerprint "
+                         "detail, every wire: auto-materialized input pair, and "
+                         "de-anonymize the sequence summary. "
+                         "Output-only — never changes the emitted bytes "
+                         "(manifest_hash is always emitted regardless).")
+    ap.add_argument("--lock", action="store_true",
+                    help="Also write <def-dir>/closure.lock.json (hash-only closure "
+                         "baseline: name, profile_used, manifest_hash, "
+                         "node_fingerprints) — commit it as the CI drift baseline.")
+    ap.add_argument("--check", action="store_true",
+                    help="Recompile in memory (write NOTHING) and fail loud when the "
+                         "computed closure drifts from the committed "
+                         "closure.lock.json. The CI registry-drift gate.")
+    ap.add_argument("--annotate", action="store_true",
+                    help="Also write .compiled/PARTITION.md — a generated, human-readable "
+                         "partition sidecar (step sequence + per-node classification, the "
+                         "same data --explain prints). Replaces hand-maintained "
+                         "Seg/Checkpoint assertion comments; a plain compile removes a "
+                         "stale sidecar. Never changes manifest/segment bytes.")
     args = ap.parse_args()
+
+    if args.lock and (args.plan or args.check):
+        die("--lock writes artifacts and cannot combine with --plan or --check", 1)
+    if args.annotate and (args.plan or args.check):
+        die("--annotate writes artifacts and cannot combine with --plan or --check", 1)
+    # --check is read-only by construction: like --plan it computes the full plan
+    # but writes nothing (CI must never dirty the checkout it is gating).
+    do_write = not (args.plan or args.check)
 
     defs_root = Path(args.defs_root).resolve()
     def_dir = defs_root / args.name
@@ -749,18 +1662,79 @@ def main():
         path, _, val = ov.partition("=")
         apply_override(wf, path.strip(), val.strip())
 
+    # --node-override <node-id>:<dotted>=<value> — node-addressable per-run
+    # overrides, applied POST-merge (profiles + --override already in) and
+    # PRE-validation (the closed customize schema and the use:-only placement
+    # check below still see the injected shape). Each flag merges one entry into
+    # the named node's customize.overrides, exactly as if it were authored in
+    # YAML — so it rides the SAME two resolution paths. (--override cannot
+    # address nodes: a dotted path through the nodes LIST clobbers it.)
+    for nov in args.node_override:
+        spec, eq, val = nov.partition("=")
+        nid, colon, dotted = spec.partition(":")
+        nid, dotted = nid.strip(), dotted.strip()
+        if not eq or not colon or not nid or not dotted:
+            die(f"malformed --node-override (expected "
+                f"'<node-id>:<dotted.path>=<value>'): {nov}", 1)
+        target = next((n for n in (wf.get("nodes") or [])
+                       if isinstance(n, dict) and n.get("id") == nid), None)
+        if target is None:
+            die(f"--node-override names unknown node '{nid}'", 1)
+        cust = target.setdefault("customize", {})
+        if not isinstance(cust, dict):
+            die(f"node '{nid}': customize is not a mapping; cannot apply "
+                f"--node-override", 1)
+        ovr = cust.setdefault("overrides", {})
+        if not isinstance(ovr, dict):
+            die(f"node '{nid}': customize.overrides is not a mapping; cannot "
+                f"apply --node-override", 1)
+        ovr[dotted] = parse_override_value(val.strip())
+
     wf = strip_nulls(wf)
 
-    # --- INTRA-DEF VARS: double-brace {{key}} pre-pass (Phase 5b) ---
-    # Substitute {{key}} tokens throughout the merged doc from the top-level vars:
-    # map, using the SAME substitute_vars resolve-microskill already ships. Runs
-    # AFTER deep-merge + strip_nulls (so a profile may override a var) and BEFORE
-    # schema validation. Pure textual pre-compile transform → deterministic; a
-    # workflow with no vars: leaves every string byte-identical. An unresolved
-    # {{key}} is left intact and recorded (warned), consistent with resolve-microskill.
-    wf, unresolved_vars = apply_workflow_vars(wf)
+    # --- INTRA-DEF VARS: {{snippet:NAME}} includes, then {{key}} vars (Phase 5b) ---
+    # Substitute {{snippet:NAME}} tokens from <defs-root>/_snippets/NAME.md FIRST
+    # (so a snippet body may carry vars), then {{key}} tokens from the top-level
+    # vars: map, using the SAME substitute_vars resolve-microskill already ships.
+    # Runs AFTER deep-merge + strip_nulls (so a profile may override a var) and
+    # BEFORE schema validation. Pure textual pre-compile transform → deterministic;
+    # snippet files join the compile input set exactly like profile overlays. An
+    # unresolved {{key}} is left intact and recorded (warned), consistent with
+    # resolve-microskill; an unresolved SNIPPET is a HARD block (a missing include
+    # must never ship a literal token into a compiled prompt).
+    wf, unresolved_vars, snippet_errors = apply_workflow_vars(
+        wf, snippets_dir=defs_root / "_snippets")
+    if snippet_errors:
+        die("unresolvable {{snippet:...}} include(s)", 1, snippet_errors=snippet_errors)
     for _uk in unresolved_vars:
         sys.stderr.write(f"warning: unresolved workflow var '{_uk}' left intact\n")
+
+    # --- COMPILE-TIME EXPAND: static fan-out templates (shared desugar) ---
+    # Immediately after the vars pre-pass and BEFORE schema validation (placement is
+    # load-bearing: the closed node schema never sees the expand:/inputs_each:
+    # sugar). Generated nodes are ordinary use:/agent: nodes classified after
+    # expansion; profile merge already ran, so overlays customize the fan-out by
+    # patching the template's over list only.
+    wf, expand_errors = expand_static_fanout(wf)
+    if expand_errors:
+        die("expand: desugar failed", 1, expand_errors=expand_errors)
+
+    # --- FAIL-LOUD: reserved wf_ node-id prefix (defense in depth with the
+    # schema pattern + validate's block — the 1.1 fail-loud pattern). A
+    # ${workflow.inputs.<x>} ref translates to `_args.wf_<x>` (translate_ref),
+    # and run-step builds the same wf_<name> keys into segment args and
+    # checkpoint contexts — so a node id matching ^wf_ silently clobbers (or is
+    # clobbered by) a workflow input in the threaded args. Runs AFTER the
+    # expand desugar (a template id `wf` + over item `x` GENERATES `wf_x`) and
+    # BEFORE schema validation, so the named error wins over the generic
+    # pattern message.
+    for _n in wf.get("nodes") or []:
+        if isinstance(_n, dict) and isinstance(_n.get("id"), str) \
+                and _n["id"].startswith("wf_"):
+            die(f"node id '{_n['id']}' uses the reserved 'wf_' prefix — it "
+                f"collides with the workflow-input args namespace "
+                f"(${{workflow.inputs.<x>}} rides as _args.wf_<x> in compiled "
+                f"segments and the run-step context); rename the node", 1)
 
     # An OMITTED version defaults to 1 BEFORE schema validation (the const:1 check
     # stays intact, so an EXPLICIT wrong version still blocks). Mirrors the
@@ -769,20 +1743,91 @@ def main():
 
     if not SCHEMA_PATH.exists():
         die(f"workflow schema not found: {SCHEMA_PATH}", 1)
-    schema = json.loads(SCHEMA_PATH.read_text())
+    schema_bytes = SCHEMA_PATH.read_bytes()
+    # Provenance of the VALIDATING schema (the four-way _templates_root fallback
+    # means different environments may validate against different bytes). Recorded
+    # in the manifest, OUTSIDE manifest_hash — see the hash comment below.
+    schema_sha256 = hashlib.sha256(schema_bytes).hexdigest()
+    schema = json.loads(schema_bytes)
     errs = sorted(Draft202012Validator(schema).iter_errors(wf), key=lambda e: list(e.path))
     if errs:
         msgs = ["schema " + ("/".join(str(x) for x in e.path) or "<root>") + ": " + e.message for e in errs]
         die("merged workflow fails schema validation", 1, schema_errors=msgs)
 
+    # --- Declared gate policy (shared helpers with validate-workflow) ---
+    # Mode-independent coherence first: a declared default must be one of the
+    # gate's effective options; on_headless: take_default needs a default.
+    gp_errs = gate_policy_errors(wf.get("gates"))
+    if gp_errs:
+        gid, gmsg = gp_errs[0]
+        die(f"gate '{gid}': {gmsg}", 1)
+
+    # Effective gate mode: the merged doc's declared gate_mode (a profile overlay
+    # may set it — e.g. the autonomous profiles) WINS over the --gate-mode flag
+    # (the parent-dispatcher inheritance channel), which wins over the
+    # interactive default. Under auto, a pausing gate that can neither take a
+    # declared default nor legitimately stop (on_headless: fail) dies HERE —
+    # before any work — rather than stranding a headless run at AskUserQuestion.
+    effective_gate_mode = wf.get("gate_mode") or args.gate_mode or "interactive"
+    if effective_gate_mode == "auto":
+        gh_errs = gate_headless_errors(wf.get("gates"))
+        if gh_errs:
+            gid, gmsg = gh_errs[0]
+            die(f"gate '{gid}': {gmsg}", 1)
+
+    # --- FAIL-LOUD: nested-workflow depth<=1 + import-cycle (shared helper) ---
+    # The dispatcher's bounded-recursion contract ("the child contains no
+    # further nested call") is guaranteed by the COMPILER, not only by an
+    # optional validate --defs-root pass: the shared
+    # nested_workflow_depth_cycle_errors helper walks the import graph
+    # reachable from this def and dies on a depth-2 nesting or an import
+    # cycle before any emit. The die carries ALL findings (a cycle world
+    # usually also trips the depth check — report both, name everything).
+    nw_errs = nested_workflow_depth_cycle_errors(defs_root, wf)
+    if nw_errs:
+        die("nested-workflow depth/import-cycle check failed", 1,
+            nested_workflow_errors=[
+                {"location": loc, "message": msg} for loc, msg in nw_errs])
+
     nodes = wf.get("nodes") or []
 
     # side_effect: true is a readable alias for delegation: orchestrator. Normalize
     # it BEFORE classify so the node classifies as an orchestrator checkpoint. An
-    # explicit delegation already present wins (side_effect only sets the default).
+    # explicit delegation: orchestrator already present is a no-op; an explicit
+    # delegation: auto CONTRADICTS the alias (the side-effect node would silently
+    # run in a background segment) — fail loud instead of letting one win.
     for n in nodes:
         if isinstance(n, dict) and n.pop("side_effect", None) is True:
+            if n.get("delegation") == "auto":
+                die(f"node '{n.get('id', '?')}': side_effect: true contradicts "
+                    f"delegation: auto — a side-effect node must run as an "
+                    f"orchestrator checkpoint; remove one of the two fields", 1)
             n.setdefault("delegation", "orchestrator")
+
+    # FAIL-LOUD: customize.overrides override the microskill's RESOLUTION, so
+    # they are meaningful ONLY on a use: node that actually resolves. Anywhere
+    # else they would be silently ignored — the exact hole this feature closes —
+    # so die instead: on workflow:/agent:/orchestrator-native nodes (no
+    # resolution exists) and on a use: node under explicit
+    # delegation: orchestrator (the escape hatch SKIPS resolution).
+    for n in nodes:
+        if not isinstance(n, dict):
+            continue
+        if not ((n.get("customize") or {}).get("overrides") or {}):
+            continue
+        nid = n.get("id", "?")
+        if not n.get("use"):
+            kind = ("a workflow: node" if n.get("workflow")
+                    else "an agent: node" if n.get("agent")
+                    else "an orchestrator-native step")
+            die(f"node '{nid}': customize.overrides is only valid on a use: "
+                f"microskill node (it overrides the microskill's resolved "
+                f"config); this is {kind}, where it would be silently ignored", 1)
+        if n.get("delegation") == "orchestrator":
+            die(f"node '{nid}': customize.overrides cannot take effect under "
+                f"explicit delegation: orchestrator — that escape hatch skips "
+                f"microskill resolution, so the overrides would be silently "
+                f"ignored; remove one of the two", 1)
 
     node_by_id = {n["id"]: n for n in nodes}
     loop = wf.get("loop")
@@ -815,12 +1860,183 @@ def main():
     if contig_err:
         die(contig_err, 1)
 
+    # --- classify every node ONCE, in topological order ---
+    # classify() stashes _exec_* on use: nodes (consumed by the emit) and DIES on
+    # the fail-loud governance violations (unresolvable use:, delegation: auto on
+    # an interactive microskill), so it runs BEFORE the loop-body check, the
+    # partition, and any disk write. The per-node record (node id → class +
+    # reason) is surfaced only under --explain; it never affects emitted bytes.
+    classes = {}
+    classification = []
+    for nid in order:
+        node = node_by_id[nid]
+        klass, reason = classify(node, gates_after, defs_root)
+        classes[nid] = klass
+        # Executor identity per node (surfaced only under --explain): for a use:
+        # node these are EXACTLY the literals node_call_js bakes into the
+        # runMicroskill call (profile opt + agentType/model from the stashed
+        # _exec_*); for an agent: node the agent type itself (model rides the
+        # agent definition at run time); null fields where not applicable.
+        if node.get("use"):
+            executor = {"profile": (node.get("customize") or {}).get("profile", "base"),
+                        "agent": node.get("_exec_agent"),
+                        "model": node.get("_exec_model")}
+        elif node.get("agent"):
+            executor = {"profile": None, "agent": node.get("agent"), "model": None}
+        else:
+            executor = {"profile": None, "agent": None, "model": None}
+        classification.append({"node": nid, "class": klass, "reason": reason,
+                               "executor": executor})
+
+    # --- FAIL-LOUD: retry is background-only ---
+    # withRetry lives in compiled segment JS; an orchestrator-classified node
+    # never runs there, so its retry would be silently dropped. Die instead
+    # (validate blocks the statically-detectable subset; this also catches
+    # resolution-driven reclassification, e.g. an AskUserQuestion microskill).
+    for nid in order:
+        if node_by_id[nid].get("retry") and classes[nid] == "orchestrator":
+            r_reason = next((c["reason"] for c in classification if c["node"] == nid), "")
+            die(f"node '{nid}': retry is only valid on a background use:/agent: "
+                f"node, but this node classifies as an orchestrator checkpoint "
+                f"({r_reason}); retry lives in compiled segment JS and cannot "
+                f"wrap an orchestrator step", 1)
+
+    # --- FAIL-LOUD: no orchestrator-classified loop.body member ---
+    # The partition below flushes the open segment at every orchestrator node, so
+    # an orchestrator-classified body member would split the body across steps;
+    # the is_loop check (set(segment) == body) would then never match and the
+    # do/while scaffold would be SILENTLY dropped (loop runs exactly once). Die
+    # before any emit. (loop_contiguity_error cannot catch this: the member is IN
+    # the body, so the window contains no interleaved out-of-body node.)
+    if loop:
+        for b in (loop.get("body") or []):
+            if classes.get(b) == "orchestrator":
+                b_reason = next((c["reason"] for c in classification if c["node"] == b), "")
+                die(f"loop.body node '{b}' classifies as an orchestrator checkpoint "
+                    f"({b_reason}); a loop body must be entirely background — an "
+                    f"orchestrator member silently drops the do/while scaffold", 1)
+
+    # --- spill_outputs: declared node-output-by-reference (shared checks) ---
+    # Placement (no for_each fan-out), schema coherence (every spilled field
+    # must exist in the node's EFFECTIVE output schema — explicit wins, else
+    # the resolved microskill schema stashed on _exec_schema by classify), and
+    # the HARD guard block: a spilled field referenced in a when / for_each
+    # guard or the loop while/until would branch on a handoff file PATH, not
+    # the value. Shared helpers with validate-workflow — the tools can never
+    # disagree. The compile itself only RECORDS the declaration (the `spill`
+    # map on the producing manifest step below); the dispatcher's run-step
+    # kernel does the runtime writing/substitution.
+    sp_errs = spill_placement_errors(nodes)
+    if sp_errs:
+        sp_nid, sp_msg = sp_errs[0]
+        die(f"node '{sp_nid}': {sp_msg}", 1)
+    for nid in order:
+        node = node_by_id[nid]
+        spill = node.get("spill_outputs")
+        if not spill:
+            continue
+        ss_errs = spill_schema_errors(
+            nid, spill, node.get("output_schema") or node.get("_exec_schema"))
+        if ss_errs:
+            die(f"node '{nid}': {ss_errs[0]}", 1)
+    sg_errs = spill_guard_ref_errors(nodes, loop)
+    if sg_errs:
+        sg_loc, sg_msg = sg_errs[0]
+        die(f"{sg_loc}: {sg_msg}", 1)
+
+    # --- wire: auto — materialize declared pass-through forwards (pre-emit) ---
+    # Opt-in per node (shared helpers with validate-workflow): every input the
+    # node's TARGET declares (the resolved microskill profile config's inputs
+    # for a use: node — already resolved by classify, which DIED on an
+    # unresolvable target; the child WORKFLOW.yaml's declared inputs for a
+    # workflow: node — an unreadable child is a hard die here) that the node
+    # does not explicitly supply, and whose name exactly matches a declared
+    # workflow input, materializes as `inputs.<name>: ${workflow.inputs.<name>}`
+    # — byte-identical to the hand-written forward. Explicit always wins; wired
+    # pairs append after the explicit pairs in sorted name order. Runs AFTER
+    # classify and BEFORE the freeze/partition/emit so segments, nested
+    # checkpoints, needs, and fingerprints all see the materialized map — the
+    # sugar is fully desugared at compile time and never reaches the manifest
+    # as itself. A wired ref is ${workflow.inputs.*}-only, so it can never add
+    # a node edge or perturb the topo order computed above. Auto-wired pairs
+    # are surfaced under --explain; auto-satisfying a REQUIRED target input
+    # warns on stderr (collision risk on generic names like 'name').
+    auto_wired = {}
+    declared_wf_inputs = wf.get("inputs") if isinstance(wf.get("inputs"), dict) else {}
+    for nid in order:
+        node = node_by_id[nid]
+        if node.get("wire") != "auto":
+            continue
+        perr = wire_auto_placement_error(node)
+        if perr:
+            die(f"node '{nid}': {perr}", 1)
+        if node.get("workflow"):
+            child_path = defs_root / node["workflow"] / "WORKFLOW.yaml"
+            try:
+                child_doc = yaml.safe_load(child_path.read_text()) or {}
+            except OSError:
+                die(f"node '{nid}': wire: auto needs the child workflow's declared "
+                    f"inputs, but workflow: '{node['workflow']}' does not resolve "
+                    f"to {child_path}", 1)
+            except yaml.YAMLError as e:
+                die(f"node '{nid}': wire: auto needs the child workflow's declared "
+                    f"inputs, but '{node['workflow']}' WORKFLOW.yaml failed to "
+                    f"parse: {e}", 1)
+            target_inputs = (child_doc.get("inputs")
+                             if isinstance(child_doc.get("inputs"), dict) else {})
+        else:
+            payload = node.get("_resolved_payload") or {}
+            cfg = payload.get("config") if isinstance(payload.get("config"), dict) else {}
+            target_inputs = cfg.get("inputs") if isinstance(cfg.get("inputs"), dict) else {}
+        wired, required_wired = auto_wire_node_inputs(node, target_inputs, declared_wf_inputs)
+        if wired:
+            auto_wired[nid] = wired
+        for rname in required_wired:
+            sys.stderr.write(
+                f"warning: node '{nid}': wire: auto satisfied REQUIRED target input "
+                f"'{rname}' from ${{workflow.inputs.{rname}}} — verify the same-named "
+                f"workflow input is really the intended source\n")
+
+    # --- compile closure: freeze each resolved use: node's resolver payload ---
+    # The resolver payload (rendered body, directives, config, schemas) is part
+    # of the compile's INPUT SET. Freezing it to .compiled/resolved/<node-id>.json
+    # (a) declares the registry dependency, (b) lets the emitted runMicroskill
+    # READ the frozen bytes at run time instead of re-shelling the resolver
+    # against a possibly-drifted registry, and (c) yields the resolution_sha256
+    # folded into the per-node semantic fingerprints below. Env stays out of
+    # the compile closure end to end: the classify-time resolver subprocess
+    # runs with --skip-inject (inject_from sources are never EXECUTED at
+    # compile time — no side effects, no env-dependent success/failure shape
+    # in required_inputs / profile_overrides_inputs / the rewritten Inputs
+    # table; a node whose resolved config carries inject_from inputs gets
+    # `inject: true` baked instead, and the segment runs
+    # `resolve-microskill --inject-only` at execution time), and two keys are
+    # additionally EXCLUDED from the frozen bytes:
+    #   - injected_inputs — {} under --skip-inject, but excluded anyway so a
+    #     hand-run full resolution can never fork the frozen shape;
+    #   - warnings — compile-time diagnostics (already surfaced on the resolver/
+    #     compile stdout).
+    compiled_dir = def_dir / ".compiled"
+    resolved_dir = compiled_dir / "resolved"
+    frozen_payloads = {}
+    for nid in order:
+        node = node_by_id[nid]
+        payload = node.pop("_resolved_payload", None)
+        if payload is None:
+            continue
+        pruned = {k: v for k, v in payload.items()
+                  if k not in ("injected_inputs", "warnings")}
+        raw = json.dumps(pruned, indent=2) + "\n"
+        frozen_payloads[nid] = raw
+        node["_resolution_sha256"] = hashlib.sha256(raw.encode()).hexdigest()
+        node["_resolved_path"] = rel(resolved_dir / f"{nid}.json")
+        node["_inject"] = any(
+            isinstance(spec, dict) and spec.get("inject_from")
+            for spec in ((pruned.get("config") or {}).get("inputs") or {}).values())
+
     # --- partition into manifest steps ---
     steps = []
     seg = []
-    # Per-node classification record (node id → reason), in topological order.
-    # Surfaced only under --explain; never affects partitioning or emitted bytes.
-    classification = []
 
     def flush_segment():
         nonlocal seg
@@ -830,9 +2046,7 @@ def main():
 
     for nid in order:
         node = node_by_id[nid]
-        klass, reason = classify(node, gates_after, defs_root)
-        classification.append({"node": nid, "class": klass, "reason": reason})
-        if klass == "orchestrator":
+        if classes[nid] == "orchestrator":
             flush_segment()
             if node.get("workflow"):
                 # Nested-workflow checkpoint: the dispatcher re-enters the workflow
@@ -855,6 +2069,16 @@ def main():
             for k in ("when", "for_each", "as"):
                 if node.get(k) is not None:
                     chk[k] = node[k]
+            # Per-node IO contract: an orchestrator checkpoint's declared
+            # output_schema is its RETURN CONTRACT (check-step-io validates the
+            # stored result against it after the step) — no longer prose-only.
+            chk["io"] = {nid: node_io(node)}
+            # Declared output-by-reference: recorded on the PRODUCING step,
+            # OMITTED when absent (spill-free defs stay byte-identical). The
+            # dispatcher's run-step kernel reads it when threading this node's
+            # result onward.
+            if node.get("spill_outputs"):
+                chk["spill"] = {nid: list(node["spill_outputs"])}
             steps.append(chk)
         else:
             seg.append(nid)
@@ -864,20 +2088,56 @@ def main():
                 steps.append({"kind": "checkpoint", "checkpoint_type": "gate", "gate": g})
     flush_segment()
 
+    # Spill substitution happens ONLY at the dispatcher's threading boundary, so
+    # a consumer in the SAME segment as the producer reads the in-memory VALUE
+    # (n_<id>.<field>), while a cross-checkpoint consumer of the same ref reads
+    # the handoff file PATH. That two-world meaning is deliberate (in-segment
+    # values never cross the args boundary, so they need no spill) but easy to
+    # misread — warn deterministically (stderr, never the emitted bytes) so it
+    # is never silent. (Guards were already hard-blocked above.)
+    for step in steps:
+        if step["kind"] != "segment":
+            continue
+        seg_set = set(step["nodes"])
+        for nid in step["nodes"]:
+            n = node_by_id[nid]
+            scoped = {k: n.get(k) for k in SCOPED_REF_FIELDS if k in n}
+            for s in collect_strings(scoped):
+                for inner in REF_RE.findall(s):
+                    for prod, field in NODE_OUTPUT_FIELD_RE.findall(inner):
+                        if (prod in seg_set and prod != nid and field in
+                                (node_by_id[prod].get("spill_outputs") or [])):
+                            sys.stderr.write(
+                                f"warning: node '{nid}': reads "
+                                f"${{{prod}.output.{field}}} in the SAME segment "
+                                f"as its producer — it receives the in-memory "
+                                f"VALUE there, while a cross-checkpoint consumer "
+                                f"of the same field receives the handoff file "
+                                f"path; make sure this consumer expects the "
+                                f"value\n")
+
     # --- emit segments ---
-    # ALL disk-mutating operations are guarded behind `not args.plan`. Under --plan
-    # we still compute the full plan (segment JS, needs, produces, manifest) so the
-    # summary is identical to a real compile, but write nothing: no mkdir, no
-    # stale-clean unlink, no seg files, no manifest.json. This mirrors the harness
-    # reconcile loops' --plan-by-default ergonomics.
-    compiled_dir = def_dir / ".compiled"
-    if not args.plan:
+    # ALL disk-mutating operations are guarded behind `do_write` (--plan and
+    # --check both write NOTHING). Under either flag we still compute the full
+    # plan (segment JS, needs, produces, frozen payloads, manifest) so the
+    # summary/check is identical to a real compile, but write nothing: no mkdir,
+    # no stale-clean unlink, no seg files, no resolved/*.json, no manifest.json.
+    # This mirrors the harness reconcile loops' --plan-by-default ergonomics.
+    if do_write:
         compiled_dir.mkdir(parents=True, exist_ok=True)
-        # clean stale segment files for determinism. (Note: only seg-*.js are
-        # globbed — manifest.json is overwritten below, and the dispatcher's
-        # .run-state.json is intentionally NOT touched.)
+        # clean stale segment files + frozen resolutions for determinism. (Note:
+        # only seg-*.js and resolved/*.json are globbed — manifest.json is
+        # overwritten below, and the dispatcher's .run-state.json is
+        # intentionally NOT touched.)
         for old in compiled_dir.glob("seg-*.js"):
             old.unlink()
+        if resolved_dir.is_dir():
+            for old in resolved_dir.glob("*.json"):
+                old.unlink()
+        if frozen_payloads:
+            resolved_dir.mkdir(parents=True, exist_ok=True)
+            for nid in sorted(frozen_payloads):
+                (resolved_dir / f"{nid}.json").write_text(frozen_payloads[nid])
 
     seg_index = 0
     manifest_steps = []
@@ -887,17 +2147,36 @@ def main():
             seg_nodes = [node_by_id[i] for i in step["nodes"]]
             js, needs, produces = emit_segment_js(seg_nodes, wf, loop, seg_index)
             fname = f"seg-{seg_index}.js"
-            if not args.plan:
+            if do_write:
                 (compiled_dir / fname).write_text(js)
-            manifest_steps.append({
+            manifest_step = {
                 "kind": "segment",
                 "index": seg_index,
-                "script": str(compiled_dir / fname),
+                # Stored RELATIVE to the def dir (portable single-shape manifest):
+                # manifest bytes — and manifest_hash — are now identical across
+                # checkouts, and a repo move no longer breaks resume. The
+                # dispatcher resolves it against the def dir
+                # (.claude/workflow-defs/<name>/<script>).
+                "script": f".compiled/{fname}",
                 "nodes": step["nodes"],
                 "is_loop": bool(loop) and set(step["nodes"]) == set((loop or {}).get("body") or []),
                 "needs": needs,
                 "produces": produces,
-            })
+                # Per-node IO contract for every produced node (topo order) —
+                # check-step-io validates the dispatcher-stored results against
+                # it between steps.
+                "io": {nid: node_io(node_by_id[nid]) for nid in step["nodes"]},
+            }
+            # Declared output-by-reference: the producing step's spill map
+            # (node id -> declared field list, topo order), OMITTED when no
+            # node in the segment declares spill_outputs — manifest bytes for
+            # spill-free defs are unchanged. Runtime consumption is run-step's.
+            seg_spill = {nid: list(node_by_id[nid]["spill_outputs"])
+                         for nid in step["nodes"]
+                         if node_by_id[nid].get("spill_outputs")}
+            if seg_spill:
+                manifest_step["spill"] = seg_spill
+            manifest_steps.append(manifest_step)
         else:
             manifest_steps.append(step)
 
@@ -926,24 +2205,164 @@ def main():
         "output": wf.get("output"),
         "steps": manifest_steps,
     }
+    # gate_mode is stamped ONLY when the effective mode is auto (and INSIDE the
+    # hashed payload): an interactive compile of an existing def stays
+    # byte-identical, while an auto compile gets a DISTINCT manifest_hash so
+    # interactive run-state never resumes into a headless run (or vice versa).
+    if effective_gate_mode == "auto":
+        manifest["gate_mode"] = "auto"
+    # Applied per-node overrides (effective customize.overrides AFTER any
+    # --node-override flags merged in), recorded ONLY when non-empty so an
+    # override-free compile stays byte-identical — and, being inside the hashed
+    # manifest, an override run gets a DISTINCT manifest_hash (stale resume
+    # state and the committed lockfile correctly refuse to match it).
+    node_overrides = {}
+    for nid in order:
+        ovr = (node_by_id[nid].get("customize") or {}).get("overrides") or {}
+        if ovr:
+            node_overrides[nid] = {k: ovr[k] for k in sorted(ovr)}
+    if node_overrides:
+        manifest["node_overrides"] = node_overrides
+    # --- per-node SEMANTIC fingerprints (folded into manifest_hash) ---
+    # The manifest alone covers only the partition/needs/produces; the EXECUTED
+    # semantics — substituted prompt, baked inputs, effective schema, executor
+    # identity, the frozen registry resolution — live only in seg JS bytes.
+    # Fingerprint them per node so manifest_hash quantifies over the full
+    # declared input set: a registry edit, prompt change, or executor swap is
+    # hash-visible (and invalidates resume) even though the manifest dict is
+    # unchanged. phase_group is EXCLUDED by design (emit-only cosmetics — it
+    # must keep manifest_hash stable). Computed UNCONDITIONALLY; the per-node
+    # detail is surfaced only under --explain (stdout-only — the written bytes
+    # never fork on flags).
+    node_fingerprints = {}
+    fingerprint_detail = []
+    for nid in order:
+        node = node_by_id[nid]
+        fp = {
+            "use": node.get("use"),
+            "agent": node.get("agent"),
+            "profile": ((node.get("customize") or {}).get("profile", "base")
+                        if node.get("use") else None),
+            "prompt": node.get("prompt"),
+            "inputs": node.get("inputs") or {},
+            "schema": node.get("output_schema") or node.get("_exec_schema"),
+            "exec_agent": node.get("_exec_agent"),
+            "exec_model": node.get("_exec_model"),
+            "when": node.get("when"),
+            "for_each": node.get("for_each"),
+            "as": node.get("as"),
+            "resolution_sha256": node.get("_resolution_sha256"),
+        }
+        # retry changes EXECUTED semantics that live only in seg JS (the
+        # withRetry wrap) — fold it in, but only when PRESENT so every
+        # retry-free node's fingerprint (and the committed lockfiles built on
+        # them) stays byte-for-byte unchanged.
+        if node.get("retry"):
+            fp["retry"] = node.get("retry")
+        # spill_outputs changes what downstream consumers RECEIVE (a handoff
+        # path instead of the value) — fold it in, but only when PRESENT (same
+        # rationale as retry: spill-free fingerprints, and the lockfiles built
+        # on them, stay byte-for-byte unchanged), so a --check drift report can
+        # name the node that adopted spill.
+        if node.get("spill_outputs"):
+            fp["spill_outputs"] = node.get("spill_outputs")
+        digest = hashlib.sha256(
+            json.dumps(fp, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        node_fingerprints[nid] = digest
+        fingerprint_detail.append({"node": nid, "sha256": digest, "fingerprint": fp})
+
     # Deterministic content hash over the canonical (sorted-key, compact) JSON of
-    # the manifest — computed over the manifest WITHOUT its own manifest_hash key,
-    # so the hash can never depend on itself. Same inputs → same hash; any change
-    # to the partition/needs/produces changes it. (rank14's dispatcher consumes it
-    # to decide whether stored run-state matches the just-compiled workflow.)
+    # the SEMANTIC manifest PLUS the per-node fingerprints above. Three keys live
+    # OUTSIDE the hashed payload:
+    #   - manifest_hash itself (the hash can never depend on itself);
+    #   - schema_sha256 — PROVENANCE ONLY. manifest_hash gates dispatcher resume
+    #     (stored run-state is reusable only while partition/needs/produces still
+    #     line up); a schema-bytes-only change moves no node output, so stamping
+    #     it INSIDE the hash would needlessly invalidate resumable run-state;
+    #   - schema_source — PROVENANCE ONLY (which _templates_candidates tier
+    #     selected the validating schema); same rationale.
+    # Same inputs → same hash; any change to the partition/needs/produces — or to
+    # any fingerprinted node semantic — changes it. The dispatcher compares it
+    # against stored run-state before resuming; --check compares it against the
+    # committed closure.lock.json.
     manifest_hash = hashlib.sha256(
-        json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+        json.dumps({"manifest": manifest, "node_fingerprints": node_fingerprints},
+                   sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
 
     manifest_path = compiled_dir / "manifest.json"
-    # manifest_hash is additive/opt-in: included in the WRITTEN manifest only under
-    # --explain, so a default compile's .compiled/ bytes stay byte-identical to
-    # before. The dispatcher obtains it via --explain.
+    # SINGLE MANIFEST SHAPE: schema_sha256, schema_source and manifest_hash are
+    # ALWAYS written — a default compile and an --explain compile produce
+    # byte-identical .compiled/ output (--explain only enriches the stdout
+    # summary). Migration note: adding these keys + the relative script path
+    # changes manifest bytes once; the dispatcher's run-state manifest_hash
+    # gate absorbs it (stale state is ignored, runs start fresh) — and since
+    # both schema_* keys sit OUTSIDE manifest_hash, committed lockfiles (which
+    # pin manifest_hash + node fingerprints only) never need re-locking for a
+    # provenance-only delta.
     out_manifest = dict(manifest)
-    if args.explain:
-        out_manifest["manifest_hash"] = manifest_hash
-    if not args.plan:
+    out_manifest["schema_sha256"] = schema_sha256
+    out_manifest["schema_source"] = SCHEMA_SOURCE
+    out_manifest["manifest_hash"] = manifest_hash
+    if do_write:
         manifest_path.write_text(json.dumps(out_manifest, indent=2) + "\n")
+
+    # --- PARTITION.md sidecar (--annotate) ---
+    # Written only under --annotate; a PLAIN compile unlinks a stale copy (same
+    # rationale as the seg-*.js stale-clean: .compiled/ stays a pure function of
+    # the compile inputs + flags). Never touches manifest/segment bytes.
+    partition_path = compiled_dir / "PARTITION.md"
+    if do_write:
+        if args.annotate:
+            partition_path.write_text(partition_md(
+                wf["name"], profile_used, manifest_steps, classification,
+                manifest_hash))
+        elif partition_path.exists():
+            partition_path.unlink()
+
+    # --- closure lockfile: the COMMITTED drift baseline ---
+    # .compiled/ is gitignored, so a fresh CI checkout has no compiled baseline —
+    # the committed closure.lock.json IS the baseline. Hash-only by design: it
+    # pins manifest_hash (which folds the per-node fingerprints, including each
+    # frozen resolution's sha256) plus the per-node fingerprint digests so a
+    # --check failure can name WHICH node drifted.
+    lock_path = def_dir / "closure.lock.json"
+    if args.lock:
+        lock_obj = {
+            "name": wf["name"],
+            "profile_used": profile_used,
+            "manifest_hash": manifest_hash,
+            "node_fingerprints": node_fingerprints,
+        }
+        lock_path.write_text(json.dumps(lock_obj, indent=2, sort_keys=True) + "\n")
+    if args.check:
+        if not lock_path.exists():
+            die(f"closure.lock.json not found: {rel(lock_path)} — generate it with "
+                f"`compile-workflow {wf['name']} --lock` and commit it", 1)
+        try:
+            locked = json.loads(lock_path.read_text())
+        except (OSError, json.JSONDecodeError) as e:
+            die(f"closure.lock.json unreadable: {e}", 1)
+        drift = {}
+        if locked.get("profile_used") != profile_used:
+            drift["profile_used"] = {"locked": locked.get("profile_used"),
+                                     "computed": profile_used}
+        if locked.get("manifest_hash") != manifest_hash:
+            drift["manifest_hash"] = {"locked": locked.get("manifest_hash"),
+                                      "computed": manifest_hash}
+        locked_fp = locked.get("node_fingerprints") or {}
+        changed = sorted(n for n in node_fingerprints
+                         if n in locked_fp and locked_fp[n] != node_fingerprints[n])
+        added = sorted(n for n in node_fingerprints if n not in locked_fp)
+        removed = sorted(n for n in locked_fp if n not in node_fingerprints)
+        if changed or added or removed:
+            drift["nodes"] = {"changed": changed, "added": added, "removed": removed}
+        if drift:
+            die(f"compile closure drifted from committed {rel(lock_path)} — the "
+                f"registry or workflow def changed without re-locking; review the "
+                f"delta, then run `compile-workflow {wf['name']} --lock` and commit "
+                f"the updated lockfile to accept it", 1, drift=drift)
 
     def seq_label(s):
         """A segment's bracketed node list, or a checkpoint label. WITHOUT --explain
@@ -965,15 +2384,33 @@ def main():
         "manifest_path": rel(manifest_path),
         "segments": sum(1 for s in manifest_steps if s["kind"] == "segment"),
         "checkpoints": sum(1 for s in manifest_steps if s["kind"] == "checkpoint"),
+        # Always surfaced (single manifest shape): the dispatcher's resume gate
+        # needs it on every compile, not only under --explain.
+        "manifest_hash": manifest_hash,
         "sequence": [seq_label(s) for s in manifest_steps],
     }
-    # --explain (and --plan, the dry-run preview) are additive: they only ADD keys.
-    # With neither flag the summary is byte-identical to before.
+    # --explain (and --plan/--check/--lock, the dry-run/gate modes) are additive:
+    # they only ADD keys.
     if args.explain:
-        summary["manifest_hash"] = manifest_hash
         summary["classification"] = classification
+        summary["fingerprints"] = fingerprint_detail
+        # Every wire:auto-materialized pair, node -> sorted wired input names
+        # (each wired as inputs.<name>: ${workflow.inputs.<name>}), in topo
+        # order. Stdout-only — the written bytes never fork on flags.
+        summary["auto_wired"] = auto_wired
     if args.plan:
         summary["plan"] = True
+        # --plan writes NO manifest.json, and the lean summary carries none of
+        # the gate/inputs data a preflight renderer needs — so the dry-run
+        # summary embeds the FULL manifest object (steps incl. gate dicts,
+        # required_inputs, input_defaults, provenance keys) verbatim.
+        summary["manifest"] = out_manifest
+    if args.lock:
+        summary["lock_path"] = rel(lock_path)
+    if args.annotate:
+        summary["partition_path"] = rel(partition_path)
+    if args.check:
+        summary["check"] = "ok"
     print(json.dumps(summary, indent=2))
     sys.exit(0)
 

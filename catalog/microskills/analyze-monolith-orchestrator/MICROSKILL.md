@@ -32,7 +32,7 @@ Given skill_path to a monolith orchestrator SKILL.md, read it and produce a deco
 
 ## Output
 
-A single JSON object emitted as the skill's result (no prose), conforming to output_schema: decomposition_requirement_path (path to the planner-ready requirement file written under staging_dir), responsibilities (each with name, purpose, shape, target, atomic_core, hoisted_concerns), control_flow, data_flow, agent_dependencies, and nested_workflows (each with name, requirement, exists, invoke_target). Only responsibilities with target=microskill are meant to become microskills; the rest are workflow constructs, and nested_workflow targets become orchestrator-node invokes — built via workflow-create when exists is false, invoked as-is when true.
+A single JSON object emitted as the skill's result (no prose), conforming to output_schema: decomposition_requirement_path (path to the planner-ready requirement file written under staging_dir), responsibilities (each with name, purpose, shape, target, atomic_core, hoisted_concerns), step_order (flat step ordering, mirroring control_flow.ordering, for quick review at the approval gate), control_flow, data_flow, agent_dependencies, and nested_workflows (each with name, requirement, exists, invoke_target). Only responsibilities with target=microskill are meant to become microskills; the rest are workflow constructs, and nested_workflow targets become orchestrator-node invokes — built via workflow-create when exists is false, invoked as-is when true.
 
 ## Failure modes
 

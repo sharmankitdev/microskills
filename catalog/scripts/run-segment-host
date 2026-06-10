@@ -1,0 +1,213 @@
+#!/usr/bin/env node
+/*
+run-segment-host — execute one compiled Workflow-JS segment under a MOCKED
+engine (the golden-run test harness; dependency-free Node, stdlib only).
+
+The compiled segments (compile-workflow's seg-*.js) are otherwise executed
+only by Claude Code's native Workflow engine in live paid runs. This host
+runs the SAME bytes deterministically:
+
+  1. strips the `export const meta = {...}` prefix (the only ES-module
+     syntax in a compiled segment);
+  2. wraps the remaining body in an AsyncFunction;
+  3. injects mock implementations of the host globals the emitted code uses
+     — agent / parallel / log / phase — plus the `args` value (passed as the
+     raw JSON STRING, exactly as documented: the native engine passes args
+     as a string and the compiled fail-loud guard JSON.parses it). Helpers
+     like parallelChunked / withRetry are emitted INTO the segment and build
+     on these globals, so they run as compiled — never re-implemented here.
+
+FIXTURES — ORDERED QUEUES PER LABEL, never flat label keys. Every agent()
+call carries a label (`ms:<microskill>` from runMicroskill, the node label
+from runAgent). A label is NOT unique per call: expanded sibling nodes share
+`ms:<name>` (review-changes' review_<dimension> siblings), and a for_each
+fan-out calls the same label once per item. Call order under this mock is
+deterministic (the mock `parallel` awaits its thunks SEQUENTIALLY in array
+order — see the host-contract note below), so the fixtures file maps each
+label to an ORDERED QUEUE consumed call by call:
+
+    { "<label>": [ {"result": <value>},
+                   {"match": "<prompt substring>", "result": <value>},
+                   {"error": "<message>"},          // simulated failed call
+                   {"result": null} ],              // native failure shape
+      ... }
+
+Each call takes the FIRST unconsumed entry in its label's queue whose
+optional `match` is a substring of the rendered prompt (an entry without
+`match` matches unconditionally). `match` disambiguates same-label calls
+without relying on position (e.g. one verify-finding verdict per finding
+id). An exhausted queue / unmatched call FAILS LOUD with the label and the
+prompt head — never a silent default.
+
+CALL JOURNAL — when --journal is given, one compact-JSON line is appended
+per host-global event, in execution order:
+    {"event":"agent","label":..,"agentType":..,"model":..,"phase":..,"prompt":..}
+    {"event":"phase","name":..}
+    {"event":"log","message":..}
+The agent line is written BEFORE fixture selection, so a failing call is
+always the journal's last line. agentType/model are the executor-identity
+literals the compiler baked — the journal pins them.
+
+DOCUMENTED LIMIT: this verifies the compiled bytes against the DOCUMENTED
+host contract (args as a JSON string; agent/parallel/log/phase globals; a
+failed agent() call rejecting or returning null) — NOT against the live
+native engine. True concurrency, the engine's args-size truncation, and
+subagent behavior are out of scope; the mock `parallel` is sequential so
+runs are deterministic, which preserves result ORDER (the contract) but not
+interleaving (unobservable to the segment).
+
+Usage:
+  run-segment-host --script <seg-N.js> --fixtures <fixtures.json>
+                   [--args-file <args.json>] [--journal <calls.jsonl>]
+
+Stdout: {"ok": true, "result": <segment return value>} on success;
+        {"ok": false, "error": "..."} on a segment throw / fixture miss.
+Exit codes: 0 OK · 1 segment error or fixture violation · 2 usage error.
+*/
+'use strict'
+const fs = require('fs')
+
+function usageDie(msg) {
+  process.stdout.write(JSON.stringify({ ok: false, error: msg }) + '\n')
+  process.exit(2)
+}
+
+// --- minimal flag parsing (dependency-free) ---
+const opts = {}
+const argv = process.argv.slice(2)
+for (let i = 0; i < argv.length; i++) {
+  const flag = argv[i]
+  if (!flag.startsWith('--')) usageDie(`unexpected positional argument: ${flag}`)
+  const key = flag.slice(2)
+  if (!['script', 'fixtures', 'args-file', 'journal'].includes(key)) {
+    usageDie(`unknown flag: ${flag}`)
+  }
+  if (i + 1 >= argv.length) usageDie(`flag ${flag} needs a value`)
+  opts[key] = argv[++i]
+}
+if (!opts.script) usageDie('--script is required')
+if (!opts.fixtures) usageDie('--fixtures is required')
+
+function readText(p, label) {
+  try {
+    return fs.readFileSync(p, 'utf8')
+  } catch (e) {
+    usageDie(`${label} unreadable: ${e.message}`)
+  }
+}
+
+// --- fixtures: ordered queues per label ---
+let fixtures
+try {
+  fixtures = JSON.parse(readText(opts.fixtures, 'fixtures file'))
+} catch (e) {
+  usageDie(`fixtures file is not valid JSON: ${e.message}`)
+}
+if (typeof fixtures !== 'object' || fixtures === null || Array.isArray(fixtures)) {
+  usageDie('fixtures file must hold an object mapping label -> ordered queue (array)')
+}
+for (const [label, queue] of Object.entries(fixtures)) {
+  if (!Array.isArray(queue)) {
+    usageDie(`fixtures["${label}"] must be an ARRAY (an ordered queue of ` +
+             `entries) — labels collide across sibling nodes and for_each ` +
+             `items, so a flat per-label value cannot express distinct calls`)
+  }
+  for (const entry of queue) {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry) ||
+        (!('result' in entry) && !('error' in entry))) {
+      usageDie(`fixtures["${label}"] entries must be objects carrying ` +
+               `"result" (the mocked return value) or "error" (a simulated ` +
+               `rejection), optionally with "match" (a prompt substring)`)
+    }
+  }
+}
+
+// A FixtureError is a harness-contract violation (exhausted queue / no
+// matching entry), distinct from an ordinary segment throw only in message.
+class FixtureError extends Error {}
+
+function selectFixture(label, prompt) {
+  const queue = fixtures[label]
+  if (queue === undefined) {
+    throw new FixtureError(
+      `fixture: no queue for label "${label}" (known labels: ` +
+      `${Object.keys(fixtures).sort().join(', ') || '<none>'})`)
+  }
+  for (const entry of queue) {
+    if (entry.__consumed) continue
+    if (entry.match !== undefined && !prompt.includes(entry.match)) continue
+    entry.__consumed = true
+    return entry
+  }
+  const remaining = queue.filter((e) => !e.__consumed).length
+  throw new FixtureError(
+    `fixture: queue for label "${label}" has no usable entry for this call ` +
+    `(${remaining} unconsumed entr${remaining === 1 ? 'y' : 'ies'} left, ` +
+    `none match). Prompt head: ${JSON.stringify(prompt.slice(0, 200))}`)
+}
+
+function journal(line) {
+  if (!opts.journal) return
+  fs.appendFileSync(opts.journal, JSON.stringify(line) + '\n')
+}
+
+// --- mock host globals (the documented contract) ---
+async function agent(prompt, options = {}) {
+  const { label = null, agentType = null, model = null, phase = null } = options
+  // Journal BEFORE selection so a failing call is the journal's last line.
+  journal({ event: 'agent', label, agentType, model, phase, prompt })
+  const entry = selectFixture(label, String(prompt))
+  if ('error' in entry) throw new Error(entry.error)
+  return entry.result
+}
+
+async function parallel(elements) {
+  // Deterministic mock: await SEQUENTIALLY in array order. The contract the
+  // segments rely on — results positionally aligned with the input array, a
+  // null element tolerated as null — is preserved; true concurrency is not
+  // observable from inside the segment.
+  const out = []
+  for (const el of elements) {
+    if (el === null || el === undefined) { out.push(null); continue }
+    out.push(typeof el === 'function' ? await el() : await el)
+  }
+  return out
+}
+
+function log(message) { journal({ event: 'log', message: String(message) }) }
+function phase(name) { journal({ event: 'phase', name: String(name) }) }
+
+// --- strip the meta prefix, wrap the body, run ---
+const scriptText = readText(opts.script, 'segment script')
+const META_OPEN = 'export const meta = {'
+const META_CLOSE = '\n}\n\n'
+if (!scriptText.startsWith(META_OPEN)) {
+  usageDie('segment script does not start with the compiled ' +
+           '`export const meta = {` prefix — is this a compile-workflow seg-*.js?')
+}
+const closeIdx = scriptText.indexOf(META_CLOSE)
+if (closeIdx === -1) {
+  usageDie('meta prefix terminator (`\\n}\\n\\n`) not found in segment script')
+}
+const body = scriptText.slice(closeIdx + META_CLOSE.length)
+
+// args rides as the raw JSON STRING — the documented native-engine shape; the
+// compiled fail-loud guard JSON.parses (and throws on) it.
+const argsText = opts['args-file'] ? readText(opts['args-file'], 'args file') : '{}'
+
+const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
+let segment
+try {
+  segment = new AsyncFunction('args', 'agent', 'parallel', 'log', 'phase', body)
+} catch (e) {
+  usageDie(`segment body failed to compile as an AsyncFunction: ${e.message}`)
+}
+
+segment(argsText, agent, parallel, log, phase).then((result) => {
+  process.stdout.write(JSON.stringify(
+    { ok: true, result: result === undefined ? null : result }, null, 2) + '\n')
+}).catch((e) => {
+  process.stdout.write(JSON.stringify(
+    { ok: false, error: String((e && e.message) || e) }, null, 2) + '\n')
+  process.exit(1)
+})

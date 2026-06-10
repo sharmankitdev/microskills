@@ -14,6 +14,28 @@ Usage:
                                   [--override <dotted.path=value>]...
                                   [--skip-step <n>]...
                                   [--skill-root <dir>]
+                                  [--inject-only | --skip-inject]
+
+`--inject-only` resolves the profile config, executes ONLY the env-dependent
+`inputs.<name>.inject_from` sources, and emits {skill_name, profile_used,
+profile_requested, warnings, injected_inputs} — no body rendering. It is the
+execution-time companion of compile-workflow's frozen resolver payloads
+(.compiled/resolved/<node-id>.json), which exclude injected_inputs so the
+compile closure stays env-independent.
+
+`--skip-inject` is the COMPILE-TIME mode (compile-workflow / validate-workflow
+pass it): inject_from sources are never EXECUTED — no env reads, no git config,
+no arbitrary `command:` shell in the compile path — so resolution is
+side-effect-free and cannot fail (or vary) on the compile machine's env.
+injected_inputs is {} by construction; the execution-time `--inject-only` call
+applies the sources for real. Mutually exclusive with `--inject-only`.
+
+The required-input ledger (`required_inputs`, `profile_overrides_inputs`, and
+the rewritten Inputs table) is computed from DECLARED `inject_from` presence,
+never from inject success: a declared-inject input is supplied by the
+execution environment (or `--inject-only` fails loud there), so it is never
+caller-gathered — and the emitted payload shape is a pure function of registry
+bytes + profile, regardless of the resolving machine's env.
 
 Stdout: JSON (see README / config-schema doc for the shape).
 Exit codes: 0 OK · 1 block · 2 environment / script error.
@@ -189,8 +211,26 @@ def deep_merge(base, overlay, path=""):
     return result
 
 
+def parse_override_value(raw_value):
+    """Parse a --override value per the CLI contract: YAML for typed values
+    (`true` -> bool, `3` -> int, `[a,b]` -> list), empty string -> None (delete).
+
+    PAPER-CUT FIX: a value LEADING with '#' is taken as the LITERAL STRING. An
+    unquoted leading-'#' value is a full-line YAML comment — yaml.safe_load
+    returns None, silently turning `--override tag=#smoke` into a key DELETE.
+    No expressible value changes meaning (a bare '#...' could never parse to
+    anything but None), so the literal reading only closes the silent-delete
+    hole. Shared by resolve-microskill --override AND compile-workflow's
+    customize.overrides / --node-override (one parser, one semantics)."""
+    if raw_value == "":
+        return None
+    if raw_value.lstrip().startswith("#"):
+        return raw_value
+    return yaml.safe_load(raw_value)
+
+
 def apply_override(cfg, dotted, raw_value):
-    parsed = yaml.safe_load(raw_value) if raw_value != "" else None
+    parsed = parse_override_value(raw_value)
     keys = [k for k in dotted.split(".") if k]
     if not keys:
         raise ValueError(f"empty override path: {dotted!r}")
@@ -685,7 +725,22 @@ def main():
                     help="Skip an optional step by number. Repeatable.")
     ap.add_argument("--skill-root", default=str(DEFAULT_SKILL_ROOT),
                     help="Override skill-root directory.")
+    ap.add_argument("--inject-only", action="store_true",
+                    help="Resolve the profile config, execute ONLY the inject_from "
+                         "sources, and emit the injected_inputs (no body rendering). "
+                         "Execution-time companion of compile-workflow's frozen "
+                         "resolver payloads, which exclude env-dependent inject results.")
+    ap.add_argument("--skip-inject", action="store_true",
+                    help="Never EXECUTE inject_from sources (compile-time mode: the "
+                         "compile path must be side-effect-free and the frozen "
+                         "payload env-independent). injected_inputs is {} and an "
+                         "unsatisfiable source cannot block; --inject-only applies "
+                         "the sources at execution time instead.")
     args = ap.parse_args()
+
+    if args.inject_only and args.skip_inject:
+        emit_and_exit({"error": "--inject-only and --skip-inject are mutually "
+                                "exclusive (execute-the-sources vs never-execute)"}, 2)
 
     skill_root = Path(args.skill_root).resolve()
     skill_dir = skill_root / args.skill
@@ -808,15 +863,34 @@ def main():
 
     injected_inputs = {}
     inject_failed = False
-    for name, spec in (cfg.get("inputs") or {}).items():
-        inj = (spec or {}).get("inject_from")
-        if not inj:
-            continue
-        val = resolve_inject_from(name, inj, skill_dir, warnings)
-        if val is None:
-            inject_failed = True
-        else:
-            injected_inputs[name] = val
+    # --skip-inject: compile-time resolution never EXECUTES inject sources
+    # (env reads, git config, arbitrary `command:` shell are execution-time
+    # concerns — see --inject-only); the payload below is independent of
+    # whether the compile machine's env could satisfy them.
+    if not args.skip_inject:
+        for name, spec in (cfg.get("inputs") or {}).items():
+            inj = (spec or {}).get("inject_from")
+            if not inj:
+                continue
+            val = resolve_inject_from(name, inj, skill_dir, warnings)
+            if val is None:
+                inject_failed = True
+            else:
+                injected_inputs[name] = val
+
+    # --inject-only: emit ONLY the env-dependent inject results and stop. The
+    # compile-time freeze (compile-workflow) excludes injected_inputs from the
+    # frozen resolver payload so the compile closure stays env-independent; this
+    # mode re-applies the inject_from sources at execution time. No body
+    # rendering — the frozen payload already carries rendered_skill_body.
+    if args.inject_only:
+        emit_and_exit({
+            "skill_name": args.skill,
+            "profile_used": profile_used,
+            "profile_requested": args.profile,
+            "warnings": warnings,
+            "injected_inputs": injected_inputs,
+        }, 1 if inject_failed else 0)
 
     skill_md = skill_dir / "MICROSKILL.md"
     if not skill_md.exists():
@@ -839,7 +913,14 @@ def main():
                 f"input '{name}': declared required in config but not found in MICROSKILL.md Inputs table"
             )
             continue
-        if name in injected_inputs:
+        # DECLARED inject_from presence — never inject SUCCESS — excludes an
+        # input from the caller-gathered ledger: the value comes from the
+        # execution environment (a failed source fails loud there via exit 1 /
+        # --inject-only). Keying this off injected_inputs made required_inputs,
+        # profile_overrides_inputs, and the rewritten Inputs table depend on
+        # the resolving machine's env — and leaked env into compile-workflow's
+        # frozen payloads (different bytes, different manifest_hash, same def).
+        if (spec or {}).get("inject_from"):
             continue
         required_inputs.append(name)
         if skill_md_inputs[name]["required_col"].lower() != "yes":

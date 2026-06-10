@@ -20,10 +20,10 @@ REAL_DEFS = REPO / ".claude" / "workflow-defs"
 _ENV = {**os.environ, "MICROSKILLS_TEMPLATES_ROOT": str(REPO / "templates")}
 
 
-def run(defs_root, name, *args):
+def run(defs_root, name, *args, env=None):
     proc = subprocess.run(
         [sys.executable, str(SCRIPT), name, "--defs-root", str(defs_root), *args],
-        capture_output=True, text=True, cwd=str(REPO), env=_ENV)
+        capture_output=True, text=True, cwd=str(REPO), env=env or _ENV)
     data = json.loads(proc.stdout) if proc.stdout.strip().startswith("{") else None
     return proc.returncode, data, proc.stdout, proc.stderr
 
@@ -469,17 +469,21 @@ def test_gates_patch_verb_equals_full_restatement(tmp_path):
 
 
 def test_real_autonomous_gate_patch_applies():
-    # The shipped autonomous profiles soften approve_plan via gates:{patch:[...]}.
-    # Verify the patch merged by id on the REAL defs: severity→warn + the autonomous
-    # prompt land, while after/type/options are inherited from the base gate.
-    for name, domain in [("microskill-create", "microskill"), ("workflow-create", "workflow")]:
+    # The shipped autonomous profiles are pure flips to the declared gate-policy
+    # mechanism: gate_mode: auto + a declared default patched onto approve_plan
+    # by id (gates:{patch:[...]}) — severity/prompt/after/type/options are all
+    # inherited from the base gate (no more warn-softening or prompt swap; the
+    # dispatcher takes the declared default and records it verbatim).
+    for name in ("microskill-create", "workflow-create"):
         rc, data, out, err = run(REAL_DEFS, name, "--profile", "autonomous")
         assert rc == 0, err
+        m = json.loads((REAL_DEFS / name / ".compiled" / "manifest.json").read_text())
+        assert m["gate_mode"] == "auto"
         gate = _gate_checkpoint(REAL_DEFS, name)
         assert gate["id"] == "approve_plan"
-        assert gate["severity"] == "warn"
-        assert gate["prompt"].startswith("(autonomous)")
-        assert f"created {domain} afterward" in gate["prompt"]
+        assert gate["severity"] == "hard"          # NOT flipped any more
+        assert gate["default"] == "approve"        # the patch merged by id
+        assert "(autonomous)" not in gate["prompt"]
         assert gate["after"] == "plan"
         assert gate["type"] == "human_approval"
         assert gate["options"] == ["approve", "revise", "abandon"]
@@ -666,6 +670,104 @@ def test_split_loop_body_dies_before_emit(tmp_path):
     assert not list(compiled.glob("seg-*.js")) if compiled.exists() else True
 
 
+# --- Nested-workflow depth<=1 + import-cycle enforced in COMPILE too ---
+# The dispatcher's bounded-recursion contract ("the child contains no further
+# nested call") must be guaranteed by the compiler itself, not only by an
+# optional validate --defs-root pass — same shared helper, hard die pre-emit.
+
+def _nesting_def(defs_root, name, imports, node_yaml):
+    make_flow(defs_root, name, f"""\
+version: 1
+name: {name}
+imports: [{imports}]
+nodes:
+{node_yaml}
+""")
+
+
+def test_depth_two_nesting_dies_in_compile(tmp_path):
+    _nesting_def(tmp_path, "grand-flow", "",
+                 "  - id: g\n    agent: ag\n    prompt: leaf work\n")
+    _nesting_def(tmp_path, "child-flow", "grand-flow",
+                 "  - id: call\n    workflow: grand-flow\n    inputs: {}\n")
+    _nesting_def(tmp_path, "parent-flow", "child-flow",
+                 "  - id: build\n    workflow: child-flow\n    inputs: {}\n")
+    rc, data, out, err = run(tmp_path, "parent-flow")
+    assert rc == 1, out + err
+    msgs = json.dumps(data)
+    assert "depth" in msgs, msgs
+    compiled = tmp_path / "parent-flow" / ".compiled"
+    assert not list(compiled.glob("seg-*.js")) if compiled.exists() else True
+
+
+def test_import_cycle_dies_in_compile(tmp_path):
+    # a -> b -> a over the import graph: hard compile error, never an emit.
+    _nesting_def(tmp_path, "a-flow", "b-flow",
+                 "  - id: call\n    workflow: b-flow\n    inputs: {}\n")
+    _nesting_def(tmp_path, "b-flow", "a-flow",
+                 "  - id: call\n    workflow: a-flow\n    inputs: {}\n")
+    rc, data, out, err = run(tmp_path, "a-flow")
+    assert rc == 1, out + err
+    msgs = json.dumps(data)
+    assert "cycle" in msgs, msgs
+
+
+def test_depth_one_nesting_still_compiles(tmp_path):
+    _nesting_def(tmp_path, "child-flow", "",
+                 "  - id: c\n    agent: ag\n    prompt: leaf work\n")
+    _nesting_def(tmp_path, "parent-flow", "child-flow",
+                 "  - id: build\n    workflow: child-flow\n    inputs: {}\n")
+    rc, data, out, err = run(tmp_path, "parent-flow")
+    assert rc == 0, out + err
+    assert data["checkpoints"] == 1
+
+
+# --- Reserved wf_ node-id prefix (workflow-input args namespace) ---
+
+WF_PREFIX = """\
+version: 1
+name: wf-prefix
+inputs:
+  diff:
+    type: string
+nodes:
+  - id: wf_diff
+    agent: ag
+    prompt: do a
+"""
+
+
+def test_wf_prefixed_node_id_dies_in_compile(tmp_path):
+    # Defense in depth (the 1.1 fail-loud pattern): `${workflow.inputs.<x>}`
+    # translates to `_args.wf_<x>`, so a node id matching ^wf_ would silently
+    # clobber (or be clobbered by) a workflow input in the threaded args.
+    make_flow(tmp_path, "wf-prefix", WF_PREFIX)
+    rc, data, out, err = run(tmp_path, "wf-prefix")
+    assert rc == 1
+    assert data is not None and "reserved 'wf_' prefix" in data["error"]
+    # fail-loud BEFORE any emit
+    compiled = tmp_path / "wf-prefix" / ".compiled"
+    assert not list(compiled.glob("seg-*.js")) if compiled.exists() else True
+
+
+def test_wf_prefix_via_expand_suffix_dies_in_compile(tmp_path):
+    # The desugar can GENERATE a colliding id (`<id>_<item>`): template id `wf`
+    # + over item `x` → `wf_x`. The guard runs post-expansion, so it catches it.
+    make_flow(tmp_path, "wf-expand", """\
+version: 1
+name: wf-expand
+nodes:
+  - id: wf
+    agent: ag
+    expand:
+      over: [x]
+    prompt: do {{each.item}}
+""")
+    rc, data, out, err = run(tmp_path, "wf-expand")
+    assert rc == 1
+    assert data is not None and "reserved 'wf_' prefix" in data["error"]
+
+
 # --- S-INFER: union-edge cycle + ref-implied ordering in compile ---
 
 REF_CYCLE = """\
@@ -743,13 +845,14 @@ output_schema:
 """
 
 
-def make_inh_world(tmp_path, wf_yaml, ms_base=ECHO_MS_BASE, extra_profiles=None):
+def make_inh_world(tmp_path, wf_yaml, ms_base=ECHO_MS_BASE, extra_profiles=None,
+                   ms_md=ECHO_MS_MD):
     """Build a hermetic world: <tmp>/workflow-defs/inh-flow + <tmp>/microskills/echo-ms.
     Returns (defs_root, def_dir)."""
     defs_root = tmp_path / "workflow-defs"
     ms_dir = tmp_path / "microskills" / "echo-ms" / "profiles"
     ms_dir.mkdir(parents=True)
-    (tmp_path / "microskills" / "echo-ms" / "MICROSKILL.md").write_text(ECHO_MS_MD)
+    (tmp_path / "microskills" / "echo-ms" / "MICROSKILL.md").write_text(ms_md)
     (ms_dir / "base.yaml").write_text(ms_base)
     for pname, ptext in (extra_profiles or {}).items():
         (ms_dir / f"{pname}.yaml").write_text(ptext)
@@ -1016,13 +1119,14 @@ def test_default_compile_byte_identical_to_explain_compiled_bytes(tmp_path):
     assert plain == expl
 
 
-def test_default_summary_byte_identical_no_manifest_hash(tmp_path):
-    # With neither flag the stdout summary stays exactly as today: no
-    # manifest_hash key, no classification reasons, bare sequence labels.
+def test_default_summary_has_hash_but_no_explain_extras(tmp_path):
+    # SINGLE MANIFEST SHAPE: manifest_hash is core (always in the summary — the
+    # dispatcher's resume gate needs it on every compile); classification reasons
+    # and de-anonymized sequence labels remain --explain-only extras.
     make_flow(tmp_path, "gated-flow", GATED.replace("name: linear-flow", "name: gated-flow"))
     rc, data, out, err = run(tmp_path, "gated-flow")
     assert rc == 0, err
-    assert "manifest_hash" not in data
+    assert "manifest_hash" in data
     assert "classification" not in data
     assert data["sequence"] == ["segment[a]", "gate", "segment[b]"]
 
@@ -1075,18 +1179,26 @@ def test_manifest_hash_present_and_deterministic(tmp_path):
     assert data2["manifest_hash"] == h1
 
 
-def test_manifest_hash_excludes_itself(tmp_path):
-    # The hash is computed over the manifest WITHOUT its own manifest_hash key —
-    # recomputing the hash over the on-disk manifest (sans manifest_hash) must
-    # reproduce the stored value.
+def test_manifest_hash_excludes_itself_and_schema_sha(tmp_path):
+    # The hash is computed over the SEMANTIC manifest PLUS the per-node semantic
+    # fingerprints: its own manifest_hash key AND the schema_sha256 /
+    # schema_source provenance stamps are all OUTSIDE the hashed payload —
+    # recomputing over the on-disk manifest minus those keys, joined with the
+    # --explain fingerprint digests, must reproduce the stored value (so a
+    # schema-bytes-only or template-provenance-only change never invalidates
+    # resume). This also pins the fingerprint fold recipe.
     import hashlib
     d = make_flow(tmp_path, "gated-flow", GATED.replace("name: linear-flow", "name: gated-flow"))
     rc, data, out, err = run(tmp_path, "gated-flow", "--explain")
     assert rc == 0, err
     m = json.loads((d / ".compiled" / "manifest.json").read_text())
     stored = m.pop("manifest_hash")
+    m.pop("schema_sha256")
+    m.pop("schema_source")
+    node_fps = {f["node"]: f["sha256"] for f in data["fingerprints"]}
     recomputed = hashlib.sha256(
-        json.dumps(m, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        json.dumps({"manifest": m, "node_fingerprints": node_fps},
+                   sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     assert recomputed == stored
 
 
@@ -1107,10 +1219,11 @@ def test_manifest_hash_changes_when_workflow_changes(tmp_path):
     assert data1["manifest_hash"] != data2["manifest_hash"]
 
 
-def test_plan_can_emit_manifest_hash_without_writing(tmp_path):
-    # --plan --explain prints the manifest_hash but still writes nothing.
+def test_plan_emits_manifest_hash_without_writing(tmp_path):
+    # --plan prints the manifest_hash (always surfaced now — no --explain needed)
+    # but still writes nothing.
     make_flow(tmp_path, "gated-flow", GATED.replace("name: linear-flow", "name: gated-flow"))
-    rc, data, out, err = run(tmp_path, "gated-flow", "--plan", "--explain")
+    rc, data, out, err = run(tmp_path, "gated-flow", "--plan")
     assert rc == 0, err
     assert "manifest_hash" in data
     assert not (tmp_path / "gated-flow" / ".compiled").exists()
@@ -1334,9 +1447,9 @@ def test_items_ref_cross_segment_resolves_to_args(tmp_path):
 def test_no_items_ref_byte_identical(tmp_path):
     # DETERMINISM: a workflow that uses no .items ref compiles byte-identically.
     # Recompiling the SAME def is byte-identical (manifest included), and the
-    # emitted segment JS is identical across two independent worlds (only the
-    # manifest's absolute `script` path is path-dependent, so seg-*.js is the
-    # path-free determinism surface).
+    # WHOLE .compiled/ output is identical across two independent worlds — the
+    # manifest stores script paths relative to the def dir, so nothing in the
+    # output is path-dependent (portable single-shape manifest).
     d = make_flow(tmp_path, "fe-flow", FE_PLAIN)
     run(tmp_path, "fe-flow")
     first = {p.name: p.read_text() for p in (d / ".compiled").iterdir()}
@@ -1345,9 +1458,9 @@ def test_no_items_ref_byte_identical(tmp_path):
     assert first == second
     d2 = make_flow(tmp_path / "b", "fe-flow", FE_PLAIN)
     run(tmp_path / "b", "fe-flow")
-    segs1 = {p.name: p.read_text() for p in (d / ".compiled").glob("seg-*.js")}
-    segs2 = {p.name: p.read_text() for p in (d2 / ".compiled").glob("seg-*.js")}
-    assert segs1 == segs2
+    all1 = {p.name: p.read_text() for p in (d / ".compiled").iterdir()}
+    all2 = {p.name: p.read_text() for p in (d2 / ".compiled").iterdir()}
+    assert all1 == all2
 
 
 # --- PHASE 5b FEATURE B: intra-def vars (double-brace {{key}} pre-pass) ---
@@ -1866,3 +1979,2311 @@ def test_decompose_analyze_writes_requirement_path_plan_reads_it(tmp_path):
     assert "decomposition_requirement_path" in seg
     assert '"requirement_path"' in seg            # plan node consumes the path
     assert "decomposition_requirement" not in seg.replace("decomposition_requirement_path", "")
+
+
+# --- FAIL-LOUD CLASSIFICATION (rank: fail-loud-classification) ---
+# The three silent partition-mutation holes are now hard die paths:
+#   (i)  use:-resolution failure (was: silent orchestrator that DROPPED use:)
+#   (ii) delegation: auto skipping resolution (was: stripped _exec_* identity and
+#        could force an interactive microskill into a background segment)
+#   (iii) an orchestrator-classified loop.body member (was: silently dropped
+#        do/while scaffold — loop ran once).
+
+CLS_MS_MD = """\
+---
+name: {name}
+description: minimal microskill for classification tests
+---
+
+# {name}
+
+## Purpose
+
+Do the thing.
+
+## Steps
+
+1. Return the result.
+"""
+
+ASK_MS_BASE = """\
+version: 1
+runtime:
+  allowed_tools: [Read, AskUserQuestion]
+"""
+
+GATED_MS_BASE = """\
+version: 1
+gates:
+  add:
+    - id: confirm-it
+      after: step-1
+      type: human_approval
+      prompt: ok?
+"""
+
+EXEC_MS_BASE = """\
+version: 1
+runtime:
+  agent: echo-runner
+  model: haiku
+output_schema:
+  type: object
+  required: [echoed]
+  properties:
+    echoed: { type: string }
+"""
+
+
+def make_cls_world(tmp_path, wf_yaml, ms=None):
+    """Hermetic world: <tmp>/workflow-defs/cls-flow + <tmp>/microskills/<name> for
+    each entry in `ms` ({name: base_yaml}). Returns (defs_root, def_dir)."""
+    defs_root = tmp_path / "workflow-defs"
+    for name, base in (ms or {}).items():
+        mdir = tmp_path / "microskills" / name / "profiles"
+        mdir.mkdir(parents=True)
+        (tmp_path / "microskills" / name / "MICROSKILL.md").write_text(
+            CLS_MS_MD.format(name=name))
+        (mdir / "base.yaml").write_text(base)
+    d = defs_root / "cls-flow"
+    (d / "profiles").mkdir(parents=True)
+    (d / "WORKFLOW.yaml").write_text(wf_yaml)
+    (d / "profiles" / "base.yaml").write_text("version: 1\n")
+    return defs_root, d
+
+
+def test_use_resolution_failure_is_hard_error(tmp_path):
+    # (i) A typo'd use: target is a HARD compile error naming the node, the
+    # target, and the delegation: orchestrator escape hatch — and nothing is
+    # written (die happens before any mkdir/emit).
+    wf = "version: 1\nname: cls-flow\nnodes:\n  - id: u\n    use: no-such-ms\n"
+    defs_root, d = make_cls_world(tmp_path, wf)
+    rc, data, out, err = run(defs_root, "cls-flow")
+    assert rc == 1
+    assert "no-such-ms" in data["error"]
+    assert "failed to resolve" in data["error"]
+    assert "delegation: orchestrator" in data["error"]    # escape hatch named
+    assert not (d / ".compiled").exists()                 # died before any write
+
+
+def test_use_resolution_failure_escape_hatch_orchestrator(tmp_path):
+    # (i) Explicit delegation: orchestrator skips resolution entirely — the node
+    # compiles as an orchestrator checkpoint (the author owns the drop of use:).
+    wf = ("version: 1\nname: cls-flow\nnodes:\n"
+          "  - id: u\n    use: no-such-ms\n    delegation: orchestrator\n"
+          "    prompt: do it by hand\n")
+    defs_root, d = make_cls_world(tmp_path, wf)
+    rc, data, out, err = run(defs_root, "cls-flow")
+    assert rc == 0, err
+    assert data["sequence"] == ["orchestrator_node"]
+
+
+def test_use_askuserquestion_classifies_orchestrator(tmp_path):
+    # Classifier branch: resolved allowed_tools exposing AskUserQuestion →
+    # orchestrator checkpoint (not background, not an error).
+    wf = "version: 1\nname: cls-flow\nnodes:\n  - id: u\n    use: ask-ms\n"
+    defs_root, d = make_cls_world(tmp_path, wf, ms={"ask-ms": ASK_MS_BASE})
+    rc, data, out, err = run(defs_root, "cls-flow", "--explain")
+    assert rc == 0, err
+    assert data["sequence"] == ["orchestrator_node:u"]
+    by_node = {c["node"]: c for c in data["classification"]}
+    assert by_node["u"]["class"] == "orchestrator"
+    assert "AskUserQuestion" in by_node["u"]["reason"]
+
+
+def test_use_hard_gate_classifies_orchestrator(tmp_path):
+    # Classifier branch: a resolved hard-severity gate → orchestrator checkpoint.
+    wf = "version: 1\nname: cls-flow\nnodes:\n  - id: u\n    use: gated-ms\n"
+    defs_root, d = make_cls_world(tmp_path, wf, ms={"gated-ms": GATED_MS_BASE})
+    rc, data, out, err = run(defs_root, "cls-flow", "--explain")
+    assert rc == 0, err
+    assert data["sequence"] == ["orchestrator_node:u"]
+    by_node = {c["node"]: c for c in data["classification"]}
+    assert by_node["u"]["class"] == "orchestrator"
+    assert "hard gate" in by_node["u"]["reason"]
+
+
+def test_delegation_auto_resolves_and_bakes_executor_identity(tmp_path):
+    # (ii) delegation: auto no longer skips resolution: the executor identity
+    # (runtime.agent / runtime.model) and the inherited output_schema are stashed
+    # and baked into the emitted runMicroskill call.
+    wf = ("version: 1\nname: cls-flow\nnodes:\n"
+          "  - id: u\n    use: exec-ms\n    delegation: auto\n")
+    defs_root, d = make_cls_world(tmp_path, wf, ms={"exec-ms": EXEC_MS_BASE})
+    rc, data, out, err = run(defs_root, "cls-flow")
+    assert rc == 0, err
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert 'agentType: "echo-runner"' in seg
+    assert 'model: "haiku"' in seg
+    assert '"echoed"' in seg                  # inherited schema baked in
+    assert "schema: null" not in seg
+
+
+def test_delegation_auto_dies_on_askuserquestion(tmp_path):
+    # (ii) auto cannot force an interactive microskill into a background segment.
+    wf = ("version: 1\nname: cls-flow\nnodes:\n"
+          "  - id: u\n    use: ask-ms\n    delegation: auto\n")
+    defs_root, d = make_cls_world(tmp_path, wf, ms={"ask-ms": ASK_MS_BASE})
+    rc, data, out, err = run(defs_root, "cls-flow")
+    assert rc == 1
+    assert "AskUserQuestion" in data["error"]
+    assert not (d / ".compiled").exists()
+
+
+def test_delegation_auto_dies_on_hard_gate(tmp_path):
+    # (ii) auto cannot force a hard-gated microskill into a background segment.
+    wf = ("version: 1\nname: cls-flow\nnodes:\n"
+          "  - id: u\n    use: gated-ms\n    delegation: auto\n")
+    defs_root, d = make_cls_world(tmp_path, wf, ms={"gated-ms": GATED_MS_BASE})
+    rc, data, out, err = run(defs_root, "cls-flow")
+    assert rc == 1
+    assert "hard gate" in data["error"]
+    assert "confirm-it" in data["error"]
+
+
+def test_delegation_auto_dies_on_resolution_failure(tmp_path):
+    # (i)+(ii) auto is NOT an escape hatch for an unresolvable use: target — the
+    # segment would need the resolved identity, so it dies like the default path.
+    wf = ("version: 1\nname: cls-flow\nnodes:\n"
+          "  - id: u\n    use: no-such-ms\n    delegation: auto\n")
+    defs_root, d = make_cls_world(tmp_path, wf)
+    rc, data, out, err = run(defs_root, "cls-flow")
+    assert rc == 1
+    assert "failed to resolve" in data["error"]
+
+
+def test_delegation_auto_on_workflow_node_dies(tmp_path):
+    # (ii) a nested workflow can never run inside a background segment.
+    wf = ("version: 1\nname: cls-flow\nimports: [child-flow]\nnodes:\n"
+          "  - id: w\n    workflow: child-flow\n    delegation: auto\n")
+    defs_root, d = make_cls_world(tmp_path, wf)
+    rc, data, out, err = run(defs_root, "cls-flow")
+    assert rc == 1
+    assert "workflow:" in data["error"]
+    assert "orchestrator checkpoint" in data["error"]
+
+
+def test_side_effect_contradicting_delegation_auto_dies(tmp_path):
+    # side_effect: true is an alias for delegation: orchestrator; pairing it with
+    # delegation: auto is a contradiction — fail loud instead of letting one win.
+    wf = ("version: 1\nname: cls-flow\nnodes:\n"
+          "  - id: s\n    agent: ag\n    prompt: do it\n"
+          "    side_effect: true\n    delegation: auto\n")
+    defs_root, d = make_cls_world(tmp_path, wf)
+    rc, data, out, err = run(defs_root, "cls-flow")
+    assert rc == 1
+    assert "contradicts" in data["error"]
+
+
+LOOP_BODY_ORCH = """\
+version: 1
+name: cls-flow
+nodes:
+  - id: p
+    agent: ag
+    prompt: plan
+  - id: impl
+    delegation: orchestrator
+    depends_on: [p]
+    prompt: impl by hand
+  - id: ev
+    agent: ag
+    depends_on: [impl]
+    prompt: ev
+loop:
+  while: ${!ev.output.pass}
+  max_iters: 2
+  body: [impl, ev]
+"""
+
+
+def test_loop_body_orchestrator_member_dies(tmp_path):
+    # (iii) an orchestrator-classified body member used to pass contiguity and
+    # silently drop the do/while scaffold (loop ran once). Now a hard error.
+    defs_root, d = make_cls_world(tmp_path, LOOP_BODY_ORCH)
+    rc, data, out, err = run(defs_root, "cls-flow")
+    assert rc == 1
+    assert "loop.body node 'impl'" in data["error"]
+    assert "do/while" in data["error"]
+    assert not (d / ".compiled").exists()
+
+
+def test_loop_body_interactive_use_member_dies(tmp_path):
+    # (iii) the resolution-driven case: a body member whose microskill exposes
+    # AskUserQuestion classifies orchestrator → same hard error (this subset is
+    # NOT statically detectable in validate-workflow; only compile catches it).
+    wf = ("version: 1\nname: cls-flow\nnodes:\n"
+          "  - id: impl\n    agent: ag\n    prompt: impl\n"
+          "  - id: ev\n    use: ask-ms\n    depends_on: [impl]\n"
+          "loop:\n  while: ${!ev.output.pass}\n  max_iters: 2\n  body: [impl, ev]\n")
+    defs_root, d = make_cls_world(tmp_path, wf, ms={"ask-ms": ASK_MS_BASE})
+    rc, data, out, err = run(defs_root, "cls-flow")
+    assert rc == 1
+    assert "loop.body node 'ev'" in data["error"]
+    assert "AskUserQuestion" in data["error"]
+
+
+# --- PORTABLE SINGLE-SHAPE MANIFEST (rank: portable-single-shape-manifest) ---
+# Manifest step script paths are stored relative to the def dir; manifest_hash is
+# always emitted (no default-vs---explain byte fork); schema_sha256 records the
+# provenance of the validating schema OUTSIDE the hash.
+
+
+def test_manifest_script_path_relative_to_def_dir(tmp_path):
+    d = make_flow(tmp_path, "gated-flow", GATED.replace("name: linear-flow", "name: gated-flow"))
+    rc, data, out, err = run(tmp_path, "gated-flow")
+    assert rc == 0, err
+    m = json.loads((d / ".compiled" / "manifest.json").read_text())
+    segs = [s for s in m["steps"] if s["kind"] == "segment"]
+    assert [s["script"] for s in segs] == [".compiled/seg-1.js", ".compiled/seg-2.js"]
+    # The relative path actually resolves against the def dir.
+    for s in segs:
+        assert (d / s["script"]).is_file()
+
+
+def test_manifest_always_carries_hash_and_schema_sha(tmp_path):
+    # A DEFAULT compile (no --explain) writes manifest_hash + schema_sha256 —
+    # single manifest shape, no opt-in fork.
+    d = make_flow(tmp_path, "linear-flow", LINEAR)
+    rc, data, out, err = run(tmp_path, "linear-flow")
+    assert rc == 0, err
+    m = json.loads((d / ".compiled" / "manifest.json").read_text())
+    assert isinstance(m.get("manifest_hash"), str) and len(m["manifest_hash"]) == 64
+    assert isinstance(m.get("schema_sha256"), str) and len(m["schema_sha256"]) == 64
+    assert data["manifest_hash"] == m["manifest_hash"]    # summary matches manifest
+
+
+def test_default_and_explain_manifests_byte_identical(tmp_path):
+    # The on-disk .compiled/ bytes no longer fork on --explain.
+    import hashlib
+    d1 = make_flow(tmp_path / "a", "gated-flow", GATED.replace("name: linear-flow", "name: gated-flow"))
+    run(tmp_path / "a", "gated-flow")
+    d2 = make_flow(tmp_path / "b", "gated-flow", GATED.replace("name: linear-flow", "name: gated-flow"))
+    run(tmp_path / "b", "gated-flow", "--explain")
+    plain = {p.name: p.read_text() for p in (d1 / ".compiled").iterdir()}
+    expl = {p.name: p.read_text() for p in (d2 / ".compiled").iterdir()}
+    assert plain == expl
+
+
+def test_schema_sha256_matches_validating_schema_bytes(tmp_path):
+    # schema_sha256 is the sha256 of the exact workflow-schema.json bytes used
+    # for validation (pinned here via MICROSKILLS_TEMPLATES_ROOT).
+    import hashlib
+    d = make_flow(tmp_path, "linear-flow", LINEAR)
+    rc, data, out, err = run(tmp_path, "linear-flow")
+    assert rc == 0, err
+    m = json.loads((d / ".compiled" / "manifest.json").read_text())
+    schema_path = REPO / "templates" / "references" / "workflow-schema.json"
+    assert m["schema_sha256"] == hashlib.sha256(schema_path.read_bytes()).hexdigest()
+
+
+def test_schema_source_records_selected_tier_outside_hash(tmp_path):
+    # schema_source names WHICH fallback tier selected the validating schema
+    # (env:MICROSKILLS_TEMPLATES_ROOT | env:CLAUDE_PLUGIN_ROOT |
+    # runtime:.claude/templates | repo). Provenance only — like schema_sha256
+    # it sits OUTSIDE manifest_hash, so the same def compiled under two tiers
+    # keeps one hash (resume/lockfiles never fork on template provenance).
+    d = make_flow(tmp_path, "linear-flow", LINEAR)
+    rc, data, out, err = run(tmp_path, "linear-flow")  # _ENV pins the override
+    assert rc == 0, err
+    m1 = json.loads((d / ".compiled" / "manifest.json").read_text())
+    assert m1["schema_source"] == "env:MICROSKILLS_TEMPLATES_ROOT"
+    # Without the override the materialized runtime copy wins (the repo
+    # dogfood state — .claude/templates exists after initialize-harness).
+    env2 = {k: v for k, v in os.environ.items()
+            if k not in ("MICROSKILLS_TEMPLATES_ROOT", "CLAUDE_PLUGIN_ROOT")}
+    rc, data2, out, err = run(tmp_path, "linear-flow", env=env2)
+    assert rc == 0, err
+    m2 = json.loads((d / ".compiled" / "manifest.json").read_text())
+    assert m2["schema_source"] == "runtime:.claude/templates"
+    # provenance only: tier choice never moves manifest_hash
+    assert m1["manifest_hash"] == m2["manifest_hash"]
+
+
+def test_manifest_bytes_portable_across_checkouts(tmp_path):
+    # The SAME def compiled from two different absolute roots produces
+    # byte-identical manifest.json — and therefore the same manifest_hash —
+    # so a repo move/clone no longer invalidates resume by path alone.
+    d1 = make_flow(tmp_path / "checkout-one", "linear-flow", LINEAR)
+    rc1, data1, _, e1 = run(tmp_path / "checkout-one", "linear-flow")
+    assert rc1 == 0, e1
+    d2 = make_flow(tmp_path / "checkout-two", "linear-flow", LINEAR)
+    rc2, data2, _, e2 = run(tmp_path / "checkout-two", "linear-flow")
+    assert rc2 == 0, e2
+    m1 = (d1 / ".compiled" / "manifest.json").read_text()
+    m2 = (d2 / ".compiled" / "manifest.json").read_text()
+    assert m1 == m2
+    assert data1["manifest_hash"] == data2["manifest_hash"]
+
+
+# --- FAIL-LOUD ARGS GUARD (rank: cross-segment-output-spill, part (a)) ---
+# The emitted guard THROWS on JSON parse failure (never degrades to _args = {})
+# and asserts every per-segment needed key is PRESENT (a guarded-skip null is
+# legal — presence, not truthiness). No spill mechanism yet.
+
+
+def test_args_guard_throws_on_parse_failure(tmp_path):
+    d = make_flow(tmp_path, "gated-flow", GATED.replace("name: linear-flow", "name: gated-flow"))
+    rc, data, out, err = run(tmp_path, "gated-flow")
+    assert rc == 0, err
+    for seg_name in ("seg-1.js", "seg-2.js"):
+        seg = (d / ".compiled" / seg_name).read_text()
+        assert "JSON.parse(_args)" in seg
+        assert "_args = {}" not in seg                         # the old swallow is gone
+        assert "throw new Error('workflow args is not valid JSON" in seg
+
+
+def test_args_guard_asserts_needed_keys_presence(tmp_path):
+    # seg-2 of the gated flow needs upstream node `a` (b reads ${a.output.x}) —
+    # its guard must assert the key is PRESENT via the `in` operator (presence,
+    # not truthiness: `_args.a === null` from a guarded skip must pass).
+    d = make_flow(tmp_path, "gated-flow", GATED.replace("name: linear-flow", "name: gated-flow"))
+    rc, data, out, err = run(tmp_path, "gated-flow")
+    assert rc == 0, err
+    seg2 = (d / ".compiled" / "seg-2.js").read_text()
+    assert '["a"].filter((k) =>' in seg2
+    assert "!(k in _args)" in seg2                             # presence check, not truthiness
+    assert "missing required key(s)" in seg2
+    m = json.loads((d / ".compiled" / "manifest.json").read_text())
+    seg2_step = [s for s in m["steps"] if s["kind"] == "segment"][1]
+    assert seg2_step["needs"]["nodes"] == ["a"]                # guard mirrors needs
+
+
+def test_args_guard_no_keys_block_when_segment_needs_nothing(tmp_path):
+    # seg-1 of the gated flow needs nothing — no presence block is emitted (the
+    # parse guard alone), keeping no-needs segments minimal.
+    d = make_flow(tmp_path, "gated-flow", GATED.replace("name: linear-flow", "name: gated-flow"))
+    rc, data, out, err = run(tmp_path, "gated-flow")
+    assert rc == 0, err
+    seg1 = (d / ".compiled" / "seg-1.js").read_text()
+    assert "__missing" not in seg1
+    assert "missing required key(s)" not in seg1
+
+
+WF_NEEDS_MIX = """\
+version: 1
+name: mix-flow
+inputs:
+  topic: { type: string, required: true }
+nodes:
+  - id: a
+    agent: ag
+    prompt: do a on ${workflow.inputs.topic}
+  - id: fin
+    delegation: orchestrator
+    depends_on: [a]
+    prompt: checkpoint
+  - id: b
+    agent: ag
+    depends_on: [fin]
+    prompt: use ${a.output.x} and ${workflow.inputs.topic}
+"""
+
+
+def test_args_guard_lists_wf_inputs_and_node_keys_deterministically(tmp_path):
+    # The needed-keys list covers wf_<input> AND upstream node ids, in the same
+    # sorted order the manifest needs record uses (deterministic bytes).
+    d = make_flow(tmp_path, "mix-flow", WF_NEEDS_MIX)
+    rc, data, out, err = run(tmp_path, "mix-flow")
+    assert rc == 0, err
+    seg2 = (d / ".compiled" / "seg-2.js").read_text()
+    assert '["wf_topic", "a"]' in seg2          # wf_inputs first, then nodes (sorted)
+
+
+LOOP_NEEDS = """\
+version: 1
+name: ln-flow
+nodes:
+  - id: p
+    agent: ag
+    prompt: plan
+  - id: impl
+    agent: ag
+    depends_on: [p]
+    prompt: impl from ${p.output.spec} with notes ${loop.carry.last}
+  - id: ev
+    agent: ag
+    depends_on: [impl]
+    prompt: ev
+gates:
+  - id: g
+    after: p
+    type: human_approval
+    prompt: ok?
+loop:
+  while: ${!ev.output.pass}
+  max_iters: 2
+  body: [impl, ev]
+  carry:
+    last: ${ev.output}
+"""
+
+
+def test_args_guard_loop_segment_includes_carry_keys(tmp_path):
+    # A loop segment whose body reads a cross-segment node AND a loop.carry var
+    # asserts both keys (the dispatcher must pass carry_last: null — present,
+    # value null — plus the upstream node's output).
+    d = make_flow(tmp_path, "ln-flow", LOOP_NEEDS)
+    rc, data, out, err = run(tmp_path, "ln-flow")
+    assert rc == 0, err
+    seg2 = (d / ".compiled" / "seg-2.js").read_text()
+    assert '["p", "carry_last"]' in seg2        # needs node p + the carry seed
+    assert "missing required key(s)" in seg2
+    m = json.loads((d / ".compiled" / "manifest.json").read_text())
+    loop_step = [s for s in m["steps"] if s["kind"] == "segment"][1]
+    assert loop_step["needs"] == {"wf_inputs": [], "nodes": ["p"], "carry": ["last"]}
+
+
+# =============================================================================
+# 1.2 COMPILE-CLOSURE LOCKFILE — (a) frozen resolutions, (b) semantic
+# fingerprints folded into manifest_hash, (c) closure.lock.json + --lock/--check.
+# =============================================================================
+
+import hashlib
+import shutil
+
+
+def test_use_node_freezes_resolver_payload(tmp_path):
+    # (a) Each resolved use: node's resolver payload is frozen to
+    # .compiled/resolved/<node-id>.json, and the emitted runMicroskill Reads it
+    # (project-root-relative path baked into the call) instead of shelling the
+    # resolver at run time.
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF)
+    rc, data, out, err = run(defs_root, "inh-flow")
+    assert rc == 0, err
+    frozen_path = d / ".compiled" / "resolved" / "e.json"
+    assert frozen_path.exists()
+    frozen = json.loads(frozen_path.read_text())
+    assert frozen["skill_name"] == "echo-ms"
+    assert "rendered_skill_body" in frozen
+    assert "directives" in frozen
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert "FROZEN resolver payload" in seg          # helper Reads, never re-resolves
+    assert 'resolved: "' in seg and "resolved/e.json" in seg
+
+
+def test_frozen_payload_excludes_env_dependent_keys(tmp_path):
+    # (a) injected_inputs (and the inject-noise warnings) are env-dependent and
+    # stay OUT of the frozen payload — env stays out of the compile closure.
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF)
+    rc, data, out, err = run(defs_root, "inh-flow")
+    assert rc == 0, err
+    frozen = json.loads((d / ".compiled" / "resolved" / "e.json").read_text())
+    assert "injected_inputs" not in frozen
+    assert "warnings" not in frozen
+
+
+INJECT_MS_BASE = """\
+version: 1
+inputs:
+  who:
+    inject_from:
+      env: __COMPILE_TEST_INJECT_VAR__
+output_schema:
+  type: object
+  required: [echoed]
+  properties:
+    echoed: { type: string }
+"""
+
+
+def test_inject_from_microskill_bakes_inject_flag(tmp_path):
+    # (a) A microskill with inject_from inputs gets `inject: true` baked, so the
+    # segment runs `resolve-microskill --inject-only` at EXECUTION time; one
+    # without inject_from bakes no inject flag.
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF, ms_base=INJECT_MS_BASE)
+    rc, data, out, err = run(defs_root, "inh-flow")
+    assert rc == 0, err
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert ", inject: true }" in seg                 # baked into the call opts
+    assert "--inject-only" in seg                    # helper names the runtime mode
+    defs_root2, d2 = make_inh_world(tmp_path / "plain", INHERIT_WF)
+    rc2, *_ = run(defs_root2, "inh-flow")
+    assert rc2 == 0
+    seg2 = (d2 / ".compiled" / "seg-1.js").read_text()
+    assert ", inject: true }" not in seg2
+
+
+# A microskill whose REQUIRED input is inject-supplied, with the input declared
+# in the MICROSKILL.md Inputs table — the exact shape that used to leak inject
+# SUCCESS/FAILURE into the frozen payload (required_inputs flipped between []
+# and ['who'], and the Inputs table row between 'no … world' and 'yes … —').
+REQ_INJECT_MS_MD = """\
+---
+name: echo-ms
+description: echo microskill with a required inject-supplied input
+---
+
+# Echo
+
+## Inputs
+
+| Name | Required | Type | Description | Default |
+|---|---|---|---|---|
+| who | no | string | who to greet | world |
+
+## Steps
+
+1. Return the result.
+"""
+
+REQ_INJECT_MS_BASE = """\
+version: 1
+inputs:
+  who:
+    required: true
+    inject_from:
+      env: __COMPILE_TEST_REQ_INJECT_VAR__
+output_schema:
+  type: object
+  required: [echoed]
+  properties:
+    echoed: { type: string }
+"""
+
+
+def test_required_inject_compile_closure_is_env_independent(tmp_path):
+    # Invariant (e)/(a): the SAME def must compile to byte-identical frozen
+    # payloads and the same manifest_hash whether or not the compile machine's
+    # env satisfies a `required: true` + `inject_from` input. (Compile-time
+    # resolution passes --skip-inject, and the resolver's ledger keys off
+    # DECLARED inject_from presence — never inject success.)
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF,
+                                  ms_base=REQ_INJECT_MS_BASE,
+                                  ms_md=REQ_INJECT_MS_MD)
+    env_set = {**_ENV, "__COMPILE_TEST_REQ_INJECT_VAR__": "alice"}
+    env_unset = {k: v for k, v in _ENV.items()
+                 if k != "__COMPILE_TEST_REQ_INJECT_VAR__"}
+    rc1, d1, out1, err1 = run(defs_root, "inh-flow", env=env_set)
+    assert rc1 == 0, err1
+    frozen_set = (d / ".compiled" / "resolved" / "e.json").read_bytes()
+    hash_set = d1["manifest_hash"]
+    rc2, d2, out2, err2 = run(defs_root, "inh-flow", env=env_unset)
+    assert rc2 == 0, err2
+    frozen_unset = (d / ".compiled" / "resolved" / "e.json").read_bytes()
+    assert frozen_unset == frozen_set
+    assert d2["manifest_hash"] == hash_set
+    payload = json.loads(frozen_set)
+    # the declared-inject input is execution-time-supplied, never caller-gathered
+    assert payload["required_inputs"] == []
+    assert payload["profile_overrides_inputs"] == {}
+    # the Inputs table rides AS AUTHORED — no env-dependent required-flip rewrite
+    who_rows = [ln for ln in payload["rendered_skill_body"].splitlines()
+                if ln.startswith("| who ")]
+    assert len(who_rows) == 1
+    assert who_rows[0].split("|")[2].strip() == "no"
+    assert "world" in who_rows[0]
+
+
+def test_compile_never_executes_inject_sources(tmp_path):
+    # inject_from execution is an EXECUTION-TIME concern (--inject-only in the
+    # emitted segment); the compile path resolves with --skip-inject, so a
+    # `command:` source's side effect must never fire during classify/freeze.
+    sentinel = tmp_path / "inject-side-effect-ran.txt"
+    ms_base = f"""\
+version: 1
+inputs:
+  who:
+    inject_from:
+      command: "touch {sentinel} && echo alice"
+output_schema:
+  type: object
+  required: [echoed]
+  properties:
+    echoed: {{ type: string }}
+"""
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF, ms_base=ms_base)
+    rc, data, out, err = run(defs_root, "inh-flow")
+    assert rc == 0, err
+    assert not sentinel.exists()                     # the command never ran
+    # the execution-time path is still baked: inject: true + --inject-only
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert ", inject: true }" in seg
+    assert "--inject-only" in seg
+    assert "--skip-inject" not in seg                # compile-only flag, never baked
+
+
+def test_stale_frozen_payloads_cleaned(tmp_path):
+    # (a) stale-clean extends to resolved/*.json: a renamed node's old frozen
+    # file must not survive the recompile.
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF)
+    rc, *_ = run(defs_root, "inh-flow")
+    assert rc == 0
+    assert (d / ".compiled" / "resolved" / "e.json").exists()
+    (d / "WORKFLOW.yaml").write_text(INHERIT_WF.replace("- id: e", "- id: e2"))
+    rc2, *_ = run(defs_root, "inh-flow")
+    assert rc2 == 0
+    assert not (d / ".compiled" / "resolved" / "e.json").exists()
+    assert (d / ".compiled" / "resolved" / "e2.json").exists()
+
+
+def test_plan_writes_no_frozen_payloads(tmp_path):
+    # (a) --plan stays a pure dry-run: no .compiled/, no resolved/.
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF)
+    rc, data, out, err = run(defs_root, "inh-flow", "--plan")
+    assert rc == 0, err
+    assert not (d / ".compiled").exists()
+
+
+def test_frozen_payload_byte_deterministic(tmp_path):
+    # (a) Recompiling the same def leaves the frozen payload byte-identical.
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF)
+    run(defs_root, "inh-flow")
+    first = (d / ".compiled" / "resolved" / "e.json").read_bytes()
+    run(defs_root, "inh-flow")
+    assert (d / ".compiled" / "resolved" / "e.json").read_bytes() == first
+
+
+def test_prompt_change_changes_manifest_hash(tmp_path):
+    # (b) The substituted prompt lives only in seg JS; the semantic fingerprint
+    # makes a prompt edit hash-visible (the old manifest-only hash missed it).
+    d = make_flow(tmp_path, "linear-flow", LINEAR)
+    rc1, d1, *_ = run(tmp_path, "linear-flow")
+    assert rc1 == 0
+    (d / "WORKFLOW.yaml").write_text(LINEAR.replace("prompt: do a", "prompt: do a differently"))
+    rc2, d2, *_ = run(tmp_path, "linear-flow")
+    assert rc2 == 0
+    assert d1["manifest_hash"] != d2["manifest_hash"]
+
+
+def test_registry_edit_changes_manifest_hash(tmp_path):
+    # (b) THE registry-drift case: editing the microskill's MICROSKILL.md (body
+    # only — no schema/partition change) changes resolution_sha256 and therefore
+    # manifest_hash. The undeclared registry dependency is now declared.
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF)
+    rc1, d1, *_ = run(defs_root, "inh-flow")
+    assert rc1 == 0
+    ms_md = tmp_path / "microskills" / "echo-ms" / "MICROSKILL.md"
+    ms_md.write_text(ms_md.read_text() + "2. Also log the echo.\n")
+    rc2, d2, *_ = run(defs_root, "inh-flow")
+    assert rc2 == 0
+    assert d1["manifest_hash"] != d2["manifest_hash"]
+
+
+def test_explain_surfaces_fingerprint_detail(tmp_path):
+    # (b) Fingerprints are computed unconditionally but the DETAIL is stdout-only
+    # under --explain; resolution_sha256 matches the frozen file's exact bytes,
+    # and the written manifest carries no fingerprint payload.
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF)
+    rc, data, out, err = run(defs_root, "inh-flow", "--explain")
+    assert rc == 0, err
+    fps = {f["node"]: f for f in data["fingerprints"]}
+    assert fps["e"]["fingerprint"]["use"] == "echo-ms"
+    frozen_raw = (d / ".compiled" / "resolved" / "e.json").read_bytes()
+    assert fps["e"]["fingerprint"]["resolution_sha256"] == hashlib.sha256(frozen_raw).hexdigest()
+    man = (d / ".compiled" / "manifest.json").read_text()
+    assert "fingerprint" not in man and "resolution_sha256" not in man
+    rc2, data2, *_ = run(defs_root, "inh-flow")
+    assert "fingerprints" not in data2               # default summary stays lean
+
+
+def test_lock_writes_hash_only_lockfile(tmp_path):
+    # (c) --lock writes the committed drift baseline next to WORKFLOW.yaml
+    # (NOT under gitignored .compiled/): hash-only closure record.
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF)
+    rc, data, out, err = run(defs_root, "inh-flow", "--lock")
+    assert rc == 0, err
+    lock = json.loads((d / "closure.lock.json").read_text())
+    assert lock["name"] == "inh-flow"
+    assert lock["profile_used"] == "base"
+    assert lock["manifest_hash"] == data["manifest_hash"]
+    assert set(lock["node_fingerprints"]) == {"e"}
+    assert data["lock_path"].endswith("closure.lock.json")
+
+
+def test_check_ok_and_writes_nothing(tmp_path):
+    # (c) --check against an up-to-date lockfile passes — and writes NOTHING
+    # (a fresh CI checkout has no .compiled/; --check must not create one).
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF)
+    rc, *_ = run(defs_root, "inh-flow", "--lock")
+    assert rc == 0
+    shutil.rmtree(d / ".compiled")                   # simulate the fresh checkout
+    rc2, data2, out2, err2 = run(defs_root, "inh-flow", "--check")
+    assert rc2 == 0, err2
+    assert data2["check"] == "ok"
+    assert not (d / ".compiled").exists()
+
+
+def test_check_detects_registry_drift_and_names_node(tmp_path):
+    # (c) A registry edit after --lock makes --check fail loud, naming the
+    # drifted node in the diagnosable drift report.
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF)
+    rc, *_ = run(defs_root, "inh-flow", "--lock")
+    assert rc == 0
+    ms_md = tmp_path / "microskills" / "echo-ms" / "MICROSKILL.md"
+    ms_md.write_text(ms_md.read_text() + "2. Also log the echo.\n")
+    rc2, data2, out2, err2 = run(defs_root, "inh-flow", "--check")
+    assert rc2 == 1
+    assert "drifted" in data2["error"]
+    assert data2["drift"]["nodes"]["changed"] == ["e"]
+    assert "manifest_hash" in data2["drift"]
+
+
+def test_check_without_lockfile_dies(tmp_path):
+    # (c) --check with no committed baseline is a hard error naming --lock.
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF)
+    rc, data, out, err = run(defs_root, "inh-flow", "--check")
+    assert rc == 1
+    assert "closure.lock.json not found" in data["error"]
+    assert "--lock" in data["error"]
+
+
+def test_lock_is_mutually_exclusive_with_plan_and_check(tmp_path):
+    # (c) --lock writes artifacts; combining it with the no-write modes is a block.
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF)
+    rc, data, *_ = run(defs_root, "inh-flow", "--lock", "--check")
+    assert rc == 1
+    rc2, data2, *_ = run(defs_root, "inh-flow", "--lock", "--plan")
+    assert rc2 == 1
+
+
+# =============================================================================
+# 3.2 NODE-SCOPED RUN OVERRIDES — customize closed to {profile?, overrides?},
+# overrides plumbed through BOTH resolution paths, --node-override CLI twin,
+# manifest record only-when-non-empty, use:-only placement.
+# =============================================================================
+
+import importlib.machinery as _ilm
+import importlib.util as _ilu
+
+import pytest
+
+
+def _load_compiler_module():
+    """Import the compile-workflow script as a module (SourceFileLoader — the
+    extension-less-script pattern validate-workflow itself uses) so tests can
+    pin its emitted-JS constants verbatim."""
+    loader = _ilm.SourceFileLoader("compile_workflow_under_test", str(SCRIPT))
+    spec = _ilu.spec_from_loader("compile_workflow_under_test", loader)
+    mod = _ilu.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+OVERRIDES_WF = """\
+version: 1
+name: inh-flow
+nodes:
+  - id: e
+    use: echo-ms
+    customize:
+      overrides:
+        runtime.model: haiku
+"""
+
+RUNTIME_MS_BASE = """\
+version: 1
+runtime:
+  agent: echo-agent
+  model: echo-model-1
+output_schema:
+  type: object
+  required: [echoed]
+  properties:
+    echoed: { type: string }
+"""
+
+
+def test_customize_unknown_key_fails_closed_schema(tmp_path):
+    # customize is CLOSED to {profile?, overrides?}: an unknown key (the old
+    # silently-ignored hole) now fails schema validation.
+    wf = OVERRIDES_WF.replace(
+        "    customize:\n      overrides:\n        runtime.model: haiku\n",
+        "    customize:\n      profilee: oops\n")
+    defs_root, d = make_inh_world(tmp_path, wf)
+    rc, data, out, err = run(defs_root, "inh-flow")
+    assert rc == 1
+    assert any("profilee" in m for m in data["schema_errors"])
+
+
+def test_customize_overrides_flow_into_resolution_and_frozen_payload(tmp_path):
+    # BOTH resolution paths by construction: the classify-time resolution
+    # carries the overrides (exec identity changes), and the frozen payload —
+    # that same resolution's stdout — records the overridden config.
+    defs_root, d = make_inh_world(tmp_path, OVERRIDES_WF, ms_base=RUNTIME_MS_BASE)
+    rc, data, out, err = run(defs_root, "inh-flow")
+    assert rc == 0, err
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert 'model: "haiku"' in seg                     # baked executor overridden
+    assert 'model: "echo-model-1"' not in seg
+    frozen = json.loads((d / ".compiled" / "resolved" / "e.json").read_text())
+    assert frozen["config"]["runtime"]["model"] == "haiku"
+    assert frozen["directives"]["model"] == "haiku"
+
+
+def test_override_granting_askuserquestion_reclassifies_orchestrator(tmp_path):
+    # Background-can't-pause STRENGTHENED: an override exposing AskUserQuestion
+    # deterministically reclassifies the use: node to an orchestrator
+    # checkpoint at classify time (the override rides the resolve subprocess).
+    wf = OVERRIDES_WF.replace("        runtime.model: haiku\n",
+                              "        runtime.allowed_tools: [AskUserQuestion]\n")
+    defs_root, d = make_inh_world(tmp_path, wf)
+    rc, data, out, err = run(defs_root, "inh-flow", "--explain")
+    assert rc == 0, err
+    assert data["segments"] == 0 and data["checkpoints"] == 1
+    by_node = {c["node"]: c for c in data["classification"]}
+    assert by_node["e"]["class"] == "orchestrator"
+    assert "AskUserQuestion" in by_node["e"]["reason"]
+    # Counter-case: the SAME world without the override stays background.
+    defs_root2, d2 = make_inh_world(tmp_path / "plain", INHERIT_WF)
+    rc2, data2, *_ = run(defs_root2, "inh-flow", "--explain")
+    assert rc2 == 0
+    assert {c["node"]: c["class"] for c in data2["classification"]}["e"] == "background"
+
+
+def test_node_override_flag_reclassifies_like_yaml(tmp_path):
+    # The CLI twin rides the same path: --node-override granting
+    # AskUserQuestion reclassifies exactly like the YAML form.
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF)
+    rc, data, out, err = run(defs_root, "inh-flow", "--explain",
+                             "--node-override", "e:runtime.allowed_tools=[AskUserQuestion]")
+    assert rc == 0, err
+    assert {c["node"]: c["class"] for c in data["classification"]}["e"] == "orchestrator"
+
+
+def test_node_override_flag_byte_identical_to_yaml_overrides(tmp_path):
+    # --node-override merges into customize.overrides exactly as if authored in
+    # YAML — same def dir, so the compiled bytes (seg JS, manifest, frozen
+    # payload) and manifest_hash are IDENTICAL by construction.
+    defs_root, d = make_inh_world(tmp_path, OVERRIDES_WF, ms_base=RUNTIME_MS_BASE)
+    rc1, data1, *_ = run(defs_root, "inh-flow")
+    assert rc1 == 0
+    yaml_bytes = {p.name: p.read_bytes()
+                  for p in sorted((d / ".compiled").rglob("*")) if p.is_file()}
+    (d / "WORKFLOW.yaml").write_text(INHERIT_WF)   # overrides removed from YAML
+    rc2, data2, *_ = run(defs_root, "inh-flow",
+                         "--node-override", "e:runtime.model=haiku")
+    assert rc2 == 0
+    flag_bytes = {p.name: p.read_bytes()
+                  for p in sorted((d / ".compiled").rglob("*")) if p.is_file()}
+    assert yaml_bytes == flag_bytes
+    assert data1["manifest_hash"] == data2["manifest_hash"]
+
+
+def test_node_override_changes_baked_model_and_explain_executor(tmp_path):
+    # 'run e on haiku for this smoke run': the flag changes BOTH the baked seg
+    # literal and the --explain executor surface, with no profile fork.
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF, ms_base=RUNTIME_MS_BASE)
+    rc, data, out, err = run(defs_root, "inh-flow", "--explain",
+                             "--node-override", "e:runtime.model=haiku")
+    assert rc == 0, err
+    execu = {c["node"]: c["executor"] for c in data["classification"]}["e"]
+    assert execu == {"profile": "base", "agent": "echo-agent", "model": "haiku"}
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert 'model: "haiku"' in seg
+
+
+def test_node_override_malformed_or_unknown_node_dies(tmp_path):
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF)
+    rc, data, *_ = run(defs_root, "inh-flow", "--node-override", "e:no-equals")
+    assert rc == 1 and "malformed --node-override" in data["error"]
+    rc2, data2, *_ = run(defs_root, "inh-flow", "--node-override", "no-colon=1")
+    assert rc2 == 1 and "malformed --node-override" in data2["error"]
+    rc3, data3, *_ = run(defs_root, "inh-flow", "--node-override", "ghost:runtime.model=haiku")
+    assert rc3 == 1 and "unknown node 'ghost'" in data3["error"]
+
+
+def test_node_override_leading_hash_value_stays_literal(tmp_path):
+    # The '#'-leading-value paper cut is FIXED in the shared parser: the value
+    # survives as a literal string into the frozen resolution (it used to be
+    # eaten as a YAML comment -> None -> silent key delete).
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF)
+    rc, data, out, err = run(defs_root, "inh-flow",
+                             "--node-override", "e:vars.tag=#smoke-7")
+    assert rc == 0, err
+    frozen = json.loads((d / ".compiled" / "resolved" / "e.json").read_text())
+    assert frozen["config"]["vars"]["tag"] == "#smoke-7"
+    m = json.loads((d / ".compiled" / "manifest.json").read_text())
+    assert m["node_overrides"] == {"e": {"vars.tag": "#smoke-7"}}
+
+
+def test_overrides_recorded_in_manifest_only_when_nonempty(tmp_path):
+    # Override-free compile: NO node_overrides key (byte-identity preserved).
+    # Override run: the key records the effective per-node map, and the hash
+    # diverges (stale resume state / lockfile correctly refuse to match).
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF)
+    rc1, data1, *_ = run(defs_root, "inh-flow")
+    assert rc1 == 0
+    m1 = json.loads((d / ".compiled" / "manifest.json").read_text())
+    assert "node_overrides" not in m1
+    rc2, data2, *_ = run(defs_root, "inh-flow",
+                         "--node-override", "e:runtime.model=haiku")
+    assert rc2 == 0
+    m2 = json.loads((d / ".compiled" / "manifest.json").read_text())
+    assert m2["node_overrides"] == {"e": {"runtime.model": "haiku"}}
+    assert data1["manifest_hash"] != data2["manifest_hash"]
+
+
+def test_customize_overrides_blocked_on_agent_and_workflow_nodes(tmp_path):
+    agent_wf = """\
+version: 1
+name: ov-flow
+nodes:
+  - id: a
+    agent: ag
+    customize:
+      overrides:
+        runtime.model: haiku
+    prompt: do a
+"""
+    make_flow(tmp_path, "ov-flow", agent_wf)
+    rc, data, *_ = run(tmp_path, "ov-flow")
+    assert rc == 1
+    assert "customize.overrides is only valid on a use:" in data["error"]
+    wf_node_wf = """\
+version: 1
+name: ov2-flow
+imports: [child-flow]
+nodes:
+  - id: w
+    workflow: child-flow
+    customize:
+      overrides:
+        runtime.model: haiku
+"""
+    make_flow(tmp_path, "ov2-flow", wf_node_wf)
+    rc2, data2, *_ = run(tmp_path, "ov2-flow")
+    assert rc2 == 1
+    assert "workflow: node" in data2["error"]
+
+
+def test_customize_overrides_blocked_under_explicit_delegation_orchestrator(tmp_path):
+    # The delegation: orchestrator escape hatch SKIPS resolution, so overrides
+    # there would be silently ignored — die instead.
+    wf = OVERRIDES_WF.replace("    use: echo-ms\n",
+                              "    use: echo-ms\n    delegation: orchestrator\n")
+    defs_root, d = make_inh_world(tmp_path, wf)
+    rc, data, *_ = run(defs_root, "inh-flow")
+    assert rc == 1
+    assert "delegation: orchestrator" in data["error"]
+    assert "silently ignored" in data["error"]
+
+
+INJECT_OVERRIDE_MS_BASE = """\
+version: 1
+inputs:
+  who:
+    inject_from:
+      env: __COMPILE_TEST_INJECT_VAR2__
+output_schema:
+  type: object
+  required: [echoed]
+  properties:
+    echoed: { type: string }
+"""
+
+
+def test_inject_plus_overrides_bakes_escaped_flags_and_variant_helper(tmp_path):
+    # The execution-time --inject-only command line must carry the SAME
+    # overrides the compile-time resolution carried — baked as ONE pre-escaped
+    # (shlex.quote) string, consumed by the overrideFlags-aware helper variant
+    # that is emitted ONLY into segments needing it.
+    defs_root, d = make_inh_world(tmp_path, OVERRIDES_WF,
+                                  ms_base=INJECT_OVERRIDE_MS_BASE)
+    rc, data, out, err = run(defs_root, "inh-flow")
+    assert rc == 0, err
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert ", inject: true" in seg
+    assert 'overrideFlags: " --override \'runtime.model=\\"haiku\\"\'"' in seg
+    assert "overrideFlags = ''" in seg                       # variant helper text
+    assert "${overrideFlags} --inject-only" in seg
+    # Override-free inject node keeps the BASE helper byte-identical (no
+    # overrideFlags anywhere).
+    defs_root2, d2 = make_inh_world(tmp_path / "plain", INHERIT_WF,
+                                    ms_base=INJECT_OVERRIDE_MS_BASE)
+    rc2, *_ = run(defs_root2, "inh-flow")
+    assert rc2 == 0
+    seg2 = (d2 / ".compiled" / "seg-1.js").read_text()
+    assert "overrideFlags" not in seg2
+
+
+def test_override_free_def_emits_no_override_machinery(tmp_path):
+    # Byte-identity guard for the entire 3.2 feature: an override-free def
+    # carries NO overrideFlags text, NO node_overrides manifest key.
+    d = make_flow(tmp_path, "linear-flow", LINEAR)
+    rc, *_ = run(tmp_path, "linear-flow")
+    assert rc == 0
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert "overrideFlags" not in seg
+    assert "node_overrides" not in (d / ".compiled" / "manifest.json").read_text()
+
+
+# =============================================================================
+# 3.6 DECLARED BOUNDED NODE RETRY — withRetry wrap on use:/agent: nodes,
+# helper emitted conditionally, host contract (null-return AND rejection both
+# retry; exhaustion reproduces the native failure shape) pinned + executed.
+# =============================================================================
+
+RETRY_WF = """\
+version: 1
+name: retry-flow
+nodes:
+  - id: a
+    agent: ag
+    retry: { max_attempts: 3 }
+    prompt: do a
+  - id: b
+    agent: ag
+    depends_on: [a]
+    prompt: use ${a.output.x}
+"""
+
+
+def test_retry_wraps_agent_call_and_emits_helper_conditionally(tmp_path):
+    d = make_flow(tmp_path, "retry-flow", RETRY_WF)
+    rc, data, out, err = run(tmp_path, "retry-flow")
+    assert rc == 0, err
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert "async function withRetry" in seg
+    assert 'await withRetry(() => runAgent("ag"' in seg
+    assert ", 3)" in seg
+    # The non-retry sibling stays a bare call.
+    assert 'const n_b = await runAgent("ag"' in seg
+
+
+def test_retry_free_def_emits_no_retry_helper(tmp_path):
+    # PARALLEL_CHUNKED_JS precedent: the helper is per-segment conditional, so
+    # retry-free defs compile byte-identically (no withRetry text at all).
+    d = make_flow(tmp_path, "linear-flow", LINEAR)
+    rc, *_ = run(tmp_path, "linear-flow")
+    assert rc == 0
+    assert "withRetry" not in (d / ".compiled" / "seg-1.js").read_text()
+
+
+RETRY_USE_FE_WF = """\
+version: 1
+name: inh-flow
+inputs:
+  items: { type: array, required: true }
+nodes:
+  - id: e
+    use: echo-ms
+    retry: { max_attempts: 2 }
+    for_each: ${workflow.inputs.items}
+    as: item
+    inputs:
+      payload: ${item}
+"""
+
+
+def test_retry_wraps_use_node_per_item_inside_for_each(tmp_path):
+    # Wrapping the PER-CALL expression means a for_each fan-out retries per
+    # ITEM: the withRetry sits INSIDE each mapped thunk.
+    defs_root, d = make_inh_world(tmp_path, RETRY_USE_FE_WF)
+    rc, data, out, err = run(defs_root, "inh-flow")
+    assert rc == 0, err
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert '.map((item) => () => withRetry(() => runMicroskill("echo-ms"' in seg
+    assert ", 2))" in seg
+
+
+def test_retry_max_attempts_below_two_blocks_schema(tmp_path):
+    make_flow(tmp_path, "retry-flow",
+              RETRY_WF.replace("max_attempts: 3", "max_attempts: 1"))
+    rc, data, *_ = run(tmp_path, "retry-flow")
+    assert rc == 1
+    assert any("minimum" in m or "less than" in m for m in data["schema_errors"])
+
+
+def test_retry_on_workflow_node_dies(tmp_path):
+    wf = """\
+version: 1
+name: rw-flow
+imports: [child-flow]
+nodes:
+  - id: w
+    workflow: child-flow
+    retry: { max_attempts: 2 }
+"""
+    make_flow(tmp_path, "rw-flow", wf)
+    rc, data, *_ = run(tmp_path, "rw-flow")
+    assert rc == 1
+    assert "retry is only valid on a background use:/agent: node" in data["error"]
+
+
+def test_retry_on_orchestrator_native_node_dies(tmp_path):
+    wf = """\
+version: 1
+name: ro-flow
+nodes:
+  - id: a
+    agent: ag
+    prompt: do a
+  - id: fin
+    delegation: orchestrator
+    retry: { max_attempts: 2 }
+    depends_on: [a]
+    prompt: finalize
+"""
+    make_flow(tmp_path, "ro-flow", wf)
+    rc, data, *_ = run(tmp_path, "ro-flow")
+    assert rc == 1
+    assert "orchestrator checkpoint" in data["error"]
+
+
+ASK_MS_BASE = """\
+version: 1
+runtime:
+  allowed_tools: [AskUserQuestion]
+output_schema:
+  type: object
+  required: [echoed]
+  properties:
+    echoed: { type: string }
+"""
+
+
+def test_retry_on_resolution_classified_orchestrator_use_node_dies(tmp_path):
+    # The case validate CANNOT statically catch: a use: node whose RESOLUTION
+    # (AskUserQuestion) classifies it orchestrator — compile still dies on the
+    # retry rather than silently dropping it with the checkpoint.
+    wf = INHERIT_WF.replace("    use: echo-ms\n",
+                            "    use: echo-ms\n    retry: { max_attempts: 2 }\n")
+    defs_root, d = make_inh_world(tmp_path, wf, ms_base=ASK_MS_BASE)
+    rc, data, *_ = run(defs_root, "inh-flow")
+    assert rc == 1
+    assert "retry is only valid on a background use:/agent: node" in data["error"]
+    assert "AskUserQuestion" in data["error"]
+
+
+def test_retry_changes_manifest_hash(tmp_path):
+    # retry changes executed semantics that live only in seg JS — the semantic
+    # fingerprint folds it in (only when PRESENT: retry-free fingerprints are
+    # byte-for-byte unchanged, so committed lockfiles stay valid).
+    make_flow(tmp_path / "one", "retry-flow",
+              RETRY_WF.replace("    retry: { max_attempts: 3 }\n", ""))
+    rc1, d1, *_ = run(tmp_path / "one", "retry-flow")
+    assert rc1 == 0
+    make_flow(tmp_path / "two", "retry-flow", RETRY_WF)
+    rc2, d2, *_ = run(tmp_path / "two", "retry-flow")
+    assert rc2 == 0
+    assert d1["manifest_hash"] != d2["manifest_hash"]
+
+
+def test_retry_helper_text_pins_host_contract(tmp_path):
+    # The emitted helper must pin the HOST CONTRACT in its own text: retry on
+    # BOTH a thrown rejection and a null/undefined return; on exhaustion
+    # reproduce the final attempt's native failure shape (return / rethrow).
+    d = make_flow(tmp_path, "retry-flow", RETRY_WF)
+    rc, *_ = run(tmp_path, "retry-flow")
+    assert rc == 0
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert "result !== null && result !== undefined" in seg   # null-return retry
+    assert "if (attempt >= maxAttempts) return result" in seg  # exhaustion: return null as-is
+    assert "if (attempt >= maxAttempts) throw e" in seg        # exhaustion: rethrow
+    # And the emitted text IS the module constant the executed-contract test runs.
+    mod = _load_compiler_module()
+    assert mod.WITH_RETRY_JS in seg
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
+def test_with_retry_host_contract_executed_under_node(tmp_path):
+    # Execute the EXACT emitted helper under node and pin the contract:
+    #  (1) flaky (throw, null, then valid) -> returns the valid result, 3 attempts;
+    #  (2) always-null -> exhausts, returns null (native failure shape), exactly N calls;
+    #  (3) always-throw -> exhausts, RETHROWS the final error;
+    #  (4) immediate success -> exactly 1 call, result passed through untouched
+    #      (never re-rolled).
+    mod = _load_compiler_module()
+    script = mod.WITH_RETRY_JS + r"""
+;(async () => {
+  const out = {}
+  let c1 = 0
+  const r1 = await withRetry(() => {
+    c1++
+    if (c1 === 1) return Promise.reject(new Error('x'))
+    if (c1 === 2) return Promise.resolve(null)
+    return Promise.resolve({ v: 42 })
+  }, 5)
+  out.flaky = { result: r1, attempts: c1 }
+  let c2 = 0
+  const r2 = await withRetry(() => { c2++; return Promise.resolve(null) }, 3)
+  out.allNull = { result: r2, attempts: c2 }
+  let c3 = 0
+  let threw = null
+  try {
+    await withRetry(() => { c3++; return Promise.reject(new Error('boom')) }, 2)
+  } catch (e) { threw = e.message }
+  out.allThrow = { threw, attempts: c3 }
+  let c4 = 0
+  const r4 = await withRetry(() => { c4++; return Promise.resolve({ done: true }) }, 4)
+  out.ok = { result: r4, attempts: c4 }
+  console.log(JSON.stringify(out))
+})()
+"""
+    proc = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    data = json.loads(proc.stdout)
+    assert data["flaky"] == {"result": {"v": 42}, "attempts": 3}
+    assert data["allNull"] == {"result": None, "attempts": 3}
+    assert data["allThrow"] == {"threw": "boom", "attempts": 2}
+    assert data["ok"] == {"result": {"done": True}, "attempts": 1}
+
+
+# =============================================================================
+# 3.5 (compiler half) — --explain classification gains executor
+# {profile, agent, model} pinned against the baked seg literals; --plan embeds
+# the FULL manifest object in the printed summary.
+# =============================================================================
+
+
+def test_explain_executor_pinned_against_baked_seg_literals(tmp_path):
+    # The executor surfaced per node under --explain must be EXACTLY what the
+    # emit baked into the runMicroskill call (agentType/model literals) — the
+    # previously-unasserted gap.
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF, ms_base=RUNTIME_MS_BASE)
+    rc, data, out, err = run(defs_root, "inh-flow", "--explain")
+    assert rc == 0, err
+    execu = {c["node"]: c["executor"] for c in data["classification"]}["e"]
+    assert execu == {"profile": "base", "agent": "echo-agent", "model": "echo-model-1"}
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert f'agentType: {json.dumps(execu["agent"])}' in seg
+    assert f'model: {json.dumps(execu["model"])}' in seg
+    assert f'profile: {json.dumps(execu["profile"])}' in seg
+
+
+def test_explain_executor_for_agent_and_orchestrator_nodes(tmp_path):
+    # agent: node -> executor.agent is the agent type (model rides the agent
+    # definition at run time); orchestrator-native -> all-null executor.
+    make_flow(tmp_path, "orch-flow", ORCH)
+    rc, data, out, err = run(tmp_path, "orch-flow", "--explain")
+    assert rc == 0, err
+    ex = {c["node"]: c["executor"] for c in data["classification"]}
+    assert ex["a"] == {"profile": None, "agent": "ag", "model": None}
+    assert ex["fin"] == {"profile": None, "agent": None, "model": None}
+    seg = (tmp_path / "orch-flow" / ".compiled" / "seg-1.js").read_text()
+    assert 'runAgent("ag"' in seg
+
+
+def test_plan_summary_embeds_full_manifest(tmp_path):
+    # --plan writes no manifest.json, so the summary embeds the FULL manifest
+    # object — including the gate/inputs data the lean summary never carried —
+    # while still writing NOTHING.
+    wf = GATED.replace("name: linear-flow", "name: gated-flow") + """\
+inputs:
+  diff_path: { type: string, required: true }
+  depth: { type: string, default: lite }
+"""
+    make_flow(tmp_path, "gated-flow", wf)
+    rc, data, out, err = run(tmp_path, "gated-flow", "--plan")
+    assert rc == 0, err
+    man = data["manifest"]
+    assert man["name"] == "gated-flow"
+    assert man["required_inputs"] == ["diff_path"]
+    assert man["input_defaults"] == {"depth": "lite"}
+    gate_steps = [s for s in man["steps"] if s.get("checkpoint_type") == "gate"]
+    assert gate_steps and gate_steps[0]["gate"]["id"] == "g1"
+    assert gate_steps[0]["gate"]["options"] == ["approve", "abandon"]
+    assert man["manifest_hash"] == data["manifest_hash"]
+    assert "schema_sha256" in man
+    assert not (tmp_path / "gated-flow" / ".compiled").exists()
+    # The non-plan summary stays lean: no embedded manifest.
+    rc2, data2, *_ = run(tmp_path, "gated-flow")
+    assert rc2 == 0
+    assert "manifest" not in data2
+
+
+def test_plan_explain_combined_is_the_dispatcher_preflight_shape(tmp_path):
+    # 3.5 (dispatcher half) — the dispatcher's preflight (`/workflow <name>
+    # --plan`) compiles with `--plan --explain` and renders EXCLUSIVELY from
+    # the printed summary: the embedded full manifest (steps incl. gate dicts,
+    # inputs) PLUS the per-node executor entries. Pin that the two flags
+    # compose additively and still write nothing.
+    wf = GATED.replace("name: linear-flow", "name: gated-flow")
+    make_flow(tmp_path, "gated-flow", wf)
+    rc, data, out, err = run(tmp_path, "gated-flow", "--plan", "--explain")
+    assert rc == 0, err
+    assert data["plan"] is True
+    # full manifest object: the gate dict a preflight renderer needs
+    gate = [s for s in data["manifest"]["steps"]
+            if s.get("checkpoint_type") == "gate"][0]["gate"]
+    assert gate["id"] == "g1" and gate["options"] == ["approve", "abandon"]
+    # executor identity per node, de-anonymized sequence
+    ex = {c["node"]: c["executor"] for c in data["classification"]}
+    assert ex["a"] == {"profile": None, "agent": "ag", "model": None}
+    assert data["sequence"] == ["segment[a]", "gate:g1", "segment[b]"]
+    # still a dry-run: nothing written
+    assert not (tmp_path / "gated-flow" / ".compiled").exists()
+
+
+# --- {{snippet:NAME}} includes (shared prose from <defs-root>/_snippets/) ---
+# Resolved by the SHARED apply_workflow_vars pre-pass BEFORE ordinary {{var}}
+# substitution, so a snippet body may carry vars. Unresolved snippet → HARD block.
+
+SNIPPET_FLOW = """\
+version: 1
+name: snip-flow
+vars:
+  topic: kubernetes
+nodes:
+  - id: a
+    agent: ag
+    prompt: "{{snippet:greet}} now"
+"""
+
+
+def test_snippet_resolves_before_vars(tmp_path):
+    # The include lands first, THEN {{topic}} inside the snippet body resolves —
+    # parameterized shared prose.
+    (tmp_path / "_snippets").mkdir()
+    (tmp_path / "_snippets" / "greet.md").write_text("research {{topic}} thoroughly\n")
+    d = make_flow(tmp_path, "snip-flow", SNIPPET_FLOW)
+    rc, data, out, err = run(tmp_path, "snip-flow")
+    assert rc == 0, err
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert "research kubernetes thoroughly now" in seg
+    assert "{{snippet:" not in seg
+
+
+def test_missing_snippet_hard_blocks(tmp_path):
+    # An unresolvable {{snippet:...}} is a HARD compile error (exit 1) — never a
+    # warn, never a literal token shipped into a compiled prompt.
+    make_flow(tmp_path, "snip-flow", SNIPPET_FLOW)  # no _snippets dir at all
+    rc, data, out, err = run(tmp_path, "snip-flow")
+    assert rc == 1, out
+    assert "snippet" in json.dumps(data).lower()
+    assert any("greet" in e for e in data.get("snippet_errors", [])), data
+
+
+def test_nested_snippet_blocks(tmp_path):
+    # A snippet that itself contains a {{snippet:...}} token is unsupported (V1:
+    # one pass, no recursion) — hard block, not silent passthrough.
+    (tmp_path / "_snippets").mkdir()
+    (tmp_path / "_snippets" / "greet.md").write_text("outer {{snippet:inner}}\n")
+    (tmp_path / "_snippets" / "inner.md").write_text("inner\n")
+    make_flow(tmp_path, "snip-flow", SNIPPET_FLOW)
+    rc, data, out, err = run(tmp_path, "snip-flow")
+    assert rc == 1, out
+    assert any("nested" in e for e in data.get("snippet_errors", [])), data
+
+
+def test_snippet_trailing_newline_stripped_once(tmp_path):
+    # The include is the file text minus ONE trailing newline (POSIX convention),
+    # so a snippet embeds cleanly mid-string.
+    (tmp_path / "_snippets").mkdir()
+    (tmp_path / "_snippets" / "greet.md").write_text("research {{topic}} thoroughly\n")
+    d = make_flow(tmp_path, "snip-flow", SNIPPET_FLOW)
+    run(tmp_path, "snip-flow")
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert "thoroughly\n now" not in seg
+    assert "thoroughly now" in seg
+
+
+def test_real_finalize_snippet_renders_in_both_creators():
+    # The shared finalize protocol (ONE snippet, ~6 vars) renders into BOTH
+    # microskill-create and build-workflow-from-plan with the domain literals
+    # substituted and no token residue.
+    rc, data, out, err = run(REAL_DEFS, "microskill-create", "--plan")
+    assert rc == 0, err
+    fin = [s for s in data["manifest"]["steps"] if s.get("node") == "finalize"][0]
+    assert "vendoring the approved microskill" in fin["prompt"]
+    assert "harness_root}/microskills/<name>" in fin["prompt"]
+    assert "`microskills:` list" in fin["prompt"]
+    assert "{{" not in fin["prompt"]
+    rc, data, out, err = run(REAL_DEFS, "build-workflow-from-plan", "--plan")
+    assert rc == 0, err
+    fin = [s for s in data["manifest"]["steps"] if s.get("node") == "finalize"][0]
+    assert "vendoring the approved workflow" in fin["prompt"]
+    assert "harness_root}/workflow-defs/<name>" in fin["prompt"]
+    assert "`workflows:` list" in fin["prompt"]
+    assert "compile-workflow <name>" in fin["prompt"]   # workflow epilogue compiles
+    assert "{{" not in fin["prompt"]
+
+
+# --- compile-time expand: — static fan-out templates + inputs_each fan-in ---
+# Desugared PRE-VALIDATION (immediately after apply_workflow_vars), so the closed
+# node schema never sees the sugar; generated <id>_<item> siblings are ordinary nodes.
+
+EXPANDED_FAN = """\
+version: 1
+name: fan-flow
+nodes:
+  - id: seed
+    agent: ag
+    prompt: seed
+  - id: scan
+    agent: ag
+    depends_on: [seed]
+    expand:
+      over: [alpha, beta]
+    prompt: scan {{each.item}} with ${seed.output.x}
+  - id: gather
+    agent: ag
+    inputs_each: scan
+    prompt: gather everything
+"""
+
+HAND_FAN = """\
+version: 1
+name: fan-flow
+nodes:
+  - id: seed
+    agent: ag
+    prompt: seed
+  - id: scan_alpha
+    agent: ag
+    depends_on: [seed]
+    prompt: scan alpha with ${seed.output.x}
+  - id: scan_beta
+    agent: ag
+    depends_on: [seed]
+    prompt: scan beta with ${seed.output.x}
+  - id: gather
+    agent: ag
+    inputs:
+      alpha: ${scan_alpha.output}
+      beta: ${scan_beta.output}
+    depends_on: [scan_alpha, scan_beta]
+    prompt: gather everything
+"""
+
+
+def test_expand_byte_identical_to_hand_written(tmp_path):
+    # DETERMINISM: the expanded template compiles BYTE-IDENTICAL to the
+    # hand-cloned sibling form — same generated ids, same fan-in inputs map, same
+    # explicit depends_on, same manifest_hash.
+    da = make_flow(tmp_path / "a", "fan-flow", EXPANDED_FAN)
+    db = make_flow(tmp_path / "b", "fan-flow", HAND_FAN)
+    rc, d1, out, err = run(tmp_path / "a", "fan-flow")
+    assert rc == 0, err
+    rc, d2, out, err = run(tmp_path / "b", "fan-flow")
+    assert rc == 0, err
+    files_a = {p.name: p.read_text() for p in (da / ".compiled").iterdir() if p.is_file()}
+    files_b = {p.name: p.read_text() for p in (db / ".compiled").iterdir() if p.is_file()}
+    assert files_a == files_b
+    assert d1["manifest_hash"] == d2["manifest_hash"]
+    assert d1["sequence"] == ["segment[seed,scan_alpha,scan_beta,gather]"]
+
+
+def test_expand_siblings_share_rank_and_parallelize(tmp_path):
+    # Generated siblings depend only on the template's deps, so they land in one
+    # dependency rank → ONE parallel([...]) batch.
+    d = make_flow(tmp_path, "fan-flow", EXPANDED_FAN)
+    run(tmp_path, "fan-flow")
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert "const [n_scan_alpha, n_scan_beta] = await parallel([" in seg
+    assert "scan alpha with" in seg and "scan beta with" in seg
+
+
+def test_expand_item_extras_deep_merge(tmp_path):
+    # A map over-entry's extras (minus 'item') deep-merge onto the generated node:
+    # per-item variation rides in the over list, not a forked template.
+    body = """\
+version: 1
+name: fan-flow
+inputs:
+  min_cov: { type: integer, default: 80 }
+nodes:
+  - id: seed
+    agent: ag
+    prompt: seed
+  - id: scan
+    agent: ag
+    depends_on: [seed]
+    expand:
+      over:
+        - alpha
+        - item: test-coverage
+          inputs:
+            threshold: ${workflow.inputs.min_cov}
+    inputs:
+      common: ${seed.output.x}
+    prompt: scan {{each.item}}
+"""
+    make_flow(tmp_path, "fan-flow", body)
+    rc, data, out, err = run(tmp_path, "fan-flow", "--explain")
+    assert rc == 0, err
+    fp = {f["node"]: f["fingerprint"] for f in data["fingerprints"]}
+    # '-' normalizes to '_' in the generated id; the raw item name feeds {{each.item}}.
+    assert "scan_test_coverage" in fp
+    assert fp["scan_test_coverage"]["inputs"] == {
+        "common": "${seed.output.x}",
+        "threshold": "${workflow.inputs.min_cov}"}
+    assert fp["scan_test_coverage"]["prompt"] == "scan test-coverage"
+    assert fp["scan_alpha"]["inputs"] == {"common": "${seed.output.x}"}
+
+
+def test_expand_profile_patches_over_list_only(tmp_path):
+    # Profile merge precedes expansion: an overlay patches the TEMPLATE's over
+    # list (lists replace wholesale) and the whole fan-out + fan-in follows.
+    d = make_flow(tmp_path, "fan-flow", EXPANDED_FAN)
+    (d / "profiles" / "narrow.yaml").write_text(
+        "version: 1\nnodes:\n  patch:\n    - id: scan\n      expand:\n        over: [alpha]\n")
+    rc, data, out, err = run(tmp_path, "fan-flow", "--profile", "narrow")
+    assert rc == 0, err
+    assert data["sequence"] == ["segment[seed,scan_alpha,gather]"]
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert "scan_beta" not in seg
+
+
+def test_expand_empty_over_blocks(tmp_path):
+    body = EXPANDED_FAN.replace("over: [alpha, beta]", "over: []")
+    make_flow(tmp_path, "fan-flow", body)
+    rc, data, out, err = run(tmp_path, "fan-flow")
+    assert rc == 1
+    assert any("non-empty" in e for e in data.get("expand_errors", [])), data
+
+
+def test_expand_duplicate_item_blocks(tmp_path):
+    body = EXPANDED_FAN.replace("over: [alpha, beta]", "over: [alpha, alpha]")
+    make_flow(tmp_path, "fan-flow", body)
+    rc, data, out, err = run(tmp_path, "fan-flow")
+    assert rc == 1
+    assert any("duplicate" in e for e in data.get("expand_errors", [])), data
+
+
+def test_inputs_each_without_template_blocks(tmp_path):
+    body = """\
+version: 1
+name: fan-flow
+nodes:
+  - id: seed
+    agent: ag
+    prompt: seed
+  - id: gather
+    agent: ag
+    inputs_each: seed
+    prompt: gather
+"""
+    make_flow(tmp_path, "fan-flow", body)
+    rc, data, out, err = run(tmp_path, "fan-flow")
+    assert rc == 1
+    assert any("inputs_each" in e for e in data.get("expand_errors", [])), data
+
+
+def test_leftover_each_token_blocks(tmp_path):
+    # Only {{each.item}} is substituted; any other {{each.*}} token (or one outside
+    # a template) is fail-loud — it would otherwise ship verbatim.
+    body = EXPANDED_FAN.replace("scan {{each.item}}", "scan {{each.threshold}}")
+    make_flow(tmp_path, "fan-flow", body)
+    rc, data, out, err = run(tmp_path, "fan-flow")
+    assert rc == 1
+    assert any("each" in e for e in data.get("expand_errors", [])), data
+
+
+def test_real_review_changes_expand_matches_hand_cloned_shape():
+    # The flagship adoption: review-changes' ONE expand template generates the
+    # exact node ids + collect fan-in the hand-cloned siblings used to declare.
+    rc, data, out, err = run(REAL_DEFS, "review-changes", "--plan", "--explain")
+    assert rc == 0, err
+    seg = [s for s in data["manifest"]["steps"] if s["kind"] == "segment"][0]
+    assert seg["nodes"] == ["summarize", "review_correctness", "review_security",
+                            "review_performance", "collect", "verify", "synthesize"]
+    fp = {f["node"]: f["fingerprint"] for f in data["fingerprints"]}
+    assert fp["collect"]["inputs"] == {
+        "correctness": "${review_correctness.output}",
+        "security": "${review_security.output}",
+        "performance": "${review_performance.output}"}
+    assert fp["review_security"]["profile"] == "security"
+    assert fp["review_correctness"]["profile"] == "correctness"
+
+
+def test_real_review_changes_lite_is_one_over_patch():
+    rc, data, out, err = run(REAL_DEFS, "review-changes", "--plan", "--profile", "lite")
+    assert rc == 0, err
+    seg = [s for s in data["manifest"]["steps"] if s["kind"] == "segment"][0]
+    assert seg["nodes"] == ["summarize", "review_correctness", "collect", "verify",
+                            "synthesize"]
+
+
+def test_real_review_changes_comprehensive_adds_dimensions():
+    rc, data, out, err = run(REAL_DEFS, "review-changes", "--plan", "--profile",
+                             "comprehensive", "--explain")
+    assert rc == 0, err
+    seg = [s for s in data["manifest"]["steps"] if s["kind"] == "segment"][0]
+    assert seg["nodes"] == ["summarize", "review_correctness", "review_security",
+                            "review_performance", "review_style", "review_documentation",
+                            "review_test_coverage", "collect", "verify", "synthesize"]
+    fp = {f["node"]: f["fingerprint"] for f in data["fingerprints"]}
+    assert fp["review_test_coverage"]["inputs"]["threshold"] == "${workflow.inputs.min_coverage}"
+    assert fp["review_test_coverage"]["profile"] == "test-coverage"
+    assert "test_coverage" in fp["collect"]["inputs"]
+
+
+# =============================================================================
+# 2.2 — `--annotate`: write .compiled/PARTITION.md, a generated sidecar derived
+# from the data --explain already computes (classification + step sequence).
+# Replaces hand-maintained Seg/Checkpoint assertion comments in WORKFLOW.yaml.
+# =============================================================================
+
+ANNOTATE_WF = """\
+version: 1
+name: ann-flow
+nodes:
+  - id: a
+    agent: ag
+    prompt: do a
+  - id: fin
+    delegation: orchestrator
+    depends_on: [a]
+    prompt: finalize
+gates:
+  - id: g1
+    after: a
+    type: human_approval
+    prompt: approve a?
+    options: [approve, abandon]
+"""
+
+
+def test_annotate_writes_partition_sidecar(tmp_path):
+    d = make_flow(tmp_path, "ann-flow", ANNOTATE_WF)
+    rc, data, out, err = run(tmp_path, "ann-flow", "--annotate")
+    assert rc == 0, err
+    part = d / ".compiled" / "PARTITION.md"
+    assert part.exists()
+    text = part.read_text()
+    # Derived from the de-anonymized sequence + per-node classification.
+    assert "segment[a]" in text
+    assert "gate:g1" in text
+    assert "orchestrator_node:fin" in text
+    assert data["manifest_hash"] in text          # staleness is detectable
+    assert data["partition_path"].endswith("PARTITION.md")
+
+
+def test_annotate_never_changes_manifest_bytes(tmp_path):
+    d = make_flow(tmp_path, "ann-flow", ANNOTATE_WF)
+    rc1, data1, *_ = run(tmp_path, "ann-flow")
+    plain = (d / ".compiled" / "manifest.json").read_bytes()
+    rc2, data2, *_ = run(tmp_path, "ann-flow", "--annotate")
+    annotated = (d / ".compiled" / "manifest.json").read_bytes()
+    assert rc1 == rc2 == 0
+    assert plain == annotated
+    assert data1["manifest_hash"] == data2["manifest_hash"]
+
+
+def test_plain_recompile_removes_stale_partition_sidecar(tmp_path):
+    # .compiled/ stays a pure function of (inputs, flags): a non-annotate compile
+    # unlinks a leftover PARTITION.md exactly like the seg-*.js stale-clean.
+    d = make_flow(tmp_path, "ann-flow", ANNOTATE_WF)
+    run(tmp_path, "ann-flow", "--annotate")
+    assert (d / ".compiled" / "PARTITION.md").exists()
+    run(tmp_path, "ann-flow")
+    assert not (d / ".compiled" / "PARTITION.md").exists()
+
+
+def test_annotate_rejects_plan_and_check(tmp_path):
+    make_flow(tmp_path, "ann-flow", ANNOTATE_WF)
+    for flag in ("--plan", "--check"):
+        rc, data, out, err = run(tmp_path, "ann-flow", "--annotate", flag)
+        assert rc != 0
+        assert "annotate" in (data or {}).get("error", ""), out
+
+
+def test_annotate_loop_segment_marked(tmp_path):
+    wf = """\
+version: 1
+name: ann-loop
+nodes:
+  - id: x
+    agent: ag
+    prompt: do x
+  - id: y
+    agent: ag
+    prompt: check ${x.output.ok}
+loop:
+  while: ${!y.output.ok}
+  max_iters: 2
+  body: [x, y]
+"""
+    d = make_flow(tmp_path, "ann-loop", wf)
+    rc, data, out, err = run(tmp_path, "ann-loop", "--annotate")
+    assert rc == 0, err
+    text = (d / ".compiled" / "PARTITION.md").read_text()
+    assert "segment[x,y] (loop body)" in text
+
+
+# ---------------------------------------------------------------------------
+# Run-ledger quarantine: .compiled/runs/ is dispatcher RUNTIME state (run-journal)
+# and must survive a recompile — stale-clean globs only seg-*.js, resolved/*.json
+# (and the PARTITION.md sidecar), never the runs/ tree or the legacy .run-state.json.
+
+
+def test_recompile_preserves_runs_tree_and_legacy_run_state(tmp_path):
+    d = make_flow(tmp_path, "linear-flow", LINEAR)
+    rc, data, *_ = run(tmp_path, "linear-flow")
+    assert rc == 0
+    compiled = d / ".compiled"
+    assert (compiled / "seg-1.js").exists()
+
+    # Plant a per-run ledger exactly as the dispatcher + run-journal lay it out.
+    run_dir = compiled / "runs" / "20260610T120000Z-abc123"
+    (run_dir / "run-inputs").mkdir(parents=True)
+    (run_dir / "run-config.json").write_text(json.dumps(
+        {"v": 1, "run_id": "20260610T120000Z-abc123",
+         "manifest_hash": data["manifest_hash"], "profile_used": None,
+         "overrides": [], "inputs": {"x": "/abs/x.cat"}}))
+    (run_dir / "run-state.json").write_text(json.dumps(
+        {"manifest_hash": data["manifest_hash"], "step_index": 1,
+         "results": {"a": {"x": 1}}}))
+    (run_dir / "journal.jsonl").write_text('{"v":1,"event":"run_start"}\n')
+    (run_dir / "run-inputs" / "x.cat").write_text("materialized")
+    legacy = compiled / ".run-state.json"
+    legacy.write_text(json.dumps(
+        {"manifest_hash": data["manifest_hash"], "step_index": 1, "results": {}}))
+
+    rc2, data2, *_ = run(tmp_path, "linear-flow")
+    assert rc2 == 0
+    assert data2["manifest_hash"] == data["manifest_hash"]  # byte-identical recompile
+    # the whole per-run tree survived the stale-clean
+    assert (run_dir / "run-config.json").exists()
+    assert (run_dir / "run-state.json").exists()
+    assert (run_dir / "journal.jsonl").exists()
+    assert (run_dir / "run-inputs" / "x.cat").exists()
+    assert legacy.exists()
+
+
+# ---------------------------------------------------------------------------
+# Per-node IO contracts: every manifest step records io: {<node-id>: {schema,
+# guarded, fan_out}} for the nodes it produces — the dispatcher's post-step
+# check-step-io validates run-state results against it. Deterministic: derived
+# from the merged doc + resolution only (inside manifest_hash).
+
+
+IO_CONTRACT_WF = """\
+version: 1
+name: ioc-flow
+inputs:
+  items:
+    type: array
+    required: true
+nodes:
+  - id: a
+    agent: ag
+    prompt: do a
+    output_schema:
+      type: object
+      required: [x]
+      properties:
+        x: { type: string }
+  - id: b
+    agent: ag
+    when: ${a.output.x == 'go'}
+    depends_on: [a]
+    prompt: maybe b
+  - id: scan
+    agent: ag
+    depends_on: [a]
+    for_each: ${workflow.inputs.items}
+    as: item
+    prompt: scan ${item}
+  - id: fin
+    delegation: orchestrator
+    depends_on: [scan]
+    prompt: finalize
+    output_schema:
+      type: object
+      required: [choice]
+      properties:
+        choice: { type: string }
+gates:
+  - id: g1
+    after: fin
+    type: human_approval
+    prompt: ok?
+    options: [approve, abandon]
+"""
+
+
+def test_manifest_steps_carry_per_node_io(tmp_path):
+    d = make_flow(tmp_path, "ioc-flow", IO_CONTRACT_WF)
+    rc, data, out, err = run(tmp_path, "ioc-flow")
+    assert rc == 0, err
+    m = json.loads((d / ".compiled" / "manifest.json").read_text())
+
+    seg = m["steps"][0]
+    assert set(seg["io"]) == set(seg["produces"])
+    assert seg["io"]["a"] == {
+        "schema": {"type": "object", "required": ["x"],
+                   "properties": {"x": {"type": "string"}}},
+        "guarded": False, "fan_out": False}
+    # A when-guarded node: null is a legal skip; no declared schema -> null.
+    assert seg["io"]["b"] == {"schema": None, "guarded": True, "fan_out": False}
+    # A for_each node fans out: the stored result is an ARRAY of schema items.
+    assert seg["io"]["scan"]["fan_out"] is True
+
+    chk = m["steps"][1]
+    assert chk["checkpoint_type"] == "orchestrator_node"
+    assert chk["io"]["fin"] == {
+        "schema": {"type": "object", "required": ["choice"],
+                   "properties": {"choice": {"type": "string"}}},
+        "guarded": False, "fan_out": False}
+
+    # Gates are not nodes: a gate checkpoint carries no io block.
+    gate = m["steps"][2]
+    assert gate["checkpoint_type"] == "gate"
+    assert "io" not in gate
+
+
+def test_use_node_io_schema_is_the_inherited_microskill_schema(tmp_path):
+    # A use: node with no inline output_schema records the microskill's RESOLVED
+    # schema in io (same effective-schema rule node_call_js bakes into seg JS).
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF)
+    rc, data, out, err = run(defs_root, "inh-flow")
+    assert rc == 0, err
+    m = json.loads((d / ".compiled" / "manifest.json").read_text())
+    io_e = m["steps"][0]["io"]["e"]
+    assert io_e["schema"]["required"] == ["echoed"]
+    assert io_e["guarded"] is False and io_e["fan_out"] is False
+
+
+def test_nested_workflow_checkpoint_carries_io(tmp_path):
+    # A workflow: node's checkpoint records io too (schema only when the node
+    # declares one inline — the child's output contract is not resolved here).
+    defs_root = tmp_path / "workflow-defs"
+    child = defs_root / "child-flow"
+    (child / "profiles").mkdir(parents=True)
+    (child / "WORKFLOW.yaml").write_text(
+        "version: 1\nname: child-flow\nnodes:\n  - id: c\n    agent: ag\n    prompt: c\n")
+    (child / "profiles" / "base.yaml").write_text("version: 1\n")
+    parent = defs_root / "parent-flow"
+    (parent / "profiles").mkdir(parents=True)
+    (parent / "WORKFLOW.yaml").write_text("""\
+version: 1
+name: parent-flow
+imports: [child-flow]
+nodes:
+  - id: a
+    agent: ag
+    prompt: do a
+  - id: build
+    workflow: child-flow
+    when: ${a.output.ok}
+    depends_on: [a]
+    inputs: {}
+""")
+    (parent / "profiles" / "base.yaml").write_text("version: 1\n")
+    rc, data, out, err = run(defs_root, "parent-flow")
+    assert rc == 0, err
+    m = json.loads((parent / ".compiled" / "manifest.json").read_text())
+    chk = next(s for s in m["steps"] if s.get("checkpoint_type") == "nested_workflow")
+    assert chk["io"]["build"] == {"schema": None, "guarded": True, "fan_out": False}
+
+
+def test_real_refine_requirements_orchestrator_contracts(tmp_path):
+    # The prose-only orchestrator return contracts now ride as declared
+    # output_schema blocks: clarify + approve carry them into their checkpoint io.
+    rc, data, out, err = run(REAL_DEFS, "refine-requirements")
+    assert rc == 0, err
+    m = json.loads(
+        (REAL_DEFS / "refine-requirements" / ".compiled" / "manifest.json").read_text())
+    chks = {s["node"]: s for s in m["steps"]
+            if s.get("checkpoint_type") == "orchestrator_node"}
+    clarify = chks["clarify"]["io"]["clarify"]
+    assert clarify["guarded"] is True            # when: gaps_count > 0
+    assert set(clarify["schema"]["required"]) == {
+        "choice", "final_document_path", "rounds", "converged", "remaining_gaps"}
+    approve = chks["approve"]["io"]["approve"]
+    assert set(approve["schema"]["required"]) == {
+        "choice", "final_document_path", "remaining_gaps"}
+
+
+# ---------------------------------------------------------------------------
+# Declared gate policy + headless mode (gate default / on_headless / gate_mode)
+# ---------------------------------------------------------------------------
+
+GATED_DEFAULT = GATED.replace(
+    "    options: [approve, abandon]\n",
+    "    options: [approve, abandon]\n    default: approve\n")
+
+
+def _manifest(defs_root, name):
+    return json.loads(
+        (defs_root / name / ".compiled" / "manifest.json").read_text())
+
+
+def test_gate_mode_unstamped_keeps_byte_identity(tmp_path):
+    # A def with NO gate-policy fields compiles byte-identically with no flag and
+    # with an explicit --gate-mode interactive: nothing is ever stamped unless
+    # the effective mode is auto.
+    d = make_flow(tmp_path, "gated-flow", GATED.replace("name: linear-flow", "name: gated-flow"))
+    rc, data, out, err = run(tmp_path, "gated-flow")
+    assert rc == 0, err
+    first = {p.name: p.read_text() for p in (d / ".compiled").iterdir()}
+    assert "gate_mode" not in _manifest(tmp_path, "gated-flow")
+    rc2, data2, out2, err2 = run(tmp_path, "gated-flow", "--gate-mode", "interactive")
+    assert rc2 == 0, err2
+    second = {p.name: p.read_text() for p in (d / ".compiled").iterdir()}
+    assert first == second
+    assert data["manifest_hash"] == data2["manifest_hash"]
+
+
+def test_gate_mode_auto_stamps_manifest_and_changes_hash(tmp_path):
+    make_flow(tmp_path, "gated-flow",
+              GATED_DEFAULT.replace("name: linear-flow", "name: gated-flow"))
+    rc, data, out, err = run(tmp_path, "gated-flow")
+    assert rc == 0, err
+    interactive_hash = data["manifest_hash"]
+    rc2, data2, out2, err2 = run(tmp_path, "gated-flow", "--gate-mode", "auto")
+    assert rc2 == 0, err2
+    m = _manifest(tmp_path, "gated-flow")
+    assert m["gate_mode"] == "auto"
+    # Distinct hash: interactive run-state must never resume into a headless run.
+    assert data2["manifest_hash"] != interactive_hash
+    # Partition is untouched — auto gates remain orchestrator checkpoints.
+    assert data2["sequence"] == data["sequence"] == ["segment[a]", "gate", "segment[b]"]
+
+
+def test_gate_mode_auto_dies_on_defaultless_hard_gate(tmp_path):
+    make_flow(tmp_path, "gated-flow", GATED.replace("name: linear-flow", "name: gated-flow"))
+    rc, data, out, err = run(tmp_path, "gated-flow", "--gate-mode", "auto")
+    assert rc == 1
+    assert "g1" in data["error"] and "default" in data["error"]
+
+
+def test_gate_mode_auto_allows_declared_on_headless_fail(tmp_path):
+    # on_headless: fail is the author-declared "do the work, then stop at this
+    # gate" escape — a mode=auto compile must succeed (the dispatcher stops at
+    # run time, with resumable state).
+    body = GATED.replace("name: linear-flow", "name: gated-flow") + \
+        "    on_headless: fail\n"
+    make_flow(tmp_path, "gated-flow", body)
+    rc, data, out, err = run(tmp_path, "gated-flow", "--gate-mode", "auto")
+    assert rc == 0, err
+    assert _manifest(tmp_path, "gated-flow")["gate_mode"] == "auto"
+
+
+def test_gate_default_must_be_member_of_options(tmp_path):
+    # Mode-independent: the recorded auto/warn choice must be a label the gate
+    # actually offers — even an interactive compile dies.
+    body = GATED_DEFAULT.replace("default: approve", "default: yes-do-it") \
+                        .replace("name: linear-flow", "name: gated-flow")
+    make_flow(tmp_path, "gated-flow", body)
+    rc, data, out, err = run(tmp_path, "gated-flow")
+    assert rc == 1
+    assert "yes-do-it" in data["error"] and "options" in data["error"]
+
+
+def test_optionless_gate_default_checked_against_confirm_stop(tmp_path):
+    # An options-less gate offers the implicit confirm/stop pair: default:
+    # confirm compiles; default: approve dies naming the implicit pair.
+    base = GATED.replace("name: linear-flow", "name: gated-flow") \
+                .replace("    options: [approve, abandon]\n", "")
+    make_flow(tmp_path, "gated-flow", base + "    default: confirm\n")
+    rc, data, out, err = run(tmp_path, "gated-flow", "--gate-mode", "auto")
+    assert rc == 0, err
+    make_flow(tmp_path / "w2", "gated-flow", base + "    default: approve\n")
+    rc2, data2, out2, err2 = run(tmp_path / "w2", "gated-flow")
+    assert rc2 == 1
+    assert "confirm/stop" in data2["error"]
+
+
+def test_on_headless_take_default_requires_default(tmp_path):
+    body = GATED.replace("name: linear-flow", "name: gated-flow") + \
+        "    on_headless: take_default\n"
+    make_flow(tmp_path, "gated-flow", body)
+    rc, data, out, err = run(tmp_path, "gated-flow")
+    assert rc == 1
+    assert "take_default" in data["error"] and "default" in data["error"]
+
+
+def test_profile_declared_gate_mode_wins_over_flag(tmp_path):
+    # (a) A profile overlay declaring gate_mode: auto stamps without any flag.
+    d = make_flow(tmp_path, "gated-flow",
+                  GATED_DEFAULT.replace("name: linear-flow", "name: gated-flow"))
+    (d / "profiles" / "autonomous.yaml").write_text("version: 1\ngate_mode: auto\n")
+    rc, data, out, err = run(tmp_path, "gated-flow", "--profile", "autonomous")
+    assert rc == 0, err
+    assert _manifest(tmp_path, "gated-flow")["gate_mode"] == "auto"
+    # (b) A doc-declared interactive PINS interactive even under --gate-mode auto
+    # (child profile-declared mode wins over parent inheritance).
+    (d / "profiles" / "pinned.yaml").write_text("version: 1\ngate_mode: interactive\n")
+    rc2, data2, out2, err2 = run(tmp_path, "gated-flow", "--profile", "pinned",
+                                 "--gate-mode", "auto")
+    assert rc2 == 0, err2
+    assert "gate_mode" not in _manifest(tmp_path, "gated-flow")
+
+
+def test_gate_policy_fields_ride_manifest_step_verbatim(tmp_path):
+    body = GATED_DEFAULT.replace("name: linear-flow", "name: gated-flow") + """\
+    on_headless: take_default
+    present:
+      - a.output.x
+      - read_file: a.output.path
+"""
+    make_flow(tmp_path, "gated-flow", body)
+    rc, data, out, err = run(tmp_path, "gated-flow")
+    assert rc == 0, err
+    m = _manifest(tmp_path, "gated-flow")
+    gate = next(s for s in m["steps"] if s.get("checkpoint_type") == "gate")["gate"]
+    assert gate["default"] == "approve"
+    assert gate["on_headless"] == "take_default"
+    assert gate["present"] == ["a.output.x", {"read_file": "a.output.path"}]
+
+
+def test_real_microskill_create_autonomous_profile_is_headless(tmp_path):
+    # The migrated autonomous profile is a pure flip to the new mechanism:
+    # gate_mode: auto + a declared default on the (still hard) approval gate.
+    # --plan writes nothing, so this cannot perturb the runtime .compiled/ that
+    # other e2e tests read.
+    rc, data, out, err = run(REAL_DEFS, "microskill-create",
+                             "--profile", "autonomous", "--plan")
+    assert rc == 0, err
+    assert data["profile_used"] == "autonomous"
+    m = data["manifest"]
+    assert m["gate_mode"] == "auto"
+    gate = next(s for s in m["steps"] if s.get("checkpoint_type") == "gate")["gate"]
+    assert gate["id"] == "approve_plan"
+    assert gate["default"] == "approve"
+    assert gate["severity"] == "hard"   # severity is NOT flipped any more
+
+
+# ---------------------------------------------------------------------------
+# spill_outputs — declared node-output-by-reference (output spill, 4.1b). The
+# compiler only RECORDS the declaration: a `spill` map on the PRODUCING
+# manifest step, OMITTED when absent (spill-free defs compile byte-identically
+# — segment JS never changes either way); the handoff writing + path
+# substitution is the dispatcher's run-step kernel. Hard blocks (shared with
+# validate-workflow): a spilled field referenced in a when/for_each guard or
+# the loop while/until (a path is not the value), spill on a for_each fan-out
+# producer, and a spilled field the effective output schema does not declare.
+
+
+SPILL_WF = """\
+version: 1
+name: spill-flow
+nodes:
+  - id: review
+    agent: ag
+    prompt: review it
+    output_schema:
+      type: object
+      required: [report, count]
+      properties:
+        report: { type: string }
+        count: { type: integer }
+    spill_outputs: [report]
+  - id: post
+    agent: ag
+    prompt: post ${review.output.report} (${review.output.count} findings)
+gates:
+  - id: g1
+    after: review
+    type: human_approval
+    prompt: ok?
+    options: [approve, abandon]
+"""
+
+SPILL_FREE_WF = SPILL_WF.replace("    spill_outputs: [report]\n", "")
+
+
+def test_spill_recorded_on_producing_segment_step_only(tmp_path):
+    d = make_flow(tmp_path, "spill-flow", SPILL_WF)
+    rc, data, out, err = run(tmp_path, "spill-flow")
+    assert rc == 0, err
+    m = json.loads((d / ".compiled" / "manifest.json").read_text())
+    seg1, gate, seg2 = m["steps"]
+    assert seg1["spill"] == {"review": ["report"]}   # the PRODUCING step
+    assert "spill" not in gate                       # gates are not producers
+    assert "spill" not in seg2                       # consumers carry nothing
+
+
+def test_spill_free_def_manifest_has_no_spill_key(tmp_path):
+    d = make_flow(tmp_path, "spill-flow", SPILL_FREE_WF)
+    rc, data, out, err = run(tmp_path, "spill-flow")
+    assert rc == 0, err
+    m = json.loads((d / ".compiled" / "manifest.json").read_text())
+    assert all("spill" not in s for s in m["steps"])
+
+
+def test_spill_never_changes_segment_js_but_is_hash_visible(tmp_path):
+    # Same def with and without spill_outputs: every emitted seg-*.js is
+    # byte-identical (spill is manifest metadata + dispatcher runtime, never
+    # compiled JS — the S1 presence guard already passes a path string), while
+    # manifest_hash differs (the spill map is inside the hashed payload) and
+    # only the PRODUCING node's fingerprint moves.
+    da = make_flow(tmp_path / "with", "spill-flow", SPILL_WF)
+    db = make_flow(tmp_path / "without", "spill-flow", SPILL_FREE_WF)
+    rca, a, _, erra = run(tmp_path / "with", "spill-flow", "--explain")
+    rcb, b, _, errb = run(tmp_path / "without", "spill-flow", "--explain")
+    assert rca == 0 and rcb == 0, erra + errb
+    segs_a = {p.name: p.read_text() for p in (da / ".compiled").glob("seg-*.js")}
+    segs_b = {p.name: p.read_text() for p in (db / ".compiled").glob("seg-*.js")}
+    assert segs_a == segs_b
+    assert a["manifest_hash"] != b["manifest_hash"]
+    fp_a = {f["node"]: f for f in a["fingerprints"]}
+    fp_b = {f["node"]: f for f in b["fingerprints"]}
+    assert fp_a["review"]["sha256"] != fp_b["review"]["sha256"]
+    assert fp_a["review"]["fingerprint"]["spill_outputs"] == ["report"]
+    assert "spill_outputs" not in fp_b["review"]["fingerprint"]
+    assert fp_a["post"]["sha256"] == fp_b["post"]["sha256"]   # consumers untouched
+
+
+def test_spill_on_orchestrator_checkpoint_step(tmp_path):
+    wf = """\
+version: 1
+name: sp-orch
+nodes:
+  - id: a
+    agent: ag
+    prompt: do a
+  - id: fin
+    delegation: orchestrator
+    depends_on: [a]
+    prompt: finalize
+    output_schema:
+      type: object
+      required: [summary]
+      properties:
+        summary: { type: string }
+    spill_outputs: [summary]
+"""
+    d = make_flow(tmp_path, "sp-orch", wf)
+    rc, data, out, err = run(tmp_path, "sp-orch")
+    assert rc == 0, err
+    m = json.loads((d / ".compiled" / "manifest.json").read_text())
+    chk = next(s for s in m["steps"]
+               if s.get("checkpoint_type") == "orchestrator_node")
+    assert chk["spill"] == {"fin": ["summary"]}
+
+
+def test_spill_field_in_when_guard_is_a_hard_die(tmp_path):
+    wf = SPILL_WF.replace(
+        "    prompt: post ${review.output.report} (${review.output.count} findings)\n",
+        "    when: ${review.output.report == 'ok'}\n"
+        "    prompt: post it\n")
+    make_flow(tmp_path, "spill-flow", wf)
+    rc, data, out, err = run(tmp_path, "spill-flow")
+    assert rc == 1
+    assert "spill_outputs" in data["error"] and "PATH" in data["error"]
+    assert "nodes/post/when" in data["error"]
+
+
+def test_spill_field_in_for_each_is_a_hard_die(tmp_path):
+    wf = """\
+version: 1
+name: sp-fe
+nodes:
+  - id: collect
+    agent: ag
+    prompt: collect
+    output_schema:
+      type: object
+      properties:
+        findings: { type: array }
+    spill_outputs: [findings]
+  - id: verify
+    agent: ag
+    for_each: ${collect.output.findings}
+    as: f
+    prompt: verify ${f}
+gates:
+  - id: g1
+    after: collect
+    type: human_approval
+    prompt: ok?
+"""
+    make_flow(tmp_path, "sp-fe", wf)
+    rc, data, out, err = run(tmp_path, "sp-fe")
+    assert rc == 1
+    assert "nodes/verify/for_each" in data["error"]
+    assert "spill_outputs" in data["error"]
+
+
+def test_spill_field_in_loop_while_is_a_hard_die(tmp_path):
+    wf = """\
+version: 1
+name: sp-loop
+nodes:
+  - id: impl
+    agent: ag
+    prompt: impl
+  - id: ev
+    agent: ag
+    depends_on: [impl]
+    prompt: ev
+    output_schema:
+      type: object
+      properties:
+        report: { type: string }
+    spill_outputs: [report]
+loop:
+  while: ${ev.output.report != 'done'}
+  max_iters: 2
+  body: [impl, ev]
+"""
+    make_flow(tmp_path, "sp-loop", wf)
+    rc, data, out, err = run(tmp_path, "sp-loop")
+    assert rc == 1
+    assert "loop/while" in data["error"] and "spill_outputs" in data["error"]
+
+
+def test_spill_on_for_each_fan_out_node_is_a_hard_die(tmp_path):
+    wf = """\
+version: 1
+name: sp-fan
+inputs:
+  items:
+    type: array
+    required: true
+nodes:
+  - id: scan
+    agent: ag
+    for_each: ${workflow.inputs.items}
+    as: item
+    prompt: scan ${item}
+    spill_outputs: [report]
+"""
+    make_flow(tmp_path, "sp-fan", wf)
+    rc, data, out, err = run(tmp_path, "sp-fan")
+    assert rc == 1
+    assert "ARRAY" in data["error"] and "spill_outputs" in data["error"]
+
+
+def test_spill_field_not_in_effective_schema_is_a_hard_die(tmp_path):
+    wf = SPILL_WF.replace("spill_outputs: [report]", "spill_outputs: [reprot]")
+    make_flow(tmp_path, "spill-flow", wf)
+    rc, data, out, err = run(tmp_path, "spill-flow")
+    assert rc == 1
+    assert "reprot" in data["error"] and "schema" in data["error"]
+
+
+def test_spill_schema_less_producer_is_any_and_passes(tmp_path):
+    # No effective output schema -> 'any': the field-coherence check never
+    # flags (mirrors the typed-ref field check), and the spill map records.
+    wf = SPILL_WF.replace("""\
+    output_schema:
+      type: object
+      required: [report, count]
+      properties:
+        report: { type: string }
+        count: { type: integer }
+""", "")
+    d = make_flow(tmp_path, "spill-flow", wf)
+    rc, data, out, err = run(tmp_path, "spill-flow")
+    assert rc == 0, err
+    m = json.loads((d / ".compiled" / "manifest.json").read_text())
+    assert m["steps"][0]["spill"] == {"review": ["report"]}
+
+
+def test_spill_same_segment_consumer_warns_on_stderr(tmp_path):
+    # No checkpoint between producer and consumer: the consumer reads the
+    # in-memory VALUE (no spill substitution happens in-segment) — warn,
+    # never silent, never a byte change.
+    wf = SPILL_WF.replace("""\
+gates:
+  - id: g1
+    after: review
+    type: human_approval
+    prompt: ok?
+    options: [approve, abandon]
+""", "")
+    d = make_flow(tmp_path, "spill-flow", wf)
+    rc, data, out, err = run(tmp_path, "spill-flow")
+    assert rc == 0
+    assert "SAME segment" in err and "review.output.report" in err
+    m = json.loads((d / ".compiled" / "manifest.json").read_text())
+    assert m["steps"][0]["spill"] == {"review": ["report"]}  # still recorded
+
+
+def test_spill_outputs_schema_rejects_empty_and_duplicates(tmp_path):
+    wf = SPILL_WF.replace("spill_outputs: [report]", "spill_outputs: []")
+    make_flow(tmp_path, "spill-flow", wf)
+    rc, data, *_ = run(tmp_path, "spill-flow")
+    assert rc == 1 and "schema_errors" in data
+    wf = SPILL_WF.replace("spill_outputs: [report]",
+                          "spill_outputs: [report, report]")
+    make_flow(tmp_path, "spill-flow2", wf.replace("name: spill-flow",
+                                                  "name: spill-flow2"))
+    rc, data, *_ = run(tmp_path, "spill-flow2")
+    assert rc == 1 and "schema_errors" in data

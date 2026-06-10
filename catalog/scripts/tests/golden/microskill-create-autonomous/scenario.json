@@ -1,0 +1,21 @@
+{
+  "workflow": "microskill-create",
+  "profile": "autonomous",
+  "inputs": {
+    "requirement_path": "Create a microskill that slugifies a document title into a kebab-case identifier: lowercase, spaces and punctuation collapsed to single hyphens, leading/trailing hyphens trimmed. Input: title (string, required). Output: {slug}."
+  },
+  "fixtures": "fixtures.json",
+  "gates": {},
+  "checkpoints": {
+    "finalize": {
+      "name": "slugify-title",
+      "vendored_to": "harness/microskills/slugify-title",
+      "manifest_updated": true,
+      "synced": true
+    }
+  },
+  "goldens": {
+    "results": "golden-results.json",
+    "journal": "golden-journal.jsonl"
+  }
+}

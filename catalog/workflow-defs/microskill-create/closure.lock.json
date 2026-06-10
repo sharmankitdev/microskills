@@ -1,0 +1,12 @@
+{
+  "manifest_hash": "4d65b3a3d8f2dd9ab9201e2350931d6644f7839030b4da73cdce88fcc7318935",
+  "name": "microskill-create",
+  "node_fingerprints": {
+    "advise": "1ec258019009c4a878fec97fce9cfb1d90f6cc9d1f69f38737d0b0bb6801e2ac",
+    "evaluate": "8c1456616e112f4da166cd1682183871e467adcb8a1af2faa67c18e163362af3",
+    "finalize": "a2182f28faf2d70866d311c8050f01a1001e5745b5983d14f0f5f73fce63e3bc",
+    "implement": "7250ad6fbb9f0ee299565601accca5da0ce046c5b373eea6450a0fee5d4d25aa",
+    "plan": "0be81585bcb6233af1413ef01ea50e427bba12b6ea01108d6c508f336c7878fa"
+  },
+  "profile_used": "base"
+}

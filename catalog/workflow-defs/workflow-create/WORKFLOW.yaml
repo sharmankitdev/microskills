@@ -10,10 +10,7 @@ inputs:
     required: true
     materialize: file
     description: >-
-      Natural-language description of the workflow to create, passed BY REFERENCE.
-      `materialize: file` lets the dispatcher accept a raw string, a single file, or a
-      directory of files and normalize it into one canonical file, threading only the
-      short path into the run (dodging the args-size truncation). task-plan / task-evaluate
+      Natural-language description of the workflow to create. task-plan / task-evaluate
       Read the path; the nested build-workflow-from-plan receives the same path.
   name:
     type: string
@@ -40,12 +37,11 @@ imports:
   - build-workflow-from-plan
   - microskill-create
 
-# Node definition order is load-bearing: orchestrator nodes (provision, advise)
-# come BEFORE the loop body so they don't split the implement/evaluate segment.
 nodes:
-  # Seg 1 (background): plan the workflow. The planner enumerates reusable
-  # microskills/agents/workflows, designs the node graph + profile reuse, and
-  # lists any microskills that must be created first. Human approves at the gate.
+  # Plan the workflow. The planner enumerates reusable microskills/agents/
+  # workflows, designs the node graph + profile reuse, and lists any microskills
+  # that must be created first. Human approves at the gate. Node output shape:
+  # the resolved task-plan (workflow profile) output_schema (inherited).
   - id: plan
     use: task-plan
     customize: { profile: workflow }
@@ -53,37 +49,21 @@ nodes:
       requirement_path: ${workflow.inputs.requirement_path}
       name_override: ${workflow.inputs.name}
       staging_dir: ${workflow.inputs.staging_dir}
-    output_schema:
-      type: object
-      required: [plan_path, name, scope_advisory, missing_microskills]
-      properties:
-        plan_path: { type: ["string", "null"], description: Path to the written WORKFLOW.yaml-design plan file under staging_dir, or null when a scope advisory applies. }
-        name: { type: ["string", "null"] }
-        scope_advisory: { type: ["object", "null"], description: "{kind: split|promote|adapt, reason, recommendation} or null." }
-        missing_microskills:
-          type: array
-          description: Microskills the workflow needs that do not yet exist; each is created via microskill-create before implement.
-          items:
-            type: object
-            properties:
-              name: { type: string }
-              requirement: { type: string }
 
-  # Checkpoint (nested workflow): create the microskills the planner flagged as
-  # missing, one per item, by invoking microskill-create with the autonomous
-  # (gates-warn) profile — passed structurally via customize.profile, so no human
-  # pause. First-class workflow: node (mirrors `build` below): runs in the main loop
-  # — the only place a node may invoke a nested workflow. for_each fans out one child
-  # run per missing microskill; each vendors into harness/microskills/<name>/, upserts
-  # harness.yaml, and runs sync-harness so later nodes can reference it. microskill-create
-  # is a leaf (no nested workflow: node) so depth stays ≤ 1. Guarded so the advisory
-  # path skips it.
+  # Create the microskills the planner flagged as missing, one per item, by
+  # invoking microskill-create with the autonomous (gates-warn) profile — passed
+  # structurally via customize.profile, so no human pause. First-class workflow:
+  # node (mirrors `build` below): runs in the main loop — the only place a node
+  # may invoke a nested workflow. for_each fans out one child run per missing
+  # microskill; each vendors into harness/microskills/<name>/, upserts
+  # harness.yaml, and runs sync-harness so later nodes can reference it.
+  # microskill-create is a leaf (no nested workflow: node) so depth stays ≤ 1.
+  # Guarded so the advisory path skips it.
   - id: provision
     workflow: microskill-create
     when: ${plan.output.scope_advisory == null}
     for_each: ${plan.output.missing_microskills}
     as: ms_spec
-    depends_on: [plan]
     customize: { profile: autonomous }
     inputs:
       requirement_path: ${ms_spec.requirement}
@@ -91,12 +71,11 @@ nodes:
       harness_root: ${workflow.inputs.harness_root}
       harness_yaml: ${workflow.inputs.harness_yaml}
 
-  # Checkpoint (orchestrator): when the planner returns a scope_advisory instead
-  # of a plan, surface it and stop. Defined before the loop body.
+  # When the planner returns a scope_advisory instead of a plan, surface it and
+  # stop.
   - id: advise
     delegation: orchestrator
     when: ${plan.output.scope_advisory != null}
-    depends_on: [plan]
     prompt: >
       The planner returned a scope advisory instead of a plan:
       ${plan.output.scope_advisory}. Present it to the user. For kind=split, list
@@ -105,33 +84,36 @@ nodes:
       kind=adapt, name the existing workflow that already covers this. Do not
       implement anything — stop here.
 
-  # Checkpoint (orchestrator): build the approved plan into a finalized workflow by
-  # invoking the shared build-workflow-from-plan workflow (implement ↔ evaluate loop +
-  # the canonical vendor→manifest→sync→compile finalize). Runs in the main loop — the only
-  # place a node may invoke a nested workflow. Guarded so the advisory path skips it. The
-  # build half lives in ONE place so workflow-create and decompose-monolith-orchestrator
-  # cannot drift. build-workflow-from-plan invokes no further nested workflow, so recursion
-  # stays bounded.
-  # First-class nested workflow call: build-workflow-from-plan runs the implement ↔ evaluate
-  # loop, vendors the workflow into harness/workflow-defs/<name>/, upserts harness.yaml,
-  # runs sync-harness to install .claude/workflow-defs/<name>/ + its shim, and compiles
-  # .compiled/. Classified as an orchestrator checkpoint; runs in the main loop (the only place
-  # nesting is allowed). build-workflow-from-plan invokes no further nested workflow, so
-  # recursion stays bounded (depth = 1).
+  # Build the approved plan into a finalized workflow by invoking the shared
+  # build-workflow-from-plan workflow (implement ↔ evaluate loop + the canonical
+  # vendor→manifest→sync→compile finalize): it vendors the workflow into
+  # harness/workflow-defs/<name>/, upserts harness.yaml, runs sync-harness to
+  # install .claude/workflow-defs/<name>/ + its shim, and compiles .compiled/.
+  # First-class nested workflow call — runs in the main loop, the only place a
+  # node may invoke a nested workflow. Guarded so the advisory path skips it. The
+  # build half lives in ONE place so workflow-create and
+  # decompose-monolith-orchestrator cannot drift; build-workflow-from-plan
+  # invokes no further nested workflow, so recursion stays bounded (depth = 1).
+  # The explicit depends_on edge on `provision` is PURE ORDERING (no ref carries
+  # it): the provisioned microskills must exist before the build starts.
+  # wire: auto forwards the OPTIONAL harness plumbing the child declares
+  # (harness_root, harness_yaml) as ${workflow.inputs.<name>} pass-throughs;
+  # the child's REQUIRED inputs stay explicit — `name` must be the planner's
+  # proposal (NOT this workflow's optional `name` override), and
+  # requirement_path / staging_dir stay deliberate wires for the same reason.
   - id: build
     workflow: build-workflow-from-plan
     when: ${plan.output.scope_advisory == null}
-    depends_on: [plan, provision]
+    depends_on: [provision]
+    wire: auto
     inputs:
       plan_path: ${plan.output.plan_path}
       name: ${plan.output.name}
       requirement_path: ${workflow.inputs.requirement_path}
-      harness_root: ${workflow.inputs.harness_root}
-      harness_yaml: ${workflow.inputs.harness_yaml}
       staging_dir: ${workflow.inputs.staging_dir}
 
-# Human-approval gate after `plan`: the segment boundary. Approving the plan also
-# authorizes creation of the microskills it lists under missing_microskills.
+# Human-approval gate after `plan`. Approving the plan also authorizes creation
+# of the microskills it lists under missing_microskills.
 gates:
   - id: approve_plan
     after: plan

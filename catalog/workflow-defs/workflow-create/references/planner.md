@@ -18,7 +18,7 @@ The `workflow-planner` agent turns a natural-language requirement into a structu
    - Two or more independent workflows → `scope_advisory.kind: split`, list candidates.
    - An existing workflow already covers this → `scope_advisory.kind: adapt`, name it.
    - Otherwise → design the workflow.
-3. **Design the node graph.** For each step pick the dispatch form (`use:` / `agent:` / `delegation: orchestrator`), wire `depends_on` + `inputs` + `output_schema`, place gates, and use `when` / `for_each` / `loop` where the requirement calls for branching, fan-out, or iteration. Keep loop-body nodes contiguous and orchestrator nodes out of the loop body.
+3. **Design the node graph.** For each step pick the dispatch form (`use:` / `agent:` / `delegation: orchestrator`), wire `inputs` (a `${<id>.output...}` ref already implies the dependency edge; use `depends_on` only for pure ordering edges that carry no ref), place gates, and use `when` / `for_each` / `loop` where the requirement calls for branching, fan-out, or iteration. On a `use:` node omit `output_schema` — it inherits the microskill's resolved schema; declare one only to deliberately narrow it. Keep loop-body nodes contiguous and orchestrator nodes out of the loop body.
 4. **Decide reuse + profile fit.** For each `use:` node, choose the profile: `base`, an existing overlay, or a NEW profile. Record new profiles in `_new_profiles`.
 5. **List missing microskills.** Any microskill the graph needs that does not exist yet goes in `missing_microskills` (name + crisp requirement); the pipeline provisions it via `microskill-create` before implement.
 
@@ -46,12 +46,12 @@ plan_yaml: |                        # ← WRITE this document to <staging_dir>/p
   nodes:
     - id: <node>
       use|agent|delegation: …
-      depends_on: [ … ]
+      depends_on: [ … ]             # pure-ordering edges ONLY (refs already imply theirs)
       when: ${…}                    # optional
       for_each: ${…}                # optional (+ as:)
       inputs: { <field>: ${…} }
       prompt: > …                   # agent nodes
-      output_schema: { … }
+      output_schema: { … }          # agent nodes; use: nodes inherit the resolved schema — omit it
       customize: { profile: <name> }  # use: nodes
   gates: [ … ]
   loop: { while: ${…}, max_iters: N, body: [ … ], carry: { … } }
@@ -73,7 +73,7 @@ When `scope_advisory` is set, no plan file is written (`plan_path` is `null`) an
 ## Constraints
 
 - Never invent a `workflow:` node type. Reuse a whole workflow only by inline-expanding its nodes (rename ids, rewire refs, annotate under `_reuse`) or by flagging `scope_advisory.kind: adapt`.
-- Every `${<id>.output...}` ref a node uses must be in its `depends_on`; every `${workflow.inputs.x}` must be declared in top-level `inputs`.
+- A `${<id>.output...}` ref already implies its dependency edge — do NOT restate it in `depends_on` (validate warns); reserve `depends_on` for pure ordering edges that carry no ref. Every `${workflow.inputs.x}` must be declared in top-level `inputs` (validate blocks an undeclared name).
 - Name by capability, not by occasion. Both the workflow `name` and every `missing_microskills[].name` (which becomes the permanent registry name via `name_override`) must say exactly what the artifact does while excluding the domain, caller, or step that motivated it: `task-evaluate` (the phase; a profile binds the domain), not `evaluate-microskill-for-create`; `extract-pr-links`, not `extract-links-for-the-release-workflow`. Forbidden: position/step/caller tokens. Scope: registry names only — not node ids, gate ids, input names, or profile names (profiles are where domain-coupling belongs). A name coupled to this one workflow is a plan defect.
 - `_new_profiles` / `_reuse` are plan-only — they are not valid WORKFLOW.yaml keys and the implementer removes them.
 - Emit YAML only. No preamble, no commentary, no postscript.
