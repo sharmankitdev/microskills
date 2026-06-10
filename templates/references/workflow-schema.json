@@ -89,7 +89,7 @@
             "type": "object",
             "additionalProperties": false,
             "required": ["max_attempts"],
-            "description": "Bounded retry for a BACKGROUND use:/agent: node only (a block anywhere else — retry lives in compiled segment JS and cannot wrap an orchestrator checkpoint). The node's call is wrapped in withRetry(...): a thrown rejection AND a null/undefined return both count as a failed attempt (host contract: a failed agent() call in the native engine typically RETURNS NULL rather than throwing); after exhausting max_attempts the FINAL attempt's native failure shape is reproduced exactly (return null / rethrow) — never re-rolled, never fabricated. The helper is emitted only into segments that contain a retry node, so retry-free defs compile byte-identically.",
+            "description": "Bounded retry for a BACKGROUND use:/agent: node only (a block anywhere else — retry lives in compiled segment JS and cannot wrap an orchestrator checkpoint). The node's call is wrapped in withRetry(...): a thrown rejection AND a null/undefined return both count as a failed attempt (OBSERVED host behavior, 2026-06-10: terminal subagent API errors surfaced as null results in the parallel() results array, not catchable throws; throws are also possible per the host docs); after exhausting max_attempts the FINAL attempt's native failure shape is reproduced exactly (return null / rethrow) — never re-rolled, never fabricated. The helper is emitted only into segments that contain a retry node, so retry-free defs compile byte-identically.",
             "properties": {
               "max_attempts": { "type": "integer", "minimum": 2, "description": "Total attempt cap, first try included (boundedness mirrors loop.max_iters)." }
             }

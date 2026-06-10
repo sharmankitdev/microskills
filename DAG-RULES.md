@@ -1095,12 +1095,19 @@ segments that contain a retry node** (the `parallelChunked` precedent), so retry
 **byte-identically**. Wrapping the *per-call* expression means a `for_each` fan-out retries **per
 item**, and a `when` guard short-circuits *outside* the retry (a skipped node is never retried).
 
-**Host contract (assumed + pinned by tests):** in the native engine a failed `agent()` call
-typically **returns `null`** rather than throwing. `withRetry` therefore counts **both** a thrown
-rejection **and** a `null`/`undefined` return as a failed attempt, and — after exhausting
-`max_attempts` — **reproduces the final attempt's native failure shape exactly**: return the
-`null`/`undefined` as-is, or rethrow the error. It never re-rolls and never fabricates valid output;
-a non-null result is returned untouched on the first success.
+**Host contract (observed behavior, pinned by tests):** in the native engine a failed `agent()`
+call typically **returns `null`** rather than throwing; throws are also possible per the host
+docs. `withRetry` therefore counts **both** a thrown rejection **and** a `null`/`undefined`
+return as a failed attempt, and — after exhausting `max_attempts` — **reproduces the final
+attempt's native failure shape exactly**: return the `null`/`undefined` as-is, or rethrow the
+error. It never re-rolls and never fabricates valid output; a non-null result is returned
+untouched on the first success.
+
+> **Host-contract evidence (2026-06-10):** during this repo's own development, native-engine
+> `agent()` calls that died on **terminal subagent API errors** (session-limit) surfaced as
+> **NULL RETURNS in the `parallel()` results array**, not as catchable throws. That observation —
+> plus the host docs allowing throws — is why `withRetry` treats both shapes as failed attempts
+> rather than retrying on rejection alone.
 
 Placement is fail-loud: `retry` on a `workflow:` node or an orchestrator-native step is a validate
 block, and a node that **classifies** orchestrator (including resolution-driven reclassification — an
@@ -1731,10 +1738,12 @@ Before you compile, confirm:
       producing node's `spill_outputs`; downstream consumers read it **by reference** (`*_path`
       inputs); no guard (`when`/`for_each`/loop `while`/`until`) references a spilled field
       (blocks — a path is not the value); no `spill_outputs` on a `for_each` producer.
-- [ ] Run `validate-workflow` (expect `pass: true`; add `--strict` to make an unresolvable `use:`
-      block) then `compile-workflow` and eyeball the `sequence` in the summary — it should match the
-      segments/checkpoints you intended (`--annotate` writes the same view to
-      `.compiled/PARTITION.md`; don't hand-maintain partition comments in the def).
+- [ ] Run `validate-workflow` (expect `pass: true`). Unresolvable `use:` is two-mode by design:
+      **with `--defs-root` it always blocks** (fail-loud parity with compile's hard die); standalone
+      it warns — add `--strict` to escalate the standalone warn to a block. Then `compile-workflow`
+      and eyeball the `sequence` in the summary — it should match the segments/checkpoints you
+      intended (`--annotate` writes the same view to `.compiled/PARTITION.md`; don't hand-maintain
+      partition comments in the def).
 
 ```bash
 .claude/scripts/validate-workflow  .claude/workflow-defs/<name>/WORKFLOW.yaml \

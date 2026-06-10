@@ -1399,12 +1399,15 @@ async function parallelChunked(thunks, k) {
 """.strip("\n")
 
 # Emitted ONLY into a segment that has a retry: node (PARALLEL_CHUNKED_JS
-# precedent), so retry-free defs compile byte-identically. HOST CONTRACT (pinned
-# by tests): a failed agent() call in the native engine typically RETURNS NULL
-# rather than throwing — so BOTH a thrown rejection AND a null/undefined return
-# count as a failed attempt. After exhausting max_attempts the FINAL attempt's
-# native failure shape is reproduced exactly — return the null/undefined, or
-# rethrow the error — never re-rolled, never fabricated into valid output.
+# precedent), so retry-free defs compile byte-identically. HOST CONTRACT
+# (observed behavior, pinned by tests — see DAG-RULES §12 'Host-contract
+# evidence'): terminal subagent API errors surfaced live (2026-06-10) as NULL
+# RETURNS in the parallel() results, not catchable throws; throws are also
+# possible per the host docs — so BOTH a thrown rejection AND a null/undefined
+# return count as a failed attempt. After exhausting max_attempts the FINAL
+# attempt's native failure shape is reproduced exactly — return the
+# null/undefined, or rethrow the error — never re-rolled, never fabricated
+# into valid output.
 WITH_RETRY_JS = r"""
 async function withRetry(thunk, maxAttempts) {
   // Retry on a thrown rejection AND on a null/undefined return (the native
