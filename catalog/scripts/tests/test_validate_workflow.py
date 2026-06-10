@@ -1048,6 +1048,41 @@ def test_equivalent_guards_via_negation_block(tmp_path):
                if i["severity"] == "block"), data["issues"]
 
 
+def test_bare_negated_comparison_outside_grammar_no_false_block(tmp_path):
+    # REGRESSION: JS precedence — unary ! binds tighter than any comparison,
+    # so `!a.output.f == 'y'` means `(!a.output.f) == 'y'`, NOT
+    # `a.output.f != 'y'`. Folding the negation across the operator is only
+    # sound for `!(<comparison>)`; the bare form parses to None (outside the
+    # bounded grammar). This pair must NOT be reported provably-both-fire and
+    # must not block.
+    rc, data, _ = run(write_wf(tmp_path,
+                               _fork("${!p.output.f == 'y'}",
+                                     "${p.output.f != 'y'}")))
+    assert rc == 0 and data["pass"] is True, data["issues"]
+    assert not any("BOTH fire" in i["message"] or "disjoint" in i["message"]
+                   for i in data["issues"]), data["issues"]
+
+
+def test_bare_negated_field_truthiness_still_folds(tmp_path):
+    # `!<field>` with NO comparison stays inside the grammar (JS `!x` is the
+    # truthiness negation): vs the bare `x` guard it is provably disjoint.
+    rc, data, _ = run(write_wf(tmp_path,
+                               _fork("${p.output.ok}", "${!p.output.ok}")))
+    assert rc == 0 and data["pass"] is True, data["issues"]
+    assert not any("fire" in i["message"] or "disjoint" in i["message"]
+                   for i in data["issues"]), data["issues"]
+
+
+def test_identical_bare_negated_comparisons_still_block_textually(tmp_path):
+    # The bare-negated form is outside the bounded grammar, but two textually
+    # identical copies still provably both fire via the identity fallback.
+    w = "${!p.output.f == 'y'}"
+    rc, data, _ = run(write_wf(tmp_path, _fork(w, w)))
+    assert rc == 1 and data["pass"] is False
+    assert any("BOTH fire" in i["message"] for i in data["issues"]
+               if i["severity"] == "block"), data["issues"]
+
+
 def test_disjoint_comparison_forks_stay_clean(tmp_path):
     # Provably disjoint same-field pairs raise NOTHING: == null vs != null,
     # > 0 vs == 0 (touching open/closed interval bounds), distinct == literals.

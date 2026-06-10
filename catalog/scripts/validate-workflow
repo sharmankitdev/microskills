@@ -711,8 +711,18 @@ def main():
                 s = stripped
                 continue
             if s.startswith("!"):
+                rest = s[1:].strip()
+                # JS precedence: unary ! binds tighter than any comparison, so
+                # a bare `!<field> <op> <literal>` means `(!<field>) <op>
+                # <literal>` — folding the negation across the operator would
+                # invert the wrong thing. Folding is sound only for
+                # `!(<comparison>)`, `!<field>` (truthiness) and chained unary
+                # `!`; anything else falls out of the bounded grammar (None).
+                if not (rest.startswith("(") or rest.startswith("!")
+                        or re.fullmatch(r"[A-Za-z_][\w.]*", rest)):
+                    return None
                 neg = not neg
-                s = s[1:].strip()
+                s = rest
                 continue
             break
         m = _GUARD_CMP_RE.match(s)
