@@ -837,3 +837,135 @@ gates:
     # needed key — a path string satisfies it (S1 parity by construction)
     seg2 = (d / manifest["steps"][2]["script"]).read_text()
     assert '["review"]' in seg2 and "__missing" in seg2
+
+
+# ================================================================== loop.on_exhaust
+
+def _loop_step(carry_vars=("last",), needs_carry=("last",)):
+    return {"kind": "segment", "index": 1, "script": ".compiled/seg-1.js",
+            "nodes": ["impl", "ev"], "is_loop": True,
+            "needs": {"wf_inputs": [], "nodes": [], "carry": sorted(needs_carry)},
+            "produces": ["impl", "ev", "loop"],
+            "on_exhaust": {"action": "escalate",
+                           "carry_vars": sorted(carry_vars)}}
+
+
+def test_args_extend_flag_seeds_carry_from_committed_loop_result(tmp_path):
+    man, st = world(
+        tmp_path, [_loop_step(carry_vars=("last", "extra"))],
+        results={"impl": {"art": "a"}, "ev": {"pass": False},
+                 "loop": {"converged": False, "rounds": 3,
+                          "carry": {"last": {"pass": False}, "extra": 0}}})
+    rc, data, out, err = run("args", "--manifest", str(man),
+                             "--run-state", str(st), "--step", "0", "--extend")
+    assert rc == 0, out + err
+    # every DECLARED carry var is seeded (carry_vars ∪ needs.carry), and a
+    # falsy committed value (0) survives — presence semantics, not truthiness
+    assert data["args"] == {"carry_extra": 0, "carry_last": {"pass": False}}
+
+
+def test_args_fresh_loop_entry_still_seeds_null(tmp_path):
+    man, st = world(tmp_path, [_loop_step(carry_vars=("last", "extra"))],
+                    results={})
+    rc, data, out, err = run("args", "--manifest", str(man),
+                             "--run-state", str(st), "--step", "0")
+    assert rc == 0, out + err
+    assert data["args"] == {"carry_extra": None, "carry_last": None}
+
+
+def test_args_escalate_step_without_extend_flag_keeps_null_seeds(tmp_path):
+    # the EXPLICIT-flag contract: a committed 'loop' result alone never
+    # triggers seeding — a revise-style re-run of the same segment must get
+    # today's null seeds, not a silent continuation from the committed carry
+    man, st = world(
+        tmp_path, [_loop_step(carry_vars=("last", "extra"))],
+        results={"loop": {"converged": False, "rounds": 3,
+                          "carry": {"last": {"pass": False}, "extra": 0}}})
+    rc, data, out, err = run("args", "--manifest", str(man),
+                             "--run-state", str(st), "--step", "0")
+    assert rc == 0, out + err
+    assert data["args"] == {"carry_extra": None, "carry_last": None}
+
+
+def test_args_plain_loop_step_keeps_null_seed(tmp_path):
+    # no on_exhaust record → today's always-null contract, even if a stray
+    # 'loop' result exists in run-state
+    step = _loop_step()
+    step.pop("on_exhaust")
+    man, st = world(tmp_path, [step],
+                    results={"loop": {"converged": False, "rounds": 1,
+                                      "carry": {"last": {"pass": False}}}})
+    rc, data, out, err = run("args", "--manifest", str(man),
+                             "--run-state", str(st), "--step", "0")
+    assert rc == 0, out + err
+    assert data["args"] == {"carry_last": None}
+
+
+def test_args_extend_on_non_escalate_step_dies(tmp_path):
+    step = _loop_step()
+    step.pop("on_exhaust")
+    man, st = world(tmp_path, [step], results={})
+    rc, data, out, err = run("args", "--manifest", str(man),
+                             "--run-state", str(st), "--step", "0", "--extend")
+    assert rc == 2
+    assert "only valid on a loop segment" in data["error"]
+
+
+def test_args_extend_without_committed_loop_result_dies(tmp_path):
+    man, st = world(tmp_path, [_loop_step()], results={})
+    rc, data, out, err = run("args", "--manifest", str(man),
+                             "--run-state", str(st), "--step", "0", "--extend")
+    assert rc == 2
+    assert "committed 'loop' pseudo-result" in data["error"]
+
+
+def _exhaust_gate_step(when="${!(loop.output.converged)}"):
+    return {"kind": "checkpoint", "checkpoint_type": "gate",
+            "gate": {"id": "loop_exhaust", "type": "human_approval",
+                     "severity": "hard", "prompt": "cap hit",
+                     "options": ["extend", "accept", "abandon"],
+                     "after": "ev"},
+            "when": when}
+
+
+def test_eval_conditional_gate_fires_when_unconverged(tmp_path):
+    man, st = world(tmp_path, [_exhaust_gate_step()],
+                    results={"loop": {"converged": False, "rounds": 3,
+                                      "carry": {}}})
+    rc, data, out, err = run("eval", "--manifest", str(man),
+                             "--run-state", str(st), "--step", "0")
+    assert rc == 0, out + err
+    assert data["gate"] == "loop_exhaust"
+    assert data["when"] == {"expr": "${!(loop.output.converged)}", "value": True}
+    assert data["skipped"] is False
+    # a gate carries no prompt/child_inputs payload
+    assert "prompt" not in data and "child_inputs" not in data
+
+
+def test_eval_conditional_gate_skipped_when_converged(tmp_path):
+    man, st = world(tmp_path, [_exhaust_gate_step()],
+                    results={"loop": {"converged": True, "rounds": 2,
+                                      "carry": {}}})
+    rc, data, out, err = run("eval", "--manifest", str(man),
+                             "--run-state", str(st), "--step", "0")
+    assert rc == 0, out + err
+    assert data["skipped"] is True
+
+
+def test_eval_conditional_gate_missing_loop_result_fails_loud(tmp_path):
+    man, st = world(tmp_path, [_exhaust_gate_step()], results={})
+    rc, data, out, err = run("eval", "--manifest", str(man),
+                             "--run-state", str(st), "--step", "0")
+    assert rc == 1
+    assert any("no recorded result for node 'loop'" in e
+               for e in data["errors"])
+
+
+def test_eval_plain_gate_step_still_rejected(tmp_path):
+    step = _exhaust_gate_step()
+    step.pop("when")
+    man, st = world(tmp_path, [step], results={})
+    rc, data, out, err = run("eval", "--manifest", str(man),
+                             "--run-state", str(st), "--step", "0")
+    assert rc == 2
+    assert "gates carry no expressions" in data["error"]

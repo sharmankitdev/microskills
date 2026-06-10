@@ -235,6 +235,12 @@ def main():
     for later in steps[args.step + 1:]:
         if later.get("kind") == "segment":
             threaded.update((later.get("needs") or {}).get("nodes") or [])
+    # loop.on_exhaust: escalate — the 'loop' pseudo-result's carry threads back
+    # into THIS step on an extend re-entry (a self-edge the forward-only scan
+    # above can never see; carry seeding rides args like any node result), so
+    # size it as threaded too. Warning-only, like every look-ahead here.
+    if (step.get("on_exhaust") or {}).get("action") == "escalate":
+        threaded.add("loop")
 
     # This step's recorded spill map (compile records the producing node's
     # declared spill_outputs here, omitted when absent): a spilled field is

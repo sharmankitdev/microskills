@@ -354,6 +354,20 @@ class Harness:
         gate = step["gate"]
         gid = gate.get("id", "?")
         outcome = None
+        # Conditional gate (the compiler-emitted loop_exhaust step carries a
+        # step-level `when`): evaluate it in the kernel exactly like an
+        # orchestrator node's guard. False (the loop converged) → record the
+        # guarded null and continue — the gate never renders.
+        if step.get("when") is not None:
+            data = kernel(f"run-step eval (step {i})", RUN_STEP, "eval",
+                          "--manifest", str(self.manifest_path),
+                          "--run-state", str(self.run_state), "--step", str(i))
+            if data.get("skipped"):
+                self.results[gid] = None
+                self.journal({"event": "gate", "gate": gid, "choice": None,
+                              "skipped": True})
+                self.commit_step(i, step_label(step), outcome="skipped")
+                return
         if not gate_pauses(gate):
             # warn gate: render + continue; record the declared default or null
             # — never an option nobody selected.
@@ -386,6 +400,10 @@ class Harness:
                 die(f"gate '{gid}': a revise-style choice folds human notes "
                     f"into a re-run — not supported by the golden harness; "
                     f"pick approve/abandon in the scenario", 1)
+            if choice == "extend":
+                die(f"gate '{gid}': an extend choice re-runs the loop segment "
+                    f"with the committed carry — not supported by the golden "
+                    f"harness; pick accept/abandon in the scenario", 1)
         self.results[gid] = {"choice": choice}
         self.journal({"event": "gate", "gate": gid, "choice": choice,
                       "mode": "auto" if self.auto else

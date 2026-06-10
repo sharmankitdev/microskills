@@ -146,7 +146,21 @@
         "until": { "type": "string", "description": "Stop-condition sugar (inner of ${...}): until: EXPR desugars to while: !(EXPR). Mutually exclusive with while." },
         "max_iters": { "type": "integer", "minimum": 1, "description": "Mandatory iteration cap." },
         "body": { "type": "array", "items": { "type": "string" }, "description": "Node ids that repeat each iteration." },
-        "carry": { "type": "object", "additionalProperties": { "type": "string" }, "description": "State passed to the next iteration: var → ${...} expression." }
+        "carry": { "type": "object", "additionalProperties": { "type": "string" }, "description": "State passed to the next iteration: var → ${...} expression." },
+        "on_exhaust": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["action"],
+          "description": "Declared cap-exhaustion policy. Absent = today's behavior (the run proceeds past an exhausted loop). `escalate` makes the compiler emit a synthetic `loop_exhaust` human_approval gate after the loop segment, skipped when the loop converged; the loop segment additionally commits a `loop` pseudo-result {converged, rounds, carry}. `fail` makes the segment throw at the cap. `continue` declares today's behavior explicitly.",
+          "properties": {
+            "action": { "enum": ["escalate", "fail", "continue"] },
+            "prompt": { "type": "string", "description": "escalate only: the synthetic gate's prompt (a default is supplied when omitted)." },
+            "options": { "type": "array", "items": { "type": "string" }, "description": "escalate only: the synthetic gate's choices. Defaults to [extend, accept, abandon]. `extend` re-runs the loop segment with the committed carry and a fresh max_iters budget." },
+            "default": { "type": "string", "description": "escalate only: taken VERBATIM under gate-mode auto. Must be a member of the effective options; `extend` is refused as a default (it would re-enter the loop unboundedly headless)." },
+            "on_headless": { "enum": ["take_default", "fail"], "description": "escalate only: same rails as a gate's on_headless — `fail` parks the run resumable at the exhaustion gate." },
+            "notes_input": { "type": "string", "description": "escalate only: a DECLARED workflow input the dispatcher folds human extend-guidance into (a materialize:file input gets the notes appended to its materialized file)." }
+          }
+        }
       }
     },
     "output": {

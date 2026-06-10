@@ -162,7 +162,9 @@ overrides, headless signal), then:
        rendering only non-null fields (an `agent:` node shows the agent type alone — its model
        rides the agent definition). `is_loop` → append "(loop)" to the header.
      - gate → severity (`hard` pauses; `warn` renders + continues), the `prompt`, the options
-       (declared `options`, or the implicit `confirm / stop` pair), and the headless behavior:
+       (declared `options`, or the implicit `confirm / stop` pair), `conditional (when)` for a
+       step-level `when` (the compiler-emitted `loop_exhaust` exhaustion gate — note it was not
+       authored: "fires only when the loop exits unconverged"), and the headless behavior:
        the declared **`default` is the auto-mode choice** — render `auto mode takes '<default>'`;
        `on_headless: fail` → `auto mode STOPS here (declared hand-off)`; a pausing gate with
        neither → `interactive-only (an auto compile refuses this gate)`.
@@ -212,7 +214,9 @@ requirement) needs a changed input, which is a NEW run, never a rerun.
 4. **Replay, never re-ask** — print one line per `replayed_gates` entry:
    `Gate <id>: replaying recorded choice '<choice>'`. Those gates sit BEFORE the from-point; their
    recorded `{choice}` results are already seeded into the run-state, so downstream branches read
-   them — do not re-present them.
+   them — do not re-present them. A replayed `loop_exhaust` whose recorded choice was `extend` is a
+   CHOICE replay only — never re-act on it (the seeded run-state already carries the
+   post-extension `results.loop`/carry).
 5. **Skip Setup steps 5-8 entirely** — the inputs are FROZEN from the record and already seeded,
    including materialized `run-inputs/` paths that point into the SOURCE run's dir (this is why
    finished run dirs are retained). Adopt `run_dir`, seed in-memory `inputs` / `results` from
@@ -236,7 +240,8 @@ and track the 0-based position `i` as you walk. **Before running each step, prin
 - gate → "Approval: {gate.id}".
 - orchestrator_node → its node id as an action — `finalize` → "Finalize", `provision` → "Provision missing microskills".
 - nested_workflow → the child workflow as an action — `build` (running `build-workflow-from-plan`) → "Build (nested workflow)".
-A skipped step (a `warn` gate, or an orchestrator node whose `when` is false) still gets a header, marked skipped.
+A skipped step (a `warn` gate, an orchestrator node whose `when` is false, or the conditional
+`loop_exhaust` gate after a converged loop) still gets a header, marked skipped.
 Walk `manifest.steps` in order (starting at the resume position `i` from the Setup resume check, default 0):
 
 **Check the step's IO, then persist run-state + journal — the check gates the commit.** After a
@@ -296,7 +301,10 @@ so retention costs nothing at resume time). Do not let journaling block the run.
    committed run-state — every needed key PRESENT with the same presence-not-truthiness rule the
    compiled segment's fail-loud guard enforces (`wf_<n>` from the recorded inputs with manifest
    defaults applied, explicit `null` for an ungathered optional; `<node-id>` from results, a
-   guarded skip's stored `null` riding as `null`; `carry_<v>: null` loop seeds). **Non-zero exit →
+   guarded skip's stored `null` riding as `null`; `carry_<v>: null` loop seeds — an extend
+   re-entry of an `on_exhaust: escalate` loop step passes `--extend`, which seeds every declared
+   carry var from the committed `results.loop.carry` instead; without the flag the seeds stay
+   null, revise re-runs included). **Non-zero exit →
    STOP** and surface its JSON `errors` (journal a `run_error`): a missing recorded result, an
    ungathered required input, or an **oversized args payload** — past the budget the native engine
    truncates, run-step fails loud and never auto-spills (silently substituting a file path would
@@ -317,22 +325,38 @@ so retention costs nothing at resume time). Do not let journaling block the run.
    `args` = the `args` object from run-step **verbatim**. The segment runs autonomously in the
    background on the native engine.
 3. When it completes, its return value is an object keyed by the node ids in `step.produces`. Store
-   each into `results` (e.g. `results.plan = <returned>.plan`).
+   each into `results` (e.g. `results.plan = <returned>.plan`). An `on_exhaust: escalate` loop
+   step's `produces` also lists `loop` — the pseudo-result `{converged, rounds, carry}`; store it
+   like any node result (`results.loop = <returned>.loop` — the conditional `loop_exhaust` gate and
+   any extend re-entry read it from the committed state).
 4. **Emit a recap** (2-4 lines, human-readable, no raw JSON) of what the segment produced, before the
    next step. Build it from `step.produces` + the stored `results`, using the **output rubric** in the
    gate block below:
    - Non-loop segment → one clause per produced node — e.g. `Planned <name> — drafted a WORKFLOW.yaml (~N nodes).`
      or `Implemented — wrote K staged files.` Never paste plan file contents or object arrays here.
    - Loop segment (`step.is_loop`) → summarize the outcome, not each round: state the round count from
-     `<returned>.__rounds` (the compiled loop returns it) and the evaluator's final verdict — e.g.
+     `<returned>.loop.rounds` when the step declares `on_exhaust: escalate` (`<returned>.__rounds`
+     otherwise — same number, one source of truth per mode) and the evaluator's final verdict — e.g.
      `Implement/evaluate loop done in 2 round(s) — verdict PASS, K staged files.` or
      `Implement/evaluate loop done in 3 round(s) — verdict FAIL at the round cap; N issues open.`
+     An extend re-run's recap names the extension explicitly (`extension 1: 3 more round(s) — ...`).
    - A produced node that is `null` (a guarded/skipped node) → say so in one clause; don't invent output.
 5. If the segment errors (a fail-loud node), stop and surface the error in readable form — do not
    fabricate a result (skip the recap; report the failure instead).
 
 ### `kind: "checkpoint"`, `checkpoint_type: "gate"`
-A human-approval / hard gate. First render the gate's evidence:
+A human-approval / hard gate.
+
+**Conditional gate first** — a gate step carrying a step-level `when` (the compiler-emitted
+`loop_exhaust` exhaustion gate; authored gates never have one) is evaluated in code BEFORE any
+rendering: the same `run-step eval` call as an orchestrator node (it returns `gate`, `when`,
+`skipped`). `skipped: true` (the loop converged) → store `results[gate.id] = null` (the guarded-null
+convention — a later `${loop_exhaust.output.choice}` branch must sit behind a converged check, e.g.
+`${loop.output.converged || loop_exhaust.output.choice == 'accept'}`), journal the step with
+`--outcome skipped`, print the header marked skipped, and continue — the gate never renders.
+`skipped: false` → the loop exhausted its cap unconverged; render and ask below.
+
+Render the gate's evidence:
 
 **`gate.present` declared → render it MECHANICALLY**, entries in declared order — no synthesis, so
 the approver sees the same evidence every run:
@@ -364,7 +388,9 @@ markdown — it is an `output_schema`-shaped object. **Never show raw JSON.** Ma
   never a re-phrasing — print one line `Gate <id>: auto — taking declared default '<default>'`, and
   journal the step with `--gate '<gate.id>' --choice '<gate.default>'`. Then act on that recorded
   choice exactly per the mapping below, with one exception: a `revise`-style default cannot gather
-  human notes — journal a `run_error` and stop, naming the gate.
+  human notes — journal a `run_error` and stop, naming the gate. (An `extend` default cannot occur:
+  compile refuses `on_exhaust.default: extend` — it would re-enter the loop unboundedly headless. A
+  hand-edited manifest carrying one → journal a `run_error` and stop, same as revise.)
 - a pausing gate with NO `default` (a hand-edited manifest — compile never emits this) → journal a
   `run_error` and stop. **Never pick an option yourself.**
 
@@ -385,6 +411,32 @@ below; always store the pick, then act on it. Then act:
   revision notes into the relevant input value (e.g. append them to the `requirement` arg), and
   re-invoke the segment's script. Then re-render the output and re-present the gate
   (re-recording `results[gate.id]` on the re-presented choice).
+- An `extend` choice (the `loop_exhaust` gate) → re-run the LOOP segment with the committed carry
+  and a fresh `max_iters` budget, in this order (the kernel reads COMMITTED state, so every fold
+  must land on disk BEFORE the args call):
+  1. **Fold guidance first** — when the loop step's manifest declares `on_exhaust.notes_input`,
+     ask the user (a follow-up `AskUserQuestion` or their free-text note) and fold it into that
+     named workflow input: a `materialize: file` input gets the notes APPENDED to its materialized
+     file under a `## Loop-extension guidance (extension N)` heading — but when that file lives
+     outside THIS run's `run_dir` (a rerun: materialized paths point into the SOURCE run's dir,
+     which is provenance and never modified), first COPY it into this run's `run-inputs/`, append
+     to the copy, and update `inputs[name]` to the copy's path; a plain string input gets the
+     notes appended to its value in `inputs`. Any `inputs` change is committed to
+     `run-state.json` (Write tmp → `run-journal append --commit-state`, no step advance) BEFORE
+     the next move.
+  2. **Rebuild args with the explicit extend flag** — `run-step args ... --step <i> --extend`
+     (same call as the segment step plus the flag, no re-compile): the kernel seeds every declared
+     `carry_<v>` from the committed `results.loop.carry` ONLY under `--extend` (a revise re-run of
+     the same segment keeps the default null seeds), and fails loud if there is nothing committed
+     to seed from.
+  3. Re-invoke the segment's script, then run the IO check + commit for the LOOP step's refreshed
+     results (the three-move protocol — an extend re-run that dies uncommitted must never leave
+     stale loop results looking current), and re-render `results.loop` (cumulative extensions are
+     dispatcher bookkeeping: say "extension N").
+  4. **Exit by verdict** — still unconverged → re-present this gate. Converged → the human's real
+     pick stays recorded (`results[gate.id] = { choice: 'extend' }`, never overwritten with a
+     skip-null), journal the gate step normally (`--gate '<gate.id>' --choice 'extend'`), and
+     continue to the next step.
 - An `abandon`/`stop` choice → stop the run cleanly (clean up any staging the segments created).
 For `severity: warn` gates (any mode), render the evidence + emit the prompt, then continue without
 pausing — record `results[gate.id] = { choice: <gate.default> }` when the gate declares a `default`
@@ -495,6 +547,9 @@ already covered the play-by-play — don't re-summarize each segment here.
 - **Unknown workflow** — no `WORKFLOW.yaml` at `.claude/workflow-defs/<name>/`. Stop.
 - **Compile error** — `compile-workflow` non-zero exit. Surface `error` / `schema_errors`, stop.
 - **Segment error** — a segment returns an error (fail-loud node). Stop, surface it, do not proceed.
+- **Loop exhausted (`on_exhaust: fail`)** — the loop segment's post-cap throw is a segment error;
+  surface it naming the loop and its round count. (`on_exhaust: escalate` is not a failure: the
+  `loop_exhaust` gate handles it; extend declined / abandoned maps onto "Gate abandoned" below.)
 - **Step IO check failed** — `check-step-io` exits non-zero on the CANDIDATE state after a step
   (schema violation, missing result, or the probable-truncation/fabrication signature). Stop
   WITHOUT committing: journal `run_error` with `--mark-failed-step <i>`, surface the `errors`,

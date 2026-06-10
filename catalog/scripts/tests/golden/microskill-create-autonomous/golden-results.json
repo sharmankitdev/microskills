@@ -28,6 +28,17 @@
         ".claude/.workflow-staging/current/slugify-title/profiles/base.yaml"
       ]
     },
+    "loop": {
+      "carry": {
+        "last_findings": {
+          "issues": [],
+          "pass": true
+        }
+      },
+      "converged": true,
+      "rounds": 2
+    },
+    "loop_exhaust": null,
     "plan": {
       "name": "slugify-title",
       "plan_path": ".claude/.workflow-staging/current/plan.yaml",

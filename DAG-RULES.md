@@ -823,12 +823,77 @@ loop:
 - `carry` threads state across iterations: each var inits from `_args.carry_<v>` (`null` on the first
   round) and is reassigned at the end of each iteration. Body nodes read it via `${loop.carry.<v>}`.
 - The loop returns a `__rounds` count (the iteration count) so the dispatcher can recap "loop done in
-  N round(s)". `__rounds` is **not** a node result.
+  N round(s)". `__rounds` is **not** a node result. (Under `on_exhaust: escalate` the committed
+  `loop` pseudo-result carries the same count as `loop.output.rounds` — see below.)
 
 **Guarded-loop break:** if any body node has a `when`, the loop tracks a `__ran` flag and emits
 `if (!__ran) break` — an iteration where *every* node skipped exits the loop immediately (instead of
 spinning to `max_iters` and reading a skipped node's `null` in the `while`). You don't write this; the
 compiler emits it when it sees a `when` in the body.
+
+### `on_exhaust` — declared cap-exhaustion policy
+
+`max_iters` is a **budget**, not a verdict: without `on_exhaust`, a loop that hits the cap with its
+continue-condition still true just ends, and the run proceeds — the unconverged artifact flows
+downstream unless an author-written guard checks the verdict (the historical behavior, preserved
+byte-identically when `on_exhaust` is absent). `on_exhaust` makes exhaustion a first-class event:
+
+```yaml
+loop:
+  while: ${!evaluate.output.pass}
+  max_iters: 3
+  body: [implement, evaluate]
+  carry:
+    last_findings: ${evaluate.output}
+  on_exhaust:
+    action: escalate              # escalate | fail | continue (absent = today's behavior)
+    prompt: Round cap hit with the evaluator still failing — extend, accept, or abandon?
+    options: [extend, accept, abandon]   # the default set when omitted
+    notes_input: requirement_path # optional: where extend-guidance folds (must be a DECLARED input)
+    on_headless: fail             # or a default: (extend is refused as a default)
+```
+
+- **`escalate`** — delegate the verdict to the orchestrator (human-in-loop). The loop segment
+  additionally commits a **`loop` pseudo-result** `{converged, rounds, carry}` (it joins the step's
+  `produces` + `io`, so check-step-io validates it and a fabricated `null` fails loud), and the
+  compiler emits a **synthetic `loop_exhaust` human_approval gate** immediately after the loop
+  segment, carrying a step-level `when: ${!(loop.output.converged)}` — the only conditional gate in
+  the vocabulary; it is **skipped when the loop converged** (the dispatcher records
+  `results.loop_exhaust = null`, the guarded-null convention). Choices: **extend** re-runs the loop
+  segment with every declared carry var seeded from the committed `results.loop.carry` (presence
+  semantics — a falsy carried value survives) and a fresh `max_iters` budget, folding optional human
+  guidance into `notes_input`; **accept** proceeds downstream with the unconverged artifact —
+  explicitly, on a recorded human choice; **abandon** stops the run cleanly. Downstream nodes may
+  branch on `${loop.output.converged}` / `${loop_exhaust.output.choice}` (both ids become accepted
+  ref producers; choice literals are cross-checked against the effective options). `converged` is
+  defined as "the cap did NOT stop a still-true condition" — a guarded-loop break (all body nodes
+  skipped) counts as converged: there was nothing left to iterate on.
+- **`fail`** — the segment **throws** at the cap (`loop exhausted max_iters=N with its
+  continue-condition still true`): a segment error, surfaced and never committed as success. The
+  honest-fail shape for pipelines where an unconverged artifact must never proceed.
+- **`continue`** — today's behavior, declared explicitly. Segment JS is unchanged, but the manifest
+  stamp still moves `manifest_hash` (re-lock and expect resume invalidation, like any policy
+  adoption).
+
+Rails and reservations (all enforced in BOTH tools via shared helpers):
+- The synthetic gate rides the standard gate rails: a declared `default` must be a member of the
+  effective options; under gate-mode auto a pausing exhaustion gate needs a `default` or
+  `on_headless: fail` (the park-resumable "do the work overnight, approve in the morning" pattern —
+  the natural headless choice here). **`default: extend` is refused outright**: a default's only
+  consumer is a headless run, where extend would re-enter the loop unboundedly.
+- `notes_input` must name a **declared** workflow input. A `materialize: file` input gets guidance
+  APPENDED to its materialized file; a plain string input gets it appended to the value.
+- **`loop` and `loop_exhaust` become reserved ids** (node AND gate) while escalate is declared —
+  the pseudo-result and the gate's recorded `{choice}` live under those keys in run-state.
+- `on_exhaust` is stamped on the loop's manifest step (omitted when absent), so the policy is
+  **manifest_hash-visible** — adopting it invalidates stale resume state and committed lockfiles,
+  exactly like any semantic change. The escalate stamp also records `carry_vars` (the FULL declared
+  carry list — `needs.carry` holds only the referenced subset) for the extend re-entry's seeding.
+- Carry budget caveat: an extend re-entry threads the committed carry **by value** through args —
+  `materialize`/`spill` cannot move a carry var by reference (the compiled carry init needs the
+  value). check-step-io sizes the committed `loop` result as self-threaded and warns past the
+  budget; keep carry small (verdicts and findings, not artifacts — spill big artifacts from the
+  producing node instead).
 
 > ### ⚠️ The loop-contiguity rule (now ENFORCED, formerly a silent footgun)
 > **An orchestrator node (or a hard/`human_approval` gate) placed *between* two loop-body nodes splits
@@ -1452,6 +1517,27 @@ profiles. This is a documented boundary, not a fixed one.
 - **`base` does nothing at runtime;** `imports` is now load-bearing (§3) — it's the `workflow:`
   allowlist, not mere documentation.
 - **Loop body can't fan out.** `for_each` inside `loop.body` is a hard block.
+- **An exhausted loop proceeds silently unless `on_exhaust` is declared.** `max_iters` is a budget,
+  not a verdict: with no `on_exhaust`, a capped-out still-failing loop flows downstream (e.g. a
+  finalize guard that never checks the verdict ships the unconverged artifact). Declare
+  `on_exhaust: escalate` (human verdict via the synthetic `loop_exhaust` gate) or `fail` (§9).
+- **Profiles cannot `gates: patch:` the synthetic `loop_exhaust` gate** — it is compiler-emitted
+  POST-merge, so the list-verb would raise "no entry with id='loop_exhaust' to patch". Configure it
+  via `loop: { on_exhaust: { ... } }` instead (a plain dict — profiles deep-merge it normally).
+- **`loop`/`loop_exhaust` are reserved ids under `on_exhaust: escalate`** (node and gate; both
+  tools enforce). A skipped `loop_exhaust` (converged loop) records `null` — branch on its choice
+  only behind a converged check (`${loop.output.converged || loop_exhaust.output.choice == '...'}`,
+  the `||` short-circuit protects the null deref).
+- **`on_exhaust` requires the loop body to form its OWN segment.** A background node topo-adjacent
+  to the body with no checkpoint between them merges into the loop's segment and the policy cannot
+  attach — compile dies on the full partition; validate blocks the provably-background (`agent:`)
+  subset. Separate the neighbor with a hard gate or an orchestrator checkpoint.
+- **A parked headless run (`on_headless: fail`) has no interactive pickup rail yet.** `gate_mode`
+  rides INSIDE `manifest_hash` and the dispatcher treats `manifest.gate_mode: auto` as
+  authoritative — an interactive session either compiles a different hash (flag-passed auto: the
+  parked run is never offered for resume) or resumes straight back into auto mode and stops at the
+  same gate again (profile-declared auto). Pickup today = a fresh interactive run (or a rerun). A
+  resume-into-interactive rail is a roadmap item, not built.
 
 ### YAML-syntax traps (these bite before any DAG rule does)
 
@@ -1728,6 +1814,10 @@ Before you compile, confirm:
       same-field guards warn).
 - [ ] `loop` has `max_iters` + `body` and exactly one of `while`/`until`; `loop.body` nodes are
       contiguous with no orchestrator node / hard gate between them (now enforced).
+- [ ] A loop whose exhausted-unconverged exit must not flow silently downstream declares
+      `on_exhaust` (`escalate` for the human verdict, `fail` for hard-stop); escalate under any
+      headless path carries `on_headless: fail` or a non-extend `default`; `notes_input` names a
+      declared input; nothing else is named `loop`/`loop_exhaust`.
 - [ ] Gate ids are unique and disjoint from node ids.
 - [ ] Every `workflow:` target is in `imports`; validate with `--defs-root` to check child contracts.
 - [ ] Human-interaction nodes are orchestrator, not background.
