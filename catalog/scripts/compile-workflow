@@ -1599,6 +1599,23 @@ def main():
     if expand_errors:
         die("expand: desugar failed", 1, expand_errors=expand_errors)
 
+    # --- FAIL-LOUD: reserved wf_ node-id prefix (defense in depth with the
+    # schema pattern + validate's block — the 1.1 fail-loud pattern). A
+    # ${workflow.inputs.<x>} ref translates to `_args.wf_<x>` (translate_ref),
+    # and run-step builds the same wf_<name> keys into segment args and
+    # checkpoint contexts — so a node id matching ^wf_ silently clobbers (or is
+    # clobbered by) a workflow input in the threaded args. Runs AFTER the
+    # expand desugar (a template id `wf` + over item `x` GENERATES `wf_x`) and
+    # BEFORE schema validation, so the named error wins over the generic
+    # pattern message.
+    for _n in wf.get("nodes") or []:
+        if isinstance(_n, dict) and isinstance(_n.get("id"), str) \
+                and _n["id"].startswith("wf_"):
+            die(f"node id '{_n['id']}' uses the reserved 'wf_' prefix — it "
+                f"collides with the workflow-input args namespace "
+                f"(${{workflow.inputs.<x>}} rides as _args.wf_<x> in compiled "
+                f"segments and the run-step context); rename the node", 1)
+
     # An OMITTED version defaults to 1 BEFORE schema validation (the const:1 check
     # stays intact, so an EXPLICIT wrong version still blocks). Mirrors the
     # resolve-microskill ergonomic.

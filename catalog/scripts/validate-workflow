@@ -306,6 +306,18 @@ def main():
             continue
         if nid in node_by_id:
             add(issues, "block", f"nodes/{nid}", f"duplicate node id '{nid}'")
+        # Reserved wf_ prefix: ${workflow.inputs.<x>} rides as _args.wf_<x> in
+        # compiled segments and the run-step context, so a node id matching
+        # ^wf_ silently clobbers (or is clobbered by) a workflow input in the
+        # threaded args. Mirrors compile's hard die (defense in depth with the
+        # schema id pattern). Runs post-expansion, so a desugar-generated
+        # `<id>_<item>` collision (template id `wf` + item `x`) is caught too.
+        if isinstance(nid, str) and nid.startswith("wf_"):
+            add(issues, "block", f"nodes/{nid}",
+                f"node id '{nid}' uses the reserved 'wf_' prefix — it collides "
+                f"with the workflow-input args namespace "
+                f"(${{workflow.inputs.<x>}} rides as _args.wf_<x> in compiled "
+                f"segments and the run-step context); rename the node")
         node_ids.append(nid)
         node_by_id[nid] = n
 

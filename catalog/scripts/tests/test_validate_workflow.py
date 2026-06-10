@@ -994,6 +994,40 @@ gates:
     assert not any("cycle" in i["message"] for i in data["issues"])
 
 
+# --- Reserved wf_ node-id prefix (workflow-input args namespace) ---
+
+def test_wf_prefixed_node_id_blocks(tmp_path):
+    # `${workflow.inputs.<x>}` rides as `_args.wf_<x>` in compiled segments and
+    # the run-step context — a node id matching ^wf_ silently clobbers (or is
+    # clobbered by) a workflow input. Fail loud at validate.
+    body = VALID.replace("id: b", "id: wf_b")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    assert any("reserved 'wf_' prefix" in i["message"] for i in data["issues"]
+               if i["severity"] == "block"), data["issues"]
+
+
+def test_schema_id_pattern_rejects_wf_prefix():
+    # Defense in depth at the schema layer too: the closed node-id pattern
+    # itself excludes the reserved prefix (negative lookahead), so a consumer
+    # validating against the raw schema is covered even without the tools.
+    import re as _re
+    schema = json.loads(
+        (REPO / "templates" / "references" / "workflow-schema.json").read_text())
+    pat = schema["properties"]["nodes"]["items"]["properties"]["id"]["pattern"]
+    assert _re.match(pat, "wf_x") is None
+    assert _re.match(pat, "wfx") is not None
+    assert _re.match(pat, "plan_2") is not None
+
+
+def test_wf_prefix_without_underscore_is_legal(tmp_path):
+    # Only the `wf_` prefix is reserved — ids like `wf` or `wfx` collide with
+    # nothing (workflow inputs ride as wf_<name>).
+    body = VALID.replace("id: b", "id: wfb")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 0 and data["pass"] is True, data["issues"]
+
+
 # --- Branch-exclusivity lint (rank12, STRENGTHENED): bounded comparison analysis ---
 # Inside the locked design (branch = exclusivity-lint only): provably-both-fire
 # guard pairs are now a BLOCK; same-field pairs neither identical nor provably

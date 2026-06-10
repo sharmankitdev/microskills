@@ -670,6 +670,52 @@ def test_split_loop_body_dies_before_emit(tmp_path):
     assert not list(compiled.glob("seg-*.js")) if compiled.exists() else True
 
 
+# --- Reserved wf_ node-id prefix (workflow-input args namespace) ---
+
+WF_PREFIX = """\
+version: 1
+name: wf-prefix
+inputs:
+  diff:
+    type: string
+nodes:
+  - id: wf_diff
+    agent: ag
+    prompt: do a
+"""
+
+
+def test_wf_prefixed_node_id_dies_in_compile(tmp_path):
+    # Defense in depth (the 1.1 fail-loud pattern): `${workflow.inputs.<x>}`
+    # translates to `_args.wf_<x>`, so a node id matching ^wf_ would silently
+    # clobber (or be clobbered by) a workflow input in the threaded args.
+    make_flow(tmp_path, "wf-prefix", WF_PREFIX)
+    rc, data, out, err = run(tmp_path, "wf-prefix")
+    assert rc == 1
+    assert data is not None and "reserved 'wf_' prefix" in data["error"]
+    # fail-loud BEFORE any emit
+    compiled = tmp_path / "wf-prefix" / ".compiled"
+    assert not list(compiled.glob("seg-*.js")) if compiled.exists() else True
+
+
+def test_wf_prefix_via_expand_suffix_dies_in_compile(tmp_path):
+    # The desugar can GENERATE a colliding id (`<id>_<item>`): template id `wf`
+    # + over item `x` → `wf_x`. The guard runs post-expansion, so it catches it.
+    make_flow(tmp_path, "wf-expand", """\
+version: 1
+name: wf-expand
+nodes:
+  - id: wf
+    agent: ag
+    expand:
+      over: [x]
+    prompt: do {{each.item}}
+""")
+    rc, data, out, err = run(tmp_path, "wf-expand")
+    assert rc == 1
+    assert data is not None and "reserved 'wf_' prefix" in data["error"]
+
+
 # --- S-INFER: union-edge cycle + ref-implied ordering in compile ---
 
 REF_CYCLE = """\
