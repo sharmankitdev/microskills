@@ -1448,3 +1448,165 @@ def test_loop_body_background_members_pass(tmp_path):
     rc, data, _ = run(write_wf(tmp_path, body))
     assert rc == 0, data
     assert data["pass"] is True
+
+
+# =============================================================================
+# 3.2 / 3.6 — customize closed to {profile?, overrides?}; overrides + retry
+# placement blocks (mirror compile's hard dies, statically-detectable subset).
+# =============================================================================
+
+USE_OVERRIDES = """\
+version: 1
+name: ov-flow
+nodes:
+  - id: e
+    use: some-ms
+    customize:
+      profile: fast
+      overrides:
+        runtime.model: haiku
+"""
+
+
+def test_customize_profile_and_overrides_on_use_node_pass(tmp_path):
+    rc, data, _ = run(write_wf(tmp_path, USE_OVERRIDES))
+    assert rc == 0, data
+    assert data["pass"] is True
+
+
+def test_customize_unknown_key_blocks_schema(tmp_path):
+    body = USE_OVERRIDES.replace("      profile: fast\n", "      profilee: oops\n")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert any("profilee" in i["message"] for i in data["issues"]
+               if i["severity"] == "block")
+
+
+def test_customize_overrides_on_agent_node_blocks(tmp_path):
+    body = """\
+version: 1
+name: ov-flow
+nodes:
+  - id: a
+    agent: ag
+    customize:
+      overrides:
+        runtime.model: haiku
+    prompt: do a
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert any("customize.overrides is only valid on a use:" in i["message"]
+               for i in data["issues"])
+
+
+def test_customize_overrides_on_workflow_node_blocks(tmp_path):
+    body = """\
+version: 1
+name: ov-flow
+imports: [child-flow]
+nodes:
+  - id: w
+    workflow: child-flow
+    customize:
+      overrides:
+        runtime.model: haiku
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert any("customize.overrides is only valid on a use:" in i["message"]
+               for i in data["issues"])
+
+
+def test_customize_overrides_under_delegation_orchestrator_blocks(tmp_path):
+    body = USE_OVERRIDES.replace("    use: some-ms\n",
+                                 "    use: some-ms\n    delegation: orchestrator\n")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert any("resolution is skipped" in i["message"] for i in data["issues"])
+
+
+def test_customize_overrides_under_side_effect_alias_blocks(tmp_path):
+    body = USE_OVERRIDES.replace("    use: some-ms\n",
+                                 "    use: some-ms\n    side_effect: true\n")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert any("resolution is skipped" in i["message"] for i in data["issues"])
+
+
+RETRY_OK = """\
+version: 1
+name: rt-flow
+nodes:
+  - id: a
+    agent: ag
+    retry: { max_attempts: 3 }
+    prompt: do a
+  - id: e
+    use: some-ms
+    retry: { max_attempts: 2 }
+    depends_on: [a]
+"""
+
+
+def test_retry_on_use_and_agent_nodes_passes(tmp_path):
+    rc, data, _ = run(write_wf(tmp_path, RETRY_OK))
+    assert rc == 0, data
+    assert data["pass"] is True
+
+
+def test_retry_max_attempts_below_two_blocks_schema(tmp_path):
+    body = RETRY_OK.replace("max_attempts: 2", "max_attempts: 1")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert any("minimum" in i["message"] or "less than" in i["message"]
+               for i in data["issues"] if i["severity"] == "block")
+
+
+def test_retry_on_workflow_node_blocks(tmp_path):
+    body = """\
+version: 1
+name: rt-flow
+imports: [child-flow]
+nodes:
+  - id: w
+    workflow: child-flow
+    retry: { max_attempts: 2 }
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert any("retry is only valid on a background use:/agent: node" in i["message"]
+               for i in data["issues"])
+
+
+def test_retry_on_orchestrator_native_node_blocks(tmp_path):
+    body = """\
+version: 1
+name: rt-flow
+nodes:
+  - id: fin
+    delegation: orchestrator
+    retry: { max_attempts: 2 }
+    prompt: finalize
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert any("retry is only valid on a background use:/agent: node" in i["message"]
+               for i in data["issues"])
+
+
+def test_retry_under_explicit_delegation_orchestrator_blocks(tmp_path):
+    body = """\
+version: 1
+name: rt-flow
+nodes:
+  - id: a
+    agent: ag
+    delegation: orchestrator
+    retry: { max_attempts: 2 }
+    prompt: do a
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1
+    assert any("explicit orchestrator checkpoint" in i["message"]
+               for i in data["issues"])

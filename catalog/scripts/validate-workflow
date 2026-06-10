@@ -296,6 +296,41 @@ def main():
                 "side_effect: true contradicts delegation: auto — a side-effect node "
                 "must run as an orchestrator checkpoint; remove one of the two fields")
 
+        # customize.overrides override the microskill's RESOLUTION — meaningful
+        # ONLY on a use: node that actually resolves. Anywhere else they would
+        # be silently ignored (mirror compile's hard die): a workflow:/agent:/
+        # orchestrator-native node has no resolution, and explicit
+        # delegation: orchestrator (incl. its side_effect alias) SKIPS it.
+        cust = n.get("customize")
+        cust_overrides = (cust or {}).get("overrides") if isinstance(cust, dict) else None
+        if cust_overrides:
+            if not has_use:
+                add(issues, "block", f"nodes/{nid}",
+                    "customize.overrides is only valid on a use: microskill node; "
+                    "on a workflow:/agent:/orchestrator node it would be silently "
+                    "ignored")
+            elif is_orch:
+                add(issues, "block", f"nodes/{nid}",
+                    "customize.overrides cannot take effect under explicit "
+                    "delegation: orchestrator (resolution is skipped, so the "
+                    "overrides would be silently ignored); remove one of the two")
+
+        # retry lives in compiled segment JS — valid on a background use:/agent:
+        # node only. Block the statically-detectable orchestrator placements
+        # (compile also dies when resolution-driven classification, e.g. an
+        # AskUserQuestion microskill, makes a retry node a checkpoint).
+        if n.get("retry"):
+            if has_wf or (not has_use and not has_agent):
+                add(issues, "block", f"nodes/{nid}",
+                    "retry is only valid on a background use:/agent: node; a "
+                    "workflow:/orchestrator node never runs inside a compiled "
+                    "segment, so its retry would be silently dropped")
+            elif is_orch:
+                add(issues, "block", f"nodes/{nid}",
+                    "retry is only honored in a background segment, but this node "
+                    "is an explicit orchestrator checkpoint "
+                    "(delegation: orchestrator / side_effect: true)")
+
         depends = n.get("depends_on") or []
         for d in depends:
             if d not in id_set:

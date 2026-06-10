@@ -1839,3 +1839,47 @@ def test_inject_only_failure_blocks(tmp_path):
     assert code == 1
     assert data["injected_inputs"] == {}
     assert any("__RESOLVE_TEST_NEVER_SET_ABC__" in w for w in data["warnings"])
+
+
+# =============================================================================
+# 3.2 — --override value parsing: the leading-'#' YAML-comment paper cut
+# =============================================================================
+
+
+def test_override_value_leading_hash_is_literal_string(tmp_path):
+    # PAPER-CUT FIX: an unquoted value LEADING with '#' is a full-line YAML
+    # comment — yaml.safe_load returned None, silently turning the override
+    # into a key DELETE. parse_override_value now reads it as the literal
+    # string (no expressible value changes meaning: a bare '#...' could never
+    # parse to anything but None).
+    body = MINIMAL_SKILL.format(name="hash-override")
+    cfg = "version: 1\nvars:\n  tag: old\n"
+    make_skill(tmp_path, "hash-override", body, default_cfg=cfg)
+    code, data, _, err = run(
+        "hash-override", "--override", "vars.tag=#smoke-7", skill_root=tmp_path)
+    assert code == 0, err
+    assert data["config"]["vars"]["tag"] == "#smoke-7"
+
+
+def test_override_value_empty_still_deletes(tmp_path):
+    # The '=' (empty value) delete contract is untouched by the '#' fix.
+    body = MINIMAL_SKILL.format(name="del-override")
+    cfg = "version: 1\nvars:\n  tag: old\n"
+    make_skill(tmp_path, "del-override", body, default_cfg=cfg)
+    code, data, _, err = run(
+        "del-override", "--override", "vars.tag=", skill_root=tmp_path)
+    assert code == 0, err
+    assert "tag" not in data["config"].get("vars", {})
+
+
+def test_override_value_typed_yaml_parsing_unchanged(tmp_path):
+    # Typed YAML values keep parsing exactly as before ('true' -> bool,
+    # '[a,b]' -> list) — the literal reading applies ONLY to leading '#'.
+    body = MINIMAL_SKILL.format(name="typed-override")
+    make_skill(tmp_path, "typed-override", body)
+    code, data, _, err = run(
+        "typed-override",
+        "--override", "runtime.allowed_tools=[Read, Grep]",
+        skill_root=tmp_path)
+    assert code == 0, err
+    assert data["config"]["runtime"]["allowed_tools"] == ["Read", "Grep"]

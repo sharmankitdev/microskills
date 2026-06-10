@@ -29,8 +29,9 @@ Pipeline:
      <def-dir>/.compiled/. Deterministic: same inputs → byte-identical output.
 
 Usage:
-  compile-workflow <name> [--profile <p>] [--override a.b=c]... [--defs-root <dir>]
-                   [--plan] [--explain] [--lock] [--check]
+  compile-workflow <name> [--profile <p>] [--override a.b=c]...
+                   [--node-override <node-id>:<dotted>=<value>]...
+                   [--defs-root <dir>] [--plan] [--explain] [--lock] [--check]
 
 Stdout: JSON summary { name, profile_used, compiled_dir, manifest_path, segments,
 checkpoints, manifest_hash, sequence }. The written manifest always carries
@@ -58,6 +59,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -108,6 +110,7 @@ _rm = importlib.util.module_from_spec(_spec)
 _loader.exec_module(_rm)
 deep_merge = _rm.deep_merge
 apply_override = _rm.apply_override
+parse_override_value = _rm.parse_override_value
 strip_nulls = _rm.strip_nulls
 substitute_vars = _rm.substitute_vars
 
@@ -347,6 +350,19 @@ def rank_partition(seg_nodes):
     return [layers[k] for k in sorted(layers)]
 
 
+def node_override_pairs(customize):
+    """Canonical `<dotted>=<value>` override pairs for a node's customize.overrides
+    map, sorted by path for determinism. Values are serialized via json.dumps —
+    JSON is yaml.safe_load-round-trippable, so the resolver's --override parser
+    reconstructs the EXACT typed value (a string 'yes' stays a string, never the
+    YAML 1.1 boolean). ONE serialization feeds BOTH resolution paths: the
+    classify-time resolver subprocess (whose stdout becomes the frozen payload)
+    and the baked execution-time --inject-only command line — identical by
+    construction."""
+    overrides = (customize or {}).get("overrides") or {}
+    return [f"{k}={json.dumps(overrides[k])}" for k in sorted(overrides)]
+
+
 def resolve_microskill_directives(use_name, customize, defs_root):
     """Run resolve-microskill to read a use: node's allowed_tools + gates AND its
     fully-resolved (profile-merged, strip_nulls'd) output_schema. Returns a dict
@@ -364,6 +380,13 @@ def resolve_microskill_directives(use_name, customize, defs_root):
     cmd = [str(RESOLVE_SCRIPT), use_name]
     if profile:
         cmd += ["--profile", str(profile)]
+    # customize.overrides ride into the SAME resolution classify consumes and the
+    # freeze records: an override exposing AskUserQuestion deterministically
+    # reclassifies the node to orchestrator, and the frozen payload (this
+    # subprocess's stdout) carries the overridden config/body — the classify path
+    # and the baked runMicroskill path cannot diverge.
+    for pair in node_override_pairs(customize):
+        cmd += ["--override", pair]
     skill_root = Path(defs_root).parent / "microskills"
     cmd += ["--skill-root", str(skill_root)]
     fail = {"directives": None, "output_schema": None, "payload": None, "error": None}
@@ -600,9 +623,26 @@ def node_call_js(node, seg_var_ids, indent="  ", declare=True, track_ran=False, 
         # time (env-dependent values are excluded from the frozen payload).
         if node.get("_inject"):
             exec_extra += ', inject: true'
+            # The execution-time --inject-only command must carry the SAME
+            # customize.overrides the compile-time resolution carried (an override
+            # can retarget inject_from). Baked as ONE pre-escaped string —
+            # shlex.quote, because the subagent pastes it into a Bash line.
+            pairs = node_override_pairs(node.get("customize"))
+            if pairs:
+                flags = "".join(" --override " + shlex.quote(p) for p in pairs)
+                exec_extra += f', overrideFlags: {json.dumps(flags)}'
         raw = (f'runMicroskill({json.dumps(node["use"])}, {{ '
                f'profile: {json.dumps(profile)}, inputs: {inputs_js}, '
                f'schema: {schema_js}, phase: {json.dumps(phase)}{exec_extra} }})')
+
+    # Bounded node retry: wrap the raw call in withRetry(..., N) — the helper is
+    # emitted into the segment only when a retry: node is present. Wrapping the
+    # PER-CALL expression means a for_each fan-out retries per ITEM, and a
+    # when-guard still short-circuits OUTSIDE the retry (a skipped node is never
+    # retried). Boundedness mirrors loop.max_iters.
+    retry = node.get("retry")
+    if retry:
+        raw = f"withRetry(() => {raw}, {int(retry['max_attempts'])})"
 
     # for_each → fan out over a collection; `as` names the per-item var, which
     # ${<as>} refs resolve to (translate_ref leaves bare identifiers untouched).
@@ -674,6 +714,21 @@ async function runAgent(agentType, prompt, schema, phase, label) {
 function __ref(v) { return typeof v === 'string' ? v : JSON.stringify(v) }
 """.strip("\n")
 
+# Variant of HELPERS_JS used ONLY by a segment that contains an inject-carrying
+# use: node WITH customize.overrides: the execution-time `--inject-only` resolver
+# call must carry the same overrides the compile-time resolution (and frozen
+# payload) carried. DERIVED from HELPERS_JS by exact string surgery so the two
+# texts can never drift; override-free segments keep the base text byte-identical.
+HELPERS_JS_WITH_OVERRIDE_FLAGS = HELPERS_JS.replace(
+    "model, resolved, inject } = {}",
+    "model, resolved, inject, overrideFlags = '' } = {}",
+).replace(
+    "--profile ${profile} --inject-only",
+    "--profile ${profile}${overrideFlags} --inject-only",
+)
+assert "overrideFlags = ''" in HELPERS_JS_WITH_OVERRIDE_FLAGS, "HELPERS_JS drifted: overrideFlags surgery missed"
+assert "${overrideFlags} --inject-only" in HELPERS_JS_WITH_OVERRIDE_FLAGS, "HELPERS_JS drifted: inject-line surgery missed"
+
 # Emitted ONLY into a segment that has a max_parallel for_each node. Built solely
 # on the host `parallel()` global + Array.slice — no Promise.allSettled, no timers.
 # Runs thunks in fixed-size batches of K, concatenating each batch's results so the
@@ -686,6 +741,30 @@ async function parallelChunked(thunks, k) {
     for (const r of batch) out.push(r)
   }
   return out
+}
+""".strip("\n")
+
+# Emitted ONLY into a segment that has a retry: node (PARALLEL_CHUNKED_JS
+# precedent), so retry-free defs compile byte-identically. HOST CONTRACT (pinned
+# by tests): a failed agent() call in the native engine typically RETURNS NULL
+# rather than throwing — so BOTH a thrown rejection AND a null/undefined return
+# count as a failed attempt. After exhausting max_attempts the FINAL attempt's
+# native failure shape is reproduced exactly — return the null/undefined, or
+# rethrow the error — never re-rolled, never fabricated into valid output.
+WITH_RETRY_JS = r"""
+async function withRetry(thunk, maxAttempts) {
+  // Retry on a thrown rejection AND on a null/undefined return (the native
+  // engine's usual failure shape for a failed agent() call). On exhaustion,
+  // reproduce the final attempt's failure exactly: rethrow / return as-is.
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const result = await thunk()
+      if (result !== null && result !== undefined) return result
+      if (attempt >= maxAttempts) return result
+    } catch (e) {
+      if (attempt >= maxAttempts) throw e
+    }
+  }
 }
 """.strip("\n")
 
@@ -811,11 +890,19 @@ def emit_segment_js(seg_nodes, wf, loop, seg_index):
         ret = "{ " + ", ".join(f"{json.dumps(i)}: {jsvar(i)}" for i in seg_ids) + " }"
         body = calls + f"\nreturn {ret}\n"
 
-    # The parallelChunked helper is appended ONLY when this segment has a
-    # max_parallel for_each node, so a segment without one stays byte-identical.
+    # Helper selection is strictly CONDITIONAL so segments that use none of the
+    # optional machinery stay byte-identical: the overrideFlags-aware runMicroskill
+    # variant only when an inject-carrying node has customize.overrides; the
+    # parallelChunked helper only for a max_parallel for_each node; the withRetry
+    # helper only for a retry: node. Fixed append order keeps output deterministic.
     helpers = HELPERS_JS
+    if any(n.get("_inject") and ((n.get("customize") or {}).get("overrides"))
+           for n in seg_nodes):
+        helpers = HELPERS_JS_WITH_OVERRIDE_FLAGS
     if any(n.get("max_parallel") is not None and n.get("for_each") for n in seg_nodes):
-        helpers = HELPERS_JS + "\n" + PARALLEL_CHUNKED_JS
+        helpers = helpers + "\n" + PARALLEL_CHUNKED_JS
+    if any(n.get("retry") for n in seg_nodes):
+        helpers = helpers + "\n" + WITH_RETRY_JS
     js = head + helpers + "\n\n" + guard + body
     return js, needs_dict, produces
 
@@ -825,13 +912,24 @@ def main():
     ap.add_argument("name", help="Workflow name (subdir under --defs-root).")
     ap.add_argument("--profile", default=None)
     ap.add_argument("--override", action="append", default=[])
+    ap.add_argument("--node-override", action="append", default=[],
+                    help="Node-addressable per-run override "
+                         "'<node-id>:<dotted.path>=<value>' merged into that node's "
+                         "customize.overrides (use: nodes only) post-merge / "
+                         "pre-validation — the CLI twin of customize.overrides. "
+                         "Value parses exactly like --override (YAML; leading-'#' "
+                         "stays a literal string). Repeatable; later flags win on "
+                         "the same node+path.")
     ap.add_argument("--defs-root", default=str(DEFAULT_DEFS_ROOT))
     ap.add_argument("--plan", action="store_true",
                     help="Dry-run: compute and print the full plan but write NOTHING to "
-                         ".compiled/ (no mkdir, no stale-clean, no seg files, no manifest).")
+                         ".compiled/ (no mkdir, no stale-clean, no seg files, no manifest). "
+                         "The printed summary embeds the FULL manifest object (steps, "
+                         "gates, inputs, provenance) since no manifest.json is written.")
     ap.add_argument("--explain", action="store_true",
-                    help="Add per-node classification reasons, per-node semantic "
-                         "fingerprint detail, and de-anonymize the sequence summary. "
+                    help="Add per-node classification reasons + executor identity "
+                         "{profile, agent, model}, per-node semantic fingerprint "
+                         "detail, and de-anonymize the sequence summary. "
                          "Output-only — never changes the emitted bytes "
                          "(manifest_hash is always emitted regardless).")
     ap.add_argument("--lock", action="store_true",
@@ -885,6 +983,34 @@ def main():
         path, _, val = ov.partition("=")
         apply_override(wf, path.strip(), val.strip())
 
+    # --node-override <node-id>:<dotted>=<value> — node-addressable per-run
+    # overrides, applied POST-merge (profiles + --override already in) and
+    # PRE-validation (the closed customize schema and the use:-only placement
+    # check below still see the injected shape). Each flag merges one entry into
+    # the named node's customize.overrides, exactly as if it were authored in
+    # YAML — so it rides the SAME two resolution paths. (--override cannot
+    # address nodes: a dotted path through the nodes LIST clobbers it.)
+    for nov in args.node_override:
+        spec, eq, val = nov.partition("=")
+        nid, colon, dotted = spec.partition(":")
+        nid, dotted = nid.strip(), dotted.strip()
+        if not eq or not colon or not nid or not dotted:
+            die(f"malformed --node-override (expected "
+                f"'<node-id>:<dotted.path>=<value>'): {nov}", 1)
+        target = next((n for n in (wf.get("nodes") or [])
+                       if isinstance(n, dict) and n.get("id") == nid), None)
+        if target is None:
+            die(f"--node-override names unknown node '{nid}'", 1)
+        cust = target.setdefault("customize", {})
+        if not isinstance(cust, dict):
+            die(f"node '{nid}': customize is not a mapping; cannot apply "
+                f"--node-override", 1)
+        ovr = cust.setdefault("overrides", {})
+        if not isinstance(ovr, dict):
+            die(f"node '{nid}': customize.overrides is not a mapping; cannot "
+                f"apply --node-override", 1)
+        ovr[dotted] = parse_override_value(val.strip())
+
     wf = strip_nulls(wf)
 
     # --- INTRA-DEF VARS: double-brace {{key}} pre-pass (Phase 5b) ---
@@ -931,6 +1057,31 @@ def main():
                     f"orchestrator checkpoint; remove one of the two fields", 1)
             n.setdefault("delegation", "orchestrator")
 
+    # FAIL-LOUD: customize.overrides override the microskill's RESOLUTION, so
+    # they are meaningful ONLY on a use: node that actually resolves. Anywhere
+    # else they would be silently ignored — the exact hole this feature closes —
+    # so die instead: on workflow:/agent:/orchestrator-native nodes (no
+    # resolution exists) and on a use: node under explicit
+    # delegation: orchestrator (the escape hatch SKIPS resolution).
+    for n in nodes:
+        if not isinstance(n, dict):
+            continue
+        if not ((n.get("customize") or {}).get("overrides") or {}):
+            continue
+        nid = n.get("id", "?")
+        if not n.get("use"):
+            kind = ("a workflow: node" if n.get("workflow")
+                    else "an agent: node" if n.get("agent")
+                    else "an orchestrator-native step")
+            die(f"node '{nid}': customize.overrides is only valid on a use: "
+                f"microskill node (it overrides the microskill's resolved "
+                f"config); this is {kind}, where it would be silently ignored", 1)
+        if n.get("delegation") == "orchestrator":
+            die(f"node '{nid}': customize.overrides cannot take effect under "
+                f"explicit delegation: orchestrator — that escape hatch skips "
+                f"microskill resolution, so the overrides would be silently "
+                f"ignored; remove one of the two", 1)
+
     node_by_id = {n["id"]: n for n in nodes}
     loop = wf.get("loop")
 
@@ -971,9 +1122,37 @@ def main():
     classes = {}
     classification = []
     for nid in order:
-        klass, reason = classify(node_by_id[nid], gates_after, defs_root)
+        node = node_by_id[nid]
+        klass, reason = classify(node, gates_after, defs_root)
         classes[nid] = klass
-        classification.append({"node": nid, "class": klass, "reason": reason})
+        # Executor identity per node (surfaced only under --explain): for a use:
+        # node these are EXACTLY the literals node_call_js bakes into the
+        # runMicroskill call (profile opt + agentType/model from the stashed
+        # _exec_*); for an agent: node the agent type itself (model rides the
+        # agent definition at run time); null fields where not applicable.
+        if node.get("use"):
+            executor = {"profile": (node.get("customize") or {}).get("profile", "base"),
+                        "agent": node.get("_exec_agent"),
+                        "model": node.get("_exec_model")}
+        elif node.get("agent"):
+            executor = {"profile": None, "agent": node.get("agent"), "model": None}
+        else:
+            executor = {"profile": None, "agent": None, "model": None}
+        classification.append({"node": nid, "class": klass, "reason": reason,
+                               "executor": executor})
+
+    # --- FAIL-LOUD: retry is background-only ---
+    # withRetry lives in compiled segment JS; an orchestrator-classified node
+    # never runs there, so its retry would be silently dropped. Die instead
+    # (validate blocks the statically-detectable subset; this also catches
+    # resolution-driven reclassification, e.g. an AskUserQuestion microskill).
+    for nid in order:
+        if node_by_id[nid].get("retry") and classes[nid] == "orchestrator":
+            r_reason = next((c["reason"] for c in classification if c["node"] == nid), "")
+            die(f"node '{nid}': retry is only valid on a background use:/agent: "
+                f"node, but this node classifies as an orchestrator checkpoint "
+                f"({r_reason}); retry lives in compiled segment JS and cannot "
+                f"wrap an orchestrator step", 1)
 
     # --- FAIL-LOUD: no orchestrator-classified loop.body member ---
     # The partition below flushes the open segment at every orchestrator node, so
@@ -1142,6 +1321,18 @@ def main():
         "output": wf.get("output"),
         "steps": manifest_steps,
     }
+    # Applied per-node overrides (effective customize.overrides AFTER any
+    # --node-override flags merged in), recorded ONLY when non-empty so an
+    # override-free compile stays byte-identical — and, being inside the hashed
+    # manifest, an override run gets a DISTINCT manifest_hash (stale resume
+    # state and the committed lockfile correctly refuse to match it).
+    node_overrides = {}
+    for nid in order:
+        ovr = (node_by_id[nid].get("customize") or {}).get("overrides") or {}
+        if ovr:
+            node_overrides[nid] = {k: ovr[k] for k in sorted(ovr)}
+    if node_overrides:
+        manifest["node_overrides"] = node_overrides
     # --- per-node SEMANTIC fingerprints (folded into manifest_hash) ---
     # The manifest alone covers only the partition/needs/produces; the EXECUTED
     # semantics — substituted prompt, baked inputs, effective schema, executor
@@ -1172,6 +1363,12 @@ def main():
             "as": node.get("as"),
             "resolution_sha256": node.get("_resolution_sha256"),
         }
+        # retry changes EXECUTED semantics that live only in seg JS (the
+        # withRetry wrap) — fold it in, but only when PRESENT so every
+        # retry-free node's fingerprint (and the committed lockfiles built on
+        # them) stays byte-for-byte unchanged.
+        if node.get("retry"):
+            fp["retry"] = node.get("retry")
         digest = hashlib.sha256(
             json.dumps(fp, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
@@ -1283,6 +1480,11 @@ def main():
         summary["fingerprints"] = fingerprint_detail
     if args.plan:
         summary["plan"] = True
+        # --plan writes NO manifest.json, and the lean summary carries none of
+        # the gate/inputs data a preflight renderer needs — so the dry-run
+        # summary embeds the FULL manifest object (steps incl. gate dicts,
+        # required_inputs, input_defaults, provenance keys) verbatim.
+        summary["manifest"] = out_manifest
     if args.lock:
         summary["lock_path"] = rel(lock_path)
     if args.check:

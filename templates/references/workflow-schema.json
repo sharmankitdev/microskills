@@ -68,7 +68,24 @@
           "output_schema": { "type": "object", "description": "JSON Schema fragment forcing structured node output (passed to agent() schema). For a use: node, OMITTING this inherits the resolved microskill's output_schema; an explicit value here wins." },
           "max_parallel": { "type": "integer", "minimum": 1, "description": "Only valid on a for_each node: bound the fan-out to batches of this size (parallelChunked) instead of one unbounded parallel()." },
           "phase_group": { "type": "string", "pattern": "^[a-z][a-z0-9_-]*$", "description": "Cosmetic /workflows progress-group label: nodes sharing a phase_group render under one group box. Emit-only — changes the segment's phase markers / meta.phases, never the manifest or manifest_hash." },
-          "customize": { "type": "object", "additionalProperties": true, "description": "Per-node knobs: on a use: microskill, the profile and/or dotted overrides; on a workflow: node, `profile` selects the child workflow's profile (passed through to the nested-workflow checkpoint)." },
+          "customize": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Per-node knobs, CLOSED to {profile?, overrides?} — an unknown key fails schema validation (it used to be silently ignored).",
+            "properties": {
+              "profile": { "type": "string", "minLength": 1, "description": "On a use: node, selects which profile of the microskill the node runs; on a workflow: node, selects the child workflow's profile (passed through to the nested-workflow checkpoint)." },
+              "overrides": { "type": "object", "additionalProperties": true, "description": "use: nodes ONLY (a hard error on workflow:/agent:/orchestrator nodes, where it could never apply). Flat map of dotted resolver-config path -> value (e.g. 'runtime.model': haiku), applied to the microskill's resolution exactly like `resolve-microskill --override` (SET at the path — not a deep-merge). Plumbed through BOTH resolution paths so they cannot diverge: the classify-time resolution (an override exposing AskUserQuestion deterministically reclassifies the node to an orchestrator checkpoint) and the frozen payload the baked runMicroskill reads (plus the execution-time --inject-only command line, shell-escaped). Recorded in the manifest as node_overrides only when non-empty, so override-free compiles stay byte-identical. CLI twin: `compile-workflow --node-override <node-id>:<dotted>=<value>`." }
+            }
+          },
+          "retry": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["max_attempts"],
+            "description": "Bounded retry for a BACKGROUND use:/agent: node only (a block anywhere else — retry lives in compiled segment JS and cannot wrap an orchestrator checkpoint). The node's call is wrapped in withRetry(...): a thrown rejection AND a null/undefined return both count as a failed attempt (host contract: a failed agent() call in the native engine typically RETURNS NULL rather than throwing); after exhausting max_attempts the FINAL attempt's native failure shape is reproduced exactly (return null / rethrow) — never re-rolled, never fabricated. The helper is emitted only into segments that contain a retry node, so retry-free defs compile byte-identically.",
+            "properties": {
+              "max_attempts": { "type": "integer", "minimum": 2, "description": "Total attempt cap, first try included (boundedness mirrors loop.max_iters)." }
+            }
+          },
           "grant_tools": { "type": "array", "items": { "type": "string" }, "description": "Extra tools granted to this node's subagent." },
           "delegation": { "enum": ["auto", "orchestrator"], "description": "Override the auto-derived delegation classification. `orchestrator` forces a checkpoint (on a use: node it also skips resolution — the escape hatch for an unresolvable target). `auto` forces background only for a node that can actually run there: a use: node still resolves (executor identity is stashed) and the compile dies if the resolved microskill exposes AskUserQuestion or carries a hard gate; `auto` on a workflow: node or an orchestrator-native step is a hard error." },
           "side_effect": { "type": "boolean", "description": "Readable alias for delegation: orchestrator. true normalizes to delegation: orchestrator before classification, so the node runs as an orchestrator checkpoint (where filesystem side effects and human interaction are allowed). Pairing it with delegation: auto is a contradiction — hard error in compile and validate." }

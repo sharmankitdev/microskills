@@ -2508,3 +2508,549 @@ def test_lock_is_mutually_exclusive_with_plan_and_check(tmp_path):
     assert rc == 1
     rc2, data2, *_ = run(defs_root, "inh-flow", "--lock", "--plan")
     assert rc2 == 1
+
+
+# =============================================================================
+# 3.2 NODE-SCOPED RUN OVERRIDES — customize closed to {profile?, overrides?},
+# overrides plumbed through BOTH resolution paths, --node-override CLI twin,
+# manifest record only-when-non-empty, use:-only placement.
+# =============================================================================
+
+import importlib.machinery as _ilm
+import importlib.util as _ilu
+
+import pytest
+
+
+def _load_compiler_module():
+    """Import the compile-workflow script as a module (SourceFileLoader — the
+    extension-less-script pattern validate-workflow itself uses) so tests can
+    pin its emitted-JS constants verbatim."""
+    loader = _ilm.SourceFileLoader("compile_workflow_under_test", str(SCRIPT))
+    spec = _ilu.spec_from_loader("compile_workflow_under_test", loader)
+    mod = _ilu.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+OVERRIDES_WF = """\
+version: 1
+name: inh-flow
+nodes:
+  - id: e
+    use: echo-ms
+    customize:
+      overrides:
+        runtime.model: haiku
+"""
+
+RUNTIME_MS_BASE = """\
+version: 1
+runtime:
+  agent: echo-agent
+  model: echo-model-1
+output_schema:
+  type: object
+  required: [echoed]
+  properties:
+    echoed: { type: string }
+"""
+
+
+def test_customize_unknown_key_fails_closed_schema(tmp_path):
+    # customize is CLOSED to {profile?, overrides?}: an unknown key (the old
+    # silently-ignored hole) now fails schema validation.
+    wf = OVERRIDES_WF.replace(
+        "    customize:\n      overrides:\n        runtime.model: haiku\n",
+        "    customize:\n      profilee: oops\n")
+    defs_root, d = make_inh_world(tmp_path, wf)
+    rc, data, out, err = run(defs_root, "inh-flow")
+    assert rc == 1
+    assert any("profilee" in m for m in data["schema_errors"])
+
+
+def test_customize_overrides_flow_into_resolution_and_frozen_payload(tmp_path):
+    # BOTH resolution paths by construction: the classify-time resolution
+    # carries the overrides (exec identity changes), and the frozen payload —
+    # that same resolution's stdout — records the overridden config.
+    defs_root, d = make_inh_world(tmp_path, OVERRIDES_WF, ms_base=RUNTIME_MS_BASE)
+    rc, data, out, err = run(defs_root, "inh-flow")
+    assert rc == 0, err
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert 'model: "haiku"' in seg                     # baked executor overridden
+    assert 'model: "echo-model-1"' not in seg
+    frozen = json.loads((d / ".compiled" / "resolved" / "e.json").read_text())
+    assert frozen["config"]["runtime"]["model"] == "haiku"
+    assert frozen["directives"]["model"] == "haiku"
+
+
+def test_override_granting_askuserquestion_reclassifies_orchestrator(tmp_path):
+    # Background-can't-pause STRENGTHENED: an override exposing AskUserQuestion
+    # deterministically reclassifies the use: node to an orchestrator
+    # checkpoint at classify time (the override rides the resolve subprocess).
+    wf = OVERRIDES_WF.replace("        runtime.model: haiku\n",
+                              "        runtime.allowed_tools: [AskUserQuestion]\n")
+    defs_root, d = make_inh_world(tmp_path, wf)
+    rc, data, out, err = run(defs_root, "inh-flow", "--explain")
+    assert rc == 0, err
+    assert data["segments"] == 0 and data["checkpoints"] == 1
+    by_node = {c["node"]: c for c in data["classification"]}
+    assert by_node["e"]["class"] == "orchestrator"
+    assert "AskUserQuestion" in by_node["e"]["reason"]
+    # Counter-case: the SAME world without the override stays background.
+    defs_root2, d2 = make_inh_world(tmp_path / "plain", INHERIT_WF)
+    rc2, data2, *_ = run(defs_root2, "inh-flow", "--explain")
+    assert rc2 == 0
+    assert {c["node"]: c["class"] for c in data2["classification"]}["e"] == "background"
+
+
+def test_node_override_flag_reclassifies_like_yaml(tmp_path):
+    # The CLI twin rides the same path: --node-override granting
+    # AskUserQuestion reclassifies exactly like the YAML form.
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF)
+    rc, data, out, err = run(defs_root, "inh-flow", "--explain",
+                             "--node-override", "e:runtime.allowed_tools=[AskUserQuestion]")
+    assert rc == 0, err
+    assert {c["node"]: c["class"] for c in data["classification"]}["e"] == "orchestrator"
+
+
+def test_node_override_flag_byte_identical_to_yaml_overrides(tmp_path):
+    # --node-override merges into customize.overrides exactly as if authored in
+    # YAML — same def dir, so the compiled bytes (seg JS, manifest, frozen
+    # payload) and manifest_hash are IDENTICAL by construction.
+    defs_root, d = make_inh_world(tmp_path, OVERRIDES_WF, ms_base=RUNTIME_MS_BASE)
+    rc1, data1, *_ = run(defs_root, "inh-flow")
+    assert rc1 == 0
+    yaml_bytes = {p.name: p.read_bytes()
+                  for p in sorted((d / ".compiled").rglob("*")) if p.is_file()}
+    (d / "WORKFLOW.yaml").write_text(INHERIT_WF)   # overrides removed from YAML
+    rc2, data2, *_ = run(defs_root, "inh-flow",
+                         "--node-override", "e:runtime.model=haiku")
+    assert rc2 == 0
+    flag_bytes = {p.name: p.read_bytes()
+                  for p in sorted((d / ".compiled").rglob("*")) if p.is_file()}
+    assert yaml_bytes == flag_bytes
+    assert data1["manifest_hash"] == data2["manifest_hash"]
+
+
+def test_node_override_changes_baked_model_and_explain_executor(tmp_path):
+    # 'run e on haiku for this smoke run': the flag changes BOTH the baked seg
+    # literal and the --explain executor surface, with no profile fork.
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF, ms_base=RUNTIME_MS_BASE)
+    rc, data, out, err = run(defs_root, "inh-flow", "--explain",
+                             "--node-override", "e:runtime.model=haiku")
+    assert rc == 0, err
+    execu = {c["node"]: c["executor"] for c in data["classification"]}["e"]
+    assert execu == {"profile": "base", "agent": "echo-agent", "model": "haiku"}
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert 'model: "haiku"' in seg
+
+
+def test_node_override_malformed_or_unknown_node_dies(tmp_path):
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF)
+    rc, data, *_ = run(defs_root, "inh-flow", "--node-override", "e:no-equals")
+    assert rc == 1 and "malformed --node-override" in data["error"]
+    rc2, data2, *_ = run(defs_root, "inh-flow", "--node-override", "no-colon=1")
+    assert rc2 == 1 and "malformed --node-override" in data2["error"]
+    rc3, data3, *_ = run(defs_root, "inh-flow", "--node-override", "ghost:runtime.model=haiku")
+    assert rc3 == 1 and "unknown node 'ghost'" in data3["error"]
+
+
+def test_node_override_leading_hash_value_stays_literal(tmp_path):
+    # The '#'-leading-value paper cut is FIXED in the shared parser: the value
+    # survives as a literal string into the frozen resolution (it used to be
+    # eaten as a YAML comment -> None -> silent key delete).
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF)
+    rc, data, out, err = run(defs_root, "inh-flow",
+                             "--node-override", "e:vars.tag=#smoke-7")
+    assert rc == 0, err
+    frozen = json.loads((d / ".compiled" / "resolved" / "e.json").read_text())
+    assert frozen["config"]["vars"]["tag"] == "#smoke-7"
+    m = json.loads((d / ".compiled" / "manifest.json").read_text())
+    assert m["node_overrides"] == {"e": {"vars.tag": "#smoke-7"}}
+
+
+def test_overrides_recorded_in_manifest_only_when_nonempty(tmp_path):
+    # Override-free compile: NO node_overrides key (byte-identity preserved).
+    # Override run: the key records the effective per-node map, and the hash
+    # diverges (stale resume state / lockfile correctly refuse to match).
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF)
+    rc1, data1, *_ = run(defs_root, "inh-flow")
+    assert rc1 == 0
+    m1 = json.loads((d / ".compiled" / "manifest.json").read_text())
+    assert "node_overrides" not in m1
+    rc2, data2, *_ = run(defs_root, "inh-flow",
+                         "--node-override", "e:runtime.model=haiku")
+    assert rc2 == 0
+    m2 = json.loads((d / ".compiled" / "manifest.json").read_text())
+    assert m2["node_overrides"] == {"e": {"runtime.model": "haiku"}}
+    assert data1["manifest_hash"] != data2["manifest_hash"]
+
+
+def test_customize_overrides_blocked_on_agent_and_workflow_nodes(tmp_path):
+    agent_wf = """\
+version: 1
+name: ov-flow
+nodes:
+  - id: a
+    agent: ag
+    customize:
+      overrides:
+        runtime.model: haiku
+    prompt: do a
+"""
+    make_flow(tmp_path, "ov-flow", agent_wf)
+    rc, data, *_ = run(tmp_path, "ov-flow")
+    assert rc == 1
+    assert "customize.overrides is only valid on a use:" in data["error"]
+    wf_node_wf = """\
+version: 1
+name: ov2-flow
+imports: [child-flow]
+nodes:
+  - id: w
+    workflow: child-flow
+    customize:
+      overrides:
+        runtime.model: haiku
+"""
+    make_flow(tmp_path, "ov2-flow", wf_node_wf)
+    rc2, data2, *_ = run(tmp_path, "ov2-flow")
+    assert rc2 == 1
+    assert "workflow: node" in data2["error"]
+
+
+def test_customize_overrides_blocked_under_explicit_delegation_orchestrator(tmp_path):
+    # The delegation: orchestrator escape hatch SKIPS resolution, so overrides
+    # there would be silently ignored — die instead.
+    wf = OVERRIDES_WF.replace("    use: echo-ms\n",
+                              "    use: echo-ms\n    delegation: orchestrator\n")
+    defs_root, d = make_inh_world(tmp_path, wf)
+    rc, data, *_ = run(defs_root, "inh-flow")
+    assert rc == 1
+    assert "delegation: orchestrator" in data["error"]
+    assert "silently ignored" in data["error"]
+
+
+INJECT_OVERRIDE_MS_BASE = """\
+version: 1
+inputs:
+  who:
+    inject_from:
+      env: __COMPILE_TEST_INJECT_VAR2__
+output_schema:
+  type: object
+  required: [echoed]
+  properties:
+    echoed: { type: string }
+"""
+
+
+def test_inject_plus_overrides_bakes_escaped_flags_and_variant_helper(tmp_path):
+    # The execution-time --inject-only command line must carry the SAME
+    # overrides the compile-time resolution carried — baked as ONE pre-escaped
+    # (shlex.quote) string, consumed by the overrideFlags-aware helper variant
+    # that is emitted ONLY into segments needing it.
+    defs_root, d = make_inh_world(tmp_path, OVERRIDES_WF,
+                                  ms_base=INJECT_OVERRIDE_MS_BASE)
+    rc, data, out, err = run(defs_root, "inh-flow")
+    assert rc == 0, err
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert ", inject: true" in seg
+    assert 'overrideFlags: " --override \'runtime.model=\\"haiku\\"\'"' in seg
+    assert "overrideFlags = ''" in seg                       # variant helper text
+    assert "${overrideFlags} --inject-only" in seg
+    # Override-free inject node keeps the BASE helper byte-identical (no
+    # overrideFlags anywhere).
+    defs_root2, d2 = make_inh_world(tmp_path / "plain", INHERIT_WF,
+                                    ms_base=INJECT_OVERRIDE_MS_BASE)
+    rc2, *_ = run(defs_root2, "inh-flow")
+    assert rc2 == 0
+    seg2 = (d2 / ".compiled" / "seg-1.js").read_text()
+    assert "overrideFlags" not in seg2
+
+
+def test_override_free_def_emits_no_override_machinery(tmp_path):
+    # Byte-identity guard for the entire 3.2 feature: an override-free def
+    # carries NO overrideFlags text, NO node_overrides manifest key.
+    d = make_flow(tmp_path, "linear-flow", LINEAR)
+    rc, *_ = run(tmp_path, "linear-flow")
+    assert rc == 0
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert "overrideFlags" not in seg
+    assert "node_overrides" not in (d / ".compiled" / "manifest.json").read_text()
+
+
+# =============================================================================
+# 3.6 DECLARED BOUNDED NODE RETRY — withRetry wrap on use:/agent: nodes,
+# helper emitted conditionally, host contract (null-return AND rejection both
+# retry; exhaustion reproduces the native failure shape) pinned + executed.
+# =============================================================================
+
+RETRY_WF = """\
+version: 1
+name: retry-flow
+nodes:
+  - id: a
+    agent: ag
+    retry: { max_attempts: 3 }
+    prompt: do a
+  - id: b
+    agent: ag
+    depends_on: [a]
+    prompt: use ${a.output.x}
+"""
+
+
+def test_retry_wraps_agent_call_and_emits_helper_conditionally(tmp_path):
+    d = make_flow(tmp_path, "retry-flow", RETRY_WF)
+    rc, data, out, err = run(tmp_path, "retry-flow")
+    assert rc == 0, err
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert "async function withRetry" in seg
+    assert 'await withRetry(() => runAgent("ag"' in seg
+    assert ", 3)" in seg
+    # The non-retry sibling stays a bare call.
+    assert 'const n_b = await runAgent("ag"' in seg
+
+
+def test_retry_free_def_emits_no_retry_helper(tmp_path):
+    # PARALLEL_CHUNKED_JS precedent: the helper is per-segment conditional, so
+    # retry-free defs compile byte-identically (no withRetry text at all).
+    d = make_flow(tmp_path, "linear-flow", LINEAR)
+    rc, *_ = run(tmp_path, "linear-flow")
+    assert rc == 0
+    assert "withRetry" not in (d / ".compiled" / "seg-1.js").read_text()
+
+
+RETRY_USE_FE_WF = """\
+version: 1
+name: inh-flow
+inputs:
+  items: { type: array, required: true }
+nodes:
+  - id: e
+    use: echo-ms
+    retry: { max_attempts: 2 }
+    for_each: ${workflow.inputs.items}
+    as: item
+    inputs:
+      payload: ${item}
+"""
+
+
+def test_retry_wraps_use_node_per_item_inside_for_each(tmp_path):
+    # Wrapping the PER-CALL expression means a for_each fan-out retries per
+    # ITEM: the withRetry sits INSIDE each mapped thunk.
+    defs_root, d = make_inh_world(tmp_path, RETRY_USE_FE_WF)
+    rc, data, out, err = run(defs_root, "inh-flow")
+    assert rc == 0, err
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert '.map((item) => () => withRetry(() => runMicroskill("echo-ms"' in seg
+    assert ", 2))" in seg
+
+
+def test_retry_max_attempts_below_two_blocks_schema(tmp_path):
+    make_flow(tmp_path, "retry-flow",
+              RETRY_WF.replace("max_attempts: 3", "max_attempts: 1"))
+    rc, data, *_ = run(tmp_path, "retry-flow")
+    assert rc == 1
+    assert any("minimum" in m or "less than" in m for m in data["schema_errors"])
+
+
+def test_retry_on_workflow_node_dies(tmp_path):
+    wf = """\
+version: 1
+name: rw-flow
+imports: [child-flow]
+nodes:
+  - id: w
+    workflow: child-flow
+    retry: { max_attempts: 2 }
+"""
+    make_flow(tmp_path, "rw-flow", wf)
+    rc, data, *_ = run(tmp_path, "rw-flow")
+    assert rc == 1
+    assert "retry is only valid on a background use:/agent: node" in data["error"]
+
+
+def test_retry_on_orchestrator_native_node_dies(tmp_path):
+    wf = """\
+version: 1
+name: ro-flow
+nodes:
+  - id: a
+    agent: ag
+    prompt: do a
+  - id: fin
+    delegation: orchestrator
+    retry: { max_attempts: 2 }
+    depends_on: [a]
+    prompt: finalize
+"""
+    make_flow(tmp_path, "ro-flow", wf)
+    rc, data, *_ = run(tmp_path, "ro-flow")
+    assert rc == 1
+    assert "orchestrator checkpoint" in data["error"]
+
+
+ASK_MS_BASE = """\
+version: 1
+runtime:
+  allowed_tools: [AskUserQuestion]
+output_schema:
+  type: object
+  required: [echoed]
+  properties:
+    echoed: { type: string }
+"""
+
+
+def test_retry_on_resolution_classified_orchestrator_use_node_dies(tmp_path):
+    # The case validate CANNOT statically catch: a use: node whose RESOLUTION
+    # (AskUserQuestion) classifies it orchestrator — compile still dies on the
+    # retry rather than silently dropping it with the checkpoint.
+    wf = INHERIT_WF.replace("    use: echo-ms\n",
+                            "    use: echo-ms\n    retry: { max_attempts: 2 }\n")
+    defs_root, d = make_inh_world(tmp_path, wf, ms_base=ASK_MS_BASE)
+    rc, data, *_ = run(defs_root, "inh-flow")
+    assert rc == 1
+    assert "retry is only valid on a background use:/agent: node" in data["error"]
+    assert "AskUserQuestion" in data["error"]
+
+
+def test_retry_changes_manifest_hash(tmp_path):
+    # retry changes executed semantics that live only in seg JS — the semantic
+    # fingerprint folds it in (only when PRESENT: retry-free fingerprints are
+    # byte-for-byte unchanged, so committed lockfiles stay valid).
+    make_flow(tmp_path / "one", "retry-flow",
+              RETRY_WF.replace("    retry: { max_attempts: 3 }\n", ""))
+    rc1, d1, *_ = run(tmp_path / "one", "retry-flow")
+    assert rc1 == 0
+    make_flow(tmp_path / "two", "retry-flow", RETRY_WF)
+    rc2, d2, *_ = run(tmp_path / "two", "retry-flow")
+    assert rc2 == 0
+    assert d1["manifest_hash"] != d2["manifest_hash"]
+
+
+def test_retry_helper_text_pins_host_contract(tmp_path):
+    # The emitted helper must pin the HOST CONTRACT in its own text: retry on
+    # BOTH a thrown rejection and a null/undefined return; on exhaustion
+    # reproduce the final attempt's native failure shape (return / rethrow).
+    d = make_flow(tmp_path, "retry-flow", RETRY_WF)
+    rc, *_ = run(tmp_path, "retry-flow")
+    assert rc == 0
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert "result !== null && result !== undefined" in seg   # null-return retry
+    assert "if (attempt >= maxAttempts) return result" in seg  # exhaustion: return null as-is
+    assert "if (attempt >= maxAttempts) throw e" in seg        # exhaustion: rethrow
+    # And the emitted text IS the module constant the executed-contract test runs.
+    mod = _load_compiler_module()
+    assert mod.WITH_RETRY_JS in seg
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
+def test_with_retry_host_contract_executed_under_node(tmp_path):
+    # Execute the EXACT emitted helper under node and pin the contract:
+    #  (1) flaky (throw, null, then valid) -> returns the valid result, 3 attempts;
+    #  (2) always-null -> exhausts, returns null (native failure shape), exactly N calls;
+    #  (3) always-throw -> exhausts, RETHROWS the final error;
+    #  (4) immediate success -> exactly 1 call, result passed through untouched
+    #      (never re-rolled).
+    mod = _load_compiler_module()
+    script = mod.WITH_RETRY_JS + r"""
+;(async () => {
+  const out = {}
+  let c1 = 0
+  const r1 = await withRetry(() => {
+    c1++
+    if (c1 === 1) return Promise.reject(new Error('x'))
+    if (c1 === 2) return Promise.resolve(null)
+    return Promise.resolve({ v: 42 })
+  }, 5)
+  out.flaky = { result: r1, attempts: c1 }
+  let c2 = 0
+  const r2 = await withRetry(() => { c2++; return Promise.resolve(null) }, 3)
+  out.allNull = { result: r2, attempts: c2 }
+  let c3 = 0
+  let threw = null
+  try {
+    await withRetry(() => { c3++; return Promise.reject(new Error('boom')) }, 2)
+  } catch (e) { threw = e.message }
+  out.allThrow = { threw, attempts: c3 }
+  let c4 = 0
+  const r4 = await withRetry(() => { c4++; return Promise.resolve({ done: true }) }, 4)
+  out.ok = { result: r4, attempts: c4 }
+  console.log(JSON.stringify(out))
+})()
+"""
+    proc = subprocess.run(["node", "-e", script], capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    data = json.loads(proc.stdout)
+    assert data["flaky"] == {"result": {"v": 42}, "attempts": 3}
+    assert data["allNull"] == {"result": None, "attempts": 3}
+    assert data["allThrow"] == {"threw": "boom", "attempts": 2}
+    assert data["ok"] == {"result": {"done": True}, "attempts": 1}
+
+
+# =============================================================================
+# 3.5 (compiler half) — --explain classification gains executor
+# {profile, agent, model} pinned against the baked seg literals; --plan embeds
+# the FULL manifest object in the printed summary.
+# =============================================================================
+
+
+def test_explain_executor_pinned_against_baked_seg_literals(tmp_path):
+    # The executor surfaced per node under --explain must be EXACTLY what the
+    # emit baked into the runMicroskill call (agentType/model literals) — the
+    # previously-unasserted gap.
+    defs_root, d = make_inh_world(tmp_path, INHERIT_WF, ms_base=RUNTIME_MS_BASE)
+    rc, data, out, err = run(defs_root, "inh-flow", "--explain")
+    assert rc == 0, err
+    execu = {c["node"]: c["executor"] for c in data["classification"]}["e"]
+    assert execu == {"profile": "base", "agent": "echo-agent", "model": "echo-model-1"}
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert f'agentType: {json.dumps(execu["agent"])}' in seg
+    assert f'model: {json.dumps(execu["model"])}' in seg
+    assert f'profile: {json.dumps(execu["profile"])}' in seg
+
+
+def test_explain_executor_for_agent_and_orchestrator_nodes(tmp_path):
+    # agent: node -> executor.agent is the agent type (model rides the agent
+    # definition at run time); orchestrator-native -> all-null executor.
+    make_flow(tmp_path, "orch-flow", ORCH)
+    rc, data, out, err = run(tmp_path, "orch-flow", "--explain")
+    assert rc == 0, err
+    ex = {c["node"]: c["executor"] for c in data["classification"]}
+    assert ex["a"] == {"profile": None, "agent": "ag", "model": None}
+    assert ex["fin"] == {"profile": None, "agent": None, "model": None}
+    seg = (tmp_path / "orch-flow" / ".compiled" / "seg-1.js").read_text()
+    assert 'runAgent("ag"' in seg
+
+
+def test_plan_summary_embeds_full_manifest(tmp_path):
+    # --plan writes no manifest.json, so the summary embeds the FULL manifest
+    # object — including the gate/inputs data the lean summary never carried —
+    # while still writing NOTHING.
+    wf = GATED.replace("name: linear-flow", "name: gated-flow") + """\
+inputs:
+  diff_path: { type: string, required: true }
+  depth: { type: string, default: lite }
+"""
+    make_flow(tmp_path, "gated-flow", wf)
+    rc, data, out, err = run(tmp_path, "gated-flow", "--plan")
+    assert rc == 0, err
+    man = data["manifest"]
+    assert man["name"] == "gated-flow"
+    assert man["required_inputs"] == ["diff_path"]
+    assert man["input_defaults"] == {"depth": "lite"}
+    gate_steps = [s for s in man["steps"] if s.get("checkpoint_type") == "gate"]
+    assert gate_steps and gate_steps[0]["gate"]["id"] == "g1"
+    assert gate_steps[0]["gate"]["options"] == ["approve", "abandon"]
+    assert man["manifest_hash"] == data["manifest_hash"]
+    assert "schema_sha256" in man
+    assert not (tmp_path / "gated-flow" / ".compiled").exists()
+    # The non-plan summary stays lean: no embedded manifest.
+    rc2, data2, *_ = run(tmp_path, "gated-flow")
+    assert rc2 == 0
+    assert "manifest" not in data2

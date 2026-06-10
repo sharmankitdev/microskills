@@ -197,8 +197,26 @@ def deep_merge(base, overlay, path=""):
     return result
 
 
+def parse_override_value(raw_value):
+    """Parse a --override value per the CLI contract: YAML for typed values
+    (`true` -> bool, `3` -> int, `[a,b]` -> list), empty string -> None (delete).
+
+    PAPER-CUT FIX: a value LEADING with '#' is taken as the LITERAL STRING. An
+    unquoted leading-'#' value is a full-line YAML comment — yaml.safe_load
+    returns None, silently turning `--override tag=#smoke` into a key DELETE.
+    No expressible value changes meaning (a bare '#...' could never parse to
+    anything but None), so the literal reading only closes the silent-delete
+    hole. Shared by resolve-microskill --override AND compile-workflow's
+    customize.overrides / --node-override (one parser, one semantics)."""
+    if raw_value == "":
+        return None
+    if raw_value.lstrip().startswith("#"):
+        return raw_value
+    return yaml.safe_load(raw_value)
+
+
 def apply_override(cfg, dotted, raw_value):
-    parsed = yaml.safe_load(raw_value) if raw_value != "" else None
+    parsed = parse_override_value(raw_value)
     keys = [k for k in dotted.split(".") if k]
     if not keys:
         raise ValueError(f"empty override path: {dotted!r}")

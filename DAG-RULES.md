@@ -76,11 +76,12 @@ Validate and compile from the project root:
 ## 3. Top-level keys
 
 The **structural** grammar is **closed** — `additionalProperties: false` on the root and on every
-node, gate, `loop`, `output`, `profile`, and inputs-spec object — so an unknown *structural* key fails
-schema validation. Three spots are intentionally **open**: a node's `customize` (`additionalProperties:
-true`, to carry `profile` plus dotted overrides), a node's `output_schema` (an arbitrary embedded
-JSON-Schema fragment), and the map-typed `vars` / `inputs` / `node.inputs` / `loop.carry` (arbitrary
-entry *names* with typed values). Only `name` + `nodes` are required; everything else is optional.
+node, gate, `loop`, `output`, `profile`, `retry`, and inputs-spec object — and a node's `customize` is
+now closed to exactly `{profile?, overrides?}` (an unknown key there used to be silently ignored; it
+now fails schema validation). Two spots are intentionally **open**: a node's `output_schema` (an
+arbitrary embedded JSON-Schema fragment) and the map-typed `vars` / `inputs` / `node.inputs` /
+`loop.carry` / `customize.overrides` (arbitrary entry *names* with typed values). Only `name` +
+`nodes` are required; everything else is optional.
 
 | Key | Required | Purpose |
 |---|---|---|
@@ -317,7 +318,8 @@ node is blocked, and an import cycle across the reachable import graph is blocke
 | `when` | all | Conditional guard (see §6). |
 | `for_each` + `as` | all | Fan-out over a collection (see §6). |
 | `max_parallel` | for_each only | Bound the fan-out to batches of K (`parallelChunked`) instead of one unbounded `parallel()`. **Only valid on a `for_each` node** — on a non-fan-out node it is a block. |
-| `customize` | (a)(d) | On a `use:` node, `{profile: <name>}` selects the microskill's profile; on a `workflow:` node, it selects the **child workflow's** profile (passed through to the nested-workflow checkpoint). **See the footgun in §13.** |
+| `customize` | (a)(d) | **Closed to `{profile?, overrides?}`.** On a `use:` node, `profile` selects the microskill's profile and `overrides` is a flat map of dotted resolver-config path → value (per-node `resolve-microskill --override` semantics — §11); on a `workflow:` node, `profile` selects the **child workflow's** profile (passed through to the nested-workflow checkpoint) and `overrides` is a **block**. |
+| `retry` | (a)(b) | `{max_attempts: N≥2}` — bounded retry for a **background** `use:`/`agent:` node (§12). A block/hard error anywhere else (a `workflow:`/orchestrator node never runs inside a compiled segment). |
 | `grant_tools` | (a)(b) | **Declared but inert** — the compiler does not consume it. See §13. |
 
 ---
@@ -572,7 +574,21 @@ from `WORKFLOW.yaml` alone), matching the microskill resolver and the optional-`
 | Scalars / new keys | **Replace** / add. |
 
 **`--override a.b.c=value`** sets a dotted path; the value is parsed as YAML (so `=true` → boolean,
-`=[a,b]` → list, `=` → delete). After all merges/overrides, remaining `null`s are stripped.
+`=[a,b]` → list, `=` → delete) — with one fixed paper cut: a value **leading with `#`** is taken as
+the **literal string** (an unquoted `#...` is a full-line YAML comment that used to parse to `null`
+and silently *delete* the key). After all merges/overrides, remaining `null`s are stripped.
+`--override` operates on the **document** and cannot address an individual node (a dotted path
+through the `nodes:` *list* clobbers it) — for that use `--node-override` (below).
+
+**`--node-override <node-id>:<dotted>=<value>`** (compile-workflow, repeatable) is the
+node-addressable per-run override — the CLI twin of `customize.overrides`. Each flag merges one
+`<dotted>: <value>` entry into the named node's `customize.overrides` **post-merge / pre-validation**
+(profiles and `--override` are already in; the closed `customize` schema and the use:-only placement
+rule still apply to the injected shape), so it rides exactly the same machinery as the YAML form —
+byte-identical compiled output by construction. Values parse like `--override` (YAML; leading-`#`
+literal). An unknown node id or malformed flag is a hard error. Example — *run `implement` on haiku
+for this smoke run, no profile fork*: `compile-workflow my-flow --node-override
+implement:runtime.model=haiku`.
 
 **List-verb overlays — edit `nodes:` / `gates:` by id.** Beyond wholesale list replacement, a profile
 overlay can surgically `add` / `patch` / `remove` workflow `nodes:` and `gates:` by id (the
@@ -606,10 +622,31 @@ compiler stashes it on the node and bakes it into the call. An explicit node-lev
 wins. Inheritance is a default-for-*absent* only: a microskill profile that *deleted* its schema
 (`output_schema: null`) resolves to none, so a deleted schema is never resurrected.
 
-**Node-level `customize`:** on a `use:` node, `customize: { profile: <name> }` selects *which profile
-of that microskill* the node runs; on a `workflow:` node, it selects *which profile of the child
-workflow* the dispatcher compiles (§5d). `profile` is the **only** `customize` key the compiler reads
-(see §13).
+**Node-level `customize` — `{profile?, overrides?}`, closed:** on a `use:` node,
+`customize: { profile: <name> }` selects *which profile of that microskill* the node runs; on a
+`workflow:` node, it selects *which profile of the child workflow* the dispatcher compiles (§5d).
+
+**`customize.overrides`** (`use:` nodes **only**) is a flat map of **dotted resolver-config path →
+value** applied to the microskill's resolution exactly like `resolve-microskill --override` — a SET
+at that path, *not* a deep-merge (so prefer the dotted-key form `runtime.model: haiku` over a nested
+map, which would replace the whole subtree). The overrides are plumbed through **both** resolution
+paths so they can never diverge:
+
+- the **classify-time** resolution carries them — so an override that exposes `AskUserQuestion` (or
+  adds a hard gate) deterministically **reclassifies the node to an orchestrator checkpoint**, and an
+  overridden `runtime.agent`/`runtime.model` lands in the baked executor identity;
+- the **frozen payload** (`.compiled/resolved/<node-id>.json`) *is* that same resolution's output, so
+  the body the baked `runMicroskill` reads at run time already reflects them — identical by
+  construction; the execution-time `--inject-only` command line additionally carries the same
+  `--override` flags, shell-escaped.
+
+Placement is fail-loud: `overrides` on a `workflow:`/`agent:`/orchestrator-native node — or on a
+`use:` node under explicit `delegation: orchestrator` (the escape hatch *skips* resolution) — is a
+hard compile error and a validate block, never a silent no-op. Applied overrides are recorded in the
+manifest (`node_overrides`, inside `manifest_hash`) **only when non-empty**, so an override-free
+compile stays byte-identical and an override run correctly refuses stale resume state / the committed
+lockfile. The CLI twin is `--node-override` (above); a `value` of `null` is stripped pre-validation
+(the entry simply disappears).
 
 Example — the `autonomous` profile of `microskill-create` softens the approval gate from `hard` to
 `warn`: the structure stays (2 segments, the gate checkpoint still exists) but the run never pauses
@@ -632,7 +669,9 @@ The compiler classifies each node (`side_effect: true` is normalized to `delegat
    inspection.
 3. Neither `use` nor `agent` (nor `workflow`) → **orchestrator** (an orchestrator-native step).
 4. `agent:` → **background**.
-5. `use:` → resolve the microskill's directives and inspect:
+5. `use:` → resolve the microskill's directives (the node's `customize.profile` **and**
+   `customize.overrides` ride this resolution — an override that exposes `AskUserQuestion` or adds a
+   hard gate reclassifies the node here, deterministically) and inspect:
    - resolution **fails** → **hard compile error** (formerly a silent fail-safe-to-orchestrator that
      *dropped the `use:` field entirely*; mark the node `delegation: orchestrator` explicitly if a
      checkpoint is what you meant);
@@ -721,6 +760,30 @@ per-call opt is what groups them — the compiler emits **no** inline `phase()` 
 so it leaves `manifest.json` and `manifest_hash` untouched (recompiling with vs without it yields the same
 hash). A `phase_group` whose value equals a node id is a **warn** (the two boxes would merge), never a block.
 
+### Bounded node retry — `retry: { max_attempts: N }`
+
+A **background `use:`/`agent:` node** may declare `retry: { max_attempts: N }` (integer, `N ≥ 2` —
+the total attempt cap, first try included; boundedness mirrors `loop.max_iters`). The compiler wraps
+the node's raw call in `withRetry(() => <call>, N)`; the `withRetry` helper is emitted **only into
+segments that contain a retry node** (the `parallelChunked` precedent), so retry-free defs compile
+**byte-identically**. Wrapping the *per-call* expression means a `for_each` fan-out retries **per
+item**, and a `when` guard short-circuits *outside* the retry (a skipped node is never retried).
+
+**Host contract (assumed + pinned by tests):** in the native engine a failed `agent()` call
+typically **returns `null`** rather than throwing. `withRetry` therefore counts **both** a thrown
+rejection **and** a `null`/`undefined` return as a failed attempt, and — after exhausting
+`max_attempts` — **reproduces the final attempt's native failure shape exactly**: return the
+`null`/`undefined` as-is, or rethrow the error. It never re-rolls and never fabricates valid output;
+a non-null result is returned untouched on the first success.
+
+Placement is fail-loud: `retry` on a `workflow:` node or an orchestrator-native step is a validate
+block, and a node that **classifies** orchestrator (including resolution-driven reclassification — an
+`AskUserQuestion` microskill, a hard gate, or an override that adds one) dies at compile rather than
+silently dropping the retry with the checkpoint. `retry` is folded into the node's semantic
+fingerprint **only when present**, so adding/removing it is `manifest_hash`-visible while retry-free
+fingerprints (and committed lockfiles) stay unchanged. Composes with profile `nodes: patch` and with
+`customize.overrides`/`--node-override` for free.
+
 ### Runtime threading (what the dispatcher does)
 
 For each manifest step in order:
@@ -758,11 +821,16 @@ At the end, report `results[manifest.output.from]`.
 - **`compile-workflow … --plan`** — a **dry-run**: compute the full plan (segment JS, `needs`,
   `produces`, frozen payloads, manifest, summary) but **write nothing** — no `mkdir`, no stale-clean,
   no `seg-*.js`, no `resolved/*.json`, no `manifest.json`. The printed summary is identical to a real
-  compile (plus `plan: true`). Mirrors the harness reconcile loops' `--plan`-by-default ergonomics.
+  compile plus `plan: true` **and an embedded `manifest` key carrying the FULL manifest object**
+  (steps incl. gate dicts, `required_inputs`, `input_defaults`, provenance keys) — since no
+  `manifest.json` is written, the summary is the only place a preflight renderer can read the
+  gate/inputs data from. Mirrors the harness reconcile loops' `--plan`-by-default ergonomics.
   (The dispatcher never passes `--plan`.)
 - **`compile-workflow … --explain`** — **output-only**, never changes any written bytes (the on-disk
   `.compiled/` output is byte-identical with or without it — a **single manifest shape**). Adds to
-  the stdout summary: per-node `classification` (id → class + reason), per-node `fingerprints`
+  the stdout summary: per-node `classification` (id → class + reason + **`executor: {profile, agent,
+  model}`** — for a `use:` node these are exactly the literals baked into the `runMicroskill` call;
+  for an `agent:` node the agent type; null fields where not applicable), per-node `fingerprints`
   (the semantic-fingerprint detail folded into `manifest_hash`, incl. each `resolution_sha256`), and
   a **de-anonymized** `sequence` (checkpoints labelled `gate:<id>` / `orchestrator_node:<id>` /
   `nested_workflow:<id>` instead of the bare lossy type).
@@ -786,8 +854,11 @@ stdout summary):
   *excluding both provenance keys* **plus the per-node semantic fingerprints**: for every node,
   `{use/agent, profile, substituted prompt, inputs, effective schema, exec_agent/exec_model,
   when/for_each/as, resolution_sha256}` (the sha256 of the node's frozen resolver payload —
-  registry drift is hash-visible). `phase_group` is **excluded** by design (emit-only cosmetics —
-  recompiling with vs without it yields the same hash). Any change to the partition / needs /
+  registry drift is hash-visible), plus `retry` **when present**. `phase_group` is **excluded** by
+  design (emit-only cosmetics — recompiling with vs without it yields the same hash). Applied
+  per-node overrides are recorded in the manifest itself (`node_overrides`, **only when non-empty**)
+  and are therefore hash-visible too — an override run never matches override-free resume state or
+  the committed lockfile. Any change to the partition / needs /
   produces — or to any fingerprinted node semantic that previously lived only in seg JS bytes —
   changes it. Because segment `script` paths are stored relative to the def dir and the fingerprint
   carries the resolution's *content* hash (never its path), the manifest — and this hash — is
@@ -840,12 +911,18 @@ stored node outputs no longer line up) or an absent file → start fresh at step
 - **⚠️ Gate / node id collisions are blocked.** Gate ids share the `${id...}` ref namespace with node
   ids, so a gate id must be unique among gates **and** disjoint from every node id — a collision is a
   validate block.
-- **⚠️ `customize` only reads `.profile`.** The schema describes `customize` as "profile and/or
-  dotted overrides," but the compiler reads **only** `customize.profile`. Arbitrary dotted overrides
-  under `customize` are **silently ignored**. To override a microskill's resolved config per-node,
-  there is no wired mechanism today — author a dedicated profile instead. *(To tune the workflow
-  itself, e.g. `loop.max_iters`, use a profile overlay on the workflow's `base.yaml`/named profile,
-  applied via `--profile` — that path is real.)*
+- **⚠️ `customize` is closed and `overrides` is WIRED (it used to be silently ignored).** The
+  schema closes `customize` to `{profile?, overrides?}` — an unknown key is now a schema block, and
+  `customize.overrides` actually overrides the microskill's resolved config per node (§11), through
+  both resolution paths. Placement is enforced: `overrides` anywhere it could not apply
+  (`workflow:`/`agent:`/orchestrator-native nodes, or under explicit `delegation: orchestrator`) is
+  a hard error, never a no-op. *(To tune the workflow itself, e.g. `loop.max_iters`, use a profile
+  overlay on the workflow's `base.yaml`/named profile, applied via `--profile` — that path is
+  unchanged.)*
+- **⚠️ Overrides use SET-at-path semantics, not deep-merge.** `customize.overrides` /
+  `--node-override` write the value *at* the dotted path (resolver `--override` semantics). Prefer
+  the dotted-key form (`runtime.model: haiku`); a nested-map value (`runtime: {model: haiku}`)
+  replaces the **whole** `runtime` subtree — losing `runtime.agent` etc.
 - **⚠️ `grant_tools` is inert.** It's in the schema but the compiler never consumes it. Don't rely on
   it to grant tools — bake tool permissions into the microskill/agent profile.
 - **No `AskUserQuestion` in a background segment.** A node that needs to ask a human must end up an
@@ -1140,7 +1217,9 @@ Before you compile, confirm:
 - [ ] Gate ids are unique and disjoint from node ids.
 - [ ] Every `workflow:` target is in `imports`; validate with `--defs-root` to check child contracts.
 - [ ] Human-interaction nodes are orchestrator, not background.
-- [ ] No reliance on `customize` dotted-overrides or `grant_tools` (both inert).
+- [ ] `customize` carries only `profile`/`overrides`; `customize.overrides` and `retry` sit only on
+      nodes where they can apply (`overrides`: resolving `use:` nodes; `retry`: background
+      `use:`/`agent:` nodes). No reliance on `grant_tools` (still inert).
 - [ ] Run `validate-workflow` (expect `pass: true`) then `compile-workflow` and eyeball the
       `sequence` in the summary — it should match the segments/checkpoints you intended.
 
