@@ -13,6 +13,18 @@ unresolvable wire: auto target is always a block; auto-wiring a REQUIRED
 target input warns), and lints redundant depends_on entries + undeclared
 ${workflow.inputs.x} refs.
 
+TWO-MODE unresolvable-use: handling (intentional — stricter than the original
+WARN+--strict spec):
+  - WITH --defs-root (full-registry validation): an unresolvable / failed
+    use: target is an UNCONDITIONAL BLOCK — fail-loud parity with
+    compile-workflow's hard die. The caller explicitly named the registry, so
+    a missing target is a real error, never an environment artifact.
+  - STANDALONE (no --defs-root; the skill root is derived from the file's
+    layout): it is a WARN, so hermetic single-file validation keeps passing
+    when no microskill registry is reachable; --strict escalates it to a
+    block. (--strict is the STANDALONE escalation knob only — with
+    --defs-root the block is already unconditional.)
+
 Usage:
   validate-workflow <WORKFLOW.yaml> [<profile.yaml> ...] [--defs-root <dir>] [--strict]
 
@@ -168,11 +180,16 @@ def main():
     ap.add_argument("--defs-root", default=None,
                     help="Workflow-defs root enabling nested-workflow (workflow:) resolution checks "
                          "(import allowlist, target resolution, import-cycle, depth=1, required-child-input). "
-                         "Absent → those checks are skipped (backward-compatible single-file validation).")
+                         "Also makes an unresolvable use: target an UNCONDITIONAL block — fail-loud "
+                         "parity with compile-workflow's hard die (you named the registry, so a missing "
+                         "target is a real error). Absent → the nested checks are skipped and an "
+                         "unresolvable use: is a WARN (backward-compatible single-file validation).")
     ap.add_argument("--strict", action="store_true",
-                    help="Escalate an unresolvable use: target from WARN to a block. "
-                         "Default keeps hermetic standalone validation passing when no "
-                         "microskill registry is reachable.")
+                    help="STANDALONE-mode escalation only: raise an unresolvable use: target from "
+                         "WARN to a block when validating without --defs-root. Default keeps "
+                         "hermetic standalone validation passing when no microskill registry is "
+                         "reachable. With --defs-root the block is already unconditional, so this "
+                         "flag adds nothing there.")
     args = ap.parse_args()
 
     issues = []
