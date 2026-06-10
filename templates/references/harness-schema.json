@@ -51,7 +51,7 @@
           },
           "version": {
             "type": "string",
-            "description": "Optional provenance pin for 'plugin' (which catalog version was materialized). Ignored for 'custom'. The seam for a future upstream-drift check."
+            "description": "Optional version pin for 'plugin', honored by initialize-harness as a HOLD: while the pin differs from the catalog's plugin version (.claude-plugin/plugin.json), the deployed bytes stay put and the pending change surfaces in every plan (action 'hold') until the pin moves. Ignored for 'custom'."
           }
         }
       }

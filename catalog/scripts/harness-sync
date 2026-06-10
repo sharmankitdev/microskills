@@ -406,6 +406,18 @@ def main():
     desired, errors = build_desired(manifest, harness_root)
     state = load_state(state_path)
     installed_all = state.get("components") or {}
+    # Ownership guard: a desired custom component whose ledger entry is NOT custom-owned
+    # would otherwise reconcile as a fresh add — and under `--resolve <name>=overwrite`
+    # that add would clobber the plugin-owned ledger entry (initialize-harness's
+    # provenance) and its deployed files. Fail loud and name the sanctioned transfer path.
+    for name in sorted(desired):
+        owner = (installed_all.get(name) or {}).get("source")
+        if owner and owner != "custom":
+            desired.pop(name)
+            errors.append({"name": name,
+                           "reason": (f"ledger entry is owned by initialize-harness "
+                                      f"(source: {owner}); run `initialize-harness --eject "
+                                      f"{name}` to transfer ownership to harness/")})
     # Reconcile ONLY within the custom-sourced scope: plugin/engine ledger entries are
     # invisible here, so they can never be diffed as "no longer desired" and removed.
     installed = {n: e for n, e in installed_all.items() if e.get("source") == "custom"}

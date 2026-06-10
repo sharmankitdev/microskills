@@ -21,11 +21,23 @@ Plugin provenance is owned HERE. harness-sync NEVER touches source:plugin entrie
 this command NEVER touches source:custom entries. Re-running is an explicit re-pull
 from the (possibly updated) catalog.
 
+Lifecycle extras:
+  - Provenance stamping: on --apply every added/updated source:plugin ledger entry is
+    stamped with the catalog's plugin version (.claude-plugin/plugin.json beside catalog/),
+    so plans report version transitions ("0.8.0 -> 0.9.0") instead of bare hash pairs.
+  - Version pins are HOLDs: a manifest entry's `version:` field pins that component. While
+    the pin differs from the catalog's version, the deployed bytes stay put and the pending
+    change surfaces in every plan (action "hold") until the pin moves.
+  - --eject <name>: transfer a source:plugin component to source:custom ownership — vendor
+    the catalog bytes into harness/, rewrite the entry's harness.yaml source line in place,
+    and atomically flip the ledger entry. tree_hash is location-independent, so the next
+    harness-sync plans a noop when deployed bytes match the catalog.
+
 Catalog root resolves to ${CLAUDE_PLUGIN_ROOT}/catalog (installed plugin) or
 <repo>/catalog (in-repo dogfood). Project root is the cwd (or --project-root).
 
 Usage:
-  initialize-harness [--plan | --apply]
+  initialize-harness [--plan | --apply] [--adopt-base] [--eject <name>]
                      [--project-root <dir>] [--catalog <dir>]
                      [--harness-root <dir>] [--harness-yaml <file>]
                      [--state <file>] [--deploy-root <dir>]
@@ -202,6 +214,80 @@ def append_plugin_entries(text, additions):
     return out + "\n" if had_trailing_nl else out
 
 
+def read_plugin_version(catalog):
+    """The plugin's declared version (.claude-plugin/plugin.json beside catalog/), or None."""
+    pj = catalog.parent / ".claude-plugin" / "plugin.json"
+    try:
+        v = json.loads(pj.read_text()).get("version")
+    except (OSError, json.JSONDecodeError):
+        return None
+    return v if isinstance(v, str) and v else None
+
+
+def flip_entry_source(text, list_key, name):
+    """In-place line surgery on harness.yaml text: within the <list_key> block, rewrite the
+    target entry's `source: plugin` line to `source: custom`, preserving every other byte
+    (header comments, sibling entries, the entry's other fields). append_plugin_entries is
+    append-only, so eject needs this dedicated rewrite. Returns (new_text, flipped)."""
+    had_trailing_nl = text.endswith("\n")
+    lines = text.split("\n")
+    if had_trailing_nl and lines and lines[-1] == "":
+        lines.pop()
+
+    # Collect [start, end) line ranges of the items under the target top-level list key.
+    cur_key, item_start, blocks = None, None, []
+    for i, ln in enumerate(lines):
+        stripped = ln.strip()
+        if ln and not ln.startswith(" ") and not stripped.startswith("#"):
+            if cur_key == list_key and item_start is not None:
+                blocks.append((item_start, i))
+                item_start = None
+            cur_key = ln.split(":", 1)[0].strip()
+            continue
+        if cur_key != list_key or not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("- "):
+            if item_start is not None:
+                blocks.append((item_start, i))
+            item_start = i
+    if cur_key == list_key and item_start is not None:
+        blocks.append((item_start, len(lines)))
+
+    def field(block, key):
+        """(line_index, value) of `key:` within the item block (dash line included), or (None, None)."""
+        for j in range(*block):
+            t = lines[j].strip()
+            if t.startswith("- "):
+                t = t[2:].strip()
+            if t.startswith(key + ":"):
+                return j, t[len(key) + 1:].split("#", 1)[0].strip().strip("'\"")
+        return None, None
+
+    for block in blocks:
+        if field(block, "name")[1] != name:
+            continue
+        j, sval = field(block, "source")
+        if j is None or sval != "plugin":
+            return text, False
+        indent = lines[j][: len(lines[j]) - len(lines[j].lstrip())]
+        prefix = "- " if lines[j].lstrip().startswith("- ") else ""
+        lines[j] = f"{indent}{prefix}source: custom"
+        out = "\n".join(lines)
+        return (out + "\n" if had_trailing_nl else out), True
+    return text, False
+
+
+def validate_manifest(manifest):
+    if not SCHEMA_PATH.exists():
+        return
+    schema = json.loads(SCHEMA_PATH.read_text())
+    errs = sorted(Draft202012Validator(schema).iter_errors(manifest), key=lambda e: list(e.path))
+    if errs:
+        msgs = ["schema " + ("/".join(str(x) for x in e.path) or "<root>") + ": " + e.message
+                for e in errs]
+        die("harness.yaml fails schema validation", 1, schema_errors=msgs)
+
+
 def render_manifest_yaml(m):
     lines = [
         "# Harness manifest (v2) — generated by initialize-harness from the catalog base set.",
@@ -304,8 +390,106 @@ def build_plugin_desired(manifest, catalog, anchor):
                 "name": name, "kind": kind, "source": "plugin",
                 "profiles": profiles, "src_dir": src_dir,
                 "tree_hash": _hs.tree_hash(src_dir),
+                "pin": c.get("version"),
             }
     return desired, errors
+
+
+def run_eject(name, apply, catalog, harness_root, harness_yaml, state_path, anchor):
+    """Transfer one source:plugin component to source:custom ownership. Vendors the catalog
+    bytes into harness/<kind-dir>/<name>/ (vendor_skip applied — generated artifacts never
+    vendored), rewrites the entry's harness.yaml source line in place, and atomically flips
+    the ledger entry (tmp+os.replace) — source_hash and installed_paths are preserved, and
+    tree_hash is location-independent, so when the deployed copy matches the catalog the
+    next harness-sync plans a noop. catalog/ is never edited. Prints JSON and exits."""
+    if not harness_yaml.exists():
+        die(f"--eject: harness.yaml not found: {harness_yaml}", 1)
+    text = harness_yaml.read_text()
+    try:
+        manifest = yaml.safe_load(text) or {}
+    except yaml.YAMLError as e:
+        die(f"harness.yaml parse error: {e}", 1)
+    validate_manifest(manifest)
+
+    entry = list_key = kind = None
+    for lk, k in _hs.LIST_KIND.items():
+        for c in manifest.get(lk) or []:
+            if c.get("name") == name:
+                entry, list_key, kind = c, lk, k
+    if entry is None:
+        die(f"--eject: '{name}' is not listed in {harness_yaml}", 1)
+    if entry.get("source") != "plugin":
+        die(f"--eject: '{name}' is source: {entry.get('source')} — only source: plugin "
+            f"components can be ejected", 1)
+
+    state = _hs.load_state(state_path)
+    components = state.get("components") or {}
+    ledger = components.get(name)
+    if not ledger:
+        die(f"--eject: '{name}' has no ledger entry — run initialize-harness --apply first", 1)
+    if ledger.get("source") != "plugin":
+        die(f"--eject: ledger entry for '{name}' is source: {ledger.get('source')}, "
+            f"not plugin", 1)
+
+    src_dir = catalog / _hs.KIND_DIR[kind] / name
+    if not src_dir.is_dir():
+        die(f"--eject: catalog component not found: {src_dir}", 1)
+    dest_dir = harness_root / _hs.KIND_DIR[kind] / name
+    if dest_dir.exists():
+        die(f"--eject: destination already exists: {dest_dir} — refusing to overwrite", 1)
+
+    files = []
+    for f in sorted(p for p in src_dir.rglob("*") if p.is_file()):
+        rel = f.relative_to(src_dir)
+        if _hs.vendor_skip(rel):
+            continue
+        files.append((f, rel))
+
+    new_text, flipped = flip_entry_source(text, list_key, name)
+    if not flipped:
+        die(f"--eject: could not rewrite 'source: plugin' for '{name}' in {harness_yaml}", 1)
+
+    vendored_hash = _hs.tree_hash(src_dir)
+    result = {
+        "mode": "apply" if apply else "plan",
+        "eject": {
+            "name": name, "kind": kind,
+            "from": str(src_dir),
+            "to": _hs.relto(dest_dir, anchor),
+            "files": [rel.as_posix() for _, rel in files],
+            "vendored_hash": vendored_hash,
+            "ledger_hash": ledger.get("source_hash"),
+            # vendored == deployed: the next harness-sync plans a noop. False means the
+            # catalog drifted since the last apply — sync will reconcile to the vendored bytes.
+            "in_sync": vendored_hash == ledger.get("source_hash"),
+            "harness_yaml": _hs.relto(harness_yaml, anchor),
+        },
+    }
+    if not apply:
+        print(json.dumps(result, indent=2))
+        sys.exit(0)
+
+    for src, rel in files:
+        dst = dest_dir / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(src.read_bytes())
+        if os.access(src, os.X_OK):
+            dst.chmod(dst.stat().st_mode | 0o111)
+    harness_yaml.write_text(new_text)
+    # Atomic ownership flip, ledger last: same deployed paths and hash, recast as custom.
+    # The plugin provenance stamp is dropped — custom entries are harness-sync's, unstamped.
+    new_entry = dict(ledger)
+    new_entry["source"] = "custom"
+    new_entry.pop("plugin_version", None)
+    new_state = dict(state)
+    new_state["version"] = _hs.STATE_VERSION
+    new_state["components"] = {**components, name: new_entry}
+    _hs.write_state_atomic(state_path, new_state)
+
+    result["state_path"] = _hs.relto(state_path, anchor)
+    result["state_written"] = True
+    print(json.dumps(result, indent=2))
+    sys.exit(0)
 
 
 def main():
@@ -324,6 +508,10 @@ def main():
     ap.add_argument("--adopt-base", action="store_true",
                     help="Merge newly-released base components (available_base) into harness.yaml "
                          "as source:plugin and materialize them this run.")
+    ap.add_argument("--eject", metavar="NAME", default=None,
+                    help="Transfer a source:plugin component to source:custom ownership: vendor "
+                         "the catalog bytes into harness/, rewrite its harness.yaml source line, "
+                         "and flip the ledger entry. Dry-run by default; --apply executes.")
     args = ap.parse_args()
 
     apply = args.apply  # neither flag → plan
@@ -337,6 +525,10 @@ def main():
 
     if not catalog.is_dir():
         die(f"catalog not found: {catalog} (set CLAUDE_PLUGIN_ROOT or --catalog)", 2)
+
+    # Eject is a standalone ownership transfer — it never reconciles. Exits when done.
+    if args.eject:
+        run_eject(args.eject, apply, catalog, harness_root, harness_yaml, state_path, anchor)
 
     # 1. Seed harness.yaml from the base set if absent; otherwise use it as-is.
     seeded = False
@@ -352,13 +544,7 @@ def main():
             harness_yaml.parent.mkdir(parents=True, exist_ok=True)
             harness_yaml.write_text(render_manifest_yaml(manifest))
 
-    if SCHEMA_PATH.exists():
-        schema = json.loads(SCHEMA_PATH.read_text())
-        errs = sorted(Draft202012Validator(schema).iter_errors(manifest), key=lambda e: list(e.path))
-        if errs:
-            msgs = ["schema " + ("/".join(str(x) for x in e.path) or "<root>") + ": " + e.message
-                    for e in errs]
-            die("harness.yaml fails schema validation", 1, schema_errors=msgs)
+    validate_manifest(manifest)
 
     # Base-offering drift: base-tagged catalog components missing from the manifest. Informational
     # by default; --adopt-base merges them (source:plugin) into the manifest — and into harness.yaml
@@ -382,7 +568,45 @@ def main():
     installed_all = state.get("components") or {}
     installed_plugin = {n: e for n, e in installed_all.items() if e.get("source") == "plugin"}
 
+    plugin_version = read_plugin_version(catalog)
+
+    # Version pins are HOLDs: while a manifest entry's `version:` differs from the catalog's
+    # current version, the component is withdrawn from reconciliation — deployed bytes stay
+    # put, the ledger is untouched, and the pending change surfaces in every plan until the
+    # pin moves. (No background sync past a pin; re-pull stays explicit and reviewed.)
+    held = []
+    for name in sorted(desired):
+        pin = desired[name].get("pin")
+        if not pin or pin == plugin_version:
+            continue
+        d = desired.pop(name)
+        ins = installed_plugin.pop(name, None)
+        if ins is None:
+            pending = "add"
+        elif d["tree_hash"] != ins.get("source_hash") or d["profiles"] != ins.get("profiles"):
+            pending = "update"
+        else:
+            pending = "none"
+        held.append({"action": "hold", "name": name, "kind": d["kind"],
+                     "pinned": pin, "available": plugin_version,
+                     "deployed_version": (ins or {}).get("plugin_version"),
+                     "pending": pending})
+
     actions, conflicts = _hs.reconcile(desired, installed_plugin, anchor, deploy_root, {})
+
+    # Plans speak plugin versions: a cross-version update reports the transition
+    # ("0.8.0 -> 0.9.0") instead of the bare hash pair; same-version byte drift (catalog
+    # edited, no release) keeps the hash pair — there the hashes are the only signal.
+    for a in actions:
+        if a["action"] == "add" and plugin_version:
+            a["new_version"] = plugin_version
+        elif a["action"] == "update":
+            old_v = (installed_plugin.get(a["name"]) or {}).get("plugin_version")
+            a["old_version"], a["new_version"] = old_v, plugin_version
+            if old_v and plugin_version and old_v != plugin_version:
+                a["transition"] = f"{old_v} -> {plugin_version}"
+                a.pop("old_hash", None)
+                a.pop("new_hash", None)
 
     eng_out = engine_outputs(catalog, deploy_root)
     eng_hash = engine_hash(eng_out)
@@ -395,9 +619,12 @@ def main():
         eng_action = "noop"
 
     summary = _hs.summarize(actions, conflicts, errors)
+    summary["hold"] = len(held)
+    actions = actions + held
     result = {
         "mode": "apply" if apply else "plan",
         "catalog": str(catalog),
+        "plugin_version": plugin_version,
         "deploy_root": _hs.relto(deploy_root, anchor),
         "seeded_harness_yaml": seeded,
         "available_base": drift,
@@ -423,9 +650,15 @@ def main():
     new_components = dict(installed_all)
     for a in actions:
         name, act = a["name"], a["action"]
+        if act == "hold":
+            a["applied"] = False   # pinned: deployed bytes stay put until the pin moves
+            continue
         if act in ("add", "update"):
-            new_components[name] = _hs.execute_install(desired[name], installed_plugin.get(name),
-                                                       anchor, deploy_root)
+            entry = _hs.execute_install(desired[name], installed_plugin.get(name),
+                                        anchor, deploy_root)
+            if plugin_version:
+                entry["plugin_version"] = plugin_version   # provenance stamp: add/update only
+            new_components[name] = entry
         elif act == "remove":
             _hs.execute_remove(installed_plugin[name], anchor, deploy_root)
             new_components.pop(name, None)

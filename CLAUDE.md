@@ -57,8 +57,8 @@ Edit source under `catalog/` (plugin components) or `harness/` (custom component
 
 Two scoped, non-destructive reconcile loops keep `.claude/` in sync, tracked by the `.claude/.harness-state.json` ownership ledger (never hand-edit it):
 
-- **`initialize-harness`** owns `source: plugin` entries + the engine. The one globally-registered plugin command (`/microskills:initialize-harness`). Seeds `harness.yaml` from the catalog's `base:` set on first run; on re-run, hash-gated refresh of drifted plugin/engine components + reports `available_base` (adopt with `--adopt-base`).
-- **`harness-sync`** owns `source: custom` entries.
+- **`initialize-harness`** owns `source: plugin` entries + the engine. The one globally-registered plugin command (`/microskills:initialize-harness`). Seeds `harness.yaml` from the catalog's `base:` set on first run; on re-run, hash-gated refresh of drifted plugin/engine components + reports `available_base` (adopt with `--adopt-base`). On `--apply` it stamps `plugin_version` into each added/updated ledger entry, so plans report version transitions (`0.8.0 -> 0.9.0`). A manifest entry's `version:` field is a **hold**: while it differs from the catalog's version, deployed bytes stay put and the pending change surfaces in every plan. `--eject <name>` transfers a `source: plugin` component to `source: custom` (vendors catalog bytes into `harness/`, rewrites the manifest line, atomically flips the ledger entry — the next `harness-sync` plans noop).
+- **`harness-sync`** owns `source: custom` entries. It hard-errors if a manifest `custom` entry's name is plugin-owned in the ledger (eject instead — no clobber).
 
 Neither touches the other's entries; a path with no ledger entry is never modified. Manifest schema: `templates/references/harness-schema.json` (closed grammar).
 

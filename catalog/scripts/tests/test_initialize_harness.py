@@ -8,6 +8,8 @@ find them with NO CLAUDE_PLUGIN_ROOT in the environment (segment agents run them
 path). We init into a tmp project (CLAUDE_PLUGIN_ROOT=REPO, as the dispatcher does), then run
 the MATERIALIZED scripts with the env var unset — exactly the failing case from the live test.
 """
+import importlib.machinery
+import importlib.util
 import json
 import os
 import subprocess
@@ -16,6 +18,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
 INIT = REPO / "catalog" / "scripts" / "initialize-harness"
+SYNC = REPO / "catalog" / "scripts" / "harness-sync"
 
 SCHEMAS = ["config-schema.json", "workflow-schema.json", "harness-schema.json"]
 
@@ -237,3 +240,322 @@ def test_init_materializes_run_journal_executable(tmp_path):
         "--manifest-hash", "sha256:h1", "--run-id", "r1")
     assert rc == 0, out + err
     assert json.loads(out)["run_id"] == "r1"
+
+
+# --- harness lifecycle: provenance stamping, version pins (holds), eject-to-custom ----------
+#
+# Hermetic plugin-world fixtures: a throwaway plugin root (catalog/ with one base-tagged
+# microskill + .claude-plugin/plugin.json) and a throwaway project. Nothing touches the
+# real repo; the real catalog's plugin.json version never leaks into these assertions.
+
+def set_plugin_version(plugin_root, version):
+    pj = plugin_root / ".claude-plugin"
+    pj.mkdir(exist_ok=True)
+    (pj / "plugin.json").write_text(
+        json.dumps({"name": "microskills", "version": version}) + "\n")
+
+
+def write_demo_body(plugin_root, body):
+    (plugin_root / "catalog" / "microskills" / "demo" / "MICROSKILL.md").write_text(
+        f"---\nname: demo\ndescription: A demo microskill.\nbase: true\n---\n\n# demo\n\n{body}\n")
+
+
+def make_plugin_world(tmp, version="0.9.0"):
+    """Plugin root with catalog/microskills/demo (base-tagged) + plugin.json, and a project dir."""
+    plugin_root = tmp / "plugin"
+    d = plugin_root / "catalog" / "microskills" / "demo"
+    (d / "profiles").mkdir(parents=True)
+    write_demo_body(plugin_root, "Body v1.")
+    (d / "profiles" / "base.yaml").write_text("version: 1\n")
+    set_plugin_version(plugin_root, version)
+    proj = tmp / "proj"
+    proj.mkdir()
+    return plugin_root, proj
+
+
+def run_world(proj, plugin_root, *flags):
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDE_PLUGIN_ROOT"}
+    proc = subprocess.run(
+        [sys.executable, str(INIT), *flags, "--project-root", str(proj),
+         "--catalog", str(plugin_root / "catalog")],
+        capture_output=True, text=True, env=env)
+    data = json.loads(proc.stdout) if proc.stdout.strip().startswith("{") else None
+    return proc.returncode, data
+
+
+def run_sync(proj, *flags):
+    proc = subprocess.run(
+        [sys.executable, str(SYNC), *flags,
+         "--harness-root", str(proj / "harness"),
+         "--harness-yaml", str(proj / "harness" / "harness.yaml"),
+         "--state", str(proj / ".claude" / ".harness-state.json"),
+         "--deploy-root", str(proj / ".claude")],
+        capture_output=True, text=True)
+    data = json.loads(proc.stdout) if proc.stdout.strip().startswith("{") else None
+    return proc.returncode, data
+
+
+def world_state(proj):
+    return json.loads((proj / ".claude" / ".harness-state.json").read_text())
+
+
+def write_pinned_manifest(proj, pin):
+    hy = proj / "harness" / "harness.yaml"
+    hy.parent.mkdir(parents=True, exist_ok=True)
+    hy.write_text(
+        "version: 2\nmicroskills:\n  - name: demo\n    source: plugin\n"
+        f"    version: {pin}\n")
+    return hy
+
+
+# --- provenance stamping -----------------------------------------------------------------
+
+def test_apply_stamps_plugin_version(tmp_path):
+    plugin_root, proj = make_plugin_world(tmp_path, version="0.8.0")
+    rc, res = run_world(proj, plugin_root, "--apply")
+    assert rc == 0, res
+    assert res["plugin_version"] == "0.8.0"
+    entry = world_state(proj)["components"]["demo"]
+    assert entry["source"] == "plugin"
+    assert entry["plugin_version"] == "0.8.0"
+    add = next(a for a in res["actions"] if a["action"] == "add" and a["name"] == "demo")
+    assert add["new_version"] == "0.8.0"
+
+
+def test_plan_reports_version_transition_not_hash_pair(tmp_path):
+    plugin_root, proj = make_plugin_world(tmp_path, version="0.8.0")
+    run_world(proj, plugin_root, "--apply")
+    # plugin upgrade: new version, new bytes
+    set_plugin_version(plugin_root, "0.9.0")
+    write_demo_body(plugin_root, "Body v2.")
+    rc, plan = run_world(proj, plugin_root, "--plan")
+    assert rc == 0, plan
+    upd = next(a for a in plan["actions"] if a["action"] == "update" and a["name"] == "demo")
+    assert upd["old_version"] == "0.8.0"
+    assert upd["new_version"] == "0.9.0"
+    assert upd["transition"] == "0.8.0 -> 0.9.0"
+    assert "old_hash" not in upd and "new_hash" not in upd
+    # apply re-stamps the ledger at the new version
+    rc, _ = run_world(proj, plugin_root, "--apply")
+    assert rc == 0
+    assert world_state(proj)["components"]["demo"]["plugin_version"] == "0.9.0"
+
+
+def test_same_version_drift_keeps_hash_pair(tmp_path):
+    # Catalog bytes drifted with NO version bump (the dogfood-repo case): there is no
+    # version transition to report, so the informative hash pair is preserved.
+    plugin_root, proj = make_plugin_world(tmp_path, version="0.8.0")
+    run_world(proj, plugin_root, "--apply")
+    write_demo_body(plugin_root, "Body v2.")
+    rc, plan = run_world(proj, plugin_root, "--plan")
+    assert rc == 0, plan
+    upd = next(a for a in plan["actions"] if a["action"] == "update" and a["name"] == "demo")
+    assert upd["old_version"] == "0.8.0" and upd["new_version"] == "0.8.0"
+    assert "transition" not in upd
+    assert upd["old_hash"] != upd["new_hash"]
+
+
+def test_noop_does_not_stamp(tmp_path):
+    # Stamp on add/update only: a noop never rewrites the recorded provenance.
+    plugin_root, proj = make_plugin_world(tmp_path, version="0.8.0")
+    run_world(proj, plugin_root, "--apply")
+    set_plugin_version(plugin_root, "0.9.0")   # version moved, bytes identical -> noop
+    rc, res = run_world(proj, plugin_root, "--apply")
+    assert rc == 0, res
+    assert [a["action"] for a in res["actions"] if a["name"] == "demo"] == ["noop"]
+    assert world_state(proj)["components"]["demo"]["plugin_version"] == "0.8.0"
+
+
+# --- version pins are HOLDs ---------------------------------------------------------------
+
+def test_version_pin_holds_pending_update(tmp_path):
+    plugin_root, proj = make_plugin_world(tmp_path, version="0.8.0")
+    write_pinned_manifest(proj, "0.8.0")
+    rc, res = run_world(proj, plugin_root, "--apply")   # pin == current -> installs
+    assert rc == 0, res
+    deployed = proj / ".claude" / "microskills" / "demo" / "MICROSKILL.md"
+    assert "Body v1." in deployed.read_text()
+    # plugin upgrades past the pin
+    set_plugin_version(plugin_root, "0.9.0")
+    write_demo_body(plugin_root, "Body v2.")
+    rc, plan = run_world(proj, plugin_root, "--plan")
+    assert rc == 0, plan
+    hold = next(a for a in plan["actions"] if a["action"] == "hold")
+    assert hold["name"] == "demo" and hold["kind"] == "microskill"
+    assert hold["pinned"] == "0.8.0" and hold["available"] == "0.9.0"
+    assert hold["deployed_version"] == "0.8.0"
+    assert hold["pending"] == "update"
+    assert plan["summary"]["hold"] == 1
+    assert not [a for a in plan["actions"]
+                if a["name"] == "demo" and a["action"] in ("add", "update", "remove")]
+    # apply: deployed bytes stay put, ledger untouched
+    rc, res = run_world(proj, plugin_root, "--apply")
+    assert rc == 0, res
+    assert "Body v1." in deployed.read_text()
+    entry = world_state(proj)["components"]["demo"]
+    assert entry["plugin_version"] == "0.8.0"
+    # the pending change surfaces in EVERY plan until the pin moves
+    rc, plan2 = run_world(proj, plugin_root, "--plan")
+    assert [a for a in plan2["actions"] if a["action"] == "hold"]
+    # move the pin -> the held update flows, reported as a version transition
+    write_pinned_manifest(proj, "0.9.0")
+    rc, plan3 = run_world(proj, plugin_root, "--plan")
+    assert rc == 0, plan3
+    upd = next(a for a in plan3["actions"] if a["action"] == "update")
+    assert upd["transition"] == "0.8.0 -> 0.9.0"
+    assert plan3["summary"]["hold"] == 0
+    rc, _ = run_world(proj, plugin_root, "--apply")
+    assert "Body v2." in deployed.read_text()
+    assert world_state(proj)["components"]["demo"]["plugin_version"] == "0.9.0"
+
+
+def test_version_pin_holds_uninstalled_add(tmp_path):
+    # A pinned component never materialized: the catalog can only provide its current
+    # version, so the add is held (nothing written) rather than violating the pin.
+    plugin_root, proj = make_plugin_world(tmp_path, version="0.9.0")
+    write_pinned_manifest(proj, "0.8.0")
+    rc, plan = run_world(proj, plugin_root, "--plan")
+    assert rc == 0, plan
+    hold = next(a for a in plan["actions"] if a["action"] == "hold")
+    assert hold["pending"] == "add"
+    assert hold["pinned"] == "0.8.0" and hold["available"] == "0.9.0"
+    rc, res = run_world(proj, plugin_root, "--apply")
+    assert rc == 0, res
+    assert not (proj / ".claude" / "microskills" / "demo").exists()
+    assert "demo" not in world_state(proj)["components"]
+
+
+# --- eject-to-custom ------------------------------------------------------------------------
+
+def test_eject_plan_writes_nothing(tmp_path):
+    plugin_root, proj = make_plugin_world(tmp_path)
+    run_world(proj, plugin_root, "--apply")   # seeds harness.yaml + installs demo
+    rc, res = run_world(proj, plugin_root, "--eject", "demo")
+    assert rc == 0, res
+    assert res["mode"] == "plan"
+    assert res["eject"]["name"] == "demo" and res["eject"]["kind"] == "microskill"
+    assert res["eject"]["in_sync"] is True
+    assert not (proj / "harness" / "microskills" / "demo").exists()
+    assert "source: plugin" in (proj / "harness" / "harness.yaml").read_text()
+    assert world_state(proj)["components"]["demo"]["source"] == "plugin"
+
+
+def test_eject_apply_transfers_ownership_and_next_sync_noops(tmp_path):
+    plugin_root, proj = make_plugin_world(tmp_path)
+    run_world(proj, plugin_root, "--apply")
+    before = world_state(proj)["components"]["demo"]
+    # generated junk in the catalog source must not be vendored (vendor_skip on copy)
+    src = plugin_root / "catalog" / "microskills" / "demo"
+    (src / ".compiled").mkdir()
+    (src / ".compiled" / "manifest.json").write_text("{}")
+    (src / "__pycache__").mkdir()
+    (src / "__pycache__" / "x.pyc").write_bytes(b"\x00")
+    rc, res = run_world(proj, plugin_root, "--eject", "demo", "--apply")
+    assert rc == 0, res
+    assert res["state_written"] is True
+    # bytes vendored into harness/, junk skipped
+    vend = proj / "harness" / "microskills" / "demo"
+    assert (vend / "MICROSKILL.md").exists()
+    assert (vend / "profiles" / "base.yaml").exists()
+    assert not (vend / ".compiled").exists()
+    assert not (vend / "__pycache__").exists()
+    # harness.yaml source line rewritten in place, header comment preserved
+    text = (proj / "harness" / "harness.yaml").read_text()
+    assert text.startswith("# Harness manifest (v2)")
+    entry_lines = [ln.strip() for ln in text.splitlines() if not ln.strip().startswith("#")]
+    assert "source: custom" in entry_lines and "source: plugin" not in entry_lines
+    # ledger entry flipped atomically: same hash/paths, custom-owned, stamp dropped
+    entry = world_state(proj)["components"]["demo"]
+    assert entry["source"] == "custom"
+    assert "plugin_version" not in entry
+    assert entry["source_hash"] == before["source_hash"]
+    assert entry["installed_paths"] == before["installed_paths"]
+    assert not list((proj / ".claude").glob("*.tmp"))
+    # tree_hash is location-independent -> the next harness-sync plans a noop
+    rc, sync = run_sync(proj, "--plan")
+    assert rc == 0, sync
+    assert [a["action"] for a in sync["actions"]] == ["noop"]
+    # and a subsequent initialize-harness no longer reconciles the ejected component
+    rc, plan = run_world(proj, plugin_root, "--plan")
+    assert rc == 0, plan
+    assert not [a for a in plan["actions"] if a["name"] == "demo"]
+
+
+def test_eject_rejects_bad_targets(tmp_path):
+    plugin_root, proj = make_plugin_world(tmp_path)
+    run_world(proj, plugin_root, "--apply")
+    # unknown name
+    rc, res = run_world(proj, plugin_root, "--eject", "nope")
+    assert rc == 1 and "error" in res
+    # destination already exists
+    (proj / "harness" / "microskills" / "demo").mkdir(parents=True)
+    rc, res = run_world(proj, plugin_root, "--eject", "demo")
+    assert rc == 1 and "error" in res
+    (proj / "harness" / "microskills" / "demo").rmdir()
+    # already ejected -> source: custom is not ejectable
+    rc, res = run_world(proj, plugin_root, "--eject", "demo", "--apply")
+    assert rc == 0, res
+    rc, res = run_world(proj, plugin_root, "--eject", "demo")
+    assert rc == 1 and "error" in res
+
+
+def test_eject_requires_ledger_entry(tmp_path):
+    # Listed in harness.yaml but never materialized: nothing to transfer -> hard error.
+    plugin_root, proj = make_plugin_world(tmp_path)
+    hy = proj / "harness" / "harness.yaml"
+    hy.parent.mkdir(parents=True)
+    hy.write_text("version: 2\nmicroskills:\n  - name: demo\n    source: plugin\n")
+    rc, res = run_world(proj, plugin_root, "--eject", "demo")
+    assert rc == 1 and "error" in res
+
+
+# --- flip_entry_source line surgery (unit) --------------------------------------------------
+
+def load_init_module():
+    loader = importlib.machinery.SourceFileLoader("initialize_harness", str(INIT))
+    spec = importlib.util.spec_from_loader("initialize_harness", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+GNARLY_MANIFEST = """\
+# header comment
+version: 2
+microskills:
+  - name: alpha
+    source: plugin
+  # interstitial comment
+  - name: demo
+    source: plugin
+    profiles: [base]
+    version: 0.8.0
+  - name: custom-one
+    source: custom
+workflows:
+  - name: demo
+    source: plugin
+"""
+
+
+def test_flip_entry_source_targets_exactly_one_entry():
+    mod = load_init_module()
+    out, flipped = mod.flip_entry_source(GNARLY_MANIFEST, "microskills", "demo")
+    assert flipped
+    assert out.startswith("# header comment")            # comments survive
+    assert "  # interstitial comment" in out
+    assert "profiles: [base]" in out                     # sibling fields survive
+    assert out.count("source: custom") == 2              # custom-one + the flipped demo
+    assert out.count("source: plugin") == 2              # alpha + the WORKFLOW demo untouched
+    wf_block = out.split("workflows:")[1]
+    assert "source: plugin" in wf_block                  # same-name entry in the other list kept
+
+
+def test_flip_entry_source_misses_are_loud():
+    mod = load_init_module()
+    out, flipped = mod.flip_entry_source(GNARLY_MANIFEST, "microskills", "nope")
+    assert not flipped and out == GNARLY_MANIFEST
+    out, flipped = mod.flip_entry_source(GNARLY_MANIFEST, "microskills", "custom-one")
+    assert not flipped                                   # already custom: nothing to flip
+    out, flipped = mod.flip_entry_source(GNARLY_MANIFEST, "workflows", "alpha")
+    assert not flipped                                   # wrong list

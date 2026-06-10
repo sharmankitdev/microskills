@@ -271,6 +271,69 @@ def test_plugin_ledger_entry_and_engine_preserved(tmp_path):
     assert st2["engine"]["source_hash"] == "sha256:cafe"          # preserved
 
 
+def test_custom_add_cannot_clobber_plugin_owned_ledger_entry(tmp_path):
+    # The latent ownership hole: harness.yaml lists a name as source:custom while the
+    # ledger records it as plugin-owned (initialize-harness's entry). Pre-fix, the add
+    # reconciled as fresh and `--resolve overwrite` clobbered the plugin-owned ledger
+    # entry + deployed bytes. Now it is a hard error pointing at the eject path.
+    make_microskill(tmp_path, "stolen")
+    write_manifest(tmp_path, [{"name": "stolen"}])   # source: custom
+    deployed = tmp_path / ".claude" / "microskills" / "stolen" / "MICROSKILL.md"
+    deployed.parent.mkdir(parents=True)
+    deployed.write_text("PLUGIN BYTES")
+    sp = tmp_path / ".claude" / ".harness-state.json"
+    sp.write_text(json.dumps({"version": 2, "components": {"stolen": {
+        "kind": "microskill", "source": "plugin", "profiles": "*",
+        "deploy_path": ".claude/microskills/stolen",
+        "installed_paths": [".claude/microskills/stolen/MICROSKILL.md"],
+        "source_hash": "sha256:pluginhash", "plugin_version": "0.9.0"}}}))
+    # plan: hard error, no action planned for the plugin-owned name
+    rc, data, out, err = run(tmp_path, "--plan")
+    assert rc == 1, out
+    assert data["errors"] and data["errors"][0]["name"] == "stolen"
+    assert "initialize-harness" in data["errors"][0]["reason"]
+    assert "--eject" in data["errors"][0]["reason"]
+    assert not [a for a in data["actions"] if a["name"] == "stolen"]
+    # even an explicit overwrite resolve cannot steal the entry
+    rc, data, out, err = run(tmp_path, "--apply", "--resolve", "stolen=overwrite")
+    assert rc == 1, out
+    assert data["errors"] and data["errors"][0]["name"] == "stolen"
+    st = json.loads(sp.read_text())["components"]["stolen"]
+    assert st["source"] == "plugin"                       # ledger entry untouched
+    assert st["plugin_version"] == "0.9.0"
+    assert st["source_hash"] == "sha256:pluginhash"
+    assert deployed.read_text() == "PLUGIN BYTES"         # deployed bytes untouched
+
+
+def test_ejected_entry_syncs_as_noop(tmp_path):
+    # After initialize-harness --eject: harness.yaml + ledger both say custom, bytes
+    # vendored under harness/ match the deployed copy. tree_hash is location-independent,
+    # so sync must plan a noop (no rewrite, no conflict).
+    hs = load_harness_sync()
+    src = make_microskill(tmp_path, "ejected")
+    write_manifest(tmp_path, [{"name": "ejected"}])
+    # simulate the ejected state: deployed copy + custom-owned ledger entry whose
+    # source_hash was computed from the (identical) catalog bytes pre-eject
+    dep = tmp_path / ".claude" / "microskills" / "ejected"
+    (dep / "profiles").mkdir(parents=True)
+    for rel in ("MICROSKILL.md", "profiles/base.yaml"):
+        (dep / rel).write_bytes((src / rel).read_bytes())
+    shim = tmp_path / ".claude" / "commands" / "ejected.md"
+    shim.parent.mkdir(parents=True, exist_ok=True)
+    shim.write_text("shim")
+    (tmp_path / ".claude" / ".harness-state.json").write_text(json.dumps(
+        {"version": 2, "components": {"ejected": {
+            "kind": "microskill", "source": "custom", "profiles": "*",
+            "deploy_path": ".claude/microskills/ejected",
+            "installed_paths": [".claude/microskills/ejected/MICROSKILL.md",
+                                ".claude/microskills/ejected/profiles/base.yaml",
+                                ".claude/commands/ejected.md"],
+            "source_hash": hs.tree_hash(src)}}}))
+    rc, data, out, err = run(tmp_path, "--plan")
+    assert rc == 0, out
+    assert [a["action"] for a in data["actions"]] == ["noop"]
+
+
 def test_missing_harness_yaml_exits_2(tmp_path):
     rc, data, out, err = run(tmp_path, "--plan")
     assert rc == 2
