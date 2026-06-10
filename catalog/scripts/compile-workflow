@@ -514,6 +514,143 @@ def desugar_loop_until(loop):
     loop["while"] = "${!(" + inner + ")}"
 
 
+# --- loop.on_exhaust: declared cap-exhaustion policy, SHARED by compile and validate ---
+# Absent = today's behavior (the run proceeds past an exhausted loop). `fail`
+# makes the loop segment THROW at the cap. `escalate` makes the compiler emit a
+# synthetic `loop_exhaust` human_approval gate immediately after the loop
+# segment, conditional on the committed `loop` pseudo-result
+# ({converged, rounds, carry}) — the gate is skipped when the loop converged,
+# and an `extend` pick re-runs the loop segment with the committed carry and a
+# fresh max_iters budget. The synthetic gate rides the SAME default/on_headless
+# rails as authored gates (gate_policy_errors / gate_headless_errors), so the
+# headless guarantees hold: a pausing exhaustion gate under gate-mode auto needs
+# a declared default or on_headless: fail, and nothing is ever fabricated.
+LOOP_EXHAUST_GATE_ID = "loop_exhaust"
+LOOP_RESULT_ID = "loop"
+LOOP_EXHAUST_FALLBACK_OPTIONS = ("extend", "accept", "abandon")
+# The `loop` pseudo-result's IO contract (check-step-io validates the stored
+# value against it after the loop step — a null/{} trips truncation_suspected).
+LOOP_RESULT_IO = {
+    "schema": {
+        "type": "object",
+        "required": ["converged", "rounds", "carry"],
+        "properties": {
+            "converged": {"type": "boolean"},
+            "rounds": {"type": "integer"},
+            "carry": {"type": "object"},
+        },
+    },
+    "guarded": False,
+    "fan_out": False,
+}
+
+
+def loop_exhaust_effective_options(on_exhaust):
+    """The synthetic gate's option labels: declared `options`, or the implicit
+    extend/accept/abandon triple."""
+    opts = (on_exhaust or {}).get("options")
+    return list(opts) if opts else list(LOOP_EXHAUST_FALLBACK_OPTIONS)
+
+
+def loop_on_exhaust_errors(loop, declared_inputs):
+    """SHARED on_exhaust coherence checks (compile dies, validate blocks — the
+    two tools can never disagree). Schema already enforces shape + the action
+    enum; this covers what a closed grammar cannot:
+      - gate-shaped fields (prompt/options/default/on_headless/notes_input) are
+        meaningful ONLY under action: escalate — anywhere else they would be
+        silently ignored;
+      - `default: extend` is refused outright: a default's only consumer is a
+        headless (gate-mode auto) run, where extend would re-enter the loop
+        unboundedly — the exact spin the mandatory max_iters cap exists to
+        prevent;
+      - `notes_input` must name a DECLARED workflow input (the dispatcher folds
+        extend-guidance into it; an undeclared name would silently never land).
+    Returns [message, ...] in a deterministic order."""
+    errs = []
+    oe = (loop or {}).get("on_exhaust")
+    if not isinstance(oe, dict):
+        return errs
+    action = oe.get("action")
+    if action == "escalate" and not (loop.get("body") or []):
+        errs.append("escalate requires a non-empty loop.body — there is no "
+                    "loop segment to attach the exhaustion gate to")
+    if action != "escalate":
+        extras = [k for k in ("prompt", "options", "default", "on_headless", "notes_input")
+                  if oe.get(k) is not None]
+        if extras:
+            errs.append(f"on_exhaust fields {extras} are only meaningful under "
+                        f"action: escalate (action is '{action}'); they would be "
+                        f"silently ignored — remove them or switch the action")
+        return errs
+    if oe.get("default") == "extend":
+        errs.append("on_exhaust default 'extend' is refused — a default is only "
+                    "consumed by a headless (gate-mode auto) run, where extend "
+                    "would re-enter the loop unboundedly; default to "
+                    "accept/abandon, or declare on_headless: fail to park the "
+                    "run at the exhaustion gate")
+    notes = oe.get("notes_input")
+    if notes is not None and notes not in (declared_inputs or {}):
+        errs.append(f"on_exhaust notes_input '{notes}' is not a declared workflow "
+                    f"input — the dispatcher folds extend-guidance into that "
+                    f"input, so an undeclared name would silently never land")
+    return errs
+
+
+def loop_reserved_id_errors(nodes, gates, loop):
+    """SHARED reserved-id check, active ONLY when on_exhaust: escalate is used
+    (compile dies, validate blocks): the loop segment commits a pseudo-result
+    under results['loop'] and the synthetic gate records its pick under
+    results['loop_exhaust'] — a node or gate carrying either id would clobber
+    (or be clobbered by) those records in run-state and the generic
+    `<id>.output` ref grammar. Returns [(location, message), ...]."""
+    oe = (loop or {}).get("on_exhaust") if isinstance(loop, dict) else None
+    if not (isinstance(oe, dict) and oe.get("action") == "escalate"):
+        return []
+    reserved = (LOOP_RESULT_ID, LOOP_EXHAUST_GATE_ID)
+    errs = []
+    for n in nodes or []:
+        if isinstance(n, dict) and n.get("id") in reserved:
+            errs.append((f"nodes/{n['id']}",
+                         f"node id '{n['id']}' is reserved while loop.on_exhaust: "
+                         f"escalate is declared — the loop segment commits the "
+                         f"'{LOOP_RESULT_ID}' pseudo-result and the synthetic "
+                         f"'{LOOP_EXHAUST_GATE_ID}' gate records its pick under "
+                         f"those result keys; rename the node"))
+    for g in gates or []:
+        if isinstance(g, dict) and g.get("id") in reserved:
+            errs.append((f"gates/{g['id']}",
+                         f"gate id '{g['id']}' is reserved while loop.on_exhaust: "
+                         f"escalate is declared — the compiler synthesizes the "
+                         f"'{LOOP_EXHAUST_GATE_ID}' exhaustion gate and the loop "
+                         f"segment commits the '{LOOP_RESULT_ID}' pseudo-result; "
+                         f"rename the gate"))
+    return errs
+
+
+def synth_loop_exhaust_gate(on_exhaust):
+    """Build the synthetic exhaustion gate dict from a validated
+    on_exhaust: escalate block. The compiler anchors it after the loop body's
+    LAST topo-order node (legal by loop_contiguity_error's window[:-1]
+    exemption) and stamps the conditional on the CHECKPOINT STEP (the authored
+    gate grammar stays closed — no `when` on gates). default/on_headless ride
+    verbatim so the existing gate rails apply unchanged."""
+    gate = {
+        "id": LOOP_EXHAUST_GATE_ID,
+        "type": "human_approval",
+        "severity": "hard",
+        "prompt": on_exhaust.get("prompt") or (
+            "The loop hit its max_iters cap with its continue-condition still "
+            "true — extend it with a fresh round budget, accept the current "
+            "result, or abandon the run?"),
+        "options": loop_exhaust_effective_options(on_exhaust),
+    }
+    if on_exhaust.get("default") is not None:
+        gate["default"] = on_exhaust["default"]
+    if on_exhaust.get("on_headless") is not None:
+        gate["on_headless"] = on_exhaust["on_headless"]
+    return gate
+
+
 def loop_max_parallel_errors(nodes):
     """SHARED max_parallel placement check used by BOTH compile and validate. A
     `max_parallel` knob is only meaningful on a for_each fan-out node; on a node
@@ -975,6 +1112,8 @@ def partition_md(name, profile_used, manifest_steps, classification, manifest_ha
                 g = s.get("gate", {})
                 label = (f"gate:{g.get('id', '?')} ({g.get('type', '?')}, "
                          f"severity {g.get('severity', 'hard')})")
+                if s.get("when"):
+                    label += " (conditional: skipped when the loop converges)"
             elif ctype == "nested_workflow":
                 label = f"nested_workflow:{s.get('node', '?')} -> {s.get('workflow', '?')}"
             else:
@@ -1496,10 +1635,22 @@ def emit_segment_js(seg_nodes, wf, loop, seg_index):
     if is_loop_seg:
         max_iters = int(loop["max_iters"])
         while_js = translate_ref((loop.get("while") or "true").strip().lstrip("$").strip("{}"), seg_var_ids)
+        oe = loop.get("on_exhaust") if isinstance(loop.get("on_exhaust"), dict) else {}
+        oe_action = (oe or {}).get("action")
         # carry vars: init from _args.carry_<v> (null first round), reassign each round
         carry = loop.get("carry") or {}
-        carry_init = "".join(
-            f"let carry_{v} = (_args && _args.carry_{v}) || null\n" for v in carry)
+        if oe_action == "escalate":
+            # PRESENCE semantics, not truthiness: an extend re-run seeds
+            # carry_<v> from the committed results.loop.carry, and a falsy
+            # carried value (0, "", false) must survive the round trip — the
+            # `|| null` form below would silently reset it. Emitted ONLY under
+            # escalate so on_exhaust-free loops stay byte-identical.
+            carry_init = "".join(
+                f"let carry_{v} = (_args && 'carry_{v}' in _args) ? _args.carry_{v} : null\n"
+                for v in carry)
+        else:
+            carry_init = "".join(
+                f"let carry_{v} = (_args && _args.carry_{v}) || null\n" for v in carry)
         # When a body node is `when`-guarded, track whether any node actually ran
         # this iteration; an all-skipped iteration breaks out (avoids spinning to
         # the cap and reading a skipped node's null output in the while condition).
@@ -1515,6 +1666,33 @@ def emit_segment_js(seg_nodes, wf, loop, seg_index):
         # Loop segments also return __rounds (the iteration count) so the orchestrator
         # recap can state how many rounds ran. Not in `produces` → never stored as a node result.
         ret = "{ " + ", ".join(f"{json.dumps(i)}: {jsvar(i)}" for i in seg_ids) + ', "__rounds": __iter }'
+        # on_exhaust: __exhausted is true only when the cap stopped a still-true
+        # continue-condition. The `__iter >= __max` operand comes FIRST so the
+        # && short-circuit protects the while-expression deref on the
+        # guarded-body break path (an all-skipped iteration exits with
+        # __iter < __max and possibly-null node outputs the condition would
+        # otherwise dereference); a cap exit always ran its final round fully,
+        # so re-evaluating the condition there is safe. Emitted ONLY when
+        # on_exhaust declares fail/escalate — absent keeps the segment
+        # byte-identical.
+        exhaust_js = ""
+        if oe_action == "fail":
+            exhaust_js = (
+                f"const __exhausted = (__iter >= __max) && ({while_js})\n"
+                f"if (__exhausted) throw new Error(`{name}: loop exhausted "
+                f"max_iters={max_iters} with its continue-condition still true "
+                f"after ${{__iter}} round(s)`)\n")
+        elif oe_action == "escalate":
+            carry_obj = "{ " + ", ".join(
+                f"{json.dumps(v)}: carry_{v}" for v in carry) + " }" if carry else "{}"
+            exhaust_js = f"const __exhausted = (__iter >= __max) && ({while_js})\n"
+            # The 'loop' pseudo-result IS committed (unlike __rounds it joins
+            # `produces`): the synthetic gate's `when` and an extend re-run's
+            # carry seeding both resolve from stored results.
+            ret = ("{ " + ", ".join(f"{json.dumps(i)}: {jsvar(i)}" for i in seg_ids)
+                   + ', "loop": { "converged": !__exhausted, "rounds": __iter, '
+                     '"carry": ' + carry_obj + ' }, "__rounds": __iter }')
+            produces = produces + [LOOP_RESULT_ID]
         loop_body_js = (f"{ran_init}{loop_calls}{break_line}{carry_assign}"
                         f"  __iter++\n")
         scaffold = (f"do {{\n{loop_body_js}"
@@ -1523,6 +1701,7 @@ def emit_segment_js(seg_nodes, wf, loop, seg_index):
                 f"let __iter = 0\nconst __max = {max_iters}\n"
                 f"let {', '.join(jsvar(i) for i in seg_ids)}\n"
                 + scaffold +
+                exhaust_js +
                 f"log(`{name}: ran ${{__iter}} iteration(s)`)\n"
                 f"return {ret}\n")
     else:
@@ -1841,6 +2020,22 @@ def main():
             die(wu_err, 1)
         desugar_loop_until(loop)
 
+    # --- loop.on_exhaust: declared cap-exhaustion policy (shared helpers) ---
+    # Coherence first (gate-shaped fields only under escalate; default: extend
+    # refused; notes_input must be declared), then the escalate-scoped reserved
+    # ids ('loop' pseudo-result / 'loop_exhaust' synthetic gate). The synthetic
+    # gate itself is born after the topo sort below (it anchors on the LAST
+    # topo-order body node).
+    on_exhaust = (loop or {}).get("on_exhaust") if isinstance(loop, dict) else None
+    if on_exhaust is not None:
+        oe_errs = loop_on_exhaust_errors(loop, wf.get("inputs") or {})
+        if oe_errs:
+            die(f"loop.on_exhaust: {oe_errs[0]}", 1)
+        rid_errs = loop_reserved_id_errors(nodes, wf.get("gates"), loop)
+        if rid_errs:
+            rid_loc, rid_msg = rid_errs[0]
+            die(f"{rid_loc}: {rid_msg}", 1)
+
     # --- LOOP ERGONOMICS: max_parallel is only valid on a for_each node ---
     mp_errs = loop_max_parallel_errors(nodes)
     if mp_errs:
@@ -1852,6 +2047,35 @@ def main():
         gates_after.setdefault(g["after"], []).append(g)
 
     order = topo_sort(nodes)
+
+    # --- loop.on_exhaust: escalate — synthesize the exhaustion gate ---
+    # Born AFTER profile merge + schema validation (the authored gate grammar
+    # stays closed — no `when` on gates) and BEFORE the contiguity check below
+    # (anchored after the LAST topo-order body node, which window[:-1] exempts).
+    # It must be rail-checked HERE: the wf-level gate_policy_errors /
+    # gate_headless_errors calls above ran before this gate existed, and the
+    # headless guarantee (a pausing gate under auto needs a default or
+    # on_headless: fail) must hold for compiler-emitted gates too. Prepended to
+    # the anchor's gate list so the loop's fate is decided before any authored
+    # gate on the same node renders the (possibly superseded) output.
+    synth_gate = None
+    if isinstance(on_exhaust, dict) and on_exhaust.get("action") == "escalate":
+        body_set = set((loop.get("body") or []))
+        last_body = next((nid for nid in reversed(order) if nid in body_set), None)
+        if last_body is None:
+            die("loop.on_exhaust: escalate requires a non-empty loop.body", 1)
+        synth_gate = synth_loop_exhaust_gate(on_exhaust)
+        synth_gate["after"] = last_body
+        sg_pol = gate_policy_errors([synth_gate])
+        if sg_pol:
+            die(f"loop.on_exhaust: {sg_pol[0][1]}", 1)
+        if effective_gate_mode == "auto":
+            sg_head = gate_headless_errors([synth_gate])
+            if sg_head:
+                die(f"loop.on_exhaust: {sg_head[0][1]} (the compiler-emitted "
+                    f"'{LOOP_EXHAUST_GATE_ID}' gate rides the same headless "
+                    f"rails as authored gates)", 1)
+        gates_after.setdefault(last_body, []).insert(0, synth_gate)
 
     # --- S-LOOP: loop body must stay contiguous (pre-emit, mirrors validate) ---
     # A split body silently drops the do/while scaffold; die before any emit so
@@ -2085,8 +2309,37 @@ def main():
         for g in gates_after.get(nid, []):
             if g.get("type") == "human_approval" or g.get("severity", "hard") == "hard":
                 flush_segment()
-                steps.append({"kind": "checkpoint", "checkpoint_type": "gate", "gate": g})
+                gstep = {"kind": "checkpoint", "checkpoint_type": "gate", "gate": g}
+                # The synthetic exhaustion gate is the only CONDITIONAL gate:
+                # its `when` lives on the CHECKPOINT STEP (the authored gate
+                # grammar stays closed), evaluated by `run-step eval` exactly
+                # like an orchestrator node's guard — false (the loop
+                # converged) skips the gate.
+                if synth_gate is not None and g is synth_gate:
+                    gstep["when"] = "${!(loop.output.converged)}"
+                steps.append(gstep)
     flush_segment()
+
+    # --- loop.on_exhaust: the body must form its OWN segment (fail-loud) ---
+    # Every on_exhaust emission keys off the is_loop segment (set equality with
+    # loop.body). A background node topo-adjacent to the body with no checkpoint
+    # between them merges into the same segment: `fail` would silently evaporate
+    # (no scaffold, no throw — not even hash-visible) and `escalate` would emit
+    # a manifest whose loop_exhaust `when` references a `loop` result no step
+    # can ever produce — a guaranteed-dead run. Statically detectable here, so
+    # die before any emit (validate blocks the provable subset).
+    if isinstance(on_exhaust, dict) and on_exhaust.get("action") in ("fail", "escalate"):
+        oe_body = set(loop.get("body") or [])
+        if not any(s["kind"] == "segment" and set(s["nodes"]) == oe_body
+                   for s in steps):
+            merged_seg = next((s for s in steps if s["kind"] == "segment"
+                               and oe_body and oe_body < set(s["nodes"])), None)
+            extra = (f" (the loop body shares segment[{','.join(merged_seg['nodes'])}] "
+                     f"with non-body background node(s))" if merged_seg else "")
+            die(f"loop.on_exhaust: the loop body must compile into its OWN "
+                f"background segment for on_exhaust to attach{extra} — separate "
+                f"the adjacent background node(s) from the body with a hard "
+                f"gate or an orchestrator checkpoint", 1)
 
     # Spill substitution happens ONLY at the dispatcher's threading boundary, so
     # a consumer in the SAME segment as the producer reads the in-memory VALUE
@@ -2176,6 +2429,26 @@ def main():
                          if node_by_id[nid].get("spill_outputs")}
             if seg_spill:
                 manifest_step["spill"] = seg_spill
+            # loop.on_exhaust: stamped on the LOOP step ONLY when declared
+            # (absent defs stay byte-identical), and INSIDE the hashed manifest
+            # — `fail` changes only seg JS bytes (the post-loop throw), which
+            # the node fingerprints never cover, so the stamp is what makes the
+            # policy hash-visible. Under escalate the step also records the
+            # FULL declared carry list (needs.carry holds only the REFERENCED
+            # vars, but an extend re-run must re-seed every declared var) and
+            # the `loop` pseudo-result's IO contract (check-step-io validates
+            # the committed value; run-step args keys its carry seeding off
+            # this record).
+            if manifest_step["is_loop"] and isinstance(
+                    (loop or {}).get("on_exhaust"), dict):
+                _oe = loop["on_exhaust"]
+                oe_rec = {"action": _oe.get("action")}
+                if _oe.get("action") == "escalate":
+                    oe_rec["carry_vars"] = sorted((loop.get("carry") or {}).keys())
+                    if _oe.get("notes_input"):
+                        oe_rec["notes_input"] = _oe["notes_input"]
+                    manifest_step["io"][LOOP_RESULT_ID] = LOOP_RESULT_IO
+                manifest_step["on_exhaust"] = oe_rec
             manifest_steps.append(manifest_step)
         else:
             manifest_steps.append(step)

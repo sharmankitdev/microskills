@@ -397,7 +397,9 @@ def test_scenario_microskill_create_autonomous(tmp_path):
     rc, data, out, err = run_scenario("microskill-create-autonomous", tmp_path)
     assert rc == 0, (json.dumps(data, indent=2) if data else out + err)
     assert data["ok"] is True and data["profile"] == "autonomous"
-    assert data["steps_run"] == 5
+    # 6 steps since on_exhaust: the loop's conditional loop_exhaust gate rides
+    # the manifest (skipped here — the fixture loop converges at round 2).
+    assert data["steps_run"] == 6
     assert data["stopped_at"] is None
 
 

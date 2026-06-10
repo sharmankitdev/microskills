@@ -326,10 +326,31 @@ def cmd_args(a):
                 f"no recorded result for node '{nid}' — every produced node "
                 f"must be stored in run-state results (null for a guarded "
                 f"skip), never omitted")
-    for var in needs.get("carry") or []:
-        # Loops carry state internally across their own iterations; the
-        # cross-segment seed is always null (matches the compiled carry init).
-        out_args[f"carry_{var}"] = None
+    # Carry seeding. Default: loops carry state internally across their own
+    # iterations, so the cross-segment seed is always null (matches the
+    # compiled carry init) — including a revise-style re-run of an escalate
+    # loop segment, which must NOT silently continue from the committed carry.
+    # The on_exhaust extend re-entry is EXPLICIT: the dispatcher passes
+    # --extend, and every DECLARED carry var (the step's on_exhaust.carry_vars
+    # record; needs.carry holds only the REFERENCED subset) seeds from the
+    # committed results.loop.carry. Misuse fails loud, never degrades to null.
+    oe_rec = step.get("on_exhaust") or {}
+    escalate = oe_rec.get("action") == "escalate"
+    loop_seed = {}
+    if getattr(a, "extend", False):
+        if not escalate:
+            die("--extend is only valid on a loop segment whose manifest step "
+                "declares on_exhaust: escalate — this step does not")
+        prior = results.get("loop")
+        if not (isinstance(prior, dict) and isinstance(prior.get("carry"), dict)):
+            die("--extend requires a committed 'loop' pseudo-result in "
+                "run-state results — the extend re-entry seeds carry from "
+                "results.loop.carry, and nothing is committed to seed from")
+        loop_seed = prior["carry"]
+    carry_vars = sorted(set(needs.get("carry") or [])
+                        | (set(oe_rec.get("carry_vars") or []) if escalate else set()))
+    for var in carry_vars:
+        out_args[f"carry_{var}"] = loop_seed.get(var)
 
     payload = {"step": a.step, "kind": "segment",
                "script": step.get("script"), "errors": errors}
@@ -440,6 +461,15 @@ def emit_eval_js(step, ctype):
     else:
         lines.append("__out.when = true")
 
+    if ctype == "gate":
+        # The conditional (synthetic loop_exhaust) gate: only its `when` guard
+        # is evaluated — a gate carries no prompt/child_inputs expressions and
+        # never fans out.
+        body = "\n    ".join(lines)
+        return (_JS_WRAPPER
+                .replace("__REF_HELPER__", _REF_HELPER_JS)
+                .replace("__BODY__", body))
+
     if ctype == "orchestrator_node":
         key, payload = "prompt", tmpl_literal(step.get("prompt") or "", scope)
     else:
@@ -473,16 +503,24 @@ def cmd_eval(a):
     check_hash(manifest, run_state)
     step = get_step(manifest, a.step)
     ctype = step.get("checkpoint_type")
-    if step.get("kind") != "checkpoint" or ctype not in CHECKPOINT_EVAL_TYPES:
+    # A gate checkpoint is evaluable ONLY when it carries a step-level `when`
+    # (the compiler-emitted conditional loop_exhaust gate) — every other gate
+    # stays rejected.
+    conditional_gate = ctype == "gate" and step.get("when") is not None
+    if step.get("kind") != "checkpoint" or (
+            ctype not in CHECKPOINT_EVAL_TYPES and not conditional_gate):
         die(f"--step {a.step} is kind={step.get('kind')!r} "
             f"(checkpoint_type={ctype!r}) — `run-step eval` evaluates "
             f"orchestrator_node / nested_workflow checkpoints only (gates "
-            f"carry no expressions; segments use `run-step args`)")
+            f"carry no expressions, except the when-carrying synthetic "
+            f"loop_exhaust gate; segments use `run-step args`)")
     inputs = require_state_obj(run_state, "inputs")
     results = require_state_obj(run_state, "results")
 
     payload = {"step": a.step, "kind": "checkpoint", "checkpoint_type": ctype,
                "node": step.get("node"), "errors": []}
+    if conditional_gate:
+        payload["gate"] = (step.get("gate") or {}).get("id")
     if ctype == "nested_workflow":
         payload["workflow"] = step.get("workflow")
         if step.get("profile"):
@@ -592,8 +630,9 @@ def cmd_eval(a):
         payload["for_each"] = None
         if ctype == "orchestrator_node":
             payload["prompt"] = out.get("prompt")
-        else:
+        elif ctype == "nested_workflow":
             payload["child_inputs"] = out.get("child_inputs") or {}
+        # a conditional gate carries only the when verdict — no payload key
 
     if ctype == "nested_workflow":
         defs_root = derive_defs_root(a.manifest, a.defs_root)
@@ -638,6 +677,14 @@ def main():
                     help=f"Hard args-size budget in compact-JSON bytes "
                          f"(default {DEFAULT_BUDGET}). Past it the build "
                          f"FAILS LOUD — never auto-spills.")
+    sp.add_argument("--extend", action="store_true",
+                    help="loop.on_exhaust extend re-entry: seed every declared "
+                         "carry var from the committed results.loop.carry "
+                         "instead of null. Only valid on a loop segment whose "
+                         "step declares on_exhaust: escalate, with a committed "
+                         "'loop' pseudo-result present. EXPLICIT by design — a "
+                         "revise re-run of the same segment must keep the "
+                         "default null seeds.")
     sp.set_defaults(fn=cmd_args)
 
     sp = sub.add_parser("eval", help="evaluate a checkpoint step's when / "

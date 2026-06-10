@@ -2645,3 +2645,180 @@ def test_spill_field_in_resolved_microskill_schema_passes(tmp_path):
     rc, data, _ = run_defs(defs_root, wf)
     assert rc == 0, data
     assert data["pass"] is True
+
+
+# ================================================================== loop.on_exhaust
+
+V_OX_BASE = """\
+version: 1
+name: ox-flow
+description: cap-exhaustion policy fixture
+inputs:
+  req:
+    type: string
+    required: true
+nodes:
+  - id: plan
+    agent: ag
+    prompt: plan ${workflow.inputs.req}
+  - id: impl
+    agent: ag
+    depends_on: [plan]
+    prompt: impl ${plan.output.spec} notes ${loop.carry.last}
+  - id: ev
+    agent: ag
+    depends_on: [impl]
+    prompt: eval ${impl.output.art}
+    output_schema: {type: object, required: [pass], properties: {pass: {type: boolean}}}
+  - id: done
+    delegation: orchestrator
+    when: ${loop.output.converged || loop_exhaust.output.choice == 'accept'}
+    prompt: finalize ${ev.output}
+gates:
+  - id: approve
+    after: plan
+    type: human_approval
+    prompt: ok?
+    options: [approve, abandon]
+loop:
+  while: ${!ev.output.pass}
+  max_iters: 3
+  body: [impl, ev]
+  carry:
+    last: ${ev.output}
+output:
+  from: done
+"""
+
+def _append_to_loop(body, extra):
+    """Append an indented block to the loop: section (before output:)."""
+    return body.replace("output:\n  from: done\n", "") + extra + "output:\n  from: done\n"
+
+
+V_OX_ESCALATE = _append_to_loop(V_OX_BASE, """\
+  on_exhaust:
+    action: escalate
+    notes_input: req
+    on_headless: fail
+""")
+
+
+def test_on_exhaust_escalate_accepts_pseudo_producers(tmp_path):
+    rc, data, err = run(write_wf(tmp_path, V_OX_ESCALATE))
+    assert data["pass"] is True, data["issues"]
+
+
+def test_loop_output_ref_without_escalate_blocks(tmp_path):
+    rc, data, err = run(write_wf(tmp_path, V_OX_BASE))
+    assert data["pass"] is False
+    assert any("unknown node 'loop'" in i["message"] for i in data["issues"]
+               if i["severity"] == "block")
+
+
+def test_on_exhaust_default_extend_blocks(tmp_path):
+    body = _append_to_loop(V_OX_BASE, "  on_exhaust:\n    action: escalate\n    default: extend\n")
+    rc, data, err = run(write_wf(tmp_path, body))
+    assert "loop/on_exhaust" in locs(data)
+    assert any("default 'extend' is refused" in i["message"] for i in data["issues"])
+
+
+def test_on_exhaust_undeclared_notes_input_blocks(tmp_path):
+    body = _append_to_loop(V_OX_BASE, "  on_exhaust:\n    action: escalate\n    notes_input: nope\n    on_headless: fail\n")
+    rc, data, err = run(write_wf(tmp_path, body))
+    assert "loop/on_exhaust" in locs(data)
+    assert any("notes_input 'nope'" in i["message"] for i in data["issues"])
+
+
+def test_on_exhaust_gate_fields_on_continue_block(tmp_path):
+    body = _append_to_loop(V_OX_BASE, "  on_exhaust:\n    action: continue\n    options: [a]\n")
+    rc, data, err = run(write_wf(tmp_path, body))
+    assert "loop/on_exhaust" in locs(data)
+    assert any("only meaningful under action: escalate" in i["message"]
+               for i in data["issues"])
+
+
+def test_on_exhaust_escalate_reserved_ids_block(tmp_path):
+    body = V_OX_ESCALATE.replace(
+        "nodes:\n", "nodes:\n  - id: loop\n    agent: ag\n    prompt: shadow\n")
+    rc, data, err = run(write_wf(tmp_path, body))
+    assert "nodes/loop" in locs(data)
+    body2 = V_OX_ESCALATE.replace(
+        "gates:\n", "gates:\n  - id: loop_exhaust\n    after: plan\n"
+        "    type: human_approval\n    prompt: clash\n    options: [a, b]\n")
+    rc2, data2, err2 = run(write_wf(tmp_path, body2))
+    assert "gates/loop_exhaust" in locs(data2)
+
+
+def test_on_exhaust_doc_gate_mode_auto_needs_headless_policy(tmp_path):
+    # doc-declared gate_mode: auto + escalate without default/on_headless
+    # blocks (same rails as authored gates); the authored approve gate gets a
+    # default so the synthetic gate is the only offender
+    body = V_OX_BASE.replace("version: 1\n", "version: 1\ngate_mode: auto\n") \
+                    .replace("    options: [approve, abandon]\n",
+                             "    options: [approve, abandon]\n    default: approve\n")
+    body = _append_to_loop(body, "  on_exhaust:\n    action: escalate\n")
+    rc, data, err = run(write_wf(tmp_path, body))
+    assert "loop/on_exhaust" in locs(data)
+    assert any("loop_exhaust" in i["message"] for i in data["issues"]
+               if i["location"] == "loop/on_exhaust")
+
+
+def test_loop_exhaust_choice_literal_membership_checked(tmp_path):
+    body = V_OX_ESCALATE.replace("== 'accept'", "== 'acept'")
+    rc, data, err = run(write_wf(tmp_path, body))
+    assert data["pass"] is False
+    assert any("'acept'" in i["message"] and "loop_exhaust" in i["message"]
+               for i in data["issues"] if i["severity"] == "block")
+
+
+def test_on_exhaust_escalate_empty_body_blocks(tmp_path):
+    body = _append_to_loop(
+        V_OX_BASE.replace("  body: [impl, ev]\n", "  body: []\n"),
+        "  on_exhaust:\n    action: escalate\n    on_headless: fail\n")
+    rc, data, err = run(write_wf(tmp_path, body))
+    assert "loop/on_exhaust" in locs(data)
+    assert any("escalate requires a non-empty loop.body" in i["message"]
+               for i in data["issues"])
+
+
+def test_on_exhaust_adjacent_background_node_blocks(tmp_path):
+    # an agent: node between the gate and the body merges into the loop
+    # segment (provably background, no checkpoint between) — the policy
+    # cannot attach; validate blocks the static subset
+    body = V_OX_ESCALATE.replace(
+        "gates:\n",
+        "  - id: prep\n    agent: ag\n    depends_on: [plan]\n"
+        "    prompt: prep ${plan.output.spec}\ngates:\n").replace(
+        "    depends_on: [plan]\n    prompt: impl",
+        "    depends_on: [prep]\n    prompt: impl")
+    rc, data, err = run(write_wf(tmp_path, body))
+    assert "loop/on_exhaust" in locs(data)
+    assert any("merges into the loop segment" in i["message"]
+               for i in data["issues"])
+
+
+def test_loop_pseudo_result_field_typo_blocks(tmp_path):
+    body = V_OX_ESCALATE.replace(
+        "when: ${loop.output.converged || loop_exhaust.output.choice == 'accept'}",
+        "when: ${loop.output.choice == 'accept'}")
+    rc, data, err = run(write_wf(tmp_path, body))
+    assert data["pass"] is False
+    assert any("declares only converged/rounds/carry" in i["message"]
+               for i in data["issues"] if i["severity"] == "block")
+
+
+def test_present_path_on_loop_pseudo_result_accepted_and_typed(tmp_path):
+    # an authored post-loop gate may present the loop pseudo-result; a field
+    # outside the fixed contract blocks
+    base = V_OX_ESCALATE.replace(
+        "gates:\n",
+        "gates:\n  - id: ship\n    after: ev\n    type: human_approval\n"
+        "    prompt: ship?\n    options: [confirm, stop]\n"
+        "    present: [loop.output.rounds]\n")
+    rc, data, err = run(write_wf(tmp_path, base))
+    assert data["pass"] is True, data["issues"]
+    bad = base.replace("present: [loop.output.rounds]",
+                       "present: [loop.output.choice]")
+    rc2, data2, err2 = run(write_wf(tmp_path, bad))
+    assert any("records only {converged, rounds, carry}" in i["message"]
+               for i in data2["issues"] if i["severity"] == "block")

@@ -289,13 +289,14 @@ def test_real_workflow_create_compiles():
 
 def test_real_build_workflow_from_plan_compiles():
     # The shared build half extracted from workflow-create: the implement/evaluate
-    # loop segment followed by the canonical finalize orchestrator node. No plan
-    # node and no gate (those live in the caller).
+    # loop segment, its on_exhaust escalation gate (conditional — skipped when
+    # the loop converges), and the canonical finalize orchestrator node. No plan
+    # node and no authored gate (those live in the caller).
     rc, data, out, err = run(REAL_DEFS, "build-workflow-from-plan")
     assert rc == 0, err
     assert data["segments"] == 1
     assert data["sequence"] == [
-        "segment[implement,evaluate]", "orchestrator_node"]
+        "segment[implement,evaluate]", "gate", "orchestrator_node"]
 
 
 # --- Nested-workflow profile passthrough -------------------------------------
@@ -371,14 +372,15 @@ def test_nested_workflow_omits_profile_when_no_customize(tmp_path):
 
 def test_real_flow_segments_and_advisory_branch():
     # Retrofitted with a scope_advisory branch: an `advise` orchestrator node
-    # (when scope_advisory != null) before the loop, plus the finalize node.
+    # (when scope_advisory != null) before the loop, plus the loop's on_exhaust
+    # escalation gate (conditional) and the finalize node.
     rc, data, out, err = run(REAL_DEFS, "microskill-create")
     assert rc == 0, err
     assert data["segments"] == 2
-    assert data["checkpoints"] == 3
+    assert data["checkpoints"] == 4
     assert data["sequence"] == [
         "segment[plan]", "gate", "orchestrator_node",
-        "segment[implement,evaluate]", "orchestrator_node"]
+        "segment[implement,evaluate]", "gate", "orchestrator_node"]
 
 
 def test_real_flow_guarded_loop_breaks_when_skipped():
@@ -4287,3 +4289,288 @@ def test_spill_outputs_schema_rejects_empty_and_duplicates(tmp_path):
                                                   "name: spill-flow2"))
     rc, data, *_ = run(tmp_path, "spill-flow2")
     assert rc == 1 and "schema_errors" in data
+
+
+# ================================================================== loop.on_exhaust
+
+OX_BASE = """\
+version: 1
+name: ox-flow
+description: cap-exhaustion policy fixture
+inputs:
+  req:
+    type: string
+    required: true
+nodes:
+  - id: plan
+    agent: ag
+    prompt: plan ${workflow.inputs.req}
+  - id: impl
+    agent: ag
+    depends_on: [plan]
+    prompt: impl ${plan.output.spec} notes ${loop.carry.last}
+  - id: ev
+    agent: ag
+    depends_on: [impl]
+    prompt: eval ${impl.output.art}
+    output_schema: {type: object, required: [pass], properties: {pass: {type: boolean}}}
+gates:
+  - id: approve
+    after: plan
+    type: human_approval
+    prompt: ok?
+    options: [approve, abandon]
+loop:
+  while: ${!ev.output.pass}
+  max_iters: 3
+  body: [impl, ev]
+  carry:
+    last: ${ev.output}
+"""
+
+OX_ESCALATE = OX_BASE + """\
+  on_exhaust:
+    action: escalate
+    notes_input: req
+    on_headless: fail
+"""
+
+OX_FAIL = OX_BASE + """\
+  on_exhaust:
+    action: fail
+"""
+
+
+def test_on_exhaust_escalate_emits_pseudo_result_and_synthetic_gate(tmp_path):
+    d = make_flow(tmp_path, "ox-flow", OX_ESCALATE)
+    rc, data, out, err = run(tmp_path, "ox-flow", "--explain")
+    assert rc == 0, out + err
+    # sequence gains the synthetic gate right after the loop segment
+    assert data["sequence"] == [
+        "segment[plan]", "gate:approve", "segment[impl,ev]",
+        "gate:loop_exhaust"]
+    seg2 = (d / ".compiled" / "seg-2.js").read_text()
+    # exhaustion detection: cap-operand FIRST so && short-circuits the
+    # while-expression deref on a guarded-break exit
+    assert "const __exhausted = (__iter >= __max) && (!n_ev.pass)" in seg2
+    # the committed pseudo-result
+    assert '"loop": { "converged": !__exhausted, "rounds": __iter, "carry": { "last": carry_last } }' in seg2
+    # presence-semantics carry init (a falsy committed carry survives extend)
+    assert "let carry_last = (_args && 'carry_last' in _args) ? _args.carry_last : null" in seg2
+    assert "|| null" not in seg2.split("let carry_last")[1].split("\n")[0]
+    m = json.loads((d / ".compiled" / "manifest.json").read_text())
+    loop_step = next(s for s in m["steps"] if s.get("is_loop"))
+    assert loop_step["produces"] == ["impl", "ev", "loop"]
+    assert loop_step["on_exhaust"] == {
+        "action": "escalate", "carry_vars": ["last"], "notes_input": "req"}
+    assert loop_step["io"]["loop"]["schema"]["required"] == [
+        "converged", "rounds", "carry"]
+    gate_step = next(s for s in m["steps"]
+                     if s.get("checkpoint_type") == "gate"
+                     and s["gate"]["id"] == "loop_exhaust")
+    assert gate_step["when"] == "${!(loop.output.converged)}"
+    assert gate_step["gate"]["type"] == "human_approval"
+    assert gate_step["gate"]["options"] == ["extend", "accept", "abandon"]
+    assert gate_step["gate"]["on_headless"] == "fail"
+    assert gate_step["gate"]["after"] == "ev"
+
+
+def test_on_exhaust_fail_emits_post_loop_throw(tmp_path):
+    d = make_flow(tmp_path, "ox-flow", OX_FAIL)
+    rc, data, out, err = run(tmp_path, "ox-flow")
+    assert rc == 0, out + err
+    seg2 = (d / ".compiled" / "seg-2.js").read_text()
+    assert "const __exhausted = (__iter >= __max) && (!n_ev.pass)" in seg2
+    assert "if (__exhausted) throw new Error" in seg2
+    assert "loop exhausted max_iters=3" in seg2
+    m = json.loads((d / ".compiled" / "manifest.json").read_text())
+    loop_step = next(s for s in m["steps"] if s.get("is_loop"))
+    # fail commits no pseudo-result and synthesizes no gate
+    assert loop_step["produces"] == ["impl", "ev"]
+    assert loop_step["on_exhaust"] == {"action": "fail"}
+    assert "loop" not in loop_step["io"]
+    assert not any(s.get("checkpoint_type") == "gate"
+                   and s["gate"]["id"] == "loop_exhaust" for s in m["steps"])
+
+
+def test_on_exhaust_absent_keeps_loop_emit_unchanged(tmp_path):
+    d = make_flow(tmp_path, "ox-flow", OX_BASE)
+    rc, data, out, err = run(tmp_path, "ox-flow")
+    assert rc == 0, out + err
+    seg2 = (d / ".compiled" / "seg-2.js").read_text()
+    assert "__exhausted" not in seg2
+    assert '"loop":' not in seg2
+    assert "let carry_last = (_args && _args.carry_last) || null" in seg2
+    m = json.loads((d / ".compiled" / "manifest.json").read_text())
+    loop_step = next(s for s in m["steps"] if s.get("is_loop"))
+    assert "on_exhaust" not in loop_step
+    assert loop_step["produces"] == ["impl", "ev"]
+
+
+def test_on_exhaust_is_manifest_hash_visible(tmp_path):
+    hashes = {}
+    for key, yaml_text in (("base", OX_BASE), ("fail", OX_FAIL),
+                           ("escalate", OX_ESCALATE)):
+        world = tmp_path / key
+        world.mkdir()
+        make_flow(world, "ox-flow", yaml_text)
+        rc, data, out, err = run(world, "ox-flow")
+        assert rc == 0, out + err
+        hashes[key] = data["manifest_hash"]
+    # `fail` changes only seg JS bytes — the step stamp is what makes it
+    # hash-visible; escalate also changes the partition
+    assert len(set(hashes.values())) == 3
+
+
+def test_on_exhaust_default_extend_dies(tmp_path):
+    make_flow(tmp_path, "ox-flow", OX_BASE + """\
+  on_exhaust:
+    action: escalate
+    default: extend
+""")
+    rc, data, out, err = run(tmp_path, "ox-flow")
+    assert rc == 1
+    assert "default 'extend' is refused" in data["error"]
+
+
+def test_on_exhaust_undeclared_notes_input_dies(tmp_path):
+    make_flow(tmp_path, "ox-flow", OX_BASE + """\
+  on_exhaust:
+    action: escalate
+    notes_input: nope
+    on_headless: fail
+""")
+    rc, data, out, err = run(tmp_path, "ox-flow")
+    assert rc == 1
+    assert "notes_input 'nope' is not a declared workflow input" in data["error"]
+
+
+def test_on_exhaust_gate_fields_on_fail_action_die(tmp_path):
+    make_flow(tmp_path, "ox-flow", OX_BASE + """\
+  on_exhaust:
+    action: fail
+    prompt: never rendered
+""")
+    rc, data, out, err = run(tmp_path, "ox-flow")
+    assert rc == 1
+    assert "only meaningful under action: escalate" in data["error"]
+
+
+def test_on_exhaust_default_must_be_member_of_options(tmp_path):
+    make_flow(tmp_path, "ox-flow", OX_BASE + """\
+  on_exhaust:
+    action: escalate
+    options: [accept, abandon]
+    default: approve
+""")
+    rc, data, out, err = run(tmp_path, "ox-flow")
+    assert rc == 1
+    assert "loop.on_exhaust" in data["error"]
+    assert "'approve' is not one of the gate's options" in data["error"]
+
+
+def test_on_exhaust_escalate_headless_rails(tmp_path):
+    # a pausing exhaustion gate with neither default nor on_headless: fail
+    # makes a gate-mode=auto compile die — the synthetic gate rides the same
+    # rails as authored gates (the authored approve gate gets a default so the
+    # synthetic one is the only offender)
+    auto_def = OX_BASE.replace(
+        "    options: [approve, abandon]\n",
+        "    options: [approve, abandon]\n    default: approve\n") + """\
+  on_exhaust:
+    action: escalate
+"""
+    make_flow(tmp_path, "ox-flow", auto_def)
+    rc, data, out, err = run(tmp_path, "ox-flow", "--gate-mode", "auto")
+    assert rc == 1
+    assert "loop.on_exhaust" in data["error"]
+    assert "loop_exhaust" in data["error"]
+    # on_headless: fail makes the same compile pass (park-resumable pattern)
+    world2 = tmp_path / "w2"
+    world2.mkdir()
+    make_flow(world2, "ox-flow", auto_def + "    on_headless: fail\n")
+    rc2, data2, out2, err2 = run(world2, "ox-flow", "--gate-mode", "auto")
+    assert rc2 == 0, out2 + err2
+
+
+def test_on_exhaust_escalate_reserves_loop_and_loop_exhaust_ids(tmp_path):
+    bad_node = OX_ESCALATE.replace(
+        "nodes:\n", "nodes:\n  - id: loop\n    agent: ag\n    prompt: shadow\n")
+    make_flow(tmp_path, "ox-flow", bad_node)
+    rc, data, out, err = run(tmp_path, "ox-flow")
+    assert rc == 1
+    assert "node id 'loop' is reserved" in data["error"]
+    world2 = tmp_path / "w2"
+    world2.mkdir()
+    bad_gate = OX_ESCALATE.replace(
+        "gates:\n", "gates:\n  - id: loop_exhaust\n    after: plan\n"
+        "    type: human_approval\n    prompt: clash\n"
+        "    options: [a, b]\n")
+    make_flow(world2, "ox-flow", bad_gate)
+    rc2, data2, out2, err2 = run(world2, "ox-flow")
+    assert rc2 == 1
+    assert "gate id 'loop_exhaust' is reserved" in data2["error"]
+
+
+def test_on_exhaust_continue_is_hash_visible_too(tmp_path):
+    # `continue` changes no emitted JS, but the manifest stamp still moves the
+    # hash — adopting the explicit policy invalidates resume/locks like any
+    # semantic change.
+    hashes = {}
+    for key, yaml_text in (("base", OX_BASE),
+                           ("continue", OX_BASE + "  on_exhaust:\n    action: continue\n")):
+        world = tmp_path / key
+        world.mkdir()
+        d = make_flow(world, "ox-flow", yaml_text)
+        rc, data, out, err = run(world, "ox-flow")
+        assert rc == 0, out + err
+        hashes[key] = data["manifest_hash"]
+        if key == "continue":
+            seg2 = (d / ".compiled" / "seg-2.js").read_text()
+            assert "__exhausted" not in seg2  # JS unchanged
+    assert hashes["base"] != hashes["continue"]
+
+
+def test_on_exhaust_body_must_form_own_segment_trailing_merge_dies(tmp_path):
+    # action: fail + a background node AFTER the body with no checkpoint
+    # between — it merges into the loop segment and the policy would silently
+    # evaporate (no scaffold, no throw, hash-invisible). Die instead.
+    merged = OX_FAIL.replace(
+        "gates:\n",
+        "  - id: report\n    agent: ag\n    depends_on: [ev]\n"
+        "    prompt: report ${ev.output.pass}\ngates:\n")
+    make_flow(tmp_path, "ox-flow", merged)
+    rc, data, out, err = run(tmp_path, "ox-flow")
+    assert rc == 1
+    assert "must compile into its OWN background segment" in data["error"]
+    assert "report" in data["error"]
+
+
+def test_on_exhaust_body_must_form_own_segment_leading_merge_dies(tmp_path):
+    # action: escalate + a background node BETWEEN the gate and the body — it
+    # merges into the loop segment; without the die the synthetic gate's
+    # `when` would reference a `loop` result no step ever produces.
+    merged = OX_ESCALATE.replace(
+        "gates:\n",
+        "  - id: prep\n    agent: ag\n    depends_on: [plan]\n"
+        "    prompt: prep ${plan.output.spec}\n"
+        "  - id: prep2\n    agent: ag\n    depends_on: [prep]\n"
+        "    prompt: warm ${prep.output.x}\ngates:\n").replace(
+        "    depends_on: [plan]\n    prompt: impl",
+        "    depends_on: [prep2]\n    prompt: impl")
+    make_flow(tmp_path, "ox-flow", merged)
+    rc, data, out, err = run(tmp_path, "ox-flow")
+    assert rc == 1
+    assert "must compile into its OWN background segment" in data["error"]
+
+
+def test_on_exhaust_escalate_empty_body_dies_via_shared_helper(tmp_path):
+    make_flow(tmp_path, "ox-flow", OX_BASE.replace(
+        "  body: [impl, ev]\n", "  body: []\n") + """\
+  on_exhaust:
+    action: escalate
+    on_headless: fail
+""")
+    rc, data, out, err = run(tmp_path, "ox-flow")
+    assert rc == 1
+    assert "escalate requires a non-empty loop.body" in data["error"]

@@ -112,6 +112,11 @@ auto_wire_node_inputs = _cw.auto_wire_node_inputs
 gate_effective_options = _cw.gate_effective_options
 gate_policy_errors = _cw.gate_policy_errors
 gate_headless_errors = _cw.gate_headless_errors
+loop_on_exhaust_errors = _cw.loop_on_exhaust_errors
+loop_reserved_id_errors = _cw.loop_reserved_id_errors
+synth_loop_exhaust_gate = _cw.synth_loop_exhaust_gate
+LOOP_EXHAUST_GATE_ID = _cw.LOOP_EXHAUST_GATE_ID
+LOOP_RESULT_ID = _cw.LOOP_RESULT_ID
 spill_placement_errors = _cw.spill_placement_errors
 spill_schema_errors = _cw.spill_schema_errors
 spill_guard_ref_errors = _cw.spill_guard_ref_errors
@@ -331,6 +336,18 @@ def main():
     # gate-id ref contributes no edge and cannot perturb topo_sort.
     gate_id_set = {g.get("id") for g in (merged.get("gates") or [])
                    if isinstance(g, dict) and g.get("id")}
+
+    # loop.on_exhaust: escalate — the loop segment commits a 'loop' pseudo-result
+    # ({converged, rounds, carry}) and the compiler-synthesized 'loop_exhaust'
+    # gate records its pick under that id, so BOTH become legal ${...} ref
+    # producers (accepted like gate ids: no edge, no typed field-check). Scoped
+    # to escalate — without it a ${loop.output.*} ref stays the unknown-node
+    # block it is today.
+    _loop_oe = (merged.get("loop") or {}).get("on_exhaust") \
+        if isinstance(merged.get("loop"), dict) else None
+    _oe_escalate = isinstance(_loop_oe, dict) and _loop_oe.get("action") == "escalate"
+    if _oe_escalate:
+        gate_id_set |= {LOOP_RESULT_ID, LOOP_EXHAUST_GATE_ID}
 
     # --- I-DECL: every ${workflow.inputs.<x>} ref must name a DECLARED input ---
     # Pure set membership over the whole merged doc (node fields, gate prompts,
@@ -581,6 +598,16 @@ def main():
                         add(issues, "block", f"nodes/{nid}",
                             f"references output of unknown node '{ref_id}'")
                 for prod_id, field in NODE_OUTPUT_FIELD_RE.findall(inner):
+                    if _oe_escalate and prod_id == LOOP_RESULT_ID:
+                        # the loop pseudo-result is TYPED ({converged, rounds,
+                        # carry}) — a typo'd field would silently read
+                        # undefined and dead-end the branch
+                        if field not in ("converged", "rounds", "carry"):
+                            add(issues, "block", f"nodes/{nid}",
+                                f"references ${{loop.output.{field}}} but the "
+                                f"loop pseudo-result declares only "
+                                f"converged/rounds/carry")
+                        continue
                     if prod_id in gate_id_set:
                         continue  # gate has no output_schema → 'any', never field-check
                     if prod_id not in id_set:
@@ -884,6 +911,43 @@ def main():
         for h_gid, h_msg in gate_headless_errors(gates_list):
             add(issues, "block", f"gates/{h_gid}", h_msg)
 
+    # loop.on_exhaust: escalate — the synthetic gate is born at COMPILE time
+    # (post-merge), so it is absent from gates_list; run the SAME rails on an
+    # equivalently-synthesized dict here, or a bad escalate config would pass
+    # validate and die at compile: default ∈ effective options, take_default
+    # needs a default, and (doc-declared gate_mode: auto only — validate has no
+    # --gate-mode flag) the pausing exhaustion gate needs a default or
+    # on_headless: fail. Registering it in gate_by_id also gives
+    # ${loop_exhaust.output.choice} comparison literals the standard
+    # options-membership check. Reserved ids ride the shared helper.
+    _loop_last_body = None
+    if _oe_escalate:
+        _synth_gate = synth_loop_exhaust_gate(_loop_oe)
+        # Anchor the synthetic gate exactly where compile anchors it — after
+        # the loop body's LAST topo-order node, PREPENDED to that anchor's
+        # gate list (decl pos -1: it fires before any authored same-anchor
+        # gate) — so the present-path fires-before machinery below enforces
+        # the same ordering for paths naming `loop_exhaust` as for authored
+        # gates, instead of silently skipping the check.
+        _oe_body = [b for b in ((merged.get("loop") or {}).get("body") or [])
+                    if b in id_set]
+        if not cycle_found[0] and _oe_body:
+            _oe_pos = {n: i for i, n in enumerate(topo_sort(well_formed_nodes))}
+            _loop_last_body = max(_oe_body, key=lambda b: _oe_pos.get(b, -1))
+            _synth_gate["after"] = _loop_last_body
+        for _p_gid, p_msg in gate_policy_errors([_synth_gate]):
+            add(issues, "block", "loop/on_exhaust", p_msg)
+        if merged.get("gate_mode") == "auto":
+            for _h_gid, h_msg in gate_headless_errors([_synth_gate]):
+                add(issues, "block", "loop/on_exhaust",
+                    f"{h_msg} (the compiler-emitted '{LOOP_EXHAUST_GATE_ID}' "
+                    f"gate rides the same headless rails as authored gates)")
+        gate_by_id.setdefault(LOOP_EXHAUST_GATE_ID, _synth_gate)
+    for r_loc, r_msg in loop_reserved_id_errors(
+            merged.get("nodes") or [], merged.get("gates") or [],
+            merged.get("loop")):
+        add(issues, "block", r_loc, r_msg)
+
     # --- present: declared gate presentation — checked, then rendered MECHANICALLY ---
     # A gate's `present` is an ordered list of field paths the dispatcher renders
     # verbatim (the model output-rubric is only the fallback), so the approver
@@ -898,6 +962,10 @@ def main():
     order_pos = ({o_nid: i for i, o_nid in enumerate(topo_sort(well_formed_nodes))}
                  if not cycle_found[0] else None)
     gate_decl_pos = {g.get("id"): i for i, g in enumerate(gates_list) if g.get("id")}
+    if _oe_escalate:
+        # compile PREPENDS the synthetic gate at its anchor — same-anchor
+        # authored gates fire after it
+        gate_decl_pos.setdefault(LOOP_EXHAUST_GATE_ID, -1)
 
     def present_paths(g):
         for entry in (g.get("present") or []):
@@ -913,6 +981,25 @@ def main():
         for path in present_paths(g):
             parts = path.split(".")
             lead, field = parts[0], (parts[2] if len(parts) > 2 else None)
+            if _oe_escalate and lead == LOOP_RESULT_ID:
+                # the loop pseudo-result is a TYPED producer with a fixed
+                # contract, produced by the loop segment (anchor = its last
+                # topo-order body node) — not a gate, despite riding
+                # gate_id_set for the unknown-producer acceptance
+                if (order_pos is not None and after in order_pos
+                        and _loop_last_body in order_pos
+                        and order_pos[_loop_last_body] > order_pos[after]):
+                    add(issues, "block", loc,
+                        f"path '{path}' references the loop pseudo-result, but "
+                        f"the loop segment completes after this gate's anchor "
+                        f"'{after}' — not yet produced when the gate fires")
+                    continue
+                if field is not None and field not in ("converged", "rounds", "carry"):
+                    add(issues, "block", loc,
+                        f"path '{path}': the loop pseudo-result records only "
+                        f"{{converged, rounds, carry}} — field '{field}' is "
+                        f"never recorded")
+                continue
             if lead in gate_id_set:
                 if lead == gid:
                     add(issues, "block", loc,
@@ -1063,6 +1150,14 @@ def main():
                     f"breaks the do/while scaffold")
         if "max_iters" not in loop:
             add(issues, "block", "loop", "missing required 'max_iters' cap")
+        # on_exhaust coherence (shared helper; the synthetic gate's policy/
+        # headless rails already ran in the gates section above): gate-shaped
+        # fields only under escalate, default: extend refused, notes_input must
+        # name a declared workflow input.
+        for oe_msg in loop_on_exhaust_errors(
+                loop, merged.get("inputs")
+                if isinstance(merged.get("inputs"), dict) else {}):
+            add(issues, "block", "loop/on_exhaust", oe_msg)
         for inner in refs_in({"while": loop.get("while"), "carry": loop.get("carry")}):
             for ref_id in NODE_OUTPUT_RE.findall(inner):
                 if ref_id not in id_set:
@@ -1082,6 +1177,48 @@ def main():
             contig_err = loop_contiguity_error(order, node_by_id, gates_after, loop)
             if contig_err:
                 add(issues, "block", "loop/body", contig_err)
+
+            # on_exhaust needs the body to form its OWN segment (compile dies
+            # on the full partition; this blocks the PROVABLE static subset):
+            # a provably-background node (agent:, no orchestrator markers)
+            # topo-adjacent to the body with no hard gate / orchestrator
+            # boundary between them merges into the loop segment — `fail`
+            # silently evaporates and `escalate` emits an unsatisfiable gate.
+            # use: nodes are skipped here (resolution may reclassify them);
+            # compile remains authoritative.
+            oe_doc = loop.get("on_exhaust")
+            if (isinstance(oe_doc, dict)
+                    and oe_doc.get("action") in ("fail", "escalate") and body_ids):
+                pos = {n: i for i, n in enumerate(order)}
+                lo = min(pos[b] for b in body_ids)
+                hi = max(pos[b] for b in body_ids)
+
+                def _provably_background(nb):
+                    return (isinstance(nb, dict) and nb.get("agent")
+                            and nb.get("delegation") != "orchestrator"
+                            and nb.get("side_effect") is not True)
+
+                def _hard_gate_after(anchor_id):
+                    return any(gg.get("type") == "human_approval"
+                               or gg.get("severity", "hard") == "hard"
+                               for gg in gates_after.get(anchor_id, []))
+
+                neighbors = []
+                if lo > 0:
+                    neighbors.append((order[lo - 1], order[lo - 1]))
+                # under escalate the synthetic gate flushes after the last
+                # body node, so only `fail` can merge a TRAILING neighbor
+                if oe_doc.get("action") == "fail" and hi + 1 < len(order):
+                    neighbors.append((order[hi + 1], order[hi]))
+                for nbr, boundary_anchor in neighbors:
+                    if (_provably_background(node_by_id.get(nbr, {}))
+                            and not _hard_gate_after(boundary_anchor)):
+                        add(issues, "block", "loop/on_exhaust",
+                            f"background node '{nbr}' is topo-adjacent to the "
+                            f"loop body with no checkpoint between them — it "
+                            f"merges into the loop segment, so the on_exhaust "
+                            f"policy cannot attach; separate it with a hard "
+                            f"gate or an orchestrator checkpoint")
 
     # --- output anchoring ---
     out = merged.get("output")

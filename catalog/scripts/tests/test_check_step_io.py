@@ -412,3 +412,48 @@ def test_oversized_spilled_field_does_not_warn(tmp_path):
     rc2, data2, *_ = run_check(mp2, sp2, 0)
     assert rc2 == 0
     assert any("big" in w for w in data2["warnings"])
+
+
+# ================================================================== loop.on_exhaust
+
+LOOP_IO = {"schema": {"type": "object",
+                      "required": ["converged", "rounds", "carry"],
+                      "properties": {"converged": {"type": "boolean"},
+                                     "rounds": {"type": "integer"},
+                                     "carry": {"type": "object"}}},
+           "guarded": False, "fan_out": False}
+
+
+def test_loop_pseudo_result_validates_ok(tmp_path):
+    steps = [seg_step({"ev": {"schema": None, "guarded": False, "fan_out": False},
+                       "loop": LOOP_IO})]
+    steps[0]["is_loop"] = True
+    steps[0]["on_exhaust"] = {"action": "escalate", "carry_vars": ["last"]}
+    mp, sp = world(tmp_path, steps,
+                   {"ev": {"pass": False},
+                    "loop": {"converged": False, "rounds": 3,
+                             "carry": {"last": {"pass": False}}}})
+    rc, data, out, err = run_check(mp, sp, 0)
+    assert rc == 0, out + err
+    assert by_node(data)["loop"]["result"] == "ok"
+
+
+def test_null_loop_pseudo_result_trips_truncation(tmp_path):
+    steps = [seg_step({"loop": LOOP_IO})]
+    steps[0]["is_loop"] = True
+    steps[0]["on_exhaust"] = {"action": "escalate", "carry_vars": []}
+    mp, sp = world(tmp_path, steps, {"loop": None})
+    rc, data, out, err = run_check(mp, sp, 0)
+    assert rc == 1
+    assert by_node(data)["loop"]["result"] == "truncation_suspected"
+
+
+def test_escalate_loop_result_sized_as_self_threaded(tmp_path):
+    steps = [seg_step({"loop": LOOP_IO})]
+    steps[0]["is_loop"] = True
+    steps[0]["on_exhaust"] = {"action": "escalate", "carry_vars": ["blob"]}
+    big = {"converged": False, "rounds": 3, "carry": {"blob": "x" * 64}}
+    mp, sp = world(tmp_path, steps, {"loop": big})
+    rc, data, out, err = run_check(mp, sp, 0, "--budget", "32")
+    assert rc == 0  # warning-only, like every look-ahead size check
+    assert any("'loop'" in w and "threaded" in w for w in data["warnings"])

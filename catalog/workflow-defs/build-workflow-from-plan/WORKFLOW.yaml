@@ -106,6 +106,18 @@ loop:
   body: [implement, evaluate]
   carry:
     last_findings: ${evaluate.output}
+  on_exhaust:
+    # Cap exhaustion is a verdict, not a budget overrun: delegate it to the
+    # orchestrator instead of letting a still-failing draft flow into finalize.
+    # extend re-runs the loop with the committed carry (guidance appended to the
+    # materialized requirement file); accept proceeds on an explicit human
+    # choice; headless runs PARK resumable here (on_headless: fail — the
+    # do-the-work-overnight, approve-in-the-morning pattern).
+    action: escalate
+    prompt: The implement-evaluate loop hit its round cap with the evaluator still failing - extend with another round budget (optionally with guidance), accept the draft as-is, or abandon?
+    options: [extend, accept, abandon]
+    notes_input: requirement_path
+    on_headless: fail
 
 output:
   from: finalize
