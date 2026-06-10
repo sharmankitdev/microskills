@@ -22,5 +22,15 @@ jobs:
         run: python -m pip install --upgrade pip pyyaml jsonschema pytest
       - name: Rebuild runtime from catalog
         run: catalog/scripts/initialize-harness --apply --project-root . --catalog ./catalog
+      # Compile-closure drift gate: recompile every catalog def IN MEMORY (--check
+      # writes nothing) and compare against its committed closure.lock.json — the
+      # baseline (a fresh checkout has no .compiled/; the lockfile IS the baseline).
+      # A registry/def edit that changes the executed semantics without re-locking
+      # (compile-workflow <name> --lock) fails here with a per-node drift report.
+      - name: Closure drift gate (catalog lockfiles)
+        run: |
+          for d in catalog/workflow-defs/*/; do
+            catalog/scripts/compile-workflow "$(basename "$d")" --defs-root catalog/workflow-defs --check
+          done
       - name: Run tests
         run: python -m pytest catalog/scripts/tests/ scripts/tests/ hooks/tests/ -v
