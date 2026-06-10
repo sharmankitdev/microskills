@@ -385,6 +385,14 @@ def test_scenario_review_changes_lite(tmp_path):
 
 
 @needs_node
+def test_scenario_review_changes_comprehensive(tmp_path):
+    rc, data, out, err = run_scenario("review-changes-comprehensive", tmp_path)
+    assert rc == 0, (json.dumps(data, indent=2) if data else out + err)
+    assert data["ok"] is True and data["profile"] == "comprehensive"
+    assert data["steps_run"] == 1  # comprehensive is one all-background segment
+
+
+@needs_node
 def test_scenario_microskill_create_autonomous(tmp_path):
     rc, data, out, err = run_scenario("microskill-create-autonomous", tmp_path)
     assert rc == 0, (json.dumps(data, indent=2) if data else out + err)
@@ -422,6 +430,47 @@ def test_golden_review_changes_verify_order_and_batching():
     results = golden_results("review-changes-lite")
     assert [v["finding_id"] for v in results["results"]["verify"]] == ids
     # distinct per-finding fixtures: dedup-degenerate goldens are impossible
+    verdicts = [v["verdict"] for v in results["results"]["verify"]]
+    assert len(set(verdicts)) > 1
+
+
+def test_golden_comprehensive_multi_dimension_label_collision():
+    # THE ordered-queue label-collision case that motivated the fixture design:
+    # the six expanded review_* siblings all call agent() under ONE label
+    # (ms:review-dimension). The committed fixture queue lists its entries in
+    # REVERSE expansion order, each pinned by a prompt-substring matcher on the
+    # node's frozen-resolution path — selection must follow the matcher, so
+    # every sibling consumes ITS dimension's fixture (a flat label-keyed
+    # fixture, or a positional-only queue, would cross-wire them).
+    journal = golden_journal("review-changes-comprehensive")
+    rd_calls = [ln for ln in journal
+                if ln.get("event") == "agent" and ln["label"] == "ms:review-dimension"]
+    dims = ["correctness", "security", "performance", "style",
+            "documentation", "test_coverage"]
+    assert len(rd_calls) == 6
+    for call, dim in zip(rd_calls, dims):
+        assert f"resolved/review_{dim}.json" in call["prompt"]
+    # per-item expand variation rode in: test-coverage threads threshold 80
+    # (the workflow input default) into its own call only
+    assert "- threshold: 80" in rd_calls[-1]["prompt"]
+    assert all("- threshold:" not in c["prompt"] for c in rd_calls[:-1])
+    results = golden_results("review-changes-comprehensive")
+    # DISTINCT per-dimension results — six different finding sets landed on
+    # six different nodes, and the fan-in kept all of them: collect-findings
+    # dedup (file+line+title) cannot degenerate this golden
+    first_ids = {n: results["results"][n]["findings"][0]["id"]
+                 for n in (f"review_{d}" for d in dims)}
+    assert first_ids == {
+        "review_correctness": "COR-1", "review_security": "SEC-1",
+        "review_performance": "PERF-1", "review_style": "STY-1",
+        "review_documentation": "DOC-1", "review_test_coverage": "TC-1"}
+    assert results["results"]["collect"]["count"] == 7
+    collected_dims = {f["dimension"] for f in results["results"]["collect"]["findings"]}
+    assert len(collected_dims) == 6
+    # the verify fan-out (max_parallel 4 -> 4+3 batches) preserved collection
+    # order across the batch split, exactly like the lite golden
+    assert [v["finding_id"] for v in results["results"]["verify"]] == \
+        ["COR-1", "COR-2", "SEC-1", "PERF-1", "STY-1", "DOC-1", "TC-1"]
     verdicts = [v["verdict"] for v in results["results"]["verify"]]
     assert len(set(verdicts)) > 1
 
