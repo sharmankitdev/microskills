@@ -96,9 +96,13 @@ the file may be left in place (a later run with a matching `manifest_hash` whose
 last step simply has nothing to resume) or removed — do not let writing it block the run.
 
 ### `kind: "segment"`
-1. Build the `args` object the segment expects:
-   - for each `n` in `step.needs.wf_inputs` → `args["wf_" + n] = inputs[n]`
-   - for each `id` in `step.needs.nodes` → `args[id] = results[id]` (the upstream node's output)
+1. Build the `args` object the segment expects — **every needed key must be PRESENT; use `null`,
+   never omit a key** (the compiled segment fail-louds on an absent needed key and on unparseable
+   args; a `null` value is legal — presence, not truthiness):
+   - for each `n` in `step.needs.wf_inputs` → `args["wf_" + n] = inputs[n]` (an optional input with
+     no gathered value and no default → set `null` explicitly)
+   - for each `id` in `step.needs.nodes` → `args[id] = results[id]` (the upstream node's output; a
+     skipped node's stored `null` rides as `null`)
    - for each `v` in `step.needs.carry` → `args["carry_" + v] = null` (loops carry state internally
      across their own iterations; the seed is null)
 2. Invoke the **Workflow tool** with `scriptPath` = `step.script` **resolved against the def dir**:

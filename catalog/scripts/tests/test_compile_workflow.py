@@ -2182,3 +2182,121 @@ def test_manifest_bytes_portable_across_checkouts(tmp_path):
     m2 = (d2 / ".compiled" / "manifest.json").read_text()
     assert m1 == m2
     assert data1["manifest_hash"] == data2["manifest_hash"]
+
+
+# --- FAIL-LOUD ARGS GUARD (rank: cross-segment-output-spill, part (a)) ---
+# The emitted guard THROWS on JSON parse failure (never degrades to _args = {})
+# and asserts every per-segment needed key is PRESENT (a guarded-skip null is
+# legal — presence, not truthiness). No spill mechanism yet.
+
+
+def test_args_guard_throws_on_parse_failure(tmp_path):
+    d = make_flow(tmp_path, "gated-flow", GATED.replace("name: linear-flow", "name: gated-flow"))
+    rc, data, out, err = run(tmp_path, "gated-flow")
+    assert rc == 0, err
+    for seg_name in ("seg-1.js", "seg-2.js"):
+        seg = (d / ".compiled" / seg_name).read_text()
+        assert "JSON.parse(_args)" in seg
+        assert "_args = {}" not in seg                         # the old swallow is gone
+        assert "throw new Error('workflow args is not valid JSON" in seg
+
+
+def test_args_guard_asserts_needed_keys_presence(tmp_path):
+    # seg-2 of the gated flow needs upstream node `a` (b reads ${a.output.x}) —
+    # its guard must assert the key is PRESENT via the `in` operator (presence,
+    # not truthiness: `_args.a === null` from a guarded skip must pass).
+    d = make_flow(tmp_path, "gated-flow", GATED.replace("name: linear-flow", "name: gated-flow"))
+    rc, data, out, err = run(tmp_path, "gated-flow")
+    assert rc == 0, err
+    seg2 = (d / ".compiled" / "seg-2.js").read_text()
+    assert '["a"].filter((k) =>' in seg2
+    assert "!(k in _args)" in seg2                             # presence check, not truthiness
+    assert "missing required key(s)" in seg2
+    m = json.loads((d / ".compiled" / "manifest.json").read_text())
+    seg2_step = [s for s in m["steps"] if s["kind"] == "segment"][1]
+    assert seg2_step["needs"]["nodes"] == ["a"]                # guard mirrors needs
+
+
+def test_args_guard_no_keys_block_when_segment_needs_nothing(tmp_path):
+    # seg-1 of the gated flow needs nothing — no presence block is emitted (the
+    # parse guard alone), keeping no-needs segments minimal.
+    d = make_flow(tmp_path, "gated-flow", GATED.replace("name: linear-flow", "name: gated-flow"))
+    rc, data, out, err = run(tmp_path, "gated-flow")
+    assert rc == 0, err
+    seg1 = (d / ".compiled" / "seg-1.js").read_text()
+    assert "__missing" not in seg1
+    assert "missing required key(s)" not in seg1
+
+
+WF_NEEDS_MIX = """\
+version: 1
+name: mix-flow
+inputs:
+  topic: { type: string, required: true }
+nodes:
+  - id: a
+    agent: ag
+    prompt: do a on ${workflow.inputs.topic}
+  - id: fin
+    delegation: orchestrator
+    depends_on: [a]
+    prompt: checkpoint
+  - id: b
+    agent: ag
+    depends_on: [fin]
+    prompt: use ${a.output.x} and ${workflow.inputs.topic}
+"""
+
+
+def test_args_guard_lists_wf_inputs_and_node_keys_deterministically(tmp_path):
+    # The needed-keys list covers wf_<input> AND upstream node ids, in the same
+    # sorted order the manifest needs record uses (deterministic bytes).
+    d = make_flow(tmp_path, "mix-flow", WF_NEEDS_MIX)
+    rc, data, out, err = run(tmp_path, "mix-flow")
+    assert rc == 0, err
+    seg2 = (d / ".compiled" / "seg-2.js").read_text()
+    assert '["wf_topic", "a"]' in seg2          # wf_inputs first, then nodes (sorted)
+
+
+LOOP_NEEDS = """\
+version: 1
+name: ln-flow
+nodes:
+  - id: p
+    agent: ag
+    prompt: plan
+  - id: impl
+    agent: ag
+    depends_on: [p]
+    prompt: impl from ${p.output.spec} with notes ${loop.carry.last}
+  - id: ev
+    agent: ag
+    depends_on: [impl]
+    prompt: ev
+gates:
+  - id: g
+    after: p
+    type: human_approval
+    prompt: ok?
+loop:
+  while: ${!ev.output.pass}
+  max_iters: 2
+  body: [impl, ev]
+  carry:
+    last: ${ev.output}
+"""
+
+
+def test_args_guard_loop_segment_includes_carry_keys(tmp_path):
+    # A loop segment whose body reads a cross-segment node AND a loop.carry var
+    # asserts both keys (the dispatcher must pass carry_last: null — present,
+    # value null — plus the upstream node's output).
+    d = make_flow(tmp_path, "ln-flow", LOOP_NEEDS)
+    rc, data, out, err = run(tmp_path, "ln-flow")
+    assert rc == 0, err
+    seg2 = (d / ".compiled" / "seg-2.js").read_text()
+    assert '["p", "carry_last"]' in seg2        # needs node p + the carry seed
+    assert "missing required key(s)" in seg2
+    m = json.loads((d / ".compiled" / "manifest.json").read_text())
+    loop_step = [s for s in m["steps"] if s["kind"] == "segment"][1]
+    assert loop_step["needs"] == {"wf_inputs": [], "nodes": ["p"], "carry": ["last"]}

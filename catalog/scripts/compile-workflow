@@ -684,9 +684,34 @@ def emit_segment_js(seg_nodes, wf, loop, seg_index):
             f"  description: {json.dumps('Compiled segment ' + str(seg_index) + ' of ' + wf['name'])},\n"
             f"  phases: [{phases}],\n}}\n\n")
 
-    guard = ("// Workflow args arrives as a JSON string — parse it.\n"
+    # FAIL-LOUD args guard. The native engine passes args as a JSON string and
+    # silently TRUNCATES oversized payloads (~37KB observed live); the old guard
+    # swallowed the wreckage into `_args = {}`, letting every downstream deref
+    # read `undefined` and fabricate. Now: a parse failure THROWS, and every
+    # per-segment needed key must be PRESENT — presence, not truthiness: a `null`
+    # from a guarded-skip upstream node (or a carry seed) is legal; an ABSENT key
+    # means truncation or a caller omission.
+    needs_dict = {
+        "wf_inputs": sorted(needs.wf_inputs),
+        "nodes": sorted(needs.nodes),
+        "carry": sorted(needs.carry),
+    }
+    need_keys = ([f"wf_{n}" for n in needs_dict["wf_inputs"]]
+                 + list(needs_dict["nodes"])
+                 + [f"carry_{v}" for v in needs_dict["carry"]])
+    guard = ("// Workflow args arrives as a JSON string — parse it. FAIL LOUD: never\n"
+             "// degrade a malformed/truncated payload to {} (silent downstream fabrication).\n"
              "let _args = args\n"
-             "if (typeof _args === 'string') { try { _args = JSON.parse(_args) } catch (e) { _args = {} } }\n\n")
+             "if (typeof _args === 'string') {\n"
+             "  try { _args = JSON.parse(_args) } catch (e) {\n"
+             "    throw new Error('workflow args is not valid JSON (truncated payload?): ' + e.message)\n"
+             "  }\n"
+             "}\n")
+    if need_keys:
+        guard += ("// Every needed key must be DEFINED (null is legal — presence, not truthiness).\n"
+                  f"const __missing = {json.dumps(need_keys)}.filter((k) => !_args || typeof _args !== 'object' || !(k in _args))\n"
+                  "if (__missing.length) throw new Error('workflow args is missing required key(s): ' + __missing.join(', '))\n")
+    guard += "\n"
 
     body = ""
     produces = list(seg_ids)
@@ -750,11 +775,6 @@ def emit_segment_js(seg_nodes, wf, loop, seg_index):
     if any(n.get("max_parallel") is not None and n.get("for_each") for n in seg_nodes):
         helpers = HELPERS_JS + "\n" + PARALLEL_CHUNKED_JS
     js = head + helpers + "\n\n" + guard + body
-    needs_dict = {
-        "wf_inputs": sorted(needs.wf_inputs),
-        "nodes": sorted(needs.nodes),
-        "carry": sorted(needs.carry),
-    }
     return js, needs_dict, produces
 
 

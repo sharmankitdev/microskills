@@ -715,8 +715,12 @@ hash). A `phase_group` whose value equals a node id is a **warn** (the two boxes
 For each manifest step in order:
 
 - **`segment`** → build `args`: `wf_<x>` for each needed workflow input, `<id>` for each needed
-  upstream node output, `carry_<v> = null` for loop carries. Invoke the Workflow engine with the
-  segment's `scriptPath` + `args` — the manifest stores `script` **relative to the def dir**
+  upstream node output, `carry_<v> = null` for loop carries. **Every needed key must be present —
+  pass `null`, never omit**: the compiled segment opens with a fail-loud guard that **throws** on
+  unparseable args (the native engine truncates oversized payloads — a truncated JSON string must
+  stop the run, not degrade to `{}` and let downstream nodes fabricate) and throws on any **absent**
+  needed key (presence, not truthiness — a guarded-skip `null` is legal). Invoke the Workflow engine
+  with the segment's `scriptPath` + `args` — the manifest stores `script` **relative to the def dir**
   (`.compiled/seg-N.js`), so the dispatcher resolves it against `.claude/workflow-defs/<name>/`.
   The segment returns an object keyed by its `produces` node ids;
   store each into `results`. (A loop segment also returns `__rounds`.)
@@ -797,6 +801,11 @@ stored node outputs no longer line up) or an absent file → start fresh at step
   identity is stashed and baked), and the compile **dies** if the resolved microskill exposes
   `AskUserQuestion` or carries a hard gate. `auto` on a `workflow:` node, on an orchestrator-native
   step, or combined with `side_effect: true` is a hard error.
+- **⚠️ Truncated segment args now fail loud, not silent.** The native engine truncates oversized
+  `args` payloads (~37KB observed); the compiled guard **throws** on a JSON parse failure and on any
+  absent needed key instead of degrading to `_args = {}` (which let downstream nodes read
+  `undefined` and fabricate). Keep large values **by reference** (`materialize: file` inputs,
+  `*_path` conventions) so only short paths ride in `args`.
 - **⚠️ Gate / node id collisions are blocked.** Gate ids share the `${id...}` ref namespace with node
   ids, so a gate id must be unique among gates **and** disjoint from every node id — a collision is a
   validate block.
