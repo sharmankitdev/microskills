@@ -1,3 +1,9 @@
+## [0.12.0](https://github.com/sharmankitdev/microskills/compare/v0.11.0...v0.12.0) (2026-06-10)
+
+### Features
+
+* **workflow:** loop on_exhaust — declared cap-exhaustion policy (escalate/fail/continue) ([#16](https://github.com/sharmankitdev/microskills/issues/16)) ([725013b](https://github.com/sharmankitdev/microskills/commit/725013be3f6d344aa7d74c2e02ec2123ed2c1e6c))
+
 ## [0.11.0](https://github.com/sharmankitdev/microskills/compare/v0.10.0...v0.11.0) (2026-06-10)
 
 ### Features
