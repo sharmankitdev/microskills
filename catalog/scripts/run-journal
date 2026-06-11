@@ -38,8 +38,11 @@ Subcommands:
   record-inputs  fold a gathered-inputs JSON file into run-config.json, seed (or
                  refresh the `inputs` of) run-state.json, journal
                  `inputs_recorded` with per-input byte sizes
-  append         append one event (step_complete | resume | run_complete |
-                 run_error); --commit-state atomically promotes a tmp run-state
+  append         append one event (step_complete | resume | pickup |
+                 run_complete | run_error — `pickup` records the interactive
+                 continuation of a parked gate-mode=auto run: the mode
+                 transition is journaled, never inferred);
+                 --commit-state atomically promotes a tmp run-state
                  file to run-state.json first, then sizes are computed from the
                  committed state. --mark-failed-step N (run_error after a failed
                  post-step IO check; never combinable with --commit-state — a
@@ -103,7 +106,7 @@ import time
 from pathlib import Path
 
 JOURNAL_VERSION = 1
-APPEND_EVENTS = ("step_complete", "resume", "run_complete", "run_error")
+APPEND_EVENTS = ("step_complete", "resume", "pickup", "run_complete", "run_error")
 OUTCOMES = ("ok", "skipped", "error")
 
 

@@ -508,3 +508,45 @@ def test_golden_microskill_create_auto_gate_and_guarded_skip():
            and ln["node"] == "finalize"][0]
     assert fin["skipped"] is False
     assert ".claude/.workflow-staging/current/plan.yaml" in fin["prompt"]
+
+
+# ============================================================ pickup rail
+
+@needs_node
+def test_scenario_microskill_create_park_pickup(tmp_path):
+    # The full park→pickup lifecycle: 3 failing evaluator rounds exhaust the
+    # loop unconverged → the auto run PARKS at the loop_exhaust gate
+    # (on_headless: fail) → pickup re-seeds from the committed state in the
+    # SAME run dir and re-presents the parking gate interactively → accept →
+    # finalize → run_complete.
+    rc, data, out, err = run_scenario("microskill-create-park-pickup", tmp_path)
+    assert rc == 0, (json.dumps(data, indent=2) if data else out + err)
+    assert data["ok"] is True
+    # 7 = the 5 auto-phase steps (park at the gate counts) + the re-run gate
+    # + finalize under pickup
+    assert data["steps_run"] == 7
+    assert data["stopped_at"] is None  # pickup finished the run
+
+
+def test_golden_park_pickup_journal_sequence():
+    # Pin the lifecycle order in the committed golden: auto park (stopped,
+    # choice null) → pickup event → SAME gate interactive (choice accept).
+    journal = (GOLDEN_DIR / "microskill-create-park-pickup"
+               / "golden-journal.jsonl").read_text().splitlines()
+    events = [json.loads(l) for l in journal]
+    park = next(e for e in events if e.get("gate") == "loop_exhaust"
+                and e.get("mode") == "auto")
+    assert park["stopped"] is True and park["choice"] is None
+    pk = next(e for e in events if e.get("event") == "pickup")
+    assert pk["from_step"] == 4
+    picked = next(e for e in events if e.get("gate") == "loop_exhaust"
+                  and e.get("mode") == "interactive")
+    assert picked["choice"] == "accept"
+    # order: park before pickup before interactive re-present
+    assert events.index(park) < events.index(pk) < events.index(picked)
+    results = json.loads((GOLDEN_DIR / "microskill-create-park-pickup"
+                          / "golden-results.json").read_text())
+    assert results["results"]["loop"]["converged"] is False
+    assert results["results"]["loop"]["rounds"] == 3
+    assert results["results"]["loop_exhaust"] == {"choice": "accept"}
+    assert results["stopped_at"] is None

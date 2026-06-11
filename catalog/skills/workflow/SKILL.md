@@ -8,7 +8,8 @@ description: >
   human checkpoints per the run manifest. Also handles `/workflow <name> [profile] --plan`
   (preflight: render steps/gates/inputs/executors from the dry-run compile summary, no execution)
   and `/workflow <name> rerun [--from <step|node>]` (deterministic partial re-run of a recorded
-  run on its frozen recorded inputs).
+  run on its frozen recorded inputs) and `/workflow <name> pickup [--run <run-id>]` (interactive
+  continuation of a PARKED gate-mode=auto run from its committed step).
 ---
 
 # workflow
@@ -21,13 +22,15 @@ checkpoint in the main loop (where `AskUserQuestion` works), and threads outputs
 
 **The autonomous engine cannot pause for a human** — so all interaction lives here, between segments.
 
-**Three invocation modes, routed on the args before anything runs:**
+**Four invocation modes, routed on the args before anything runs:**
 - **execute** (default) — Setup → Execute the manifest → Finish, below.
 - **preflight** — `--plan` anywhere in the args → the **Preflight** section: render the compiled
   plan (steps, gates, inputs, executors) and STOP before input gathering. Writes nothing, mints
   no run, asks no questions.
 - **rerun** — the literal token `rerun` directly after the name → the **Rerun** section:
   re-execute a recorded run from a chosen step on its FROZEN recorded inputs.
+- **pickup** — the literal token `pickup` directly after the name → the **Pickup** section:
+  continue a PARKED gate-mode=auto run interactively from its committed step, in the same run dir.
 
 ## Setup
 
@@ -51,6 +54,9 @@ checkpoint in the main loop (where `AskUserQuestion` works), and threads outputs
    def/profile may declare `gate_mode: auto` with no flag at all, and a profile-declared mode wins
    over the flag inside compile). Auto mode means: no human is present — `AskUserQuestion` must
    never be called anywhere in the run; every gate takes its author-declared `default` verbatim.
+   **One exception: a Pickup session** (the Pickup mode below) — the human's explicit `pickup`
+   invocation suspends the auto GATE rules for the remaining steps while the manifest stays
+   stamped auto; every gate asks.
 4. **Read the manifest** — read the `manifest_path` from the compile summary
    (`.claude/workflow-defs/<name>/.compiled/manifest.json`). Note `manifest.manifest_hash`.
 5. **Resume check** — all runtime state is namespaced per run under
@@ -61,7 +67,9 @@ checkpoint in the main loop (where `AskUserQuestion` works), and threads outputs
    It scans `runs/*/run-state.json` for the newest unfinished run (greatest run id) whose stored
    `manifest_hash` equals the current one — a mismatched hash means the workflow was recompiled /
    changed, so stored node outputs no longer line up and that run is simply not offered. (A
-   FINISHED run is never offered here — re-rolling part of one is the Rerun mode.) **Under auto
+   FINISHED run is never offered here — re-rolling part of one is the Rerun mode; a PARKED
+   gate-mode=auto run is invisible to this scan by design — its hash never matches an interactive
+   compile — and is continued via the **Pickup** mode instead.) **Under auto
    mode never ask: skip the offer and start fresh at step 6** (prior run dirs stay as provenance; an
    auto compile has a distinct manifest_hash anyway, so interactive state never matches). Parse the JSON:
    - `found: true` → **offer to resume** via `AskUserQuestion` ("Resume run {run_id} from step
@@ -231,6 +239,70 @@ requirement) needs a changed input, which is a NEW run, never a rerun.
    and journal the step normally. Gates at/after the from-point re-present normally (fresh
    choices).
 
+## Pickup — `/workflow <name> pickup [--run <run-id>]`
+
+Interactive continuation of a PARKED gate-mode=auto run — one that stopped with committed
+run-state at an `on_headless: fail` gate (the `loop_exhaust` exhaustion gate is the marquee case:
+an overnight run parked unconverged, extended with morning guidance) or at an
+interaction-requiring orchestrator node. Pickup is the second half of the declared "do the work
+overnight, approve in the morning" pattern: the auto-committed prefix stays exactly as recorded;
+only the NOT-YET-RUN suffix executes in this session, with interactive gate handling. Pickup
+**requires a human**: under a headless invocation (auto gate mode / `MICROSKILLS_HEADLESS`),
+refuse with a nonzero outcome — a headless pickup is a contradiction in terms.
+
+1. **Locate the parked run** — `--run <run-id>` names `runs/<run-id>` directly: read BOTH its
+   `run-config.json` (the provenance: `manifest_hash`, `profile_used`, `overrides`, `gate_mode`)
+   AND its `run-state.json` (`step_index`, `failed_step` — these two live only in the state file).
+   Otherwise run via Bash:
+   `.claude/scripts/run-journal latest --runs-dir '.claude/workflow-defs/<name>/.compiled/runs'`
+   — no `--manifest-hash`, no `--steps` (the newest committed run, ANY compile — a parked auto
+   run's hash never matches an interactive compile, which is exactly why the normal resume scan
+   cannot see it). `found: false` → stop: nothing to pick up. Note `run_id`, `manifest_hash`,
+   `profile_used`, `overrides`, `gate_mode`, `step_index`, `failed_step`.
+2. **Recompile with the RECORDED provenance** — same move as Rerun step 2: `--profile`, each
+   recorded override verbatim, and `--gate-mode auto` when the recorded `gate_mode` is `"auto"`.
+   Fresh `manifest_hash` must EQUAL the recorded one, else **STOP: the def, registry, or profile
+   changed since the run parked** — its stored results no longer line up; start a fresh run.
+   Never improvise a partial reuse.
+3. **Sanity-check the park** — `step_index >= manifest.steps.length` → the newest run already
+   finished: report that and suggest `--run` for an older parked run. The recorded `gate_mode`
+   not `"auto"` → this is an ordinary interrupted interactive run: hand off to the normal resume
+   offer instead. A non-null `failed_step` equal to `step_index` → surface it (picking up re-runs
+   that step). **`step_index > failed_step` (a POISONED record — the `--run` path bypasses the
+   latest-scan filter that screens these) → REFUSE**: no valid protocol commits past a failed IO
+   check, so the stored results beyond it are untrustworthy; continuing would thread forward
+   exactly the values the IO gate quarantined. Use `rerun --from <failed_step>` (or earlier), or
+   start fresh.
+4. **Adopt the run dir IN PLACE** — pickup continues the SAME run (no new run dir — unlike
+   rerun, nothing is replayed): seed in-memory `inputs` / `results` from
+   `<run_dir>/run-state.json`, set `i = step_index`, and journal the mode transition:
+   `.claude/scripts/run-journal append --run-dir '<run_dir>' --event pickup --step-index <i> --label 'interactive pickup of parked auto run'`.
+5. **Execute the manifest** from `i` with ONE override: **gate handling is interactive for this
+   session.** `manifest.gate_mode: "auto"` stays stamped (the manifest — and its hash — are
+   untouched), but the auto-mode gate rules are SUSPENDED: every remaining gate, starting with the
+   parking gate at step `i`, renders its evidence and asks via `AskUserQuestion`; an
+   interaction-requiring orchestrator node runs normally. A remaining `nested_workflow` checkpoint
+   compiles its child WITHOUT `--gate-mode auto` (the session-interactive override propagates,
+   exactly like auto inheritance does — see the nested checkpoint section). The full extend
+   protocol is available at a picked-up `loop_exhaust` gate. Inputs are already recorded — never
+   re-gather. **Scope honesty: pickup continues the run it is invoked on.** A park INSIDE a nested
+   child (the child run stopped at its own gate, the parent errored at the nested step) is not
+   resumable THROUGH the parent — picking the parent up re-enters the child afresh (now
+   interactive, so it completes, at the cost of re-running the child); the child's own parked run
+   dir stays as provenance. Picking up the CHILD def directly completes the child's run, but the
+   parent cannot adopt that result.
+6. **Finish normally** (`run_complete`). The journal's `pickup` event records the mode
+   transition; the committed prefix is never recomputed.
+
+**Why this is sound despite "interactive run-state never resumes into a headless run":** that
+rail prevents mode-mixing across DIFFERENT compiles — `gate_mode` rides inside `manifest_hash`
+precisely so two compiles with diverging gate behavior never share state. Pickup recompiles the
+IDENTICAL auto manifest (hash-equal by step 2), so topology, semantics, and every committed
+result line up; only the runtime gate handling of steps that have NOT yet run changes, on an
+explicit human invocation. Committed history is never recomputed — with one sanctioned exception:
+an `extend` choice at the picked-up `loop_exhaust` gate re-runs the loop segment and re-commits
+its results through the extend protocol, exactly as it would in any interactive session.
+
 ## Execute the manifest
 
 Maintain `results = {}` (node id → that node's returned output object). Let `M = manifest.steps.length`
@@ -379,7 +451,8 @@ markdown — it is an `output_schema`-shaped object. **Never show raw JSON.** Ma
   list each missing microskill's `name` + one-line `requirement`.
 - **default** → summarize key fields in 2-5 lines of prose; omit internal/verbose fields. Prefer shorter.
 
-**Auto mode (`manifest.gate_mode == "auto"`) — never `AskUserQuestion` at a gate:**
+**Auto mode (`manifest.gate_mode == "auto"`, except a Pickup session — there every gate asks) —
+never `AskUserQuestion` at a gate:**
 - `gate.on_headless == "fail"` → journal a `run_error` (`--label 'gate <id> declares on_headless:
   fail'`) and **STOP with a nonzero outcome, naming the gate**. The committed run-state is resumable
   interactively later — that is the declared "do the work, then hand off to a human" pattern.
@@ -512,7 +585,10 @@ never in a segment.
    when absent). **When this run's mode is auto (`manifest.gate_mode == "auto"`), also pass
    `--gate-mode auto` to the child's compile** — mode inheritance; a child whose merged doc/profile
    DECLARES `gate_mode` keeps its own declaration (inside compile, the doc wins over the flag), so a
-   child profile-declared mode always beats parent inheritance. Then run its manifest, supplying the
+   child profile-declared mode always beats parent inheritance. **EXCEPT under a Pickup session:**
+   the session-interactive override propagates exactly like inheritance does — do NOT pass
+   `--gate-mode auto` to the child (the human is present; the child's gates ask inline). The child
+   therefore compiles its interactive manifest and mints a fresh child run. Then run its manifest, supplying the
    resolved map as the child's gathered `inputs`
    (skip the interactive gathering — the inputs are already provided by the parent; the child still
    mints its OWN run dir under its own def's `.compiled/runs/` and records them, Setup steps 6-8). **Still
@@ -574,7 +650,15 @@ already covered the play-by-play — don't re-summarize each segment here.
   `run_error` naming the step, stop cleanly.
 - **Headless gate stop** — auto mode reached a gate with `on_headless: fail` (or a pausing gate with
   no usable `default` in a hand-edited manifest). Journal `run_error` naming the gate, stop with a
-  nonzero outcome; the run-state stays resumable interactively.
+  nonzero outcome; a TOP-LEVEL park continues later via `/workflow <name> pickup` (a park inside a
+  nested child is out of pickup's scope through the parent — see Pickup step 5).
 - **Headless interaction required** — auto mode reached an orchestrator node whose prompt requires
-  `AskUserQuestion`, or a required input was missing. Journal `run_error` naming the node/input, stop
-  with a nonzero outcome. Never fabricate the human's side.
+  `AskUserQuestion`: journal `run_error` naming the node, stop with a nonzero outcome — pickup
+  continues it interactively. A MISSING REQUIRED INPUT also stops the run, but there is nothing to
+  pick up: inputs are gathered before any step commits, so re-invoke fresh with the input supplied.
+  Never fabricate the human's side.
+- **Pickup hash mismatch** — the provenance recompile's `manifest_hash` differs from the parked
+  run's recorded one (def/registry/profile changed since the park). Stop: the parked state cannot
+  continue under a changed compile; start a fresh run. Never improvise a partial reuse.
+- **Pickup without a human** — `pickup` invoked under auto/headless. Refuse with a nonzero
+  outcome: the entire point of pickup is the human's interactive verdict.
