@@ -844,3 +844,17 @@ def test_report_renders_human_readably(tmp_path):
     assert "run_complete" in out
     # timestamps DO appear in the report (it is the human view, not the projection)
     assert "T" in out.splitlines()[-1]
+
+
+# ============================================================ pickup event
+
+def test_append_pickup_event_accepted(tmp_path):
+    rd, _ = init_run(tmp_path)
+    rc, data, out, err = run("append", "--run-dir", str(rd),
+                             "--event", "pickup", "--step-index", "4",
+                             "--label", "interactive pickup of parked auto run")
+    assert rc == 0, out + err
+    lines = [json.loads(l) for l in
+             (rd / "journal.jsonl").read_text().splitlines()]
+    assert any(l.get("event") == "pickup" and l.get("step_index") == 4
+               for l in lines)

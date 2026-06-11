@@ -1445,6 +1445,30 @@ freezes the recorded input set; re-reviewing a *changed* artifact (the fixed dif
 input, which is a NEW run — the engine-level fix→re-review loop remains a roadmap boundary, not a
 built feature.
 
+**Pickup — `/workflow <name> pickup [--run <run-id>]`.** Interactive continuation of a **parked
+gate-mode=auto run** — one stopped with committed state at an `on_headless: fail` gate (the
+`loop_exhaust` exhaustion gate is the marquee case) or an interaction-requiring orchestrator node.
+The normal resume scan can never see a parked run (its auto-stamped `manifest_hash` never matches
+an interactive compile — by design), so pickup is its own verb: locate the run (`run-journal
+latest` with no `--manifest-hash`, or `--run`), recompile with the recorded provenance exactly
+like rerun (hash equality REQUIRED — a changed def/registry/profile is a hard stop), then adopt
+the run dir **in place** (the same run — no new dir, nothing replayed), journal one `pickup`
+event, and execute the remaining steps with **gate handling forced interactive for the session**
+while the auto-stamped manifest stays byte-identical. Sound because the mode-mixing rail
+(`gate_mode` inside `manifest_hash`) guards DIFFERENT compiles; pickup is the IDENTICAL compile —
+only the runtime gate handling of not-yet-run steps changes, on an explicit human invocation, and
+committed history is never recomputed (one sanctioned exception: an `extend` pick at the picked-up
+`loop_exhaust` gate re-commits the loop step through the extend protocol). Pickup refuses headless
+invocation (no human, no pickup), a recorded `gate_mode` of `interactive` is handed to the normal
+resume offer instead, and the `--run` path refuses a POISONED record (`step_index > failed_step`)
+that the latest-scan filter would have screened. **Scope: pickup continues the run it is invoked
+on.** A remaining nested child compiles WITHOUT inherited auto (the session-interactive override
+propagates), and a park INSIDE a nested child is not resumable through the parent — the parent's
+pickup re-enters the child afresh (interactively); pick up the child def directly only to complete
+the child's own run. This is the second half of the `on_headless: fail` "do the work overnight,
+approve in the morning" pattern — the picked-up `loop_exhaust` gate has the full extend protocol
+available.
+
 **Known boundary — `runs/` isolates runtime state, NOT compiled artifacts.** Two concurrent runs
 of the *same def* compiled with *different profiles/overrides* still race on the shared
 `.compiled/seg-*.js` + `manifest.json`: the second compile rewrites them under the first run's
@@ -1532,12 +1556,12 @@ profiles. This is a documented boundary, not a fixed one.
   to the body with no checkpoint between them merges into the loop's segment and the policy cannot
   attach — compile dies on the full partition; validate blocks the provably-background (`agent:`)
   subset. Separate the neighbor with a hard gate or an orchestrator checkpoint.
-- **A parked headless run (`on_headless: fail`) has no interactive pickup rail yet.** `gate_mode`
-  rides INSIDE `manifest_hash` and the dispatcher treats `manifest.gate_mode: auto` as
-  authoritative — an interactive session either compiles a different hash (flag-passed auto: the
-  parked run is never offered for resume) or resumes straight back into auto mode and stops at the
-  same gate again (profile-declared auto). Pickup today = a fresh interactive run (or a rerun). A
-  resume-into-interactive rail is a roadmap item, not built.
+- **A parked headless run is picked up via `/workflow <name> pickup` — never the resume offer.**
+  `gate_mode` rides INSIDE `manifest_hash`, so an interactive compile never hash-matches a parked
+  auto run and the resume scan is blind to it BY DESIGN; the pickup verb recompiles with the
+  recorded provenance and continues the same run dir with session-interactive gate handling
+  (§12). Without it you'd either never see the parked run (flag-passed auto) or re-park at the
+  same gate (profile-declared auto).
 
 ### YAML-syntax traps (these bite before any DAG rule does)
 

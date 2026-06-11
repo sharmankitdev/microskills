@@ -48,6 +48,14 @@ SCENARIO file (JSON; sibling paths resolve against its directory):
       "checkpoints": { "<node>": <result> },      // orchestrator/nested
                                            // results; an ARRAY (one entry
                                            // per item) for a for_each node
+      "pickup":    true,                   // optional: the auto phase must
+                                           // PARK (on_headless: fail); the
+                                           // harness then re-seeds from the
+                                           // committed run-state in the SAME
+                                           // run dir, journals a `pickup`
+                                           // event, and walks the suffix
+                                           // with `gates` picks standing in
+                                           // for AskUserQuestion
       "goldens":   { "results": "golden-results.json",
                      "journal": "golden-journal.jsonl" }
     }
@@ -68,6 +76,10 @@ live-run-only. A nested_workflow checkpoint is NOT recursed into: run-step
 eval still cross-checks the resolved child inputs, but the child's result
 comes from the scenario. The harness also cannot detect a prompt that
 "requires a human" (the auto-mode stop rule) — scenarios own that judgment.
+Pickup models the locate (run-journal latest, hash/mode cross-checks) and
+the in-place interactive continuation, but NOT the dispatcher's --run
+selection, the provenance RECOMPILE, the headless-pickup refusal, or the
+extend re-run — those stay dispatcher prose, live-run-only.
 
 Usage:
   test-workflow --scenario <scenario.json>
@@ -212,6 +224,7 @@ class Harness:
         self.results = {}
         self.inputs = {}
         self.stopped_at = None
+        self.parked = False  # set ONLY by the auto-mode on_headless:fail stop
         self.steps_run = 0
 
     # ----------------------------------------------------------- setup
@@ -383,6 +396,7 @@ class Harness:
                        "--label", f"gate {gid} declares on_headless: fail")
                 self.stopped_at = {"step": i,
                                    "reason": f"gate {gid}: on_headless fail"}
+                self.parked = True
                 return
             choice = gate.get("default")
             if choice is None:
@@ -454,8 +468,10 @@ class Harness:
         self.commit_step(i, step_label(step))
 
     # ----------------------------------------------------------- walk
-    def execute(self):
-        for i, step in enumerate(self.manifest["steps"]):
+    def execute(self, start=0):
+        steps = self.manifest["steps"]
+        for i in range(start, len(steps)):
+            step = steps[i]
             if step.get("kind") == "segment":
                 self.run_segment(i, step)
                 self.commit_step(i, step_label(step))
@@ -470,6 +486,50 @@ class Harness:
             kernel("run-journal append", RUN_JOURNAL, "append",
                    "--run-dir", str(self.run_dir),
                    "--event", "run_complete", "--outcome", "ok")
+
+    def pickup(self):
+        """The dispatcher's pickup rail, mocked: interactive continuation of
+        the parked auto run IN PLACE (same run dir — pickup is the same run,
+        not a replay). Exercises the REAL locate + provenance rails through
+        the same kernel the dispatcher shells (run-journal latest with no
+        --manifest-hash must find this run with matching hash + auto mode),
+        then mirrors the SKILL contract: re-seed inputs/results from the
+        committed run-state, journal one `pickup` event, and walk the
+        remaining steps with the auto-mode gate rules SUSPENDED (scenario
+        gate picks stand in for AskUserQuestion); the manifest stamp — and
+        the hash — stay untouched."""
+        located = kernel("run-journal latest (pickup locate)", RUN_JOURNAL,
+                         "latest", "--runs-dir",
+                         str(self.def_dir / ".compiled" / "runs"))
+        if not located.get("found"):
+            die("pickup locate found no run — the parked run-state should "
+                "be committed", 1)
+        if Path(located["run_dir"]).resolve() != self.run_dir:
+            die(f"pickup located the wrong run: {located['run_dir']}", 1)
+        if located.get("gate_mode") != "auto":
+            die("pickup target's recorded gate_mode is not auto — an "
+                "interactive run belongs to the resume offer, not pickup", 1)
+        # the provenance recompile rail: recorded hash must equal the live
+        # manifest's (this harness never recompiles between phases, so a
+        # mismatch means the ledger drifted)
+        if located.get("manifest_hash") != self.manifest["manifest_hash"]:
+            die("pickup hash mismatch: recorded "
+                f"{located.get('manifest_hash')} != compiled "
+                f"{self.manifest['manifest_hash']}", 1)
+        state = json.loads(self.run_state.read_text())
+        start = state.get("step_index")
+        if start != located.get("step_index"):
+            die("pickup locate step_index disagrees with run-state", 1)
+        self.inputs = dict(state.get("inputs") or {})
+        self.results = dict(state.get("results") or {})
+        kernel("run-journal append (pickup)", RUN_JOURNAL, "append",
+               "--run-dir", str(self.run_dir), "--event", "pickup",
+               "--step-index", str(start),
+               "--label", "interactive pickup of parked auto run")
+        self.journal({"event": "pickup", "from_step": start})
+        self.auto = False
+        self.stopped_at = None
+        self.execute(start=start)
 
     # ----------------------------------------------------------- goldens
     def normalize(self, text):
@@ -553,6 +613,16 @@ def main():
     h.gather_inputs()
     h.record_inputs()
     h.execute()
+    # Scenario-declared pickup: the run must have PARKED (the auto-mode
+    # on_headless: fail stop specifically — an interactive abandon or any
+    # other stop is NOT a park and must not be silently continued); then
+    # continue it interactively in the same run dir.
+    if h.scen.get("pickup"):
+        if not h.parked:
+            die("scenario declares pickup: true but the run never PARKED "
+                "(the auto-mode on_headless: fail stop) — an interactive "
+                "stop/abandon is not picked up; fix the fixtures", 1)
+        h.pickup()
     mismatches = h.diff_goldens()
 
     summary = {
