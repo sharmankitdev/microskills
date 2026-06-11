@@ -1,13 +1,13 @@
 ---
 name: collect-findings
-description: "Use after a code-review workflow's per-dimension reviews complete, when you have up to six optional dimension result objects (correctness, security, performance, style, documentation, test_coverage), each shaped {dimension, findings}, and need them fanned in. Concatenates the supplied findings arrays into one flat list, stamps each finding with its source dimension, assigns each a workflow-wide global_id, and drops exact duplicates sharing file, line, and title. Produces a single JSON object {findings, count}."
+description: "Use after a review workflow's per-dimension reviews complete, when you have optional dimension result objects (base names six code-review dimensions; other profiles declare their own input names), each shaped {dimension, findings}, and need them fanned in. Concatenates the supplied findings arrays into one flat list — flattening any input that is itself an array of result objects into its elements first — stamps each finding with its source dimension, assigns workflow-wide global_ids, and drops exact duplicates sharing file, line, and title. Produces a single JSON object {findings, count}."
 ---
 
 # Collect Findings
 
 ## Purpose
 
-Given up to six optional per-dimension review results, concatenate their findings into one flat list, stamp each finding with its source dimension, assign workflow-wide global_ids, drop exact (file, line, title) duplicates, count the survivors, and return {findings, count}.
+Given the supplied optional per-dimension review results, concatenate their findings into one flat list, stamp each finding with its source dimension, assign workflow-wide global_ids, drop exact (file, line, title) duplicates, count the survivors, and return {findings, count}.
 
 ## Inputs
 
@@ -22,7 +22,7 @@ Given up to six optional per-dimension review results, concatenate their finding
 
 ## Steps
 
-1. **Concatenate findings** — Concatenate the findings arrays from every supplied dimension input (correctness, security, performance, style, documentation, test_coverage) into one combined flat list.
+1. **Concatenate findings** — Concatenate the findings arrays from every supplied optional dimension result object into one combined flat list, flattening any supplied input that is itself an array of result objects (a fan-out's per-item results) into its elements before concatenation.
 2. **Stamp dimension** — Stamp every finding with the dimension name taken from its source result's dimension field.
 3. **Assign global ids** — Assign every finding a workflow-wide sequential global_id over the combined list.
 4. **Drop duplicates** — Drop exact duplicate findings that share the same file, line, and title, keeping the first occurrence.
@@ -35,6 +35,6 @@ A single JSON object {findings, count} returned as the structured result (nothin
 
 ## Failure modes
 
-- **No dimension input supplied** — all six dimension inputs are absent; stop, state that at least one dimension result is required, do not proceed.
+- **No dimension input supplied** — every declared dimension input is absent; stop, state that at least one dimension result is required, do not proceed.
 - **Dimension input not an object with findings** — a supplied dimension input is not an object carrying a findings array; stop, name the offending input, do not proceed.
 - **Findings value not an array** — a supplied dimension result's findings value is not an array; stop, name the offending dimension, do not proceed.

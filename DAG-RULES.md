@@ -569,7 +569,7 @@ replacing the hand-cloned-siblings pattern (N near-identical nodes differing onl
   expand:
     over: [correctness, security, performance] # one generated sibling per entry
   inputs:
-    diff_path: ${workflow.inputs.diff_path}
+    artifact_path: ${workflow.inputs.diff_path}
     change_summary: ${summarize.output}        # the ref implies summarize -> each generated sibling
 
 - id: collect                                  # the paired FAN-IN

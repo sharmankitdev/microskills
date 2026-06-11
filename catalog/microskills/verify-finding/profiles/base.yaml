@@ -1,14 +1,20 @@
 version: 1
-# `diff_path` is passed by reference (`materialize: file`; the body Reads it) —
-# critical here because verify-finding fans out per finding, so an inline diff
-# would be duplicated into every parallel call.
+# `artifact_kind` names WHAT the finding cites. Substituted as {{artifact_kind}}
+# in the inputs table and the read step. Base = the code-review diff; a
+# document-review profile (e.g. `document`) overrides it.
+vars:
+  artifact_kind: unified git diff
+# `artifact_path` is passed by reference (`materialize: file`; the body Reads
+# it) — critical here because verify-finding fans out per finding, so an inline
+# artifact would be duplicated into every parallel call. `seat` is optional with
+# a null default (single-judge mode), so it needs no entry.
 inputs:
   finding:
     required: true
-  diff_path:
+  artifact_path:
     required: true
     materialize: file
-# The body Reads the diff file at diff_path, so Read must be allowlisted.
+# The body Reads the artifact file at artifact_path, so Read must be allowlisted.
 runtime:
   allowed_tools: [Read]
 output_schema:

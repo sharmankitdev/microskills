@@ -5,21 +5,31 @@ version: 1
 # prose, the output `dimension` field, and the dimension-prefixed finding id.
 # Default = correctness; a per-dimension profile overlay (security / performance
 # / style) overrides this for each fan-out branch.
+#
+# `artifact_kind` names WHAT is being reviewed. Substituted as {{artifact_kind}}
+# in the inputs table, the read/scan steps, and the not-parseable failure mode.
+# Base = the code-review diff; a document-review profile (e.g. req-nfr,
+# internal-consistency) overrides it to the document kind it reviews.
 vars:
   dimension: correctness
+  artifact_kind: unified git diff
 
-# `diff_path` is Required=yes in the MICROSKILL.md table, so the resolver needs
-# inputs.diff_path.required: true to gather it at runtime; it is passed by
-# reference (`materialize: file`; the body Reads it). `change_summary` is optional
-# with a null default, so it needs no entry. No input declares a non-null default.
+# `artifact_path` is Required=yes in the MICROSKILL.md table, so the resolver
+# needs inputs.artifact_path.required: true to gather it at runtime; it is passed
+# by reference (`materialize: file`; the body Reads it). `context_path` is
+# optional grounding material, also by reference (null = no grounding).
+# `change_summary` is optional with a null default, so it needs no entry. No
+# input declares a non-null default.
 inputs:
-  diff_path:
+  artifact_path:
     required: true
     materialize: file
+  context_path:
+    materialize: file
 
-# The body Reads the diff file at diff_path, so Read must be allowlisted. A
-# per-dimension overlay (security/style) adds runtime.model — it deep-merges with
-# this allowed_tools, so both survive.
+# The body Reads the artifact file at artifact_path, so Read must be allowlisted.
+# A per-dimension overlay (security/style) adds runtime.model — it deep-merges
+# with this allowed_tools, so both survive.
 runtime:
   allowed_tools: [Read]
 
