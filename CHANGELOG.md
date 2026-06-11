@@ -1,3 +1,9 @@
+## [0.14.0](https://github.com/sharmankitdev/microskills/compare/v0.13.0...v0.14.0) (2026-06-11)
+
+### Features
+
+* **microskill:** generalize review trio to artifact_path ([#18](https://github.com/sharmankitdev/microskills/issues/18)) ([a75226a](https://github.com/sharmankitdev/microskills/commit/a75226a0317fb6fc892cfde48b1482a531378cbb))
+
 ## [0.13.0](https://github.com/sharmankitdev/microskills/compare/v0.12.0...v0.13.0) (2026-06-11)
 
 ### Features
