@@ -1,3 +1,9 @@
+## [0.13.0](https://github.com/sharmankitdev/microskills/compare/v0.12.0...v0.13.0) (2026-06-11)
+
+### Features
+
+* **workflow:** pickup rail — interactive continuation of parked headless runs ([#17](https://github.com/sharmankitdev/microskills/issues/17)) ([ff02f07](https://github.com/sharmankitdev/microskills/commit/ff02f0705c3c303d3cc26d0b5f94e4b54d4bac91))
+
 ## [0.12.0](https://github.com/sharmankitdev/microskills/compare/v0.11.0...v0.12.0) (2026-06-10)
 
 ### Features
