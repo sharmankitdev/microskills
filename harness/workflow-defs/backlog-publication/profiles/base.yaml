@@ -1,0 +1,7 @@
+version: 1
+
+# Interactive, local publish — the default profile. Empty by design: rigor is
+# profile-invariant (every loop/refute/park lives in the base graph), so the base
+# overlay only names itself as the default.
+profile:
+  default: base

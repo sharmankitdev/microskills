@@ -1,0 +1,10 @@
+version: 1
+
+# Headless, local publish. ONE line of policy: rigor is profile-invariant — no node is
+# added/removed/weakened, no T5 prompt is patched, no on_exhaust default is declared.
+# The run does ALL the work, then parks honestly: at the synthetic loop_exhaust gate if
+# traceability never converged (on_headless: fail), at a T5 triage node if its red guard
+# fired (its prompt requires AskUserQuestion — the dispatcher stops naming the node), and
+# ALWAYS at approve_publish (defaultless, on_headless: fail — the pipeline's one
+# mandatory human gate). Morning path: /workflow backlog-publication pickup.
+gate_mode: auto
