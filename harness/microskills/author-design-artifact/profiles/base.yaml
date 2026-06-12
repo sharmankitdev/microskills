@@ -1,0 +1,35 @@
+version: 1
+
+# The active design contract the body composes the document along. Substituted as
+# {{design_contract}} throughout the MICROSKILL.md body (purpose, compose step,
+# output), so the contract flows into the rendered prose. Base ships a generic
+# design-document contract; a domain profile overlay overrides this with its own
+# contract.
+vars:
+  design_contract: structured design document
+
+# primary_path and output_dir are Required=yes in the MICROSKILL.md table, so the
+# resolver needs inputs.<name>.required: true to gather them at runtime.
+# primary_path and context_path are large/multi-shape inputs passed by reference
+# (`materialize: file`; the body Reads them). No input declares a non-null
+# default, so no `default` entries appear here.
+inputs:
+  primary_path:
+    required: true
+    materialize: file
+  output_dir:
+    required: true
+  context_path:
+    materialize: file
+
+# The body Reads the upstream artifact and optional context files and Writes the
+# composed design document, so Read and Write must be allowlisted.
+runtime:
+  allowed_tools: [Read, Write]
+
+output_schema:
+  type: object
+  required: [document_path, summary]
+  properties:
+    document_path: { type: string }
+    summary: { type: string }
