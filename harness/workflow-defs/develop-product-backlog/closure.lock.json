@@ -1,0 +1,12 @@
+{
+  "manifest_hash": "9a5e47057675bd4297deabe43349984fad3fcb99cdf46accf6d5241d87bd8656",
+  "name": "develop-product-backlog",
+  "node_fingerprints": {
+    "backlog_publication": "46cd0acfe956deacffc945dedcbba8b23e2d9b12b9c34691a28d738e2a09b47a",
+    "classify": "8eb8d4b2bbac83daf8f04f4218b640e6117c7b03490170c09efa2f96e47f833b",
+    "requirements": "9f83db161a22285780a8251064429988745945f6f40b065a8c05b3e7b4e52a47",
+    "technical_design": "140565a189cf26f0688845658c157725f6b2590acfdacdbdc25bb427ba64d60a",
+    "ux": "3f69b9d04e1d3b387327a1a7a0fabacb5807d6f52bfb9f891f6515646d588b44"
+  },
+  "profile_used": "base"
+}

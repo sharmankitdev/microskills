@@ -1,0 +1,244 @@
+version: 1
+name: develop-product-backlog
+description: >-
+  Thin conductor for the greenfield product-design cycle: refine requirements (nested,
+  self-rigorous), classify the product, run UX design for UI products (nested), run technical
+  design (nested), then generate, verify, and publish the backlog (nested — hosts the one
+  mandatory pre-publication human gate, approve_publish).
+
+# Every workflow: target below MUST be allowlisted here (DAG-RULES §3 imports).
+imports: [refine-requirements, ux-design, technical-design, backlog-publication]
+
+# Caller-supplied inputs (referenced as ${workflow.inputs.<name>}). File-shaped inputs ride
+# by reference (materialize: file) — 37KB-args-safe by construction; no spill_outputs anywhere.
+inputs:
+  sources_path:
+    type: string
+    required: true
+    materialize: file
+    description: >-
+      The product-idea material to assimilate — a raw brain-dump, a single file, or a
+      directory of notes. Threaded to refine-requirements, which Reads the path.
+  output_dir:
+    type: string
+    required: true
+    description: >-
+      Artifact root. Every stage writes and Reads under here (requirements doc, wireframes,
+      HLD/LLDs, backlog, evidence/ ledgers).
+  document_name:
+    type: string
+    required: false
+    description: >-
+      Optional filename of the requirements document under output_dir. Pure pass-through to
+      refine-requirements (which defaults it to requirements.md when absent).
+  template_path:
+    type: string
+    required: false
+    materialize: file
+    description: >-
+      Optional custom SE requirements template. Pass-through to refine-requirements; absent →
+      the assimilator's built-in template.
+  prior_answers_path:
+    type: string
+    required: false
+    materialize: file
+    description: >-
+      Optional previously-gathered gap answers, letting a caller seed or resume requirements
+      refinement. Pass-through to refine-requirements.
+  max_iterations:
+    type: integer
+    required: false
+    default: 5
+    description: >-
+      Safety cap on bounded refinement/revision rounds inside the leaves that declare one
+      (refine-requirements clarify rounds; ux-design revision loop).
+  staging_dir:
+    type: string
+    required: false
+    default: .claude/.workflow-staging/develop-product-backlog
+    description: >-
+      Scratch dir for leaf-internal ledgers (e.g. the clarify gap-answer ledger). Threaded to
+      the leaves that declare it.
+  github_repo:
+    type: string
+    required: false
+    description: >-
+      GitHub publish profiles only; forwarded to backlog-publication, which declares it
+      OPTIONAL — resolves to null on every base/local run (no default here, deliberately;
+      the github profiles treat null as "publish to the current repo").
+
+nodes:
+  # ── Stage 1: requirements — nested refine-requirements (AUGMENTED, self-rigorous leaf) ─────
+  # workflow: node => always an orchestrator checkpoint (DAG-RULES §5d). POST-B1: the leaf owns
+  # ALL requirements rigor (panel, closure refute, parks); its output.from is the UNGUARDED,
+  # always-non-null assemble_req_evidence, so the S1 output_schema below is a contract-
+  # guaranteed deref surface (check-step-io validates the stored child result before commit).
+  # No customize in base: the child's own default profile applies; the autonomous overlays
+  # patch one in (child profile-declared gate_mode wins over parent inheritance, §8).
+  - id: requirements
+    workflow: refine-requirements
+    inputs:
+      sources_path: ${workflow.inputs.sources_path}
+      output_dir: ${workflow.inputs.output_dir}
+      document_name: ${workflow.inputs.document_name}
+      template_path: ${workflow.inputs.template_path}
+      prior_answers_path: ${workflow.inputs.prior_answers_path}
+      max_iterations: ${workflow.inputs.max_iterations}
+      staging_dir: ${workflow.inputs.staging_dir}
+    # S1 parent-side contract (MULTIAGENTIC-DESIGN §2.0): the binding child interface — a leaf
+    # returning a prose summary or a fabricated null stops the parent run instead of riding on.
+    output_schema:
+      type: object
+      required: [document_path, ledger_path, evidence, escalations, unresolved_count, summary]
+      properties:
+        document_path: { type: string }
+        ledger_path: { type: string }
+        evidence:
+          type: object
+          properties:
+            report_path: { type: string }
+            tallies: { type: object }
+        escalations:
+          type: array
+          items:
+            type: object
+            required: [kind, ref, detail]
+            properties:
+              kind: { type: string }
+              ref: { type: string }
+              detail: { type: string }
+        unresolved_count: { type: integer }
+        summary: { type: string }
+
+  # ── Stage 2: classify — use: classify-product (background, Read-only) ──────────────────────
+  # The ${requirements.output.document_path} ref IMPLIES the requirements -> classify edge
+  # (§4 — never restated in depends_on). Output shape inherited from the resolved microskill:
+  # {product_kind, has_ui, confidence, rationale, summary}.
+  - id: classify
+    use: classify-product
+    inputs:
+      requirements_path: ${requirements.output.document_path}
+
+  # ── Stage 3: ux — nested ux-design leaf, UI products only ──────────────────────────────────
+  # when: reads the small boolean has_ui (the ref implies classify -> ux). Skip → stored null;
+  # every downstream consumer takes ${ux.output} as a WHOLE null-safe value (F2 — no field
+  # deref ever touches a nullable ref). Explicit customize: {profile: base} must resolve to a
+  # child profiles/base.yaml (leaf obligation L2; checked by validate --defs-root, §5d).
+  - id: ux
+    workflow: ux-design
+    when: ${classify.output.has_ui}
+    customize: { profile: base }
+    inputs:
+      requirements_path: ${requirements.output.document_path}
+      product_kind: ${classify.output.product_kind}
+      output_dir: ${workflow.inputs.output_dir}
+      max_iterations: ${workflow.inputs.max_iterations}
+      staging_dir: ${workflow.inputs.staging_dir}
+    # S2 parent-side contract: a guarded skip → null is a legal skip; a non-null result is
+    # validated by check-step-io against this schema before commit.
+    output_schema:
+      type: object
+      required: [wireframes_path, evidence, escalations, summary]
+      properties:
+        wireframes_path: { type: string }
+        evidence: { type: object }
+        escalations: { type: array }
+        summary: { type: string }
+
+  # ── Stage 4: technical design — nested technical-design leaf ───────────────────────────────
+  # S3 seam (B4 resolution): classification rides WHOLE (${classify.output} — non-null, classify
+  # is unguarded background), feeding the leaf's internal-consistency dimension — the machine
+  # cross-check on the take-default classification gate. ux rides WHOLE and null-safe (null on
+  # non-UI runs; the leaf treats null as "no UX", never derefs a field of it). The old flat
+  # product_kind/has_ui/staging_dir wires are deleted per S3 (the leaf declares none of them).
+  - id: technical_design
+    workflow: technical-design
+    customize: { profile: base }
+    inputs:
+      requirements_path: ${requirements.output.document_path}
+      classification: ${classify.output}
+      ux: ${ux.output}
+      output_dir: ${workflow.inputs.output_dir}
+    # S3 parent-side contract.
+    output_schema:
+      type: object
+      required: [hld_path, lld_set, evidence, escalations, summary]
+      properties:
+        hld_path: { type: string }
+        lld_set:
+          type: array
+          items:
+            type: object
+            required: [document_path, component_name]
+            properties:
+              document_path: { type: string }
+              component_name: { type: string }
+        evidence: { type: object }
+        escalations: { type: array }
+        summary: { type: string }
+
+  # ── Stage 5: backlog publication — nested leaf; hosts THE mandatory human gate ─────────────
+  # The evidence conduit (S4 table, verbatim): gate present: cannot reach parent nodes or
+  # workflow inputs (§8), so everything the leaf's assemble-evidence folds into ledger.json
+  # arrives here as an input. Nullable payloads ride WHOLE (F2): wireframes/ux_evidence (the
+  # same ${ux.output} value on two channels — documented D2 duplication, bytes-cheap; bodies
+  # read the non-null object's wireframes_path field, null = "no wireframes"), github_repo
+  # (null on local runs — OPTIONAL in the leaf). classification_gate_choice is the §8 gate-id
+  # ref form — accepted by validate, implies NO edge. classification_gate_mode is the
+  # PROFILE-LITERAL mode signal for the ledger's gates_taken[].mode (a gate record is {choice}
+  # only, §8): the autonomous overlays patch it to auto-default atomically with gate_mode.
+  - id: backlog_publication
+    workflow: backlog-publication
+    customize: { profile: base }
+    inputs:
+      requirements_path: ${requirements.output.document_path}
+      hld_path: ${technical_design.output.hld_path}
+      lld_set: ${technical_design.output.lld_set}
+      wireframes: ${ux.output}
+      ux_evidence: ${ux.output}
+      requirements_evidence: ${requirements.output}
+      design_evidence: ${technical_design.output}
+      classification: ${classify.output}
+      classification_gate_choice: ${confirm_classification.output.choice}
+      classification_gate_mode: human
+      output_dir: ${workflow.inputs.output_dir}
+      github_repo: ${workflow.inputs.github_repo}
+    # S4 parent-side contract (leaf output).
+    output_schema:
+      type: object
+      required: [published_target, location, ledger_path, summary]
+      properties:
+        published_target: { type: string }
+        location: { type: string }
+        ledger_path: { type: string }
+        summary: { type: string }
+
+# ── Gates ─────────────────────────────────────────────────────────────────────────────────────
+# ONE parent gate (T7 take-default). Anchors the BACKGROUND classify node so revise has a
+# segment to re-run. present: is mechanical — all four paths are declared by classify-product's
+# resolved output_schema (§8 typed present check). Legitimate as take-default because a red
+# requirements floor already parked INSIDE the leaf, and misclassification has a downstream
+# machine net (technical-design's internal-consistency dimension re-derives the classification;
+# a mismatch surfaces as a red HLD verdict and parks at that leaf's loop_exhaust).
+gates:
+  - id: confirm_classification
+    after: classify
+    type: human_approval
+    severity: hard
+    prompt: >-
+      Confirm the product classification — has_ui gates whether the UX design stage runs at
+      all, and product_kind steers the technical design. Approve to proceed, revise to re-run
+      classification with notes, or abandon to stop the run.
+    options: [approve, revise, abandon]
+    default: approve
+    on_headless: take_default
+    present:
+      - classify.output.product_kind
+      - classify.output.has_ui
+      - classify.output.confidence
+      - classify.output.rationale
+
+# The terminal leaf's result {published_target, location, ledger_path, summary} is the
+# workflow's aggregate output.
+output:
+  from: backlog_publication

@@ -1,0 +1,17 @@
+version: 1
+
+# Compose overlay: autonomous (headless, child autonomous profiles, gate-mode record literal)
+# + GitHub publish target. Identical to autonomous.yaml except backlog_publication runs its
+# github-autonomous profile. The mandatory approve_publish gate inside that leaf still parks
+# the headless run (defaultless, on_headless: fail in every profile) — morning path:
+# /workflow backlog-publication pickup.
+gate_mode: auto
+
+nodes:
+  patch:
+    - { id: requirements,     customize: { profile: autonomous } }
+    - { id: ux,               customize: { profile: autonomous } }
+    - { id: technical_design, customize: { profile: autonomous } }
+    - id: backlog_publication
+      customize: { profile: github-autonomous }
+      inputs: { classification_gate_mode: auto-default }
