@@ -20,7 +20,7 @@ Given a user story and a criterion name, adversarially weigh violation against c
 ## Steps
 
 1. **Read story** — Resolve the story text by reading story.path, falling back to story.text inline.
-2. **Select rubric section** — Select the rubric section for criterion from the built-in invest_rubric contract variable.
+2. **Select rubric section** — Select the section for criterion (matched case-insensitively against the section names) from the built-in rubric: {{invest_rubric}}
 3. **Build violation case** — Build the strongest violation case against the story using only the story text and its acceptance criteria, grounded in that rubric section.
 4. **Build compliance case** — Build the strongest compliance case for the story from the same evidence.
 5. **Weigh evidence** — Weigh the two cases on the story evidence, defaulting to refuted when the evidence is ambiguous.

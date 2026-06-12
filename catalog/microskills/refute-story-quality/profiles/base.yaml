@@ -10,7 +10,7 @@ vars:
   invest_rubric: >-
     INVEST rubric — each criterion names a section; the criterion input must
     match one of these names. Independent: a story stands alone and can be
-    built and shipped without depending on another unfinished story or a hidden
+    built and shipped free of reliance on another unfinished story or a hidden
     ordering — violated when it cannot be started or delivered until some other
     story lands first, or when two stories must move together. Negotiable: the
     story states the need and intent, not a frozen contract of implementation

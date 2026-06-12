@@ -1,4 +1,15 @@
 version: 1
+
+# The two body contract vars. Base preserves the original code-review behavior
+# byte-for-byte in MEANING: blocker-driven verdict, inline markdown report.
+# The design profile overrides both (file + sidecar target; major-strict mapping).
+vars:
+  verdict_mapping: >-
+    a surviving blocker-severity finding gives request_changes; only
+    non-blocker survivors give comment; no survivors gives approve.
+  report_target: >-
+    inline only — return the rendered markdown as the report_markdown field of
+    the structured result; write nothing to disk.
 inputs:
   change_summary:
     required: true

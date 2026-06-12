@@ -113,12 +113,13 @@ inputs:
   invest_pair_cap:
     type: integer
     required: false
-    default: 600
+    default: 1800
     description: >-
       Total-assignment scale guard for the INVEST cross-product (stories x lenses x
       seats). expand-assignments stops loud with the counts and split guidance when the
-      computed pair_count exceeds this — a 100-story backlog never silently becomes
-      1200+ refuter invocations in one segment. Raise deliberately for big backlogs.
+      computed pair_count exceeds this. Default 1800 = the publish envelope's 150-story
+      cap x 6 lenses x 2 seats, so the two scale guards describe ONE consistent
+      envelope; a backlog passing INVEST never then dies at the publish cap.
 
 nodes:
   # ── T4 convergence loop body — the leaf's opening block, its OWN segment ────────────

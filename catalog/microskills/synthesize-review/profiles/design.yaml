@@ -1,5 +1,19 @@
 version: 1
 
+# Body contract vars (REPLACE base's): the design pipelines gate their fix /
+# triage paths on request_changes for MAJORS too, and persist the report as a
+# file + machine-readable sidecar the evidence ledgers and triage prompts Read.
+vars:
+  verdict_mapping: >-
+    a surviving blocker- or major-severity finding gives request_changes;
+    only minor-or-lower survivors give comment; no survivors gives approve.
+  report_target: >-
+    write the severity-grouped markdown report to the exact file named by the
+    report_path input (creating parent directories), AND write a .json sidecar
+    next to it (same path + ".json") carrying the verdict, every count field,
+    the merged surviving findings, red_items, and red_findings; return that
+    report_path in the structured result.
+
 # The ONE canonical `design` profile for synthesize-review — MULTIAGENTIC-DESIGN
 # §3.3, pinned VERBATIM (resolves B5a). Document-review synthesis for the
 # requirements / ux-design / technical-design stages: the report is written to

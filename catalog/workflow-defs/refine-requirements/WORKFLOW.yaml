@@ -150,6 +150,9 @@ nodes:
   # Fix pass. Round 1 receives carry null → explicit no-op pass (null-safe linear path; no
   # control flow in the body). Rewrites the document IN PLACE at the stable assemble path, so
   # every downstream consumer keeps one path.
+  # Round 1 is a DELIBERATE no-op pass (null findings/notes -> apply-findings
+  # returns the document unchanged): the loop grammar has no round-conditional,
+  # and one cheap unchanged-return dispatch beats splitting the loop body.
   - id: revise_req
     use: apply-findings-to-document
     depends_on: [clarify]                    # pure ordering; tolerates the guarded skip

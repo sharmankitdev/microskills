@@ -1,5 +1,5 @@
 {
-  "manifest_hash": "594d7734f18e544327880416f70d9777b2a1f2916a9abd4aa3c839f3a86c28ff",
+  "manifest_hash": "3bdfcfa12ebe2932434c2677c6ce3376957588470a9861f4f64271c61aa1041c",
   "name": "technical-design",
   "node_fingerprints": {
     "author_hld": "52e905ef1b7b43907abdd849390630ba06694a8216f750e06a94a9865b3b5708",
@@ -26,10 +26,10 @@
     "review_lld_lld_completeness": "f738f0d621fc1d587d00f8d896ade6ef1198e0ee3a68a16069e9a4107b9b4250",
     "review_lld_lld_feasibility": "b17e4418b40f4cacda3a8930004489a8cb0c169da988abc9fb1ea00c02f59693",
     "review_lld_lld_fidelity": "11580664bbee3a2ac79d32ecb6ac9b609d01da65599947a569c51398cb61e078",
-    "synth_final_hld": "da78dfefd82fdbfb212ba2d7a5d030447b0b81ff8654942de0dd32bf63603914",
-    "synth_hld": "4707fb6811a761bf65bd54313e3faf8f928376f4d7b90771c7fd6bf005d2f399",
-    "synth_lld": "47ceb14f666f972d6fd4bcf3110cf66592dca77e2237aa1a6f8d5049b9e97844",
-    "synth_lld_final": "d597b39dd6a0a4d0c56ade41de0e9fd2e09099a075a503152e37a78f4a917ec4",
+    "synth_final_hld": "63948e93d35d76f9b62653c26ca968ad7ced5327d7fee529664eac1ef44e075e",
+    "synth_hld": "0e792104e8abecd23fd27d58005111bc68a648b76107a940e8828669f38b8508",
+    "synth_lld": "88d2019603487977d6c87a12130a4706576fc3fc51eec63821a0aea1f21e4302",
+    "synth_lld_final": "03052d248b517c83f88e28202bc1e66841f25a39a46e7f74337ec910099fde01",
     "synthesize_winner": "816acf3c00d61e86bb77b9ee9196c1a2641a45924a46fef478ae1be3e71aacd5",
     "triage_lld": "3c40d84e3cf36561543faea2f39f31e5ab00dd15ee1bc2e6e77d4b0a7fb289d6"
   },

@@ -30,7 +30,7 @@ Given per-seat verdicts and the originating assignment object, deterministically
 2. **Join and group** — Join each verdict to its assignment seat by its echoed finding_id key — matched against the pair's item id directly (a lens-less assignment, e.g. closure claims) and against the composite `<item id>:<lens>` form (a lensed assignment, e.g. story × criterion) — grouping the joined seats by item-identity × lens.
 3. **Tally each group** — Tally each group under the majority rule — majority non-refute → upheld, majority refute → refuted; treat each missing or null verdict (verdicts_received below the group's pair_count) as a counted shortfall and route ties, shortfalls, and undecidables → needs_human.
 4. **Partition and count** — Partition the groups into upheld, refuted, and needs_human lists, compute the counts (upheld_count, refuted_count, needs_human_count, attention_count, blocker_count, group_count, pair_count, verdicts_received), and assemble the seats list as the distinct seat numbers carried by the assignment object's pairs.
-5. **Derive verdict** — Derive the overall verdict from the surviving groups' severities — surviving blocker or major → request_changes, surviving minor only → comment, none → approve.
+5. **Derive verdict** — Derive the overall verdict from the refuted and needs_human groups' severities — blocker or major → request_changes, minor only → comment, none → approve; a group whose verdicts carry no severity (e.g. closure-claim votes) counts as major.
 6. **Write report** — Write the full tally report to the file at report_path.
 7. **Return tally** — Return the structured tally object, including report_path and a one-line summary.
 

@@ -199,6 +199,12 @@ nodes:
       artifact_path: ${finding.file}
 
   # Join refute verdicts → the gate-facing verdict + vote tallies + evidence report.
+  # KNOWN PAYLOAD BOUNDARY (review R4, accepted): the merged findings array
+  # crosses checkpoints inline here — synthesize-review's findings input needs
+  # the VALUE, so spill cannot apply; the severity-filtered refute driver keeps
+  # the set small, and an oversized payload fails LOUD at run-step's args
+  # budget (never silent truncation). Engine-level by-reference field readers
+  # are the recorded roadmap fix.
   - id: synth_final_hld
     use: synthesize-review
     customize: { profile: design }
