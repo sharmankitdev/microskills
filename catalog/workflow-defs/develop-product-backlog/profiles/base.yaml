@@ -1,0 +1,7 @@
+version: 1
+
+# Default profile for develop-product-backlog — interactive, local publish. Empty overlay:
+# all gate policy and child-profile pins already live in WORKFLOW.yaml (every leaf node pins
+# customize: {profile: base} explicitly — leaf obligation L2). Present as the documented
+# tuning seam and to name the default.
+profile: { default: base }

@@ -1,0 +1,26 @@
+version: 1
+
+# requirements_path is Required=yes in the MICROSKILL.md table, so the resolver needs
+# inputs.requirements_path.required: true to gather it at runtime; it is passed by
+# reference (`materialize: file`; the body Reads it). The input has no non-null default,
+# so it carries no `default` line.
+inputs:
+  requirements_path:
+    required: true
+    materialize: file
+
+# The body's only tool action is Reading the document at requirements_path; it writes no
+# file (the classification is the structured return). So Read is the sole allowlisted tool,
+# keeping a workflow `use:` node a pure BACKGROUND segment.
+runtime:
+  allowed_tools: [Read]
+
+output_schema:
+  type: object
+  required: [product_kind, has_ui, confidence, rationale, summary]
+  properties:
+    product_kind: { type: string }
+    has_ui: { type: boolean }
+    confidence: { type: string, enum: [high, medium, low] }
+    rationale: { type: string }
+    summary: { type: string }

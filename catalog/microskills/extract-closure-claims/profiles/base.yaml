@@ -1,0 +1,34 @@
+version: 1
+inputs:
+  gaps:
+    required: true
+  document_path:
+    required: true
+  answers_path:
+    materialize: file
+  refinement_record: {}
+# The body Reads the document and the optional answers ledger; it writes nothing. Pinning the tool surface
+# (matching every sibling file-touching microskill).
+runtime:
+  allowed_tools: [Read]
+
+output_schema:
+  type: object
+  required: [claims, claim_count, still_open, still_open_count]
+  properties:
+    claims:
+      type: array
+      items:
+        type: object
+        required: [id, gap_id, section, question, closure_excerpt]
+        properties:
+          id: { type: string }
+          gap_id: { type: string }
+          section: { type: string }
+          question: { type: string }
+          closure_excerpt: { type: string }
+    claim_count: { type: integer }
+    still_open:
+      type: array
+      items: { type: object }
+    still_open_count: { type: integer }

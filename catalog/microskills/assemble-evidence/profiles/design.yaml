@@ -1,0 +1,162 @@
+version: 1
+
+# Technical-design-stage ledger overlay for assemble-evidence
+# (MULTIAGENTIC-DESIGN §3.2 / seam S3 — minted for the technical-design leaf's
+# finalize_design node). Three deltas, per the W7 one-base-plus-scope-var
+# mechanism:
+#   1. vars.ledger_scope REPLACES base's consolidated-pipeline scope (scalar
+#      replace) with this stage's record contract. The three review inputs are
+#      report PATHS by design (37KB args boundary): the body Reads each
+#      report's .json sidecar — verdict objects are never threaded inline.
+#   2. inputs registers the record names the leaf wires (the collect-findings
+#      optional-input precedent: empty maps — optional, null default;
+#      declaring the name is the whole point). output_dir stays required via
+#      base; base's pipeline record inputs deep-merge in and go unsupplied.
+#      gates_mode arrives as a literal `human` from the leaf's base graph; the
+#      leaf's autonomous overlay patches the NODE input to `auto-default` — a
+#      workflow-side patch, so nothing mode-related changes in this file (W1).
+#   3. output_schema REPLACES base wholesale (resolver replace rule) with the
+#      S3 stage record the parent declares on its technical_design node.
+# runtime.allowed_tools [Read, Write] inherits from base via deep-merge.
+vars:
+  ledger_scope: >-
+    TECHNICAL-DESIGN STAGE SCOPE (technical-design leaf, seam S3). Expected
+    records: hld_path (the canonical HLD document path), classification (the
+    upstream classification record as a WHOLE object or null; the emitted
+    product_kind and has_ui fields are mapped from it — classification
+    non-null = extract its product_kind and has_ui fields verbatim;
+    classification null (a standalone leaf run) = derive product_kind and
+    has_ui by Reading the HLD document's stated product scope and
+    user-interface sections), components (the HLD's
+    component array, each {name, responsibility}), lld_set (the LLD fan-out
+    results, each {document_path, component_name}), panel (the architecture
+    judge-panel record — winner_label, winner_path, graft_notes,
+    candidates_considered, judges_heard, judges_path, summary),
+    hld_review_path / lld_review_initial_path / lld_review_path (report PATHS
+    — Read each report's .json sidecar by path for its verdict, tallies, and
+    findings; inline verdict objects are never threaded in), loop_record (the
+    committed HLD-loop pseudo-result {converged, rounds, carry}),
+    triage_record (the triage_lld record {action, remaining_escalations,
+    refreshed_report_path, post_counts}; null = the post-fix LLD review was
+    green, recorded as an explicit "absent" entry), arch_gate_choice /
+    hld_gate_choice / hld_approval_choice (the recorded gate choices), ux (the
+    ux-design stage's whole record or null — recorded, never dereferenced),
+    and gates_mode (the literal mode the active workflow profile stamps on
+    gate records) — each an optional null-safe whole value. Derived counts:
+    components_count = the length of components; lld_count = the length of
+    lld_set; coverage_complete mapping: equal counts with every component
+    named by exactly one lld_set entry = true, any mismatch = false.
+    review_verdicts = {hld: the verdict plus tallies Read from the
+    hld_review_path sidecar, lld: the verdict plus tallies Read from the
+    lld_review_path sidecar}; the lld_review_initial_path sidecar's verdict
+    plus tallies are recorded in the ledger as the pre-fix LLD baseline,
+    stamped beside the final values. Escalation derivation (linear mapping):
+    one needs_human entry per needs_human-verdict survivor in the
+    hld_review_path sidecar and one per needs_human-verdict survivor in the
+    lld_review_path sidecar; every remaining_escalations item of a present
+    triage_record carried verbatim (each already {kind, ref, detail}; a null
+    triage_record contributes zero entries); plus the exhaust-accept entry
+    derived below; unresolved_count = the length of escalations. A present
+    triage_record's refreshed_report_path and post_counts are stamped side by
+    side with the pre-remediation lld_review values in the ledger (a null
+    refreshed_report_path is recorded as "no remediation round ran" — the W2
+    re-commit-by-record convention). gates_taken sources: exactly three
+    entries — {id: confirm_architecture, choice: the arch_gate_choice input,
+    mode: the gates_mode literal}, {id: confirm_hld, choice: the
+    hld_gate_choice input, mode: the gates_mode literal}, and {id: approve_hld,
+    choice: the hld_approval_choice input, mode: the gates_mode literal}.
+    Exhaust-accept derivation: a loop_record whose converged field is false
+    implies an accept was recorded at the exhaustion gate — add one
+    exhaust-accept entry naming the HLD convergence loop. stages_green is
+    ledger-internal for this single-stage scope — the returned object omits
+    it. Ledger location: ledger.md and ledger.json under
+    <output_dir>/evidence/design/; the returned evidence.stage_record_path is
+    the ledger.json path. Returned object: hld_path, components,
+    components_count, product_kind, has_ui, lld_set, lld_count,
+    coverage_complete, review_verdicts, gates_taken, escalations, and
+    unresolved_count as derived above; evidence = {judges_path: the panel
+    judges_path, hld_review_path, lld_review_path, stage_record_path};
+    summary (one line).
+
+inputs:
+  hld_path: {}
+  classification: {}
+  components: {}
+  lld_set: {}
+  panel: {}
+  hld_review_path: {}
+  lld_review_initial_path: {}
+  lld_review_path: {}
+  loop_record: {}
+  triage_record: {}
+  arch_gate_choice: {}
+  hld_gate_choice: {}
+  hld_approval_choice: {}
+  ux: {}
+  gates_mode: {}
+
+# The S3 stage record contract — the parent's technical_design node
+# output_schema.
+output_schema:
+  type: object
+  required: [hld_path, components, components_count, product_kind, has_ui,
+             lld_set, lld_count, coverage_complete, review_verdicts,
+             gates_taken, evidence, escalations, unresolved_count, summary]
+  properties:
+    hld_path: { type: string }
+    components:
+      type: array
+      items:
+        type: object
+        required: [name, responsibility]
+        properties:
+          name: { type: string }
+          responsibility: { type: string }
+    components_count: { type: integer }
+    product_kind: { type: string }
+    has_ui: { type: boolean }
+    lld_set:
+      type: array
+      items:
+        type: object
+        required: [document_path, component_name]
+        properties:
+          document_path: { type: string }
+          component_name: { type: string }
+    lld_count: { type: integer }
+    coverage_complete: { type: boolean }
+    review_verdicts:
+      type: object
+      required: [hld, lld]
+      properties:
+        hld: { type: object }
+        lld: { type: object }
+    gates_taken:
+      type: array
+      items:
+        type: object
+        required: [id, choice, mode]
+        properties:
+          id: { type: string }
+          choice: { type: string }
+          mode: { type: string }
+    evidence:
+      type: object
+      required: [judges_path, hld_review_path, lld_review_path,
+                 stage_record_path]
+      properties:
+        judges_path: { type: string }
+        hld_review_path: { type: string }
+        lld_review_path: { type: string }
+        stage_record_path: { type: string }
+    escalations:
+      type: array
+      items:
+        type: object
+        required: [kind, ref, detail]
+        properties:
+          kind: { type: string }
+          ref: { type: string }
+          detail: { type: string }
+    unresolved_count: { type: integer }
+    summary: { type: string }

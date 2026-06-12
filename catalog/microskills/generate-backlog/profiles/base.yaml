@@ -1,0 +1,36 @@
+version: 1
+
+# The four Required=yes inputs in the MICROSKILL.md table need
+# inputs.<name>.required: true so the resolver gathers them at runtime. The two
+# document inputs (requirements_path, hld_path) are passed by reference
+# (`materialize: file`; the body Reads them) so large documents never ride inline
+# and risk args-size truncation. lld_set is a structured array and output_dir a
+# directory, so neither materializes. No input declares a non-null default.
+inputs:
+  requirements_path:
+    required: true
+    materialize: file
+  hld_path:
+    required: true
+    materialize: file
+  lld_set:
+    required: true
+  output_dir:
+    required: true
+
+# The body Reads the source documents and Writes the backlog files and index, so
+# Read and Write must be allowlisted (the dispatcher's allowed-tools step-prose
+# audit blocks a step naming an unlisted tool).
+runtime:
+  allowed_tools: [Read, Write]
+
+output_schema:
+  type: object
+  required: [backlog_dir, index_path, epic_count, story_count, mvp_story_count, summary]
+  properties:
+    backlog_dir: { type: string }
+    index_path: { type: string }
+    epic_count: { type: integer }
+    story_count: { type: integer }
+    mvp_story_count: { type: integer }
+    summary: { type: string }

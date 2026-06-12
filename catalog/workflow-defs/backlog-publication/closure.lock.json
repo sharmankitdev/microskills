@@ -1,0 +1,16 @@
+{
+  "manifest_hash": "d25570ddfa3e8105fc0bbc9f7fe609bbd2a1ba7ecc80a4b77604f6f728c3a2ea",
+  "name": "backlog-publication",
+  "node_fingerprints": {
+    "assemble_evidence": "fabf118b429f5b9057a9657a4f806232ddcf4b9cd8be58e121f3779f357aa50d",
+    "assign": "c49c7bf282bfb6b1c5a5bce47eeb987baaed63586f7bcd67b47130e10f96f08e",
+    "generate": "2b7ea8fd6d52b425caacc58079f1220593661608006b9e50039d2de3b607104f",
+    "publish": "3a428cf550f2269b9f90d654539786941f06193548e92ab6268495df7f994472",
+    "refute": "64c6bd5f51f9137ffe56e0ce23c89fb4e7713ff61dd6e0e9ac840b840dbc4ba7",
+    "tally": "273b29c6f20e993385abe2503bb96446fe541f3d8108164ea8183ba49715811b",
+    "triage_coverage": "9eaaa72061c3bbaf7f9be124225727a30bffe92c466e88079207bad84c6f4319",
+    "triage_quality": "9b74232142220f4137831120f1932403e9eeb69dd4ada8a7452f5032f54fc6ad",
+    "verify": "9502f6fa6a402b2a75f15490af1498cd2494acf1bac65d6c600b88388a0ce7e5"
+  },
+  "profile_used": "base"
+}

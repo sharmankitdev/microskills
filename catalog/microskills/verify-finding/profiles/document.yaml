@@ -1,0 +1,11 @@
+version: 1
+
+# Document-review overlay for verify-finding (MULTIAGENTIC-DESIGN §3.2 — the ONE
+# shared `document` mint). Swaps ONLY the artifact-kind var: {{artifact_kind}}
+# retargets the read step and the artifact_path input description from base's
+# unified git diff to a design or requirements document. `inputs`, `runtime`,
+# and `output_schema` deep-merge in from base untouched — the SAME adversarial
+# body serves both artifact kinds (its evidence-location step already names the
+# document path: cited section plus referenced lines).
+vars:
+  artifact_kind: design or requirements document (markdown)

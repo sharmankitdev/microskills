@@ -1,0 +1,40 @@
+version: 1
+
+# lld-fix overlay for author-design-artifact (technical-design stage, §3.2).
+# Swaps the design-contract var, flips `target_path` (the existing LLD to
+# revise) from optional to required — a fix without a target is meaningless —
+# and REPLACES output_schema wholesale to keep the component_name join key.
+vars:
+  design_contract: >-
+    lld-fix contract: revise an EXISTING low-level design IN PLACE — the
+    document at the required target_path; the revision overwrites that same
+    path, never relocates it, so the workflow's recorded LLD refs stay
+    truthful through the rewrite. Address the supplied findings, null =
+    nothing for that source: resolve every known_findings entry in its cited
+    section, and resolve every blocker and major finding Read from a non-null
+    prior_findings_path (the review report citing this document). Ground
+    truth for every resolution: the HLD at primary_path — the component's
+    declared responsibility, integration points, and technology choices — and
+    the requirements document at context_path; a fix must not contradict
+    them. A finding unresolvable inside this component's scope is recorded in
+    the document as an explicit "Open question for human review" line, never
+    silently dropped. Preserve the LLD's section structure (module breakdown,
+    API contracts, data models, key sequences, error handling) and the
+    component identity. Return component_name as the component the revised
+    document details, exactly as the HLD names it.
+
+# The target_path flip routes the write to the existing LLD instead of the
+# deterministic output_dir path (base step 4 already honors the override).
+inputs:
+  target_path:
+    required: true
+
+# REPLACES base {document_path, summary} wholesale: component_name keys the
+# post-fix recheck join back to the component's findings.
+output_schema:
+  type: object
+  required: [document_path, component_name, summary]
+  properties:
+    document_path: { type: string }
+    component_name: { type: string }
+    summary: { type: string }

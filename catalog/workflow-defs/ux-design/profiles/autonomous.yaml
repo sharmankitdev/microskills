@@ -1,0 +1,33 @@
+version: 1
+
+# Autonomous overlay — fully headless. Per arch-rigor §0 it changes ONLY pauses,
+# never rigor: the identical panel/refute/loop graph runs in both profiles.
+#   - gate_mode: auto — signoff takes its declared `default: approve`, recorded
+#     verbatim; the synthetic loop_exhaust gate keeps on_headless: fail, so an
+#     unconverged run PARKS honestly (morning path = /workflow ux-design pickup).
+#   - iterate prompt patch — the one sanctioned AskUserQuestion rewrite (the
+#     refine-requirements precedent): gate_mode cannot soften an orchestrator node
+#     that asks, so the unattended pass replaces the human steering rounds.
+#   - finalize.inputs.gates_mode patch — the W1 mode-record literal: gate records in
+#     the stage ledger are stamped auto-default instead of human. NOT a rigor delta.
+# triage_unconverged is deliberately NOT patched: headless-unconverged parks at
+# loop_exhaust before it; headless-converged skips it (guard false -> stored null).
+# It only ever runs interactively (including after a pickup `accept`); patching it
+# is banned (no unattended T5 prompts).
+gate_mode: auto
+nodes:
+  patch:
+    - id: iterate
+      prompt: >
+        UNATTENDED — there is NO human; you MUST NOT call AskUserQuestion. Invoke
+        /microskill author-design-artifact (profile wireframe-revise) exactly ONCE
+        with primary_path=${pick_winner.output.winner_path},
+        context_path=${journeys.output.document_path}, revision_notes=the graft notes
+        from ${pick_winner.output.graft_notes}, and
+        output_dir=${workflow.inputs.output_dir} — it writes the working wireframes
+        document to <output_dir>/ux/wireframes.md. Do exactly one pass (no rounds —
+        there is no one to ask). RETURN {choice: "auto-accepted", wireframes_path,
+        rounds: 1, notes: <the graft notes you applied>}.
+    - id: finalize
+      inputs:
+        gates_mode: auto-default

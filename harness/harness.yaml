@@ -33,6 +33,36 @@ microskills:
   # the refine-requirements workflow.
   - name: assimilate-requirements
     source: plugin
+  # domain: product-development — atomic microskills for the develop-product-backlog
+  # pipeline (MULTIAGENTIC-DESIGN.md), provisioned via microskill-create.
+  - name: classify-product
+    source: plugin
+  - name: judge-artifacts
+    source: plugin
+  - name: synthesize-panel
+    source: plugin
+  - name: extract-closure-claims
+    source: plugin
+  - name: generate-backlog
+    source: plugin
+  - name: verify-traceability
+    source: plugin
+  - name: refute-story-quality
+    source: plugin
+  - name: collect-artifacts
+    source: plugin
+  - name: author-design-artifact
+    source: plugin
+  - name: tally-votes
+    source: plugin
+  - name: apply-findings-to-document
+    source: plugin
+  - name: publish-backlog
+    source: plugin
+  - name: assemble-evidence
+    source: plugin
+  - name: expand-assignments
+    source: plugin
 workflows:
   - name: microskill-create
     source: plugin
@@ -48,4 +78,13 @@ workflows:
   # domain: software-engineering (requirements) — wraps assimilate-requirements with a
   # when-split, bounded gap-refinement loop driven by AskUserQuestion.
   - name: refine-requirements
+    source: plugin
+  # domain: product-development — develop-product-backlog pipeline (MULTIAGENTIC-DESIGN.md).
+  - name: ux-design
+    source: plugin
+  - name: technical-design
+    source: plugin
+  - name: backlog-publication
+    source: plugin
+  - name: develop-product-backlog
     source: plugin

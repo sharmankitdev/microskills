@@ -1,0 +1,17 @@
+version: 1
+inputs:
+  document_path:
+    required: true
+# The body Reads the document and findings context and rewrites the document in place. Pinning the tool surface
+# (matching every sibling file-touching microskill).
+runtime:
+  allowed_tools: [Read, Write]
+
+output_schema:
+  type: object
+  required: [document_path, addressed_count, deferred_count, summary]
+  properties:
+    document_path: { type: string }
+    addressed_count: { type: integer }
+    deferred_count: { type: integer }
+    summary: { type: string }

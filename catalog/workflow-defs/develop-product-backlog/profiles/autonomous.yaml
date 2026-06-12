@@ -1,0 +1,31 @@
+version: 1
+
+# Autonomous overlay — fully headless run up to the mandatory gate, which then PARKS (the
+# defaultless on_headless: fail approve_publish lives INSIDE backlog-publication, in EVERY
+# profile of that leaf — auto-approval of publication is impossible by construction).
+#
+# Rigor is profile-invariant (MULTIAGENTIC-DESIGN §1): this overlay changes ONLY gate_mode,
+# child-profile selection, and the gates_mode record literal. It never adds/removes a panel,
+# refute pass, or loop — those live in the base graphs of the leaves and run in both profiles.
+#
+# gate_mode: auto — confirm_classification takes its declared default (approve), recorded
+# verbatim; the profile-literal classification_gate_mode patch below flips the ledger's
+# gates_taken[].mode signal atomically with it (W1 convention).
+gate_mode: auto
+
+nodes:
+  patch:
+    # The requirements patch is REQUIRED, not belt-and-braces: parent-inherited gate-mode auto
+    # cannot soften an orchestrator prompt — refine-requirements' base clarify node requires
+    # AskUserQuestion whenever gaps exist, so an unpatched headless run would park immediately.
+    # Its autonomous profile (one unattended infer-from-sources pass, open questions left
+    # explicit) is the supported unattended path; child profile-declared gate_mode wins over
+    # parent inheritance (DAG-RULES §8).
+    - { id: requirements,     customize: { profile: autonomous } }
+    - { id: ux,               customize: { profile: autonomous } }
+    - { id: technical_design, customize: { profile: autonomous } }
+    - id: backlog_publication
+      customize: { profile: autonomous }
+      # patch deep-merges into the node's inputs map (§11), flipping the ledger's gate-mode
+      # signal for the classification gate record.
+      inputs: { classification_gate_mode: auto-default }

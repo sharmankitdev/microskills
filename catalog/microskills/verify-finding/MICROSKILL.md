@@ -29,7 +29,7 @@ Given one review finding and the artifact it cites, adversarially weigh the case
 
 ## Output
 
-A single JSON object returned as the skill's result (not written to a file), carrying finding_id (string, echoed from the input finding's id), verdict (one of confirmed, refuted, needs_human), rationale (string explaining how the two cases were weighed on the artifact evidence), adjusted_severity (string or null), and false_positive (boolean). Exactly one object per call.
+A single JSON object returned as the skill's result (not written to a file), carrying finding_id (string, echoed from the input finding's id), verdict (one of confirmed, refuted, needs_human), rationale (string explaining how the two cases were weighed on the artifact evidence), adjusted_severity (string or null), false_positive (boolean), and — for a supplied seat input — the echoed seat (a multi-seat tally joins per-seat verdicts back to their assignments). Exactly one object per call.
 
 ## Failure modes
 

@@ -1,0 +1,39 @@
+version: 1
+
+# `backlog_dir` and `output_dir` are Required=yes in the MICROSKILL.md table, so
+# the resolver needs inputs.<name>.required: true to gather them at runtime. No
+# input declares a non-null default, so no `default` entries. `github_repo` is
+# optional (null default) and needs no entry.
+inputs:
+  backlog_dir:
+    required: true
+  output_dir:
+    required: true
+
+# The active publish target. Substituted as {{publish_target}} throughout the
+# MICROSKILL.md body (description, steps, output) so the target's instruction
+# flows into the rendered prose and the returned `published_target` field. The
+# variable carries ALL target-specific instruction — one linear body serves
+# every target. Base = the local filesystem target; a `github` profile overlay
+# replaces this with its gh milestones/issues instruction.
+vars:
+  publish_target: >-
+    the local filesystem target: write the canonical published backlog layout
+    (epics and stories) plus an index file under output_dir, preserving the
+    source structure read from backlog_dir, and report output_dir as the
+    location where the backlog landed.
+
+# The body Reads the source backlog under backlog_dir and Writes the published
+# artifact set plus its index under output_dir (the Write tool creates missing
+# parent directories). Base is pinned to Read + Write per the requirement; the
+# `github` profile overlay adds Bash (for gh) by deep-merging over this list.
+runtime:
+  allowed_tools: [Read, Write]
+
+output_schema:
+  type: object
+  required: [published_target, location, summary]
+  properties:
+    published_target: { type: string }
+    location: { type: string }
+    summary: { type: string }

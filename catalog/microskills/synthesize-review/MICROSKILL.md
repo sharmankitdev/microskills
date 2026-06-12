@@ -31,13 +31,13 @@ Given a change summary, dimension-tagged findings, and per-finding verifications
 3. **Merge duplicates** — Merge surviving findings that share the same file, line, and root cause into a single consolidated entry.
 4. **Re-rank survivors** — Re-rank the merged survivors by adjusted severity, ordering blocker-severity entries first.
 5. **Tally blockers** — Tally the count of blocker-severity survivors.
-6. **Select verdict** — Select the overall verdict by applying the fixed severity-to-verdict mapping (a surviving blocker gives request_changes, only non-blocker survivors give comment, no survivors gives approve).
-7. **Render report** — Render the markdown report — a change overview drawn from change_summary, then the survivors grouped by severity with their file, line, and suggestion.
-8. **Assemble output** — Assemble and return the JSON object — verdict, blocker_count, a one-line outcome summary, report_markdown, and the merged surviving findings.
+6. **Select verdict** — Select the overall verdict by applying the active severity-to-verdict mapping: {{verdict_mapping}}
+7. **Render report** — Render the markdown report — a change overview drawn from change_summary, then the survivors grouped by severity with their file, line, and suggestion — delivering it per the active report target: {{report_target}}
+8. **Assemble output** — Assemble and return the JSON object matching the active profile's output schema — the verdict, the counts, a one-line outcome summary, the merged surviving findings, and the report delivered per the report target above.
 
 ## Output
 
-A single JSON object returned as the microskill's structured result (not written to disk): verdict (approve | comment | request_changes), blocker_count (integer), summary (a one-line outcome string), report_markdown (the rendered severity-grouped markdown report), and findings (the array of merged surviving findings).
+A single JSON object returned as the microskill's structured result, shaped by the active profile's output schema: the verdict (approve | comment | request_changes — per {{verdict_mapping}}), the count fields, a one-line summary, the merged surviving findings, and the rendered severity-grouped report delivered per {{report_target}}.
 
 ## Failure modes
 

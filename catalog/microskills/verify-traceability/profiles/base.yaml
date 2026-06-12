@@ -1,0 +1,36 @@
+version: 1
+inputs:
+  requirements_path:
+    required: true
+    materialize: file
+  hld_path:
+    required: true
+    materialize: file
+  lld_set:
+    required: true
+  backlog_dir:
+    required: true
+  output_dir:
+    required: true
+output_schema:
+  type: object
+  required: [coverage_ok, uncovered_count, uncovered, needs_human_count, report_path, summary]
+  properties:
+    coverage_ok:
+      type: boolean
+    uncovered_count:
+      type: integer
+    uncovered:
+      type: array
+      items:
+        type: object
+        required: [kind, ref]
+        properties:
+          kind: { type: string }
+          ref: { type: string }
+    needs_human_count:
+      type: integer
+    report_path:
+      type: string
+    summary:
+      type: string

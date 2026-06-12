@@ -1,0 +1,27 @@
+{
+  "manifest_hash": "8d323a262ae45f6570da548896e6ddcf6c27a4d06e1f1302c65cdbb4f5c99f35",
+  "name": "ux-design",
+  "node_fingerprints": {
+    "candidate_hub_dashboard": "55ed178cfdab08a10a5f3154c6d3227ca7c626918a0cc2783ff159986186e846",
+    "candidate_progressive_wizard": "1937c7b85fb211d6a039198e5079e1e7a189e11bce370f44c0a63b3f850463ad",
+    "candidate_task_flow": "76b46489196663c131a032af50f62940d08210844c6d10bbc2423bb691e39c49",
+    "collect": "b706adeba6f0d45aa0e07862e55c7262ebdecd66f4f74b710160ce9dc3277c09",
+    "collect_candidates": "c1128e78cd8033eeefeb262d0b250b6fa634d3060c6c2cf84e8284cc9969046a",
+    "final_synthesize": "bed38ff3916c4d3a783a6a66c4112ddf7b36064d943f066199a7d62b293c23a4",
+    "finalize": "60b3d8168096b302b5901d6a426d9c331e7ffabff6ba973ba208eb2c275d5b5c",
+    "iterate": "02b59e8635fc79c226b89251122911e03f7494b2cca4f2411a996411682b4de3",
+    "journeys": "a5230cc49fd1d0867a26c10e433ba40e58f1bc03390e486b64e06b411ba10aab",
+    "judge_cognitive_load": "57699b518b5a9e3b062a5df996b7a69073c3aa3338688a629d26034ac998cb46",
+    "judge_flow_efficiency": "9255c607a49841dad7b4a95aa57611cc37cb8d96f18d4fb69f6002b2eebb03ca",
+    "judge_journey_fit": "65b7c63a032c3fb941e2b7f65c92c311b008bd4e54304c18b6ef829863b56b7d",
+    "panel_ux_flow_consistency": "3da165f3927ae75666a514f59c92d66d0532e4b1c52c0711b14484cc81df7b8a",
+    "panel_ux_journey_coverage": "bea98f842d18f12b56d9bb1d8822b8f3590ec2623cc6e7b4cdab07834bc69259",
+    "panel_ux_requirements_fidelity": "45b25b3ca3b1549808ade8d47b4801e2a12accf62a07c02a19379013e8ce40f9",
+    "pick_winner": "deb38b87c965fea62a691e1f7c01252d765158cafdccee010d2a70f95d838ceb",
+    "refute": "502062877043aef38cb671066732057ec0d072adfa8e0dd9441d38b3ca1056d4",
+    "revise": "48b7798e80d9bf295b33d91abc684d2fa9f2e55975a22ec3cb30c4ff0d715497",
+    "synth": "01a0d920dc3927b0aadc3727309258979ef0973dbb89a7ad88a7ba481bb65f10",
+    "triage_unconverged": "698d716dcc0c6938b9afae6a8730e10cb2223520dd5126bb99b6bdd2467782c9"
+  },
+  "profile_used": "base"
+}

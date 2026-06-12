@@ -1,0 +1,73 @@
+version: 1
+
+# Body contract vars (REPLACE base's): the design pipelines gate their fix /
+# triage paths on request_changes for MAJORS too, and persist the report as a
+# file + machine-readable sidecar the evidence ledgers and triage prompts Read.
+vars:
+  verdict_mapping: >-
+    a surviving blocker- or major-severity finding gives request_changes;
+    only minor-or-lower survivors give comment; no survivors gives approve.
+  report_target: >-
+    write the severity-grouped markdown report to the exact file named by the
+    report_path input (creating parent directories), AND write a .json sidecar
+    next to it (same path + ".json") carrying the verdict, every count field,
+    the merged surviving findings, red_items, and red_findings; return that
+    report_path in the structured result.
+
+# The ONE canonical `design` profile for synthesize-review — MULTIAGENTIC-DESIGN
+# §3.3, pinned VERBATIM (resolves B5a). Document-review synthesis for the
+# requirements / ux-design / technical-design stages: the report is written to
+# the exact file named by report_path (plus a `.json` sidecar carrying verdict +
+# tallies + findings detail), instead of base's inline report_markdown.
+#
+# inputs: findings (required) · verifications (optional, null = "keep all
+#         findings, join nothing") · change_summary (optional) · report_path
+#         (required — the exact file to write; the body also writes a `.json`
+#         sidecar carrying verdict + tallies + findings detail)
+# runtime.allowed_tools: [Read, Write]
+inputs:
+  findings:
+    required: true          # restates base — the §3.3 contract pins it required
+  verifications:
+    required: false         # flips base's required; null = keep all findings, join nothing
+  change_summary:
+    required: false         # flips base's required; document stages have no diff summary
+  report_path:
+    required: true          # profile-introduced (not in the base Inputs table); every
+                            # stage caller wires the exact evidence-file path to write
+# The design profile writes the report file at report_path (+ .json sidecar),
+# so Write joins Read on the allowlist (base declares no runtime section).
+runtime:
+  allowed_tools: [Read, Write]
+output_schema:        # REPLACES base wholesale (resolver replace rule) — pinned VERBATIM
+  type: object
+  required: [verdict, blocker_count, confirmed_count, refuted_count, needs_human_count,
+             findings, red_items, red_findings, report_path, summary]
+  properties:
+    verdict: { type: string, enum: [approve, comment, request_changes] }
+    blocker_count: { type: integer }
+    confirmed_count: { type: integer }    # 0 when verifications is null
+    refuted_count: { type: integer }
+    needs_human_count: { type: integer }
+    findings: { type: array, items: { type: object } }   # RETAINED — load-bearing loop carry
+                                                         #   (requirements T4; schema-guaranteed)
+    red_items:                                           # surviving blocker/major grouped by
+      type: array                                        #   cited file — the t-d fix fan-out
+      items:                                             #   driver; [] when green/single-doc
+        type: object
+        required: [artifact_path, finding_ids, finding_count]
+        properties:
+          artifact_path: { type: string }
+          finding_ids: { type: array }
+          finding_count: { type: integer }
+    red_findings:                                        # the finding objects whose
+      type: array                                        #   cited file appears in
+      items:                                             #   red_items — the ONLY set a
+        type: object                                     #   post-fix recheck re-adjudicates
+                                                         #   (untouched docs keep their
+                                                         #   original verdicts through the
+                                                         #   join); [] when green
+    report_path: { type: string }
+    summary: { type: string }
+# Verdict mapping pinned (§3.3): surviving blocker/major → request_changes;
+# minor-only → comment; none → approve.

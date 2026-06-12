@@ -1,0 +1,543 @@
+version: 1
+name: technical-design
+description: >-
+  Architecture-candidate judge panel, adversarially hardened HLD (five-dimension review
+  panel inside a bounded convergence loop, then per-finding refute votes), per-component
+  LLD fan-out with cross-product adversarial verification and one bounded fix round,
+  ending in a consolidated stage evidence record (seam S3). Returns the HLD, the
+  component list, the LLD set, and the review verdicts.
+
+# Caller-supplied inputs (referenced as ${workflow.inputs.<name>}). Seam S3
+# (MULTIAGENTIC-DESIGN §2.0): requirements_path + classification + ux + output_dir,
+# plus the leaf-local revision_notes. `classification` and `ux` ride as WHOLE
+# null-safe values into microskill inputs only — no ${...} ref ever dereferences a
+# field of either (F2: a standalone leaf run may legally pass null).
+inputs:
+  requirements_path:
+    type: string
+    required: true
+    materialize: file
+    description: >-
+      The approved requirements document (refine-requirements output). Consuming
+      microskills Read the path.
+  classification:
+    type: object
+    required: false
+    description: >-
+      The parent classify node's whole output ({product_kind, has_ui, confidence,
+      rationale, summary}) or null. The HLD author confirms (or infers when null);
+      the internal-consistency review dimension cross-checks the claim against the
+      design and the requirements on every loop round.
+  ux:
+    type: object
+    required: false
+    description: >-
+      The ux-design leaf's whole result object, or null (no UI / stage skipped).
+      Consumed as a WHOLE value only; microskill bodies treat null as "no UX
+      context" and Read the wireframes document a non-null object's
+      wireframes_path field names.
+  output_dir:
+    type: string
+    required: true
+    description: Artifact root. design/ and evidence/design/ live under it.
+  revision_notes:
+    type: string
+    required: false
+    description: >-
+      Optional standing design guidance folded into HLD authoring. ALSO the
+      loop_exhaust extend-notes target (on_exhaust.notes_input must name a
+      declared workflow input).
+
+# Advisory only — documents the reused microskills; no runtime effect (no workflow: nodes here).
+imports:
+  - microskills/author-design-artifact
+  - microskills/collect-artifacts
+  - microskills/judge-artifacts
+  - microskills/synthesize-panel
+  - microskills/review-dimension
+  - microskills/collect-findings
+  - microskills/verify-finding
+  - microskills/synthesize-review
+  - microskills/assemble-evidence
+
+nodes:
+  # ════ Phase 1 — HLD CANDIDATES: judge panel (T3/P1) ════════════════════════════
+  # Three candidate HLDs from three architecture stances — compile-time static
+  # fan-out; the generated siblings share a dependency rank and run as ONE parallel
+  # batch. Each writes design/candidates/hld-<label>.md and returns
+  # {document_path, label, summary} (the hld-candidate profile schema).
+  - id: candidate
+    use: author-design-artifact
+    customize: { profile: hld-candidate }
+    phase_group: candidates
+    expand:
+      over: [simplicity-first, scale-first, delivery-first]
+    inputs:
+      primary_path: ${workflow.inputs.requirements_path}
+      label: "{{each.item}}"
+      ux: ${workflow.inputs.ux}
+      classification: ${workflow.inputs.classification}
+      output_dir: ${workflow.inputs.output_dir}
+
+  # Deterministic fan-in: ordered candidates array + count. inputs_each tracks the
+  # template's over list automatically — the desugared keys are exactly the
+  # hld-candidates profile's declared input names (simplicity_first / scale_first /
+  # delivery_first).
+  - id: collect_candidates
+    use: collect-artifacts
+    customize: { profile: hld-candidates }
+    inputs_each: candidate
+
+  # Three lens-diverse judges, one lens profile per generated sibling (exactly why
+  # these are expand siblings, not a for_each — a profile is a static literal).
+  # Each judge Reads ALL candidates by path and emits a scorecard keyed by label.
+  - id: judge
+    use: judge-artifacts
+    customize: { profile: "{{each.item}}" }
+    phase_group: judges
+    expand:
+      over: [requirements-fit, simplicity, evolvability]
+    inputs:
+      candidates: ${collect_candidates.output.candidates}
+      requirements_path: ${workflow.inputs.requirements_path}
+
+  # Deterministic vote-join: rank-sum across lenses (ties → earliest entry in the
+  # candidates order), graft notes derived from runner-up strengths, the full
+  # scorecard set persisted at judges_path. Coverage is visible:
+  # candidates_considered / judges_heard tallies (no-silent-caps rule). The
+  # inputs_each keys (requirements_fit / simplicity / evolvability) are the design
+  # profile's declared judge-input names and coexist with the explicit entries.
+  - id: synthesize_winner
+    use: synthesize-panel
+    customize: { profile: design }
+    inputs_each: judge
+    inputs:
+      candidates: ${collect_candidates.output.candidates}
+      judges_path: ${workflow.inputs.output_dir}/evidence/design/judges.json
+
+  # ════ Phase 2 — HLD CONVERGENCE LOOP (T4+P6) — see `loop:` below ═══════════════
+  # confirm_architecture (gates) is ALSO the leading own-segment separator the
+  # on_exhaust rule requires between the panel segment and the loop body.
+  #
+  # Round 1: synthesize the canonical HLD from the winning candidate + graft notes
+  # (a null prior_findings_path = first pass). Rounds 2+: revise against the
+  # previous round's panel report, carried BY PATH (a tiny string). Rewrites
+  # design/hld.md IN PLACE so every downstream reader holds one stable path.
+  # Registry contract (hld profile): primary_path = the winning candidate design,
+  # context_path = the grounding requirements document.
+  - id: author_hld
+    use: author-design-artifact
+    customize: { profile: hld }
+    inputs:
+      primary_path: ${synthesize_winner.output.winner_path}
+      context_path: ${workflow.inputs.requirements_path}
+      graft_notes: ${synthesize_winner.output.graft_notes}
+      prior_findings_path: ${loop.carry.findings_report}
+      revision_notes: ${workflow.inputs.revision_notes}
+      ux: ${workflow.inputs.ux}
+      classification: ${workflow.inputs.classification}
+      output_dir: ${workflow.inputs.output_dir}
+
+  # The adversarial panel — the five mandated dimensions as expand siblings over
+  # the generalized review-dimension (one body, dimension via profile). Loop-body
+  # nodes run serially by design; rounds are bounded at 3. The internal-consistency
+  # sibling additionally receives the threaded classification as its change_summary
+  # grounding object — its rubric carries the classification cross-check that
+  # discharges the design-classification-consistency obligation (B4).
+  - id: review_hld
+    use: review-dimension
+    customize: { profile: "{{each.item}}" }
+    phase_group: hld-review
+    expand:
+      over:
+        - item: internal-consistency
+          inputs:
+            change_summary: ${workflow.inputs.classification}
+        - requirements-fidelity
+        - nfr-coverage
+        - feasibility
+        - security-architecture
+    inputs:
+      artifact_path: ${author_hld.output.document_path}
+      context_path: ${workflow.inputs.requirements_path}
+
+  - id: collect_hld
+    use: collect-findings
+    customize: { profile: design-hld }
+    inputs_each: review_hld
+
+  # Loop verdict for the until-condition. No refute pass in-loop (for_each is a
+  # hard block inside loop.body); `verifications` is OMITTED — the design profile
+  # treats an absent verdict set as "join nothing, keep all findings".
+  - id: synth_hld
+    use: synthesize-review
+    customize: { profile: design }
+    inputs:
+      findings: ${collect_hld.output.findings}
+      report_path: ${workflow.inputs.output_dir}/evidence/design/hld-loop-review.md
+
+  # ════ Phase 3 — POST-LOOP PER-FINDING REFUTE VOTES (T2) ════════════════════════
+  # The synthetic loop_exhaust gate + confirm_hld are the trailing own-segment
+  # separators between the loop body and this fan-out. One adversarial skeptic per
+  # surviving panel finding, against the FINAL HLD (each finding cites
+  # file = the reviewed artifact's path). Post-loop placement can only remove
+  # false positives — sound.
+  - id: refute_hld
+    use: verify-finding
+    customize: { profile: document }
+    # Fans over the SYNTHESIZED (duplicate-merged) finding set — refuting the
+    # pre-merge collection would adjudicate the same defect once per duplicate —
+    # scoped to blocker/major (refuting minors prunes nothing downstream; the
+    # join tolerates absent verdicts). The filter also keeps the checkpoint-
+    # crossing driver small on the exhaust-accept path; an oversized driver can
+    # never truncate SILENTLY — run-step's args budget fails loud by design.
+    for_each: ${synth_hld.output.findings.filter(f => f.severity == 'blocker' || f.severity == 'major')}
+    as: finding
+    max_parallel: 4
+    inputs:
+      finding: ${finding}
+      artifact_path: ${finding.file}
+
+  # Join refute verdicts → the gate-facing verdict + vote tallies + evidence report.
+  # KNOWN PAYLOAD BOUNDARY (review R4, accepted): the merged findings array
+  # crosses checkpoints inline here — synthesize-review's findings input needs
+  # the VALUE, so spill cannot apply; the severity-filtered refute driver keeps
+  # the set small, and an oversized payload fails LOUD at run-step's args
+  # budget (never silent truncation). Engine-level by-reference field readers
+  # are the recorded roadmap fix.
+  - id: synth_final_hld
+    use: synthesize-review
+    customize: { profile: design }
+    inputs:
+      findings: ${synth_hld.output.findings}
+      verifications: ${refute_hld.items}
+      report_path: ${workflow.inputs.output_dir}/evidence/design/hld-review.md
+
+  # ════ Phase 4 — LLD FAN-OUT + CROSS-PRODUCT ADVERSARIAL VERIFY (T2') ═══════════
+  # ⚠ depends_on [synth_final_hld] is PURE ORDERING and LOAD-BEARING — never "clean
+  # it up". lld's only ref-implied deps target author_hld (a loop-BODY node);
+  # without this edge the shared Kahn order makes lld topo-ready mid-body and
+  # interleaves it (and transitively the three review_lld_* siblings) inside the
+  # loop window — loop-contiguity BLOCK in both validate and compile (verified
+  # 2026-06-11, stage-technical-design §9 item 4). The edge carries no ref, so the
+  # redundant-depends_on lint never flags it: it will LOOK droppable; it is not.
+  # Any future post-loop node whose only refs point INTO the loop body needs the
+  # same anchoring edge onto the last pre-existing post-loop node.
+  - id: lld
+    use: author-design-artifact
+    customize: { profile: lld }
+    depends_on: [synth_final_hld]
+    for_each: ${author_hld.output.components}
+    as: component
+    max_parallel: 4
+    inputs:
+      primary_path: ${author_hld.output.document_path}
+      context_path: ${workflow.inputs.requirements_path}
+      focus: ${component.name}
+      ux: ${workflow.inputs.ux}
+      output_dir: ${workflow.inputs.output_dir}
+
+  # 3 LLD dimensions (expand — profile per generated sibling) × N LLD docs (each
+  # sibling carries its OWN inner for_each over ${lld.items}). Background segment,
+  # so max_parallel is honored per sibling. The HLD is each review's contract
+  # source (context_path).
+  - id: review_lld
+    use: review-dimension
+    customize: { profile: "{{each.item}}" }
+    phase_group: lld-review
+    expand:
+      over: [lld-fidelity, lld-completeness, lld-feasibility]
+    for_each: ${lld.items}
+    as: lld_doc
+    max_parallel: 4
+    inputs:
+      artifact_path: ${lld_doc.document_path}
+      context_path: ${author_hld.output.document_path}
+
+  # Fan-in MUST use explicit ${<generated-id>.items} refs, NOT inputs_each (which
+  # desugars to .output refs — undefined against a for_each producer). Each input
+  # arrives ARRAY-shaped (one {dimension, findings} result per LLD doc); the
+  # design-lld profile's concatenation step flattens arrays.
+  - id: collect_lld
+    use: collect-findings
+    customize: { profile: design-lld }
+    inputs:
+      lld_fidelity: ${review_lld_lld_fidelity.items}
+      lld_completeness: ${review_lld_lld_completeness.items}
+      lld_feasibility: ${review_lld_lld_feasibility.items}
+
+  # Refute votes over the collected cross-product findings; each finding cites the
+  # LLD doc it was raised against (file), so the skeptic reads the right artifact.
+  - id: refute_lld
+    use: verify-finding
+    customize: { profile: document }
+    # Scoped to blocker/major findings — the only severities that drive red_items,
+    # fix_lld, and the stage verdict; refuting minors prunes nothing downstream.
+    # With the HLD components cap (maxItems 12) x 3 dims this bounds the fan-out
+    # structurally instead of growing with total finding volume.
+    for_each: ${collect_lld.output.findings.filter(f => f.severity == 'blocker' || f.severity == 'major')}
+    as: finding
+    max_parallel: 6
+    inputs:
+      finding: ${finding}
+      artifact_path: ${finding.file}
+
+  # Pre-fix LLD verdict: refute-verified, red_items grouped by cited document —
+  # the fix fan-out driver.
+  - id: synth_lld
+    use: synthesize-review
+    customize: { profile: design }
+    inputs:
+      findings: ${collect_lld.output.findings}
+      verifications: ${refute_lld.items}
+      report_path: ${workflow.inputs.output_dir}/evidence/design/lld-review-initial.md
+
+  # ════ Phase 5 — ONE UNROLLED FIX ROUND (bounded, NOT a loop) ═══════════════════
+  # The workflow's single loop is spent on the HLD; the LLD fix is one declared
+  # round. Guards read small unspilled fields. fix_lld / recheck_lld share guard
+  # text but are CHAINED (different effective dependency sets), so the
+  # sibling-exclusivity lint never pairs them.
+  - id: fix_lld
+    use: author-design-artifact
+    customize: { profile: lld-fix }
+    when: ${synth_lld.output.verdict == 'request_changes'}
+    for_each: ${synth_lld.output.red_items}
+    as: red
+    max_parallel: 4
+    inputs:
+      target_path: ${red.artifact_path}
+      primary_path: ${author_hld.output.document_path}
+      context_path: ${workflow.inputs.requirements_path}
+      prior_findings_path: ${synth_lld.output.report_path}
+      ux: ${workflow.inputs.ux}
+      output_dir: ${workflow.inputs.output_dir}
+
+  # Targeted re-verify: re-adjudicate each surviving finding against the REWRITTEN
+  # docs (same paths — in-place fix). Refuted-on-recheck = fixed; confirmed = still
+  # red. depends_on is PURE ORDERING (the fix must land before the recheck reads).
+  - id: recheck_lld
+    use: verify-finding
+    customize: { profile: document }
+    when: ${synth_lld.output.verdict == 'request_changes'}
+    depends_on: [fix_lld]
+    # Scoped to red_findings — only findings whose cited document the fix round
+    # actually rewrote get a fresh verdict; untouched documents' findings carry
+    # their original status through the synth_lld_final join (which tolerates
+    # absent verdicts), so no agent re-adjudicates byte-identical content.
+    for_each: ${synth_lld.output.red_findings}
+    as: finding
+    max_parallel: 6
+    inputs:
+      finding: ${finding}
+      artifact_path: ${finding.file}
+
+  # UNCONDITIONAL final LLD verdict — downstream guards always have its fields
+  # (never guard on a field of a conditionally-skipped node). Green path:
+  # recheck_lld skipped → ${recheck_lld.items} is null → the design profile joins
+  # an empty verdict set → the verdict re-derives unchanged. One path, no branch.
+  - id: synth_lld_final
+    use: synthesize-review
+    customize: { profile: design }
+    inputs:
+      findings: ${synth_lld.output.findings}
+      verifications: ${recheck_lld.items}
+      report_path: ${workflow.inputs.output_dir}/evidence/design/lld-review.md
+
+  # ════ Phase 6 — T5 ADVISORY-PARK on remaining red ══════════════════════════════
+  # The conditional-pause mechanism the gate grammar lacks. Interactive: human
+  # triage in the main loop. Headless: the dispatcher STOPS THE RUN NAMING THIS
+  # NODE — an honest park, continuable via the pickup rail. Green path: guard
+  # false → stored null, no pause in either mode. RETURN carries the uniform T5
+  # post-remediation core (W2) — check-step-io enforced.
+  - id: triage_lld
+    delegation: orchestrator
+    when: ${synth_lld_final.output.verdict == 'request_changes'}
+    prompt: >-
+      The post-fix LLD review is still red: ${synth_lld_final.output.blocker_count}
+      blocker(s) remain (report: ${synth_lld_final.output.report_path}). You run in
+      the MAIN LOOP, so you MAY call AskUserQuestion. Present the remaining blocker
+      findings (Read them from the report's .json sidecar) and ask the user to
+      choose per finding-group: accept-with-record (carry it forward as an
+      unresolved escalation) or remediate-once. For remediate-once: re-invoke
+      /microskill author-design-artifact with profile lld-fix for each cited
+      document, passing prior_findings_path=${synth_lld_final.output.report_path} —
+      prior_findings_path is a PATH input, never inline findings; if the user
+      triages only a SUBSET of the findings, first WRITE that subset to
+      ${workflow.inputs.output_dir}/evidence/design/triage-findings.json and pass
+      THAT path instead. Then re-adjudicate each remaining finding via /microskill
+      verify-finding with profile document against its rewritten document, and
+      re-synthesize via /microskill synthesize-review with profile design over
+      those findings plus verdicts, writing the refreshed report to
+      ${workflow.inputs.output_dir}/evidence/design/lld-review-post-triage.md. At
+      most ONE remediation round (the refine-requirements clarify precedent), then
+      re-present what remains. Do NOT promise a stop — mid-pipeline you cannot stop
+      the run; abandon lives at gates. RETURN {action, remaining_escalations,
+      refreshed_report_path, post_counts} where action names the triage outcome,
+      remaining_escalations is an array of {kind, ref, detail} for everything
+      accepted-with-record, refreshed_report_path is the post-triage report path
+      (null when no remediation round ran), and post_counts is the refreshed
+      report's verdict-tallies object (null when no remediation round ran).
+    output_schema:
+      type: object
+      required: [action, remaining_escalations, refreshed_report_path, post_counts]
+      properties:
+        action: { type: string }
+        remaining_escalations:
+          type: array
+          items:
+            type: object
+            required: [kind, ref, detail]
+            properties:
+              kind: { type: string }
+              ref: { type: string }
+              detail: { type: string }
+        refreshed_report_path: { type: ["string", "null"] }
+        post_counts: { type: ["object", "null"] }
+
+  # ════ Phase 7 — STAGE EVIDENCE + S3 RETURN OBJECT (background) ═════════════════
+  # The leaf's output.from node (assemble-evidence design profile = the S3 record
+  # schema). Everything inline here is a path, a count, or a small record: the three
+  # review inputs are report_path SUBFIELD refs, never whole verdict objects (the
+  # design profile schema REQUIRES findings/red_items arrays — a whole-value ref
+  # would inline three full findings arrays across the triage_lld checkpoint).
+  # The .json sidecar at each report_path carries verdict + tallies + findings; the
+  # body Reads them by path. `panel` rides whole-value because its schema is small
+  # by construction. product_kind / has_ui: the registry's hld profile emits no
+  # flat classification fields, so the claimed classification object rides WHOLE
+  # (null-safe) under both record names — the in-loop internal-consistency blocker
+  # rubric is what makes claim == confirmed by the time this node runs; on a null
+  # claim the body derives from the HLD's recorded classification per the
+  # ledger_scope contract. The exhaust-accept escalation is DERIVED from
+  # loop_record (converged == false at this node implies a recorded accept) — no
+  # ${loop_exhaust...} ref exists, so the skipped-gate null-deref hazard is avoided.
+  # Gate-id refs imply no edges; gates_mode is the W1 profile-literal mode record
+  # (patched to auto-default by the autonomous overlay).
+  - id: finalize_design
+    use: assemble-evidence
+    customize: { profile: design }
+    inputs:
+      hld_path: ${author_hld.output.document_path}
+      classification: ${workflow.inputs.classification}
+      components: ${author_hld.output.components}
+      lld_set: ${lld.items}
+      panel: ${synthesize_winner.output}
+      hld_review_path: ${synth_final_hld.output.report_path}
+      lld_review_initial_path: ${synth_lld.output.report_path}
+      lld_review_path: ${synth_lld_final.output.report_path}
+      loop_record: ${loop.output}
+      triage_record: ${triage_lld.output}
+      arch_gate_choice: ${confirm_architecture.output.choice}
+      hld_gate_choice: ${confirm_hld.output.choice}
+      hld_approval_choice: ${approve_hld.output.choice}
+      ux: ${workflow.inputs.ux}
+      gates_mode: human
+      output_dir: ${workflow.inputs.output_dir}
+
+# ════ GATES ════ (all anchor background nodes — revise needs a segment to re-run)
+gates:
+  # T7 take-default mid-gate; ALSO the leading checkpoint the on_exhaust
+  # own-segment rule requires between the panel segment and the loop body.
+  - id: confirm_architecture
+    after: synthesize_winner
+    type: human_approval
+    severity: hard
+    prompt: >-
+      Review the architecture judge panel: winning stance, judge scorecards, graft
+      notes. Approve to synthesize the canonical HLD from the winner, revise to
+      re-run the candidate/judge panel with notes, or abandon the run.
+    options: [approve, revise, abandon]
+    default: approve
+    on_headless: take_default
+    present:
+      - synthesize_winner.output.winner_label
+      - synthesize_winner.output.candidates_considered
+      - synthesize_winner.output.judges_heard
+      - synthesize_winner.output.graft_notes
+      - read_file: synthesize_winner.output.judges_path
+      - read_file: synthesize_winner.output.winner_path
+
+  # T7 take-default mid-gate; ALSO the trailing own-segment separator between the
+  # loop body and the post-loop refute fan-out (with the synthetic loop_exhaust
+  # gate). Anchored on the LAST body node (legal — gates after a non-last body node
+  # are the block). Interactively, REVISE HERE IS THE SUBSTANTIVE HLD-REVISION
+  # LEVER: it re-runs the loop segment with notes (a fresh authoring+panel budget).
+  # Headless: safe to take approve — an unconverged loop already parked at
+  # loop_exhaust (on_headless: fail) before this gate fires.
+  - id: confirm_hld
+    after: synth_hld
+    type: human_approval
+    severity: hard
+    prompt: >-
+      The HLD convergence loop has finished. Approve to run the per-finding
+      adversarial refute pass, revise to re-run the authoring/panel loop with
+      notes, or abandon.
+    options: [approve, revise, abandon]
+    default: approve
+    on_headless: take_default
+    present:
+      - synth_hld.output.verdict
+      - synth_hld.output.blocker_count
+      - author_hld.output.components_count
+      - read_file: synth_hld.output.report_path
+      - read_file: author_hld.output.document_path
+
+  # The binding arch-rigor gate. Anchored on the post-loop refute/synth node;
+  # presents the refute-verified verdict + vote tallies — machine evidence, not
+  # vibes. Headless: a red floor can never reach this default — an unconverged
+  # loop parks at loop_exhaust before this gate fires.
+  - id: approve_hld
+    after: synth_final_hld
+    type: human_approval
+    severity: hard
+    prompt: >-
+      Review the refute-verified high-level design and its component list (one LLD
+      fans out per component; the HLD document records the confirmed
+      product-kind/UI classification). Approve to proceed to detailed design,
+      revise to re-run the refute/synthesis pass with notes, or abandon.
+    options: [approve, revise, abandon]
+    default: approve
+    on_headless: take_default
+    present:
+      - author_hld.output.components
+      - synth_final_hld.output.verdict
+      - synth_final_hld.output.blocker_count
+      - synth_final_hld.output.confirmed_count
+      - synth_final_hld.output.refuted_count
+      - synth_final_hld.output.needs_human_count
+      - read_file: author_hld.output.document_path
+      - read_file: synth_final_hld.output.report_path
+
+# The leaf's ONE loop — spent on the HLD (the highest-leverage artifact). The body
+# lists the expand-GENERATED review ids (desugar runs pre-validation). A profile
+# that patches review_hld's `over` list MUST patch loop.body in the same overlay
+# AND ship the matching collect-findings fan-in profile (T4 caveat).
+loop:
+  until: ${synth_hld.output.verdict == 'approve'}
+  max_iters: 3
+  body: [author_hld,
+         review_hld_internal_consistency,
+         review_hld_requirements_fidelity,
+         review_hld_nfr_coverage,
+         review_hld_feasibility,
+         review_hld_security_architecture,
+         collect_hld,
+         synth_hld]
+  carry:
+    findings_report: ${synth_hld.output.report_path}
+  on_exhaust:
+    # Cap exhaustion is a verdict, not a budget overrun. extend re-runs the loop
+    # with the carried report path + guidance folded into revision_notes; accept
+    # proceeds on a RECORDED human choice (finalize_design derives it into an
+    # exhaust-accept escalation); headless runs PARK resumable here
+    # (on_headless: fail — never default: accept, the arch-rigor §0 ban).
+    action: escalate
+    prompt: >-
+      HLD convergence cap hit with the adversarial panel still rejecting the
+      design — extend the loop with guidance, accept the unconverged HLD (recorded
+      as an unresolved escalation in the stage ledger), or abandon the run.
+    options: [extend, accept, abandon]
+    notes_input: revision_notes
+    on_headless: fail
+
+output:
+  from: finalize_design

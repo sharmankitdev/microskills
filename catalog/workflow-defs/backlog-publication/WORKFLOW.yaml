@@ -1,0 +1,427 @@
+version: 1
+name: backlog-publication
+description: >-
+  Generate a prioritized, traceable product backlog from the requirements + design set,
+  converge it against bidirectional traceability verification, adversarially refute every
+  story's INVEST quality (cross-product-as-data), consolidate all machine evidence into a
+  ledger, pause at the one mandatory human gate, and publish to a profile-selected target.
+
+# Terminal leaf of develop-product-backlog (MULTIAGENTIC-DESIGN §2.5; seam S4). No
+# `workflow:` nodes -> no imports needed (nesting depth from the parent = 1).
+#
+# S4 contract: this leaf DECLARES every input the parent threads. All cross-stage
+# evidence objects are optional null-safe WHOLE values — null = "stage skipped/absent",
+# recorded by the ledger, never dereferenced, never branched on — so standalone leaf
+# runs stay legal and the composed parent supplies all of them.
+inputs:
+  requirements_path:
+    type: string
+    required: true
+    materialize: file
+    description: >-
+      The approved requirements document (parent wires
+      requirements.output.document_path). Passed by reference — consuming microskill
+      bodies Read the path, so the document never rides inline in args.
+  hld_path:
+    type: string
+    required: true
+    materialize: file
+    description: The approved high-level design document (parent wires technical_design.output.hld_path).
+  lld_set:
+    type: array
+    required: true
+    description: >-
+      Array of {document_path, component_name} entries from the technical-design leaf
+      (small, path-shaped — never inline content).
+  wireframes:
+    type: object
+    required: false
+    description: >-
+      WHOLE ux-design output object, or null when the UX stage skipped (non-UI product).
+      generate-backlog and verify-traceability Read the document named by a non-null
+      object's wireframes_path field (the pinned S2 field name); null means "no
+      wireframes" and is never dereferenced (F2 — no YAML field deref on a nullable ref).
+  ux_evidence:
+    type: object
+    required: false
+    description: >-
+      The SAME whole ux-design output object wired a second time for the evidence
+      ledger (the documented D2 two-channel duplication — bytes-cheap, two short path
+      strings). Null when the UX stage skipped; recorded as an explicit "absent" ledger
+      entry, never branched on.
+  requirements_evidence:
+    type: object
+    required: false
+    description: Threaded requirements-stage evidence record (the refine-requirements S1 output object) or null.
+  design_evidence:
+    type: object
+    required: false
+    description: Threaded technical-design-stage evidence record (the S3 output object) or null.
+  classification:
+    type: object
+    required: false
+    description: >-
+      The classify-product output object {product_kind, has_ui, confidence, rationale,
+      summary} or null. Ledger self-evidence; its has_ui also disambiguates a null
+      wireframes/ux_evidence (false = "skipped by design", true = "evidence missing").
+  classification_gate_choice:
+    type: string
+    required: false
+    description: >-
+      The choice recorded at the parent's confirm_classification gate (a gate-id ref on
+      the parent side — no edge). Consolidated into the ledger's gates_taken.
+  classification_gate_mode:
+    type: string
+    required: false
+    description: >-
+      Mode literal for the classification gate record. The parent wires the literal
+      `human`; its autonomous overlays patch it to `auto-default` (the sanctioned W1
+      profile-literal convention).
+  output_dir:
+    type: string
+    required: true
+    description: >-
+      Artifact root. backlog/ (generated stories + index), evidence/backlog/ (coverage
+      report + story-quality tallies), and evidence/ledger.md|json live under it.
+  github_repo:
+    type: string
+    required: false
+    description: >-
+      owner/name for the github publish profile; empty/null -> gh uses the current
+      repository. Unused by the base local target (null on local runs).
+  regeneration_notes:
+    type: string
+    required: false
+    description: >-
+      Seed guidance for backlog (re)generation. ALSO the on_exhaust notes_input target —
+      an extend pick at the loop_exhaust gate folds human guidance in here.
+  invest_lenses:
+    type: array
+    required: false
+    default: [independent, negotiable, valuable, estimable, small, testable]
+    description: >-
+      INVEST criteria lenses crossed against every story by expand-assignments. Each
+      entry must name a section of refute-story-quality's built-in invest_rubric var.
+  invest_seats:
+    type: integer
+    required: false
+    default: 2
+    description: >-
+      Independent refuter seats per (story x criterion) claim. A claim survives only on
+      majority non-refute across seats; ties, shortfalls, and undecidables fall to
+      needs_human (tally-votes majority rule — strict).
+  invest_pair_cap:
+    type: integer
+    required: false
+    default: 1800
+    description: >-
+      Total-assignment scale guard for the INVEST cross-product (stories x lenses x
+      seats). expand-assignments stops loud with the counts and split guidance when the
+      computed pair_count exceeds this. Default 1800 = the publish envelope's 150-story
+      cap x 6 lenses x 2 seats, so the two scale guards describe ONE consistent
+      envelope; a backlog passing INVEST never then dies at the publish cap.
+
+nodes:
+  # ── T4 convergence loop body — the leaf's opening block, its OWN segment ────────────
+  # generate doubles as fix: prior_findings rides loop.carry (null round 1 -> fresh
+  # generate; non-null -> regenerate honoring the listed coverage gaps). Null-safe whole
+  # values throughout (F2). Rewrites the backlog IN PLACE under output_dir so every
+  # downstream node reads one stable path regardless of round count.
+  # WHY FULL REGENERATION each round (review R3 performance-4, accepted): MoSCoW
+  # priorities, dependency links, and the MVP slice are GLOBAL properties of the story
+  # set — repairing only the uncovered refs would let a new story shift priorities or
+  # the MVP boundary without the rest of the backlog re-balancing, silently breaking
+  # coherence. Bounded cost: max 3 rounds, rounds 2+ fire only on coverage failure.
+  - id: generate
+    use: generate-backlog
+    customize: { profile: base }
+    inputs:
+      requirements_path: ${workflow.inputs.requirements_path}
+      hld_path: ${workflow.inputs.hld_path}
+      lld_set: ${workflow.inputs.lld_set}
+      wireframes: ${workflow.inputs.wireframes}
+      prior_findings: ${loop.carry.findings}
+      regeneration_notes: ${workflow.inputs.regeneration_notes}
+      output_dir: ${workflow.inputs.output_dir}
+
+  # Bidirectional traceability check; coverage_ok is the loop's convergence signal.
+  # uncovered is a SMALL {kind, ref} id list (carry rides by VALUE — F8 budget; prose
+  # detail lives in report_path, never in carry). The report lands under
+  # output_dir/evidence/backlog/ — the full-match JS-expression ref builds the subpath
+  # as one typed value (an embedded ref would ALSO resolve — DAG-RULES §4 wraps each in
+  # __ref() — the full-match form is just the cleaner single-expression spelling).
+  - id: verify
+    use: verify-traceability
+    customize: { profile: base }
+    inputs:
+      requirements_path: ${workflow.inputs.requirements_path}
+      hld_path: ${workflow.inputs.hld_path}
+      lld_set: ${workflow.inputs.lld_set}
+      backlog_dir: ${generate.output.backlog_dir}
+      wireframes: ${workflow.inputs.wireframes}
+      output_dir: ${workflow.inputs.output_dir + '/evidence/backlog'}
+
+  # ── T5 advisory-park #1: converged-path needs_human remnants ───────────────────────
+  # ALSO the structural separator the on_exhaust own-segment rule demands: without a
+  # checkpoint here, background `assign` would merge into the loop segment and kill the
+  # compile. Guarded -> the checkpoint always exists in the partition (separator holds);
+  # the PAUSE only happens on red (guard false -> stored null, no pause either mode).
+  # Deliberately does NOT guard on !coverage_ok: the exhaust-accept path is already a
+  # recorded human choice at loop_exhaust — re-asking would be double jeopardy; it rides
+  # into the ledger as an unresolved escalation instead. RETURN carries the uniform W2
+  # post-remediation core so remediated evidence re-commits through this node's own
+  # result (run-state values are immutable post-commit).
+  - id: triage_coverage
+    delegation: orchestrator
+    when: ${verify.output.needs_human_count > 0}
+    prompt: >
+      Traceability verification converged but ${verify.output.needs_human_count} link(s) need
+      human judgement (see the report at ${verify.output.report_path}). You run in the MAIN
+      LOOP and MUST resolve them with the user via AskUserQuestion. For each item: present the
+      ambiguous link and ask resolve-now (gather the user's resolution, apply it by re-invoking
+      /microskill generate-backlog with the resolution folded into regeneration_notes, then
+      re-invoke /microskill verify-traceability ONCE to write a refreshed coverage report,
+      saved beside the original with a -post-triage suffix — one bounded remediation round,
+      never a loop) or accept-with-record (the item rides into the evidence ledger as an
+      unresolved escalation). Do NOT promise to stop the run — abandon lives at the
+      approve_publish gate. RETURN {action, resolved_count, remaining_escalations,
+      refreshed_report_path, post_counts} — refreshed_report_path names the post-triage
+      report and post_counts carries its {uncovered_count, needs_human_count}; BOTH are
+      null when no remediation round ran.
+    output_schema:
+      type: object
+      required: [action, resolved_count, remaining_escalations, refreshed_report_path, post_counts]
+      properties:
+        action: { type: string, enum: [resolved, accept-with-record, mixed] }
+        resolved_count: { type: integer }
+        remaining_escalations:
+          type: array
+          items:
+            type: object
+            required: [kind, ref, detail]
+            properties:
+              kind: { type: string }
+              ref: { type: string }
+              detail: { type: string }
+        refreshed_report_path: { type: ["string", "null"] }
+        post_counts: { type: ["object", "null"] }
+
+  # ── P2 adversarial refute-vote, cross-product-as-data ──────────────────────────────
+  # Stories x INVEST criteria x seats expanded AS DATA by a deterministic microskill,
+  # then ONE for_each runs the whole cross product. All three nodes share one segment,
+  # so the pairs array rides in-memory and never crosses the args boundary. depends_on
+  # is PURE ORDERING (no ref carries it): pins assign after the triage checkpoint so
+  # the partition never rests on a topo tie-break.
+  - id: assign
+    use: expand-assignments
+    depends_on: [triage_coverage]
+    phase_group: invest
+    inputs:
+      items_path: ${generate.output.index_path}
+      lenses: ${workflow.inputs.invest_lenses}
+      seats: ${workflow.inputs.invest_seats}
+      pair_cap: ${workflow.inputs.invest_pair_cap}
+
+  # Each refuter attacks ONE claim: "story S satisfies INVEST criterion C" — default
+  # refuted when evidence is ambiguous. The expand-assignments item IS the story object
+  # the registry contract declares ({id, path, epic, title} parsed from the index table),
+  # so it rides whole as `story`; criterion selects a rubric section from the built-in
+  # invest_rubric var (data selection, not control flow); seat decorrelates seats as an
+  # input. retry is per-ITEM on a fan-out — a still-failed thunk returns null (engine
+  # contract) and tally counts the shortfall as needs_human, never silently dropped.
+  - id: refute
+    use: refute-story-quality
+    for_each: ${assign.output.pairs}
+    as: pair
+    max_parallel: 6
+    retry: { max_attempts: 2 }
+    phase_group: invest
+    inputs:
+      story: ${pair.item}
+      criterion: ${pair.lens}
+      seat: ${pair.seat}
+
+  # Deterministic vote join: group ${refute.items} by (story x criterion), majority rule
+  # across seats, write the full tally report. Emits expected-vs-received arithmetic
+  # (pair_count vs verdicts_received) — bounded coverage VISIBLE, never silent. Lexical
+  # mapping: a REFUTED INVEST claim = a confirmed story-quality violation, so downstream
+  # reads refuted_count as "violations confirmed".
+  - id: tally
+    # DESIGN CHOICE (review R3 performance-3, accepted): tally receives the whole
+    # expand-assignments object — its declared contract — so each story object rides
+    # once per (lens x seat) pair in-context. Bounded by invest_pair_cap (600) and
+    # in-segment only (never across the args boundary); a slimmed dual-contract
+    # (id-keyed pairs + items map) is the recorded future optimization.
+    use: tally-votes
+    # The vote-group arrays cross the approve_publish checkpoint by REFERENCE:
+    # spilled fields thread as handoff-file paths; small counts stay inline for
+    # the triage guard and the gate's present lines.
+    spill_outputs: [upheld, refuted, needs_human]
+    phase_group: invest
+    inputs:
+      verdicts: ${refute.items}
+      assignment: ${assign.output}
+      report_path: ${workflow.inputs.output_dir + '/evidence/backlog/story-quality.md'}
+
+  # ── T5 advisory-park #2: confirmed INVEST violations / undecidable claims ──────────
+  - id: triage_quality
+    delegation: orchestrator
+    when: ${tally.output.verdict == 'request_changes' || tally.output.needs_human_count > 0}
+    prompt: >
+      The INVEST refute pass confirmed ${tally.output.refuted_count} story-quality violation
+      group(s) (${tally.output.blocker_count} blocker-severity; ${tally.output.needs_human_count}
+      undecidable) — full vote tallies at ${tally.output.report_path}. You run in the MAIN
+      LOOP and MUST triage with the user via AskUserQuestion. Offer per violation group:
+      fix-once (re-invoke /microskill generate-backlog with the confirmed violations folded
+      into regeneration_notes, then re-invoke /microskill refute-story-quality on each
+      REWRITTEN story for its violated criteria only, hand-tally the fresh verdicts, and
+      write a refreshed tally report beside the original with a -post-triage suffix — ONE
+      bounded remediation round, never a loop) or accept-with-record (violations ride into
+      the ledger as unresolved escalations). Do NOT promise to stop the run — abandon lives
+      at the approve_publish gate. RETURN {action, fixed_count, remaining_escalations,
+      refreshed_report_path, post_counts} — refreshed_report_path names the post-triage
+      tally report and post_counts carries its {refuted_count, blocker_count,
+      needs_human_count}; BOTH are null when no remediation round ran.
+    output_schema:
+      type: object
+      required: [action, fixed_count, remaining_escalations, refreshed_report_path, post_counts]
+      properties:
+        action: { type: string, enum: [fixed, accept-with-record, mixed] }
+        fixed_count: { type: integer }
+        remaining_escalations:
+          type: array
+          items:
+            type: object
+            required: [kind, ref, detail]
+            properties:
+              kind: { type: string }
+              ref: { type: string }
+              detail: { type: string }
+        refreshed_report_path: { type: ["string", "null"] }
+        post_counts: { type: ["object", "null"] }
+
+  # ── Evidence bridge — exists because gate present: paths must lead with a KNOWN NODE
+  # id: workflow inputs (the threaded parent evidence) are unreachable from present:, so
+  # this node consolidates them into ledger.md/ledger.json + small fields. Runs the
+  # assemble-evidence BASE profile (the consolidated pipeline scope) unadorned.
+  # backlog_evidence is this leaf's own record set, assembled by the ONE full-match
+  # JS-expression ref below (a nested YAML map would NOT resolve refs in a background
+  # use:-node input — engine constraint), keyed exactly as the base ledger_scope reads
+  # it: a record whose `loop.converged` is false proves a recorded exhaust-accept (the
+  # W6 derive convention — NOTHING in this def references loop_exhaust). The triage
+  # records ride whole (null when the guard skipped = green), carrying the W2
+  # pre/post-remediation values side by side into the ledger.
+  - id: assemble_evidence
+    use: assemble-evidence
+    inputs:
+      requirements_evidence: ${workflow.inputs.requirements_evidence}
+      ux_evidence: ${workflow.inputs.ux_evidence}
+      design_evidence: ${workflow.inputs.design_evidence}
+      classification: ${workflow.inputs.classification}
+      classification_gate_choice: ${workflow.inputs.classification_gate_choice}
+      classification_gate_mode: ${workflow.inputs.classification_gate_mode}
+      # Whole records ride here; the HEAVY tally fields (the vote-group arrays)
+      # are declared spill_outputs on the tally node, so the threaded view this
+      # node receives carries handoff-file PATHS for them — by reference across
+      # the checkpoint boundary, never inline. The ledger scope derives the
+      # backlog stage's escalations from the two triage sub-records.
+      backlog_evidence: >-
+        ${Object.fromEntries([['coverage', verify.output],
+        ['story_quality', tally.output], ['loop', loop.output],
+        ['coverage_triage', triage_coverage.output],
+        ['quality_triage', triage_quality.output],
+        ['backlog_counts', generate.output]])}
+      output_dir: ${workflow.inputs.output_dir + '/evidence'}
+
+  # ── Publication — profile-selected target; runs AFTER the mandatory gate. ──────────
+  # depends_on is PURE ORDERING (the gate anchors assemble_evidence, so publish lands in
+  # the post-gate segment); the backlog_dir ref implies the generate edge.
+  - id: publish
+    use: publish-backlog
+    customize: { profile: base }
+    depends_on: [assemble_evidence]
+    inputs:
+      backlog_dir: ${generate.output.backlog_dir}
+      output_dir: ${workflow.inputs.output_dir}
+      github_repo: ${workflow.inputs.github_repo}
+
+# ── T4 loop declaration ───────────────────────────────────────────────────────────────
+# Body is contiguous, both members background use: nodes, fan-out-free. on_exhaust makes
+# cap exhaustion a first-class gated event: the committed `loop` pseudo-result
+# {converged, rounds, carry} is check-step-io-validated, and the compiler emits the
+# synthetic conditional loop_exhaust gate (skipped null when converged). NO default is
+# declared: extend is engine-refused as a default and a silent accept is banned (honest
+# park) — identical in EVERY profile.
+loop:
+  while: ${!verify.output.coverage_ok}
+  max_iters: 3
+  body: [generate, verify]
+  carry:
+    findings: ${verify.output.uncovered}
+  on_exhaust:
+    action: escalate
+    prompt: >-
+      Traceability did not converge in 3 generate-verify rounds — uncovered items remain (see
+      the latest coverage report under output_dir/evidence/backlog/). Extend regenerates with
+      your guidance and a fresh round budget; accept proceeds with the coverage gaps recorded
+      as unresolved escalations; abandon stops the run.
+    options: [extend, accept, abandon]
+    notes_input: regeneration_notes
+    on_headless: fail
+
+gates:
+  # ── T6 — THE mandatory human gate. Defaultless + on_headless: fail in EVERY profile
+  # (the pipeline's ONE such gate): auto-publication is impossible by construction — a
+  # headless run does all the work, then parks here resumable (/workflow
+  # backlog-publication pickup). present: is rendered mechanically (no .items, no
+  # workflow-input paths; every producer precedes the anchor). Where a T5 remediation
+  # ran, the present: fields render committed PRE-remediation values by design — the
+  # prompt names ledger.json as authoritative (W2).
+  - id: approve_publish
+    after: assemble_evidence
+    type: human_approval
+    severity: hard
+    prompt: >-
+      Final review before publication (the irreversible, outward step). The ledger below is
+      machine evidence: per-stage verdicts, INVEST refute-vote tallies (majority rule across
+      seats), the traceability coverage verdict, loop convergence records, every auto-taken
+      gate, and every unresolved escalation. Where a triage remediation round ran, ledger.json
+      is AUTHORITATIVE over the raw fields above (field paths render committed
+      pre-remediation values; the ledger stamps pre- and post-remediation side by side).
+      Approve to publish, revise to re-assemble the ledger with notes, or abandon to stop
+      without publishing.
+    options: [approve, revise, abandon]
+    on_headless: fail
+    present:
+      - verify.output.coverage_ok
+      - verify.output.uncovered_count
+      - verify.output.needs_human_count
+      - verify.output.summary
+      - generate.output.epic_count
+      - generate.output.story_count
+      - generate.output.mvp_story_count
+      - tally.output.verdict
+      - tally.output.blocker_count
+      - tally.output.refuted_count
+      - tally.output.needs_human_count
+      - tally.output.pair_count
+      - tally.output.verdicts_received
+      - tally.output.seats
+      - assemble_evidence.output.unresolved_count
+      - assemble_evidence.output.stages_green
+      - read_file: assemble_evidence.output.ledger_path
+      - read_file: tally.output.report_path
+      - read_file: verify.output.report_path
+      - read_file: generate.output.index_path
+
+# The workflow output IS the publish result — {published_target, location, summary}, the
+# publish-backlog registry contract. The S4 leaf output's fourth field, ledger_path, is
+# threaded BY DOCUMENTED CONVENTION rather than schema-forced (publish-backlog returns
+# exactly three fields, and an inline schema cannot add a field the body never emits):
+# the consolidated ledger lands DETERMINISTICALLY at <output_dir>/evidence/ledger.json
+# (the assemble-evidence base scope pins ledger_path as the ledger.json path under the
+# output_dir this def passes it, i.e. <output_dir>/evidence) — the approve_publish gate
+# presents it via read_file, and any caller holding this workflow's output_dir input
+# derives ledger_path from it.
+output:
+  from: publish

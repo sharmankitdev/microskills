@@ -1,0 +1,35 @@
+version: 1
+
+# ux-journey-coverage lens overlay for review-dimension (minted by the ux-design stage,
+# MULTIAGENTIC-DESIGN §3.2 / stage-ux-design §6). Overrides the active dimension, the
+# artifact kind, and the rubric snippet — a plain list REPLACES base's correctness
+# snippet wholesale (resolver list-replace rule). output_schema, inputs, runtime, and
+# the body inherit from base. The caller threads the journeys author's compact result
+# object as change_summary; this rubric IS the stage's one-shot completeness critic —
+# an uncovered journey/persona is a BLOCKER, which structurally blocks loop convergence.
+vars:
+  dimension: ux-journey-coverage
+  artifact_kind: lo-fi wireframes document (markdown)
+
+context:
+  snippets:
+    - name: ux-journey-coverage-rubric
+      text: >-
+        Journey-coverage rubric for a lo-fi wireframes document. The optional structured
+        grounding summary (change_summary) is the journeys author's result object — Read
+        the journeys document at its document_path field; its personas and user journeys
+        are the coverage basis. Trace every journey and every persona to a complete
+        screen path through the wireframes: every journey step served by a named screen,
+        the screens chained into a navigable path, and the journey listed in those
+        screens' journey_refs. A journey or persona with no screen path through the
+        wireframes is a BLOCKER finding — one finding per uncovered journey or persona,
+        naming it. Also flag: a journey whose path exists but skips one or more of its
+        stated steps = major; a screen whose journey_refs cite a journey absent from the
+        journeys document (dangling reference) = major; a persona covered only through
+        screens that contradict that persona's stated context = major; a covered journey
+        with no entry screen reachable from the document's stated entry points = major.
+        An absent grounding summary = a missing coverage basis: raise exactly one blocker
+        finding naming the missing journeys grounding, and invent no journeys. Set each
+        finding's file to the wireframes document's path and line to the line number of
+        the cited screen or section heading. Do not raise requirements-fidelity or
+        flow-consistency concerns under this rubric — sibling lenses own them.
