@@ -1,0 +1,9 @@
+version: 1
+
+# Default profile for technical-design. Interactive; an effectively empty overlay —
+# every gate default, the loop policy, and the rigor graph live in WORKFLOW.yaml
+# (rigor is profile-invariant, MULTIAGENTIC-DESIGN §1). Present as the documented
+# tuning seam (e.g. loop.max_iters, refute max_parallel) and to pin the default
+# profile name.
+profile:
+  default: base
