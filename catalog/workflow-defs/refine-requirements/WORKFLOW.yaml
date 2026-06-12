@@ -290,8 +290,10 @@ nodes:
     when: ${tally_closures.output.attention_count > 0}
     prompt: >
       ${tally_closures.output.refuted_count} gap-closure claim(s) were REFUTED by majority
-      vote and ${tally_closures.output.needs_human_count} need a human (refuted:
-      ${tally_closures.output.refuted}; uncertain: ${tally_closures.output.needs_human}).
+      vote and ${tally_closures.output.needs_human_count} need a human — Read the full
+      refuted/needs_human group detail from the tally report at
+      ${tally_closures.output.report_path} (those arrays are spilled and ride as
+      handoff-file paths, never inline).
       Triage WITH the user (AskUserQuestion): for each, either accept-with-record (it rides
       into the evidence ledger as an unresolved escalation) or run ONE bounded remediation
       round — fold the refuted gaps into the answers ledger at

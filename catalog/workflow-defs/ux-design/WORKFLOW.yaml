@@ -10,8 +10,10 @@ description: >-
 # Caller-supplied inputs (referenced as ${workflow.inputs.<name>}). Seam S2
 # (MULTIAGENTIC-DESIGN §2.0): the parent wires requirements_path / product_kind /
 # output_dir; revision_notes / max_iterations / staging_dir stay leaf-local. Files ride
-# by reference (materialize: file); node outputs are paths + small counts only — no
-# spill_outputs anywhere by construction.
+# by reference (materialize: file); node outputs are paths + small counts only, with
+# ONE declared exception: final_synthesize spills its three heavy finding fields
+# (findings / red_items / red_findings) across the signoff checkpoint, and the
+# finalize node consumes them by reference (handoff-file paths).
 inputs:
   requirements_path:
     type: string
@@ -269,7 +271,10 @@ nodes:
     use: verify-finding
     customize: { profile: document }
     depends_on: [triage_unconverged]
-    for_each: ${synth.output.findings}
+    # Blocker/major only — minors cannot change red_items or the signoff verdict,
+    # and the filtered driver stays small across the triage checkpoint (an
+    # oversized driver fails LOUD at run-step's args budget — never silently).
+    for_each: ${synth.output.findings.filter(f => f.severity == 'blocker' || f.severity == 'major')}
     as: finding
     max_parallel: 4
     inputs:

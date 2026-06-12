@@ -24,8 +24,19 @@ vars:
     file>` (e.g. `gh api repos/<owner>/<name>/issues --input <path>`), so no
     backlog-derived text ever appears in a command line — no string
     concatenation of story content into a command, no command substitution
-    around untrusted text.
+    around untrusted text. SCALE AND PACING (binding): count the stories
+    before creating anything — a backlog above 150 stories = stop loud with
+    the count and split guidance (publishing is the irreversible outward
+    step; never start a publish likely to die mid-stream); within the cap,
+    pace the calls deliberately (about one content-creating call per second,
+    well under GitHub's secondary rate limits) and back off-and-retry once on
+    a rate-limit response before stopping with the progress made so far.
 
+# KNOWN BOUNDARY (review R3 security-1, advisory): the shell discipline above is
+# prose-contract enforcement — binding on the executing agent, not machine-checked.
+# A validated wrapper script that hard-validates github_repo and accepts only an
+# --input payload path is the recorded future hardening (roadmap), keeping this
+# profile's contract verbatim meanwhile.
 # Lists REPLACE on merge, so adding Bash means restating the full list: Read
 # and Write stay (the body still Reads the source backlog under backlog_dir),
 # and Bash rides in for the gh milestone/issue calls.

@@ -1,8 +1,8 @@
 {
-  "manifest_hash": "77ebb2f81b766dcdbeade29fdfc823f1ae611c8ae028f8dfab1d2d34af98e773",
+  "manifest_hash": "4346038da3b34df8849753b7d23ac4917bbd6245db71d7d5b8c3c157c3e48234",
   "name": "backlog-publication",
   "node_fingerprints": {
-    "assemble_evidence": "0ba644888e5a67a2b9827dfa4bce13b7baaf772780f1d774cb8277a549e014bf",
+    "assemble_evidence": "fabf118b429f5b9057a9657a4f806232ddcf4b9cd8be58e121f3779f357aa50d",
     "assign": "c49c7bf282bfb6b1c5a5bce47eeb987baaed63586f7bcd67b47130e10f96f08e",
     "generate": "2b7ea8fd6d52b425caacc58079f1220593661608006b9e50039d2de3b607104f",
     "publish": "3a428cf550f2269b9f90d654539786941f06193548e92ab6268495df7f994472",

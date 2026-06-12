@@ -186,8 +186,12 @@ nodes:
     use: verify-finding
     customize: { profile: document }
     # Fans over the SYNTHESIZED (duplicate-merged) finding set — refuting the
-    # pre-merge collection would adjudicate the same defect once per duplicate.
-    for_each: ${synth_hld.output.findings}
+    # pre-merge collection would adjudicate the same defect once per duplicate —
+    # scoped to blocker/major (refuting minors prunes nothing downstream; the
+    # join tolerates absent verdicts). The filter also keeps the checkpoint-
+    # crossing driver small on the exhaust-accept path; an oversized driver can
+    # never truncate SILENTLY — run-step's args budget fails loud by design.
+    for_each: ${synth_hld.output.findings.filter(f => f.severity == 'blocker' || f.severity == 'major')}
     as: finding
     max_parallel: 4
     inputs:
@@ -199,7 +203,7 @@ nodes:
     use: synthesize-review
     customize: { profile: design }
     inputs:
-      findings: ${collect_hld.output.findings}
+      findings: ${synth_hld.output.findings}
       verifications: ${refute_hld.items}
       report_path: ${workflow.inputs.output_dir}/evidence/design/hld-review.md
 

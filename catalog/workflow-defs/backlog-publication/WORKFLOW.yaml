@@ -126,6 +126,11 @@ nodes:
   # generate; non-null -> regenerate honoring the listed coverage gaps). Null-safe whole
   # values throughout (F2). Rewrites the backlog IN PLACE under output_dir so every
   # downstream node reads one stable path regardless of round count.
+  # WHY FULL REGENERATION each round (review R3 performance-4, accepted): MoSCoW
+  # priorities, dependency links, and the MVP slice are GLOBAL properties of the story
+  # set — repairing only the uncovered refs would let a new story shift priorities or
+  # the MVP boundary without the rest of the backlog re-balancing, silently breaking
+  # coherence. Bounded cost: max 3 rounds, rounds 2+ fire only on coverage failure.
   - id: generate
     use: generate-backlog
     customize: { profile: base }
@@ -241,6 +246,11 @@ nodes:
   # mapping: a REFUTED INVEST claim = a confirmed story-quality violation, so downstream
   # reads refuted_count as "violations confirmed".
   - id: tally
+    # DESIGN CHOICE (review R3 performance-3, accepted): tally receives the whole
+    # expand-assignments object — its declared contract — so each story object rides
+    # once per (lens x seat) pair in-context. Bounded by invest_pair_cap (600) and
+    # in-segment only (never across the args boundary); a slimmed dual-contract
+    # (id-keyed pairs + items map) is the recorded future optimization.
     use: tally-votes
     # The vote-group arrays cross the approve_publish checkpoint by REFERENCE:
     # spilled fields thread as handoff-file paths; small counts stay inline for

@@ -11,7 +11,9 @@ vars:
     ux_evidence, design_evidence, backlog_evidence, classification (each an
     optional whole object; null = an explicit "absent" ledger entry — an absent
     ux_evidence entry carries the annotation mapped from classification.has_ui:
-    false = "skipped by design", true = "evidence missing"). Escalation
+    false = "skipped by design", true = "evidence missing"; a null
+    classification record = "ux evidence absent; classification
+    unavailable"). Escalation
     derivation: for the backlog_evidence record, its escalations are the
     concatenation of its coverage_triage and quality_triage sub-records'
     remaining_escalations arrays (a null sub-record contributes nothing);
