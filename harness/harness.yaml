@@ -40,10 +40,10 @@ microskills:
     profiles: [base]
   - name: judge-artifacts
     source: custom
-    profiles: [base]
+    profiles: [base, cognitive-load, evolvability, flow-efficiency, journey-fit, requirements-fit, simplicity]
   - name: synthesize-panel
     source: custom
-    profiles: [base]
+    profiles: [base, design, ux]
   - name: extract-closure-claims
     source: custom
     profiles: [base]
@@ -58,10 +58,10 @@ microskills:
     profiles: [base]
   - name: collect-artifacts
     source: custom
-    profiles: [base]
+    profiles: [base, hld-candidates, ux-candidates]
   - name: author-design-artifact
     source: custom
-    profiles: [base]
+    profiles: [base, hld, hld-candidate, lld, lld-fix, ux-journeys, wireframe-candidate, wireframe-revise]
   - name: tally-votes
     source: custom
     profiles: [base]
@@ -70,10 +70,10 @@ microskills:
     profiles: [base]
   - name: publish-backlog
     source: custom
-    profiles: [base]
+    profiles: [base, github]
   - name: assemble-evidence
     source: custom
-    profiles: [base]
+    profiles: [base, design, requirements, ux-stage]
   - name: expand-assignments
     source: custom
     profiles: [base]

@@ -1,0 +1,11 @@
+version: 1
+
+# design overlay for synthesize-panel (minted per MULTIAGENTIC-DESIGN §3.2).
+# Registers the HLD architecture panel's judge-result input names in place of base's generic
+# judge_1/judge_2/judge_3 (a null judge contributes nothing and is counted
+# absent). Optional, null-default entries — no behavioral keys. candidates and
+# judges_path stay required via base.
+inputs:
+  requirements_fit: {}
+  simplicity: {}
+  evolvability: {}

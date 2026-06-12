@@ -1,0 +1,15 @@
+version: 1
+
+# simplicity lens overlay for judge-artifacts (minted per MULTIAGENTIC-DESIGN §3.2).
+# Swaps ONLY vars.judge_lens — inputs, runtime, output_schema, and the body
+# inherit from base: the SAME body scores candidates under this lens.
+vars:
+  judge_lens: >-
+    how little incidental complexity the candidate design carries — the
+    fewest components that satisfy the requirements; boring, well-understood
+    technology over novel machinery where the requirements allow; one obvious
+    path per data flow; no speculative generality, premature
+    optimization, or infrastructure the stated scale does not demand. Score
+    high for lean component counts and boring technology choices; score low
+    for accidental complexity, speculative layers, and machinery without a
+    requirement behind it.

@@ -1,0 +1,36 @@
+version: 1
+
+# ux-flow-consistency lens overlay for review-dimension (minted by the ux-design stage,
+# MULTIAGENTIC-DESIGN §3.2 / stage-ux-design §6). Overrides the active dimension, the
+# artifact kind, and the rubric snippet — a plain list REPLACES base's correctness
+# snippet wholesale (resolver list-replace rule). output_schema, inputs, runtime, and
+# the body inherit from base. The caller threads the journeys author's compact result
+# object as change_summary so step counts are judged against each journey's own goal.
+vars:
+  dimension: ux-flow-consistency
+  artifact_kind: lo-fi wireframes document (markdown)
+
+context:
+  snippets:
+    - name: ux-flow-consistency-rubric
+      text: >-
+        Flow-consistency rubric for a lo-fi wireframes document. The optional structured
+        grounding summary (change_summary) is the journeys author's result object — Read
+        the journeys document at its document_path field to learn each journey's goal,
+        trigger, and stated steps. Flag only flow defects: dead ends — a screen on a
+        journey path with no stated exit, next action, or way back; unreachable screens —
+        a screen no other screen or stated entry point navigates to; inconsistent
+        navigation — the same action exposed with different labels, placements, or
+        interaction patterns across screens, or sibling screens carrying conflicting
+        navigation models; step-count defeat — an on-screen path whose length or detours
+        defeat the journey's stated goal, judged against the journey's own steps; broken
+        loops — a flow returning the user to a prior screen with no state change and no
+        exit; missing outcome states — a stated operation on the path with no success or
+        failure surface. Severity mapping: a dead end that prevents completing a journey
+        = blocker; an unreachable screen, a step-count defeat, a conflicting navigation
+        model, or a missing outcome state on a primary path = major; a label or placement
+        inconsistency = minor. Keep explanations concise (the synthesizer caps finding
+        prose; full detail belongs in the report). Set each finding's file to the
+        wireframes document's path and line to the line number of the cited screen or
+        section heading. Do not raise journey-coverage or requirements-fidelity concerns
+        under this rubric — sibling lenses own them.

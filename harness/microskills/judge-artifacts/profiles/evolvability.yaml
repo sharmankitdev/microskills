@@ -1,0 +1,14 @@
+version: 1
+
+# evolvability lens overlay for judge-artifacts (minted per MULTIAGENTIC-DESIGN §3.2).
+# Swaps ONLY vars.judge_lens — inputs, runtime, output_schema, and the body
+# inherit from base: the SAME body scores candidates under this lens.
+vars:
+  judge_lens: >-
+    how cheaply the candidate design absorbs likely change — components
+    have crisp responsibilities and narrow interfaces; data contracts are
+    versionable; the parts most likely to change (per the requirements'
+    stated roadmap, open questions, and growth assumptions) are isolated
+    behind seams; replacing one technology choice does not cascade. Score
+    high for isolated change hotspots and narrow seams; score low for
+    coupling that turns a likely change into a cross-cutting rewrite.

@@ -1,0 +1,34 @@
+version: 1
+
+# lld-fidelity lens overlay for review-dimension (minted by the technical-design stage,
+# MULTIAGENTIC-DESIGN §3.2 / stage-technical-design §5). Overrides the active dimension,
+# the artifact kind, and the rubric snippet — a plain list REPLACES base's correctness
+# snippet wholesale (resolver list-replace rule). output_schema, inputs, runtime, and
+# the body inherit from base. The caller threads the HLD as context_path — the LLD's
+# contract source, Read by path.
+vars:
+  dimension: lld-fidelity
+  artifact_kind: low-level design document (markdown)
+
+context:
+  snippets:
+    - name: lld-fidelity-rubric
+      text: >-
+        LLD-fidelity rubric for a low-level design document. Read the high-level design
+        from context_path — it is the contract source; the document under review details
+        ONE of its components. Flag only HLD-contract fidelity defects: stated
+        responsibilities that deviate from, drop, or exceed the responsibilities the HLD
+        assigns this component — including scope creep into sibling components'
+        territory; an exposed interface that contradicts the contract the HLD and its
+        other components expect — names, operations, direction, or data shapes; a
+        dependency this LLD takes that the HLD does not grant the component, or an
+        HLD-declared dependency the LLD ignores; a data-ownership violation — the LLD
+        reads or writes data the HLD assigns to another component; a technology or
+        pattern choice contradicting an HLD-level decision binding on this component.
+        Severity mapping: a contradicted interface contract or a data-ownership
+        violation = blocker; a dropped HLD responsibility or an ungranted dependency =
+        major; naming drift against the HLD's terms = minor. Set each finding's file to
+        the reviewed LLD document's path and line to the line number of the cited
+        section anchor — the downstream refute pass reads the artifact at the finding's
+        file. Do not raise completeness or feasibility concerns under this rubric —
+        sibling lenses own them.

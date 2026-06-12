@@ -1,0 +1,37 @@
+version: 1
+
+# feasibility lens overlay for review-dimension (minted by the technical-design stage,
+# MULTIAGENTIC-DESIGN §3.2 / stage-technical-design §5). Overrides the active dimension,
+# the artifact kind, and the rubric snippet — a plain list REPLACES base's correctness
+# snippet wholesale (resolver list-replace rule). output_schema, inputs, runtime, and
+# the body inherit from base. The caller threads the requirements document as
+# context_path (the grounding doc, Read by path).
+vars:
+  dimension: feasibility
+  artifact_kind: high-level design document (markdown)
+
+context:
+  snippets:
+    - name: feasibility-rubric
+      text: >-
+        Feasibility rubric for a high-level design document — judge implementability,
+        grounded by the requirements document Read from context_path. Flag only
+        feasibility defects: a component whose responsibilities are too vague to build —
+        no inputs, outputs, or behavioral contract inferable; named technologies,
+        services, or libraries that do not exist or do not provide the capability the
+        design assigns them; an integration point with an external system left
+        underspecified (no protocol, contract, or failure story) where the design's
+        correctness rests on it; circular dependencies between components that prevent
+        independent build or deployment; an unstated assumption the design silently
+        relies on — data volumes, third-party guarantees, operational capabilities; a
+        design scope implausible against constraints the requirements state (team,
+        timeline, budget — only where the requirements state them); critical lifecycle
+        concerns absent where the requirements demand them — data migration, deployment,
+        versioning. Severity mapping: an unbuildable element or nonexistent capability on
+        the critical path = blocker; an underspecified integration or a silent assumption
+        that changes the architecture = major; a vague responsibility on a peripheral
+        component = minor. Set each finding's file to the reviewed design document's path
+        and line to the line number of the cited section anchor — the downstream refute
+        pass reads the artifact at the finding's file. Do not raise internal-consistency,
+        requirements-fidelity, NFR-coverage, or security concerns under this rubric —
+        sibling lenses own them.

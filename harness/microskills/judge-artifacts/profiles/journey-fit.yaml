@@ -1,0 +1,15 @@
+version: 1
+
+# journey-fit lens overlay for judge-artifacts (minted per MULTIAGENTIC-DESIGN §3.2).
+# Swaps ONLY vars.judge_lens — inputs, runtime, output_schema, and the body
+# inherit from base: the SAME body scores candidates under this lens.
+vars:
+  judge_lens: >-
+    how completely and faithfully the candidate's screens realize the
+    grounded user journeys — every journey step has a screen (or an explicit
+    screen state) that serves it; entry and exit points match the journey's
+    trigger and goal; personas' distinct needs surface in the screens that
+    serve them; no journey dead-ends on a screen with no path forward. Score
+    high for full journey coverage with faithful step-to-screen mapping; score
+    low for journeys with missing screens, mismatched entry/exit flow, or
+    persona needs no screen serves.

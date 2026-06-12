@@ -1,0 +1,24 @@
+version: 1
+
+# GitHub publish-target overlay for publish-backlog (MULTIAGENTIC-DESIGN §3.1
+# #14 / §3.2 — minted by the backlog build). The {{publish_target}} var carries
+# ALL target-specific instruction, so this overlay's vars value REPLACES base's
+# local-filesystem contract (scalar replace) and the body, inputs, and
+# output_schema all inherit untouched. github_repo stays the optional input
+# base's MICROSKILL.md table already declares.
+vars:
+  publish_target: >-
+    the GitHub target: through the gh CLI (run via Bash), create one milestone
+    per epic and one issue per story in the repository named by the
+    github_repo input (owner/name form; an empty github_repo = the repository
+    gh resolves as current) — each issue titled from its story's title, its
+    body carrying the story file's content including the acceptance criteria
+    and traceability links, assigned to its epic's milestone, and labeled from
+    its MoSCoW priority — then report the repository plus the created
+    milestone and issue counts as the location where the backlog landed.
+
+# Lists REPLACE on merge, so adding Bash means restating the full list: Read
+# and Write stay (the body still Reads the source backlog under backlog_dir),
+# and Bash rides in for the gh milestone/issue calls.
+runtime:
+  allowed_tools: [Read, Write, Bash]

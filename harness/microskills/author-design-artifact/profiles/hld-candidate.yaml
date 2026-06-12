@@ -1,0 +1,47 @@
+version: 1
+
+# hld-candidate overlay for author-design-artifact (technical-design stage,
+# §3.2 — emits the lens under the canonical field `label`). Swaps the
+# design-contract var, flips `label` (the architecture-stance name the schema
+# echoes) from optional to required, and REPLACES output_schema wholesale so
+# the expand-generated candidate siblings emit {document_path, label, summary}
+# entries collect-artifacts (profile hld-candidates) fans in.
+vars:
+  design_contract: >-
+    hld-candidate contract: author a COMPLETE candidate high-level design at
+    <output_dir>/design/candidates/hld-<label>.md from the requirements
+    document at primary_path, committing every major decision to the
+    architecture stance named by the required label (simplicity-first = fewest
+    moving parts, boring proven technology, minimal infrastructure;
+    scale-first = horizontal scalability, stateless services, load isolation;
+    delivery-first = fastest credible path to shipping, managed services, a
+    team-familiar stack) — the label text itself is the stance directive.
+    Required sections: (1) Components & responsibilities — every component
+    named with a one-line responsibility; (2) Technology stack — each pick
+    paired with a stance-grounded rationale; (3) Data flows — the principal
+    request and data paths across the components; (4) Integration points —
+    external systems, APIs, and protocols, with the component that owns each;
+    (5) NFR coverage — every non-functional requirement in the requirements
+    document mapped to the design decision that satisfies it. A non-null
+    classification object grounds the product_kind/has_ui framing; a null
+    classification = infer the framing from the requirements. A non-null ux
+    object supplies the UX surface — Read the wireframes document its
+    wireframes_path field names; a null ux = no UX surface to honor. A
+    non-null stance value adds supplementary angle guidance. Echo the supplied
+    label verbatim in the returned label field.
+
+# The label flip makes the stance name a gathered input — the candidate schema
+# and the judge scorecards key on it, so it cannot ride as an optional null.
+inputs:
+  label:
+    required: true
+
+# REPLACES base {document_path, summary} wholesale: label is the join key the
+# collect/judge/synthesize-panel chain ranks candidates by.
+output_schema:
+  type: object
+  required: [document_path, label, summary]
+  properties:
+    document_path: { type: string }
+    label: { type: string }
+    summary: { type: string }

@@ -1,0 +1,45 @@
+version: 1
+
+# internal-consistency lens overlay for review-dimension (minted by the technical-design
+# stage, MULTIAGENTIC-DESIGN §3.2 / stage-technical-design §5). Overrides the active
+# dimension, the artifact kind, and the rubric snippet — a plain list REPLACES base's
+# correctness snippet wholesale (resolver list-replace rule). output_schema, inputs,
+# runtime, and the body inherit from base. The caller threads the requirements document
+# as context_path and the parent classify output as the change_summary grounding object;
+# this rubric carries the classification cross-check that discharges the arch-rigor
+# design-classification-consistency obligation (MULTIAGENTIC-DESIGN B4).
+vars:
+  dimension: internal-consistency
+  artifact_kind: high-level design document (markdown)
+
+context:
+  snippets:
+    - name: internal-consistency-rubric
+      text: >-
+        Internal-consistency rubric for a high-level design document — flag only
+        contradictions and incoherences inside the design and against its own claims: a
+        component referenced in a data flow, diagram, or interface description that is
+        absent from the component enumeration; two sections assigning the same
+        responsibility to different components, or one component carrying contradictory
+        responsibilities; an interface whose two ends disagree (caller and callee
+        describe different contracts); data with one stated owner in one section and a
+        different owner elsewhere; technology or pattern choices that contradict each
+        other or the document's own stated principles; data flows citing stores or
+        services the design never defines. Classification cross-check (binding — this
+        lens discharges the design-classification-consistency obligation): the design's
+        declared product_kind and has_ui must be consistent with (a) the design content
+        itself — has_ui true requires a user-facing layer in the architecture, has_ui
+        false forbids one, and the declared product_kind must match what the architecture
+        actually serves; (b) the requirements document Read from context_path; and (c)
+        the threaded classification context — the optional structured grounding object
+        (change_summary) carrying product_kind, has_ui, confidence, and rationale. A
+        declared classification contradicting the threaded classification context or the
+        requirements = blocker; an absent classification context = cross-check the
+        declared classification against design content and requirements only. Severity
+        mapping: a contradiction that makes the design unimplementable as written =
+        blocker; a cross-section disagreement requiring a decision = major; naming drift
+        for the same element = minor. Set each finding's file to the reviewed design
+        document's path and line to the line number of the cited section anchor — the
+        downstream refute pass reads the artifact at the finding's file. Do not raise
+        requirements-fidelity, NFR-coverage, feasibility, or security concerns under this
+        rubric — sibling lenses own them.

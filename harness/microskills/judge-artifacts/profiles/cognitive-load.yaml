@@ -1,0 +1,15 @@
+version: 1
+
+# cognitive-load lens overlay for judge-artifacts (minted per MULTIAGENTIC-DESIGN §3.2).
+# Swaps ONLY vars.judge_lens — inputs, runtime, output_schema, and the body
+# inherit from base: the SAME body scores candidates under this lens.
+vars:
+  judge_lens: >-
+    how little the candidate demands of the user's working memory and
+    attention — screens carry one primary action each; information is grouped
+    and progressively disclosed rather than dumped; navigation depth and
+    branching stay shallow; labels and affordances are self-evident without
+    recall of prior screens; repeated tasks take few steps. Score high for
+    focused screens, shallow navigation, and self-evident affordances; score
+    low for crowded screens, deep or ambiguous navigation, and flows that make
+    the user carry state in their head.

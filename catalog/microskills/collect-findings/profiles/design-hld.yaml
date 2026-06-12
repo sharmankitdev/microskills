@@ -1,0 +1,16 @@
+version: 1
+
+# HLD-review fan-in overlay for collect-findings (MULTIAGENTIC-DESIGN §3.2,
+# minted by the technical-design build). Registers the input names the
+# five-dimension HLD panel wires (review-dimension profiles
+# internal-consistency / requirements-fidelity / nfr-coverage / feasibility /
+# security-architecture). Base's six code-review inputs are NOT renamed — they
+# deep-merge in, stay optional, and go unsupplied. Each entry is an empty map:
+# optional with a null default needs no behavioral keys; declaring the name
+# registers it for the caller.
+inputs:
+  internal_consistency: {}
+  requirements_fidelity: {}
+  nfr_coverage: {}
+  feasibility: {}
+  security_architecture: {}
