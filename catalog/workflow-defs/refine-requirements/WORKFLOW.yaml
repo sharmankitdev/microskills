@@ -1,9 +1,11 @@
 version: 1
 name: refine-requirements
 description: >-
-  Assemble requirements from one source into a structured SE requirements document, then refine it
-  with the user — branch on the gaps the assembler emits: none → approve/reject/revise; some → ask
-  clarifying questions and re-assimilate in a bounded loop until the gaps clear.
+  Assemble requirements from one source into a structured SE requirements document, refine it
+  with the user (or unattended from sources), then prove completeness mechanically: a
+  perspective-diverse adversarial critic panel drives a bounded convergence loop, every
+  gap-closure claim survives a seat-decorrelated refute-vote, and the run ends at an
+  evidence-backed approval gate.
 
 # Caller-supplied inputs (referenced as ${workflow.inputs.<name>}).
 inputs:
@@ -47,6 +49,19 @@ inputs:
     required: false
     default: .claude/.workflow-staging/refine-requirements
     description: Scratch dir where the clarify node persists its accumulating gap-answer ledger (round-resumable).
+  revision_notes:
+    type: string
+    required: false
+    description: >-
+      Optional revision guidance folded into each critique-loop revision pass; the loop_exhaust
+      "extend" choice appends the human's notes here (plain-string append semantics).
+  refute_seats:
+    type: integer
+    required: false
+    default: 3
+    description: >-
+      Independent skeptic seats per gap-closure claim (keep odd; majority vote — ties land in
+      needs_human, never silently upheld).
 
 imports:
   - microskills/assimilate-requirements
@@ -67,10 +82,13 @@ nodes:
       template_path: ${workflow.inputs.template_path}
       prior_answers_path: ${workflow.inputs.prior_answers_path}
 
-  # Branch A: gaps remain. Runs in the main loop, so AskUserQuestion + the
-  # microskill re-invocation are legal here. Owns the bounded human-in-the-loop refinement loop —
-  # NOT a declarative loop: block (a loop body can't hold an orchestrator node / can't pause for a
-  # human). Mutually exclusive with `approve` via the opposite gaps_count guard (advisory-fork).
+  # The human Q&A loop, MINUS the terminal presentation (that moved to present_refined, post-rigor,
+  # where critic evidence exists; the enforceable abandon lives at the approve_requirements gate).
+  # Runs in the main loop, so AskUserQuestion + the microskill re-invocation are legal here. Owns the
+  # bounded human-in-the-loop refinement loop — NOT a declarative loop: block (a loop body can't hold
+  # an orchestrator node / can't pause for a human). ALSO the STRUCTURAL separator between assemble's
+  # segment and the critique-loop segment — required by the on_exhaust body-own-segment rule; the
+  # checkpoint exists in the static partition even when the gaps_count guard skips it at runtime.
   - id: clarify
     delegation: orchestrator
     when: ${assemble.output.gaps_count > 0}
@@ -99,10 +117,10 @@ nodes:
          this way (not by hand-editing) so gap detection stays on one code path and catches any new gap
          an answer introduces.
       Stop the loop once gaps_count reaches 0 (converged), the user chooses to stop early, or you reach
-      ${workflow.inputs.max_iterations} rounds. THEN present the completed document and ask the user
-      with AskUserQuestion to approve / reject / revise: approve → finalize; reject → stop, keep the
-      document as-is; revise → gather change notes, append them to the ledger, re-invoke
-      /assimilate-requirements once more, then re-present. RETURN
+      ${workflow.inputs.max_iterations} rounds. Do NOT present the document for terminal approval here —
+      an adversarial critique loop, a closure refute-vote, and an approval gate run downstream; the user
+      reviews the document there, with machine evidence. (Deliberately NO reject/stop: this is
+      mid-pipeline; abandon lives at the approve_requirements gate.) RETURN
       {choice, final_document_path, rounds, converged, remaining_gaps}.
     # The DECLARED return contract for the prose RETURN above: compile records it in the
     # checkpoint's per-node io and check-step-io validates the stored result after the step
@@ -112,39 +130,266 @@ nodes:
       type: object
       required: [choice, final_document_path, rounds, converged, remaining_gaps]
       properties:
-        choice: { type: string, description: "approve | reject | revise outcome (autonomous: auto-accepted)." }
+        choice: { type: string, description: "refined | stopped-early (autonomous: auto-accepted)." }
         final_document_path: { type: string, description: Path of the finished requirements document. }
         rounds: { type: integer, description: Refinement rounds actually run. }
         converged: { type: boolean, description: True when the final re-assimilation reported gaps_count 0. }
         remaining_gaps: { type: array, description: Gaps still open at stop (empty when converged). }
 
-  # Branch B: no gaps from the first pass. Mutually exclusive with `clarify`
-  # (opposite gaps_count guard), so neither depends on the other — no skipped-dependency edge.
-  - id: approve
+  # ════ The critique convergence loop body (ALL background; contiguous; listed by GENERATED
+  #      ids in loop.body) ═══════════════════════════════════════════════════════════════════
+
+  # Fix pass. Round 1 receives carry null → explicit no-op pass (null-safe linear path; no
+  # control flow in the body). Rewrites the document IN PLACE at the stable assemble path, so
+  # every downstream consumer keeps one path.
+  - id: revise_req
+    use: apply-findings-to-document
+    depends_on: [clarify]                    # pure ordering; tolerates the guarded skip
+    inputs:
+      document_path: ${assemble.output.document_path}
+      findings: ${loop.carry.findings}       # null on round 1 → no-op pass
+      notes: ${workflow.inputs.revision_notes}
+
+  # The perspective-diverse critic panel. ONE expand template → 4 generated siblings
+  # (critique_req_user_value, critique_req_edge_cases, critique_req_nfr,
+  # critique_req_testability), each running review-dimension under its lens profile.
+  # Loop bodies stay SERIAL — the four critics run one-after-another per round;
+  # acceptable (bounded by max_iters), stated honestly.
+  - id: critique
+    use: review-dimension
+    customize: { profile: "{{each.item}}" }
+    phase_group: critique
+    depends_on: [revise_req]                 # pure ordering (no ref) — critics read the revised doc
+    expand:
+      over: [req-user-value, req-edge-cases, req-nfr, req-testability]
+    inputs:
+      artifact_path: ${assemble.output.document_path}
+
+  # Fan-in (inputs_each desugars to req_user_value:${critique_req_user_value.output} … +
+  # explicit depends_on per sibling). The `requirements` profile of collect-findings declares
+  # the four dimension input names.
+  - id: collect_req
+    use: collect-findings
+    customize: { profile: requirements }
+    inputs_each: critique
+
+  # Severity-ranked verdict. Canonical design profile: verifications OPTIONAL (none exist
+  # in-loop — refute fan-out is grammar-blocked inside a body; it runs post-loop on closure
+  # claims instead), change_summary optional, report written to the exact file at report_path.
+  # Verdict mapping pinned: surviving blocker/major → request_changes; minor-only → comment;
+  # none → approve. The profile's REPLACED schema RETAINS `findings` — the load-bearing
+  # loop-carry seed — and DROPS base's report_markdown (the report rides by path).
+  - id: synth_req
+    use: synthesize-review
+    customize: { profile: design }
+    inputs:
+      findings: ${collect_req.output.findings}
+      report_path: ${workflow.inputs.output_dir}/evidence/requirements/review.md
+
+  # ════ post-loop: present, then the closure refute-vote ═══════════════════════════════════
+
+  # The interactive document review, moved here from clarify so the human reviews WITH critic
+  # evidence in hand. Orchestrator checkpoint — ALSO the mandatory structural separator between
+  # the loop segment and the refute block (on_exhaust body-own-segment rule: a background
+  # neighbor topo-adjacent to the body merges into the loop segment and kills the compile).
+  # Unguarded → never null downstream. The autonomous profile patches THIS prompt (an
+  # interaction node, NOT a quality floor).
+  # NO depends_on: the ${synth_req.output.*} refs in the prompt already imply the
+  # synth_req → present_refined edge.
+  - id: present_refined
     delegation: orchestrator
-    when: ${assemble.output.gaps_count == 0}
     prompt: >
-      The assembled requirements document at ${assemble.output.document_path} has no open gaps —
-      every template section is filled with no ambiguity or contradiction (summary:
-      ${assemble.output.summary}). Present it to the user and ask with AskUserQuestion to
-      approve / reject / revise: approve → finalize; reject → stop, keep the document as-is;
-      revise → gather change notes, write them to ${workflow.inputs.staging_dir}/answers.json and
-      re-invoke /assimilate-requirements once with sources_path=${workflow.inputs.sources_path},
-      output_dir=${workflow.inputs.output_dir}, document_name=${workflow.inputs.document_name},
-      template_path=${workflow.inputs.template_path}, and prior_answers_path set to that ledger, then
-      re-present. RETURN {choice, final_document_path, remaining_gaps}.
-    # Declared return contract for the prose RETURN (validated post-step by check-step-io).
+      Present the refined requirements document at ${assemble.output.document_path} to the
+      user, with the critique verdict ${synth_req.output.verdict}
+      (blockers: ${synth_req.output.blocker_count}; loop converged:
+      ${loop.output.converged} in ${loop.output.rounds} round(s); report at
+      ${synth_req.output.report_path} — Read and summarize it). Ask with AskUserQuestion to
+      approve / revise. approve → proceed. revise → gather change notes, run
+      /microskill apply-findings-to-document with the notes shaped as findings, then
+      re-present (ONE bounded remediation round — the clarify in-node precedent). There is
+      deliberately NO reject here (mid-pipeline; abandon lives at the approve_requirements
+      gate). RETURN {action, document_path, remediation_rounds}.
     output_schema:
       type: object
-      required: [choice, final_document_path, remaining_gaps]
+      required: [action, document_path, remediation_rounds]
       properties:
-        choice: { type: string, description: "approve | reject | revise outcome (autonomous: auto-accepted)." }
-        final_document_path: { type: string, description: Path of the finished requirements document. }
-        remaining_gaps: { type: array, description: Always empty on this no-gaps branch. }
+        action: { type: string, description: "approved | revised (autonomous: auto-accepted)." }
+        document_path: { type: string }
+        remediation_rounds: { type: integer }
 
-# The refinement path is the primary result; like microskill-create's guarded `finalize`, output.from
-# may name a when-guarded node — it is null when the clean-first-pass `approve` branch ran instead.
-# Consumers must read the finished document from output_dir/document_name (BOTH branches always write
-# it there), NOT rely on this node output being non-null.
+  # Derive the closure CLAIMS as data: one claim per ledgered gap the document no longer
+  # leaves open. Claim basis = the round-1 gaps ∪ every gap id in the answers ledger at
+  # answers_path. Null-safe whole-value clarify record (clarify may be a guarded-skip null;
+  # never deref a field of it). Each claim carries a stable `id` (claim-<gap_id>) that
+  # verify-finding echoes as finding_id — the pinned tally join key.
+  - id: extract_claims
+    use: extract-closure-claims
+    depends_on: [present_refined]            # pure ordering — claims read the post-remediation doc
+    inputs:
+      gaps: ${assemble.output.gaps}
+      document_path: ${assemble.output.document_path}
+      answers_path: ${workflow.inputs.staging_dir}/answers.json
+      refinement_record: ${clarify.output}
+
+  # Claims × seats assignment AS DATA (cross-product-as-data). Deterministic expansion; no
+  # lenses → the single null lens; empty claims → empty pairs (clean no-gaps path by
+  # construction).
+  - id: assign_refuters
+    use: expand-assignments
+    inputs:
+      items: ${extract_claims.output.claims}
+      seats: ${workflow.inputs.refute_seats}
+
+  # ONE for_each runs the whole cross product; max_parallel honored — this is a background
+  # segment. Same segment as extract/assign/tally → the pairs array rides in-memory, never
+  # across the args boundary.
+  - id: refute_closure
+    use: verify-finding
+    customize: { profile: document }
+    for_each: ${assign_refuters.output.pairs}
+    as: pair
+    max_parallel: 6
+    inputs:
+      finding: ${pair.item}                  # the closure claim, shaped as the claim-under-test;
+                                             # carries `id` — verify-finding echoes it as
+                                             # finding_id and STOPS on a finding missing its id,
+                                             # so the tally join key is pinned, never improvised
+      seat: ${pair.seat}                     # decorrelation input on one linear body path
+      artifact_path: ${assemble.output.document_path}
+
+  # Deterministic vote join: groups verdicts back to their assignment seats by finding_id
+  # (= the claim's `id`, echoed by verify-finding); majority non-refute → upheld; majority
+  # refute → refuted (a REOPENED gap-closure); ties, shortfalls, undecidables → needs_human.
+  # attention_count = refuted + needs_human (one small unspilled guard field).
+  - id: tally_closures
+    use: tally-votes
+    inputs:
+      verdicts: ${refute_closure.items}      # whole fan-out array
+      assignment: ${assign_refuters.output}
+      report_path: ${workflow.inputs.output_dir}/evidence/requirements/closure-votes.md
+
+  # T5 advisory-park: the red-floor checkpoint BEFORE the gate. Interactive: triage in the
+  # main loop. Headless: prompt requires AskUserQuestion → dispatcher STOPS naming the node —
+  # honest park, pickup-able. Green: guard false → stored null, no pause. The autonomous
+  # profile MUST NOT patch this prompt (quality floor, not an interaction nicety).
+  - id: triage_reopened
+    delegation: orchestrator
+    when: ${tally_closures.output.attention_count > 0}
+    prompt: >
+      ${tally_closures.output.refuted_count} gap-closure claim(s) were REFUTED by majority
+      vote and ${tally_closures.output.needs_human_count} need a human (refuted:
+      ${tally_closures.output.refuted}; uncertain: ${tally_closures.output.needs_human}).
+      Triage WITH the user (AskUserQuestion): for each, either accept-with-record (it rides
+      into the evidence ledger as an unresolved escalation) or run ONE bounded remediation
+      round — fold the refuted gaps into the answers ledger at
+      ${workflow.inputs.staging_dir}/answers.json as "REOPENED: needs explicit answer",
+      re-invoke /assimilate-requirements with prior_answers_path set to it, then re-invoke
+      /microskill verify-finding (profile document) on each remediated claim and re-run
+      /microskill tally-votes over the refreshed verdicts, writing the refreshed report to
+      ${workflow.inputs.output_dir}/evidence/requirements/closure-votes-post-triage.md.
+      No reject/stop here; abandon lives at the gate. RETURN {action, remediated_count,
+      remaining_escalations, refreshed_report_path, post_counts} — refreshed_report_path
+      and post_counts are the remediation re-run's report path and tally counts, both null
+      when no remediation round ran.
+    output_schema:
+      type: object
+      required: [action, remediated_count, remaining_escalations, refreshed_report_path, post_counts]
+      properties:
+        action: { type: string }
+        remediated_count: { type: integer }
+        remaining_escalations:
+          type: array
+          items:
+            type: object
+            required: [kind, ref, detail]
+            properties:
+              kind: { type: string, description: "needs_human | reopened_accepted" }
+              ref: { type: string }
+              detail: { type: string }
+        refreshed_report_path: { type: ["string", "null"] }
+        post_counts: { type: ["object", "null"] }
+
+  # The evidence bridge (gate present: paths cannot reach workflow inputs or parent nodes;
+  # this node is the bridge). Background; the gate anchors it. All record inputs are whole
+  # values, null-safe (triage skips when green; clarify skips when no gaps; the loop
+  # pseudo-result is always committed under escalate). Exhaust-accept is DERIVED, never read
+  # from the conditional gate record: converged==false ∧ this node ran ⇒ the human (or
+  # pickup) chose accept — avoiding the ${loop_exhaust.output.choice} null-deref trap.
+  - id: assemble_req_evidence
+    use: assemble-evidence
+    customize: { profile: requirements }
+    inputs:
+      synthesis: ${synth_req.output}
+      closures: ${tally_closures.output}
+      loop_record: ${loop.output}            # {converged, rounds, carry} — accepted ref producer
+      refinement_record: ${clarify.output}
+      presentation_record: ${present_refined.output}
+      triage_record: ${triage_reopened.output}
+      document_path: ${assemble.output.document_path}
+      output_dir: ${workflow.inputs.output_dir}
+
+# The ONE convergence loop (at most one per workflow — spent here, on the document, this
+# leaf's only artifact). Body = GENERATED ids (an overlay that patches the critique
+# template's `over` list MUST patch loop.body in the same overlay). All members background
+# use: nodes, contiguous in definition order; clarify above and present_refined below are
+# the checkpoints that give the body its OWN segment (the on_exhaust body-own-segment rule).
+loop:
+  until: ${synth_req.output.verdict == 'approve'}
+  max_iters: 3
+  body: [revise_req, critique_req_user_value, critique_req_edge_cases,
+         critique_req_nfr, critique_req_testability, collect_req, synth_req]
+  carry:
+    findings: ${synth_req.output.findings}   # surviving findings seed the next revision —
+                                             # small structured list, by value. LOAD-BEARING:
+                                             # `findings` is RETAINED in the design profile's
+                                             # pinned replaced schema; without it the carry
+                                             # rides undefined and every round-2+ revision
+                                             # no-ops.
+  on_exhaust:
+    action: escalate                         # synthetic loop_exhaust gate
+    prompt: >-
+      The completeness critics still find blocker/major gaps after 3 revision rounds —
+      extend the budget with guidance, accept the document with recorded gaps, or abandon?
+    options: [extend, accept, abandon]
+    notes_input: revision_notes              # declared input
+    on_headless: fail                        # honest park; default: accept is BANNED
+
+gates:
+  # The leaf's terminal gate: the human's final, evidence-backed word + the enforceable
+  # abandon. Anchors a BACKGROUND node. T7 take-default is legitimate: reaching this gate
+  # headless implies the loop converged (else loop_exhaust parked, on_headless: fail) AND
+  # the closure tally is green (else triage_reopened parked) — the default can never wave
+  # a red floor through.
+  - id: approve_requirements
+    after: assemble_req_evidence
+    type: human_approval
+    severity: hard
+    prompt: >-
+      Final review of the requirements document with its machine evidence: critic-panel
+      verdict, closure refute-vote tallies, convergence record, and the unresolved-escalation
+      list. Where a triage remediation record exists, the evidence ledger (ledger.json) is
+      authoritative over the raw fields rendered here — they show committed pre-remediation
+      values. Approve to hand the document onward, revise to re-assemble the evidence ledger
+      with notes, or abandon to stop the run.
+    options: [approve, revise, abandon]
+    default: approve
+    on_headless: take_default
+    present:                                  # mechanical; no .items; all producers run
+      - synth_req.output.verdict              #   before the gate
+      - synth_req.output.blocker_count
+      - tally_closures.output.group_count
+      - tally_closures.output.upheld_count
+      - tally_closures.output.refuted_count
+      - tally_closures.output.needs_human_count
+      - tally_closures.output.seats
+      - assemble_req_evidence.output.unresolved_count
+      - read_file: assemble_req_evidence.output.ledger_path
+      - read_file: synth_req.output.report_path
+      - read_file: assemble_req_evidence.output.document_path
+
+# The unguarded evidence node — always non-null (fixes the old guarded-`clarify` output
+# caveat). The caller/parent receives the S1 stage record:
+# {document_path, ledger_path, evidence: {report_path, tallies}, escalations,
+#  unresolved_count, summary}.
 output:
-  from: clarify
+  from: assemble_req_evidence

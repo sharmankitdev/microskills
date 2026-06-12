@@ -3863,21 +3863,30 @@ nodes:
 
 
 def test_real_refine_requirements_orchestrator_contracts(tmp_path):
-    # The prose-only orchestrator return contracts now ride as declared
-    # output_schema blocks: clarify + approve carry them into their checkpoint io.
+    # The prose-only orchestrator return contracts ride as declared
+    # output_schema blocks. Post-augmentation (multiagentic pipeline), the
+    # gaps==0 `approve` twin is gone — clarify, present_refined, and the
+    # when-guarded triage_reopened carry the contracts into their checkpoint io.
     rc, data, out, err = run(REAL_DEFS, "refine-requirements")
     assert rc == 0, err
     m = json.loads(
         (REAL_DEFS / "refine-requirements" / ".compiled" / "manifest.json").read_text())
     chks = {s["node"]: s for s in m["steps"]
             if s.get("checkpoint_type") == "orchestrator_node"}
+    assert "approve" not in chks                 # removed by the augmentation
     clarify = chks["clarify"]["io"]["clarify"]
     assert clarify["guarded"] is True            # when: gaps_count > 0
     assert set(clarify["schema"]["required"]) == {
         "choice", "final_document_path", "rounds", "converged", "remaining_gaps"}
-    approve = chks["approve"]["io"]["approve"]
-    assert set(approve["schema"]["required"]) == {
-        "choice", "final_document_path", "remaining_gaps"}
+    present = chks["present_refined"]["io"]["present_refined"]
+    assert present["guarded"] is False
+    assert set(present["schema"]["required"]) == {
+        "action", "document_path", "remediation_rounds"}
+    triage = chks["triage_reopened"]["io"]["triage_reopened"]
+    assert triage["guarded"] is True             # when: attention_count > 0
+    assert set(triage["schema"]["required"]) == {
+        "action", "remediated_count", "remaining_escalations",
+        "refreshed_report_path", "post_counts"}
 
 
 # ---------------------------------------------------------------------------
