@@ -9,6 +9,11 @@ inputs:
   judges_path:
     required: true
 
+# The body Reads candidate/judge content and Writes the scorecard set at judges_path. Pinning the tool surface
+# (matching every sibling file-touching microskill).
+runtime:
+  allowed_tools: [Read, Write]
+
 output_schema:
   type: object
   required:

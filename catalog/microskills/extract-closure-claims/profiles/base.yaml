@@ -7,6 +7,11 @@ inputs:
   answers_path:
     materialize: file
   refinement_record: {}
+# The body Reads the document and the optional answers ledger; it writes nothing. Pinning the tool surface
+# (matching every sibling file-touching microskill).
+runtime:
+  allowed_tools: [Read]
+
 output_schema:
   type: object
   required: [claims, claim_count, still_open, still_open_count]

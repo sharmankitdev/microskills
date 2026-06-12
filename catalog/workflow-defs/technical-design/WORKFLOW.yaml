@@ -185,7 +185,9 @@ nodes:
   - id: refute_hld
     use: verify-finding
     customize: { profile: document }
-    for_each: ${collect_hld.output.findings}
+    # Fans over the SYNTHESIZED (duplicate-merged) finding set — refuting the
+    # pre-merge collection would adjudicate the same defect once per duplicate.
+    for_each: ${synth_hld.output.findings}
     as: finding
     max_parallel: 4
     inputs:
@@ -259,7 +261,11 @@ nodes:
   - id: refute_lld
     use: verify-finding
     customize: { profile: document }
-    for_each: ${collect_lld.output.findings}
+    # Scoped to blocker/major findings — the only severities that drive red_items,
+    # fix_lld, and the stage verdict; refuting minors prunes nothing downstream.
+    # With the HLD components cap (maxItems 12) x 3 dims this bounds the fan-out
+    # structurally instead of growing with total finding volume.
+    for_each: ${collect_lld.output.findings.filter(f => f.severity == 'blocker' || f.severity == 'major')}
     as: finding
     max_parallel: 6
     inputs:

@@ -6,6 +6,11 @@ inputs:
     required: true
   report_path:
     required: true
+# The body reads in-memory inputs and Writes the tally report at report_path. Pinning the tool surface
+# (matching every sibling file-touching microskill).
+runtime:
+  allowed_tools: [Read, Write]
+
 output_schema:
   type: object
   required:

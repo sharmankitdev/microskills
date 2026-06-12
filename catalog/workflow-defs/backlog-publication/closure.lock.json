@@ -1,13 +1,13 @@
 {
-  "manifest_hash": "cfba4172321c2852526daf6800a259e9506f014d6b0f84418224d40dcd4f283a",
+  "manifest_hash": "77ebb2f81b766dcdbeade29fdfc823f1ae611c8ae028f8dfab1d2d34af98e773",
   "name": "backlog-publication",
   "node_fingerprints": {
-    "assemble_evidence": "412090ba577809e940299b802584becc6dbbb33979b0ae136cd384f2d7a232f3",
+    "assemble_evidence": "0ba644888e5a67a2b9827dfa4bce13b7baaf772780f1d774cb8277a549e014bf",
     "assign": "c49c7bf282bfb6b1c5a5bce47eeb987baaed63586f7bcd67b47130e10f96f08e",
     "generate": "2b7ea8fd6d52b425caacc58079f1220593661608006b9e50039d2de3b607104f",
     "publish": "3a428cf550f2269b9f90d654539786941f06193548e92ab6268495df7f994472",
     "refute": "2f1684077aec8b80db6899274aa3f133d16cf7bb4ce69a5c551cf0f25307787c",
-    "tally": "38a984cb492035c31fb060e709e5aaceabff0b28ec135a218007bfa72eb690cd",
+    "tally": "0ac6dd4096291c666f28305aa04d0b95876eb9d29e8e9b6a2f0e34df2da6432c",
     "triage_coverage": "9eaaa72061c3bbaf7f9be124225727a30bffe92c466e88079207bad84c6f4319",
     "triage_quality": "9b74232142220f4137831120f1932403e9eeb69dd4ada8a7452f5032f54fc6ad",
     "verify": "9502f6fa6a402b2a75f15490af1498cd2494acf1bac65d6c600b88388a0ce7e5"

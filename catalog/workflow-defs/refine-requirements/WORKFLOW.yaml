@@ -62,6 +62,14 @@ inputs:
     description: >-
       Independent skeptic seats per gap-closure claim (keep odd; majority vote — ties land in
       needs_human, never silently upheld).
+  closure_pair_cap:
+    type: integer
+    required: false
+    default: 300
+    description: >-
+      Total-assignment scale guard for the closure refute-vote cross-product (claims x seats).
+      expand-assignments stops loud with the counts when the computed pair_count exceeds this —
+      a pathological gap count never silently becomes an unbounded refuter fan-out.
 
 imports:
   - microskills/assimilate-requirements
@@ -182,6 +190,9 @@ nodes:
   - id: synth_req
     use: synthesize-review
     customize: { profile: design }
+    # Findings detail crosses checkpoints by REFERENCE (handoff paths); the
+    # loop carry and same-segment readers still see the in-memory value.
+    spill_outputs: [findings, red_items, red_findings]
     inputs:
       findings: ${collect_req.output.findings}
       report_path: ${workflow.inputs.output_dir}/evidence/requirements/review.md
@@ -239,6 +250,7 @@ nodes:
     inputs:
       items: ${extract_claims.output.claims}
       seats: ${workflow.inputs.refute_seats}
+      pair_cap: ${workflow.inputs.closure_pair_cap}
 
   # ONE for_each runs the whole cross product; max_parallel honored — this is a background
   # segment. Same segment as extract/assign/tally → the pairs array rides in-memory, never
@@ -263,6 +275,7 @@ nodes:
   # attention_count = refuted + needs_human (one small unspilled guard field).
   - id: tally_closures
     use: tally-votes
+    spill_outputs: [upheld, refuted, needs_human]
     inputs:
       verdicts: ${refute_closure.items}      # whole fan-out array
       assignment: ${assign_refuters.output}
@@ -318,10 +331,15 @@ nodes:
   - id: assemble_req_evidence
     use: assemble-evidence
     customize: { profile: requirements }
+    # The HEAVY fields (findings / vote-group arrays) are declared spill_outputs
+    # on their producing nodes, so this checkpoint-crossing view carries
+    # handoff-file PATHS for them — by reference, never inline. Small loop
+    # outcome fields ride as flat refs.
     inputs:
       synthesis: ${synth_req.output}
       closures: ${tally_closures.output}
-      loop_record: ${loop.output}            # {converged, rounds, carry} — accepted ref producer
+      loop_converged: ${loop.output.converged}
+      loop_rounds: ${loop.output.rounds}
       refinement_record: ${clarify.output}
       presentation_record: ${present_refined.output}
       triage_record: ${triage_reopened.output}

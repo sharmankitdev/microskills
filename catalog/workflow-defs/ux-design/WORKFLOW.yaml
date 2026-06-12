@@ -282,6 +282,7 @@ nodes:
   - id: final_synthesize
     use: synthesize-review
     customize: { profile: design }
+    spill_outputs: [findings, red_items, red_findings]
     inputs:
       findings: ${synth.output.findings}
       verifications: ${refute.items}
@@ -306,6 +307,9 @@ nodes:
       converged: ${loop.output.converged}
       judge_record: ${pick_winner.output}
       iterate_record: ${iterate.output}
+      # The heavy finding arrays cross the signoff checkpoint by REFERENCE —
+      # final_synthesize declares them spill_outputs, so this view carries
+      # handoff-file paths for them; counts and report_path stay inline.
       final_review: ${final_synthesize.output}
       triage_record: ${triage_unconverged.output}
       gates_mode: human

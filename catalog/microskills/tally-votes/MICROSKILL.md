@@ -20,7 +20,7 @@ Given per-seat verdicts and the originating assignment object, deterministically
 
 | Name | Required | Type | Description | Default |
 |---|---|---|---|---|
-| verdicts | yes | array | Per-seat adversarial verdict objects, each echoing its finding_id and seat. Each verdict records one seat's judgment for one item-identity × lens pairing. | — |
+| verdicts | yes | array | Per-seat adversarial verdict objects, each echoing its finding_id (and its seat when the producer stamps one — a verdict without a seat still counts once toward its group: the majority rule needs group membership, not seat identity, and shortfall detection rests on verdicts_received vs pair_count). Each verdict records one seat's judgment for one item-identity × lens pairing. | — |
 | assignment | yes | object | The expand-assignments whole output object — the originating set of seat assignments (item-identity × lens pairs, joined by the item id or its composite `<item id>:<lens>` form) the verdicts are joined back to. Supplies pair_count and the expected seats per pair so shortfalls can be detected. | — |
 | report_path | yes | string | Filesystem path where the full tally report is written. | — |
 

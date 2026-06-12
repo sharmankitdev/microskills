@@ -12,7 +12,10 @@ vars:
     optional whole object; null = an explicit "absent" ledger entry — an absent
     ux_evidence entry carries the annotation mapped from classification.has_ui:
     false = "skipped by design", true = "evidence missing"). Escalation
-    derivation: concatenate
+    derivation: for the backlog_evidence record, its escalations are the
+    concatenation of its coverage_triage and quality_triage sub-records'
+    remaining_escalations arrays (a null sub-record contributes nothing);
+    for every other record, concatenate
     each present record's escalations array, prefixed with its stage name.
     gates_taken sources: each present record's gates_taken array, plus one entry
     for the classification gate built from the classification_gate_choice and

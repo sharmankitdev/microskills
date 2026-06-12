@@ -242,6 +242,10 @@ nodes:
   # reads refuted_count as "violations confirmed".
   - id: tally
     use: tally-votes
+    # The vote-group arrays cross the approve_publish checkpoint by REFERENCE:
+    # spilled fields thread as handoff-file paths; small counts stay inline for
+    # the triage guard and the gate's present lines.
+    spill_outputs: [upheld, refuted, needs_human]
     phase_group: invest
     inputs:
       verdicts: ${refute.items}
@@ -305,6 +309,11 @@ nodes:
       classification: ${workflow.inputs.classification}
       classification_gate_choice: ${workflow.inputs.classification_gate_choice}
       classification_gate_mode: ${workflow.inputs.classification_gate_mode}
+      # Whole records ride here; the HEAVY tally fields (the vote-group arrays)
+      # are declared spill_outputs on the tally node, so the threaded view this
+      # node receives carries handoff-file PATHS for them — by reference across
+      # the checkpoint boundary, never inline. The ledger scope derives the
+      # backlog stage's escalations from the two triage sub-records.
       backlog_evidence: >-
         ${Object.fromEntries([['coverage', verify.output],
         ['story_quality', tally.output], ['loop', loop.output],

@@ -16,14 +16,12 @@ version: 1
 vars:
   ledger_scope: >-
     REQUIREMENTS STAGE SCOPE (refine-requirements leaf, seam S1). Expected
-    records: synthesis (the critique-loop verdict object — verdict,
-    blocker_count, confirmed_count, refuted_count, needs_human_count,
-    findings, red_items, report_path, summary), closures (the gap-closure
-    refute-vote tally — verdict, upheld, refuted, needs_human, upheld_count,
-    refuted_count, needs_human_count, attention_count, blocker_count,
-    group_count, pair_count, verdicts_received, seats, report_path, summary),
-    loop_record (the committed critique-loop pseudo-result {converged, rounds,
-    carry}), refinement_record (the clarify Q&A record; null = no
+    records: synthesis (the critique-loop verdict record — verdict and its
+    counts plus report_path and summary; the full findings detail lives in
+    the report file at report_path, Read it there), closures (the gap-closure
+    refute-vote tally record — verdict, the count fields, report_path,
+    summary; the full vote-group detail lives at report_path), loop_converged and
+    loop_rounds (the critique-loop outcome as two flat fields), refinement_record (the clarify Q&A record; null = no
     clarification round ran, recorded as an explicit "absent" entry),
     presentation_record (the present_refined review record {action,
     document_path, remediation_rounds}), triage_record (the triage_reopened
@@ -43,7 +41,7 @@ vars:
     gates_mode literal is wired here; the terminal approve_requirements gate
     post-dates this node, so its choice lives only in the run journal (the
     documented W1 residual — record that note verbatim in the ledger's notes).
-    Exhaust-accept derivation: a loop_record whose converged field is false
+    Exhaust-accept derivation: a loop_converged value of false
     implies an accept was recorded at the exhaustion gate — add one
     exhaust-accept entry naming the critique loop. Coverage caps: record under
     the ledger's coverage_caps that the closure-vote claim basis is the
@@ -61,7 +59,8 @@ vars:
 inputs:
   synthesis: {}
   closures: {}
-  loop_record: {}
+  loop_converged: {}
+  loop_rounds: {}
   refinement_record: {}
   presentation_record: {}
   triage_record: {}

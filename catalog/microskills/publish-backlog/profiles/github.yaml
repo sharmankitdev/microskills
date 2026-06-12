@@ -16,12 +16,15 @@ vars:
     owner/name shape (^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ — anything else =
     stop, quote the bad value); an empty github_repo = the repository gh
     resolves as current. Backlog-derived text NEVER rides inline in a shell
-    string: write each issue body (the story file's content including the
-    acceptance criteria and traceability links) to a scratch file with the
-    Write tool and pass it with --body-file <path>; pass the title, milestone,
-    and MoSCoW-priority label as separate single-quoted argv arguments to
-    `gh issue create` / `gh api` — no string concatenation of story content
-    into a command, no command substitution around untrusted text.
+    string: build each issue and milestone as a JSON payload file written
+    with the Write tool — the title, the body (the story file's content
+    including the acceptance criteria and traceability links), the milestone
+    number, and the MoSCoW-priority label ALL inside the JSON (a title is as
+    untrusted as a body) — and create it with `gh api` plus `--input <payload
+    file>` (e.g. `gh api repos/<owner>/<name>/issues --input <path>`), so no
+    backlog-derived text ever appears in a command line — no string
+    concatenation of story content into a command, no command substitution
+    around untrusted text.
 
 # Lists REPLACE on merge, so adding Bash means restating the full list: Read
 # and Write stay (the body still Reads the source backlog under backlog_dir),
