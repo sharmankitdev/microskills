@@ -1,3 +1,9 @@
+## [0.15.0](https://github.com/sharmankitdev/microskills/compare/v0.14.0...v0.15.0) (2026-06-12)
+
+### Features
+
+* **workflow:** build the develop-product-backlog multiagentic pipeline ([#19](https://github.com/sharmankitdev/microskills/issues/19)) ([2d2035e](https://github.com/sharmankitdev/microskills/commit/2d2035eb31560f459816244f0b0af11cce84848c))
+
 ## [0.14.0](https://github.com/sharmankitdev/microskills/compare/v0.13.0...v0.14.0) (2026-06-11)
 
 ### Features
