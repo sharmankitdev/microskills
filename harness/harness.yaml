@@ -36,47 +36,33 @@ microskills:
   # domain: product-development — atomic microskills for the develop-product-backlog
   # pipeline (MULTIAGENTIC-DESIGN.md), provisioned via microskill-create.
   - name: classify-product
-    source: custom
-    profiles: [base]
+    source: plugin
   - name: judge-artifacts
-    source: custom
-    profiles: [base, cognitive-load, evolvability, flow-efficiency, journey-fit, requirements-fit, simplicity]
+    source: plugin
   - name: synthesize-panel
-    source: custom
-    profiles: [base, design, ux]
+    source: plugin
   - name: extract-closure-claims
-    source: custom
-    profiles: [base]
+    source: plugin
   - name: generate-backlog
-    source: custom
-    profiles: [base]
+    source: plugin
   - name: verify-traceability
-    source: custom
-    profiles: [base]
+    source: plugin
   - name: refute-story-quality
-    source: custom
-    profiles: [base]
+    source: plugin
   - name: collect-artifacts
-    source: custom
-    profiles: [base, hld-candidates, ux-candidates]
+    source: plugin
   - name: author-design-artifact
-    source: custom
-    profiles: [base, hld, hld-candidate, lld, lld-fix, ux-journeys, wireframe-candidate, wireframe-revise]
+    source: plugin
   - name: tally-votes
-    source: custom
-    profiles: [base]
+    source: plugin
   - name: apply-findings-to-document
-    source: custom
-    profiles: [base]
+    source: plugin
   - name: publish-backlog
-    source: custom
-    profiles: [base, github]
+    source: plugin
   - name: assemble-evidence
-    source: custom
-    profiles: [base, design, requirements, ux-stage]
+    source: plugin
   - name: expand-assignments
-    source: custom
-    profiles: [base]
+    source: plugin
 workflows:
   - name: microskill-create
     source: plugin
@@ -95,14 +81,10 @@ workflows:
     source: plugin
   # domain: product-development — develop-product-backlog pipeline (MULTIAGENTIC-DESIGN.md).
   - name: ux-design
-    source: custom
-    profiles: [base, autonomous]
+    source: plugin
   - name: technical-design
-    source: custom
-    profiles: [base, autonomous]
+    source: plugin
   - name: backlog-publication
-    source: custom
-    profiles: [base, autonomous, github, github-autonomous]
+    source: plugin
   - name: develop-product-backlog
-    source: custom
-    profiles: [base, autonomous, github, github-autonomous]
+    source: plugin
