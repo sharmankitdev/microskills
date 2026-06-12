@@ -304,7 +304,11 @@ nodes:
     customize: { profile: document }
     when: ${synth_lld.output.verdict == 'request_changes'}
     depends_on: [fix_lld]
-    for_each: ${synth_lld.output.findings}
+    # Scoped to red_findings — only findings whose cited document the fix round
+    # actually rewrote get a fresh verdict; untouched documents' findings carry
+    # their original status through the synth_lld_final join (which tolerates
+    # absent verdicts), so no agent re-adjudicates byte-identical content.
+    for_each: ${synth_lld.output.red_findings}
     as: finding
     max_parallel: 6
     inputs:
@@ -397,8 +401,7 @@ nodes:
     customize: { profile: design }
     inputs:
       hld_path: ${author_hld.output.document_path}
-      product_kind: ${workflow.inputs.classification}
-      has_ui: ${workflow.inputs.classification}
+      classification: ${workflow.inputs.classification}
       components: ${author_hld.output.components}
       lld_set: ${lld.items}
       panel: ${synthesize_winner.output}

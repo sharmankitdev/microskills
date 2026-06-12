@@ -46,8 +46,9 @@ inputs:
 
 output_schema:
   type: object
-  required: [story_id, criterion, seat, refuted, severity, rationale, confidence, needs_human]
+  required: [finding_id, story_id, criterion, seat, refuted, severity, rationale, confidence, needs_human]
   properties:
+    finding_id: { type: string, description: "The tally join key: <story_id>:<criterion>, matching the assignment pair it answers." }
     story_id: { type: string }
     criterion: { type: string }
     seat: { type: [integer, "null"] }

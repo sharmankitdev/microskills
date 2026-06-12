@@ -21,7 +21,7 @@ Given the round-1 gaps, the answers ledger, and the current document, classify e
 ## Steps
 
 1. **Read document** — Read the document contents from the path at document_path.
-2. **Read answers ledger** — Read the accumulated answers ledger from answers_path when supplied, treating the refinement_record object as an opaque whole value.
+2. **Read answers ledger** — Read the accumulated answers ledger from answers_path for a supplied path whose file exists (a supplied path with no file behind it contributes nothing — the legal no-gaps case), treating the refinement_record object as an opaque whole value.
 3. **Judge gaps** — Judge every entry in the gaps array against the document and answers, marking it closed or still open.
 4. **Build closure claims** — Build one closure claim per closed gap, shaped {id, gap_id, section, question, closure_excerpt} with id set to claim-<gap_id> and closure_excerpt quoting the document text that resolves it.
 5. **Collect open remainder** — Collect every still-unresolved gap into the still-open remainder.
@@ -35,4 +35,4 @@ A single JSON object returned to the caller (not a written file) carrying claims
 
 - **Missing required input** — gaps or document_path is absent; stop, name the input, do not proceed.
 - **Document unreadable** — the file at document_path does not exist or is not readable; stop, quote the path, do not proceed.
-- **Answers ledger unreadable** — answers_path is supplied but the file does not exist or is not readable; stop, quote the path, do not proceed.
+- **Answers ledger absent** — answers_path is supplied but no file exists at it; treat it exactly as the absent case (the ledger is only ever written by a gaps>0 clarification round, so a missing file on a no-gaps run is the legal happy path), contributing no later-round gap ids. A file that exists but cannot be parsed is different: stop, quote the path, do not proceed.

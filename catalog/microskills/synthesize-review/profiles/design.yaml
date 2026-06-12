@@ -28,7 +28,7 @@ runtime:
 output_schema:        # REPLACES base wholesale (resolver replace rule) — pinned VERBATIM
   type: object
   required: [verdict, blocker_count, confirmed_count, refuted_count, needs_human_count,
-             findings, red_items, report_path, summary]
+             findings, red_items, red_findings, report_path, summary]
   properties:
     verdict: { type: string, enum: [approve, comment, request_changes] }
     blocker_count: { type: integer }
@@ -46,6 +46,13 @@ output_schema:        # REPLACES base wholesale (resolver replace rule) — pinn
           artifact_path: { type: string }
           finding_ids: { type: array }
           finding_count: { type: integer }
+    red_findings:                                        # the finding objects whose
+      type: array                                        #   cited file appears in
+      items:                                             #   red_items — the ONLY set a
+        type: object                                     #   post-fix recheck re-adjudicates
+                                                         #   (untouched docs keep their
+                                                         #   original verdicts through the
+                                                         #   join); [] when green
     report_path: { type: string }
     summary: { type: string }
 # Verdict mapping pinned (§3.3): surviving blocker/major → request_changes;

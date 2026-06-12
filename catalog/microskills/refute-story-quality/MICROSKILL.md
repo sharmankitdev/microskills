@@ -1,6 +1,6 @@
 ---
 name: refute-story-quality
-description: Use when you hold one user story and the name of a single quality criterion, and need an adversarial seat to test whether the story truly meets it. Selects that criterion's section from the built-in rubric, builds the strongest violation case and the strongest compliance case from the story's text and acceptance criteria, weighs them, defaults to refuted on ambiguous evidence, and produces one seat-stamped JSON verdict carrying refuted, severity, rationale, confidence, and a needs_human flag.
+description: Use when you hold one user story and the name of a single quality criterion, and need an adversarial seat to test whether the story truly meets it. Selects that criterion's section from the built-in rubric, builds the strongest violation case and the strongest compliance case from the story's text and acceptance criteria, weighs them, defaults to refuted on ambiguous evidence, and produces one seat-stamped JSON verdict carrying a finding_id join key (story_id:criterion), refuted, severity, rationale, confidence, and a needs_human flag.
 ---
 
 # Refute Story Quality
@@ -24,7 +24,7 @@ Given a user story and a criterion name, adversarially weigh violation against c
 3. **Build violation case** — Build the strongest violation case against the story using only the story text and its acceptance criteria, grounded in that rubric section.
 4. **Build compliance case** — Build the strongest compliance case for the story from the same evidence.
 5. **Weigh evidence** — Weigh the two cases on the story evidence, defaulting to refuted when the evidence is ambiguous.
-6. **Emit verdict** — Emit the seat-stamped JSON verdict carrying refuted, severity, rationale, confidence, and needs_human.
+6. **Emit verdict** — Emit the seat-stamped JSON verdict carrying finding_id (the tally join key, composed as `<story_id>:<criterion>`), refuted, severity, rationale, confidence, and needs_human.
 
 ## Output
 

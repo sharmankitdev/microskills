@@ -1,22 +1,22 @@
 {
-  "manifest_hash": "82714b053b926d3dcdc4cf02edaa393afde811cd0a03fca8b4e5737a4a8879f3",
+  "manifest_hash": "0cdeff60d28902a901d6376564ae14e4121ddb0ef9405affcf93b45ef7a8f9b5",
   "name": "refine-requirements",
   "node_fingerprints": {
     "assemble": "29f8112df2cb78e7c893df83aee8e5416efa083615221bf2920632dcdf0e8bff",
     "assemble_req_evidence": "294bf83cbcf41c20030a215bc5237d659350152174045158d22a59d6dcb9473e",
-    "assign_refuters": "57d021e263bc201cf2518ecce8d9f9fe05edb6a0867f4da957df9f9b628add76",
+    "assign_refuters": "8d826ea99178a316bbc2cbc88e02e4e9fd1879e1cc34dc9e1e16f4c85b224c0f",
     "clarify": "54b67645ed9a44b5203381b1707ab451c00ea7eec9ed76b24c5311551bc0e0e1",
     "collect_req": "a3d9597473e53a948954dd2a854b8722295870aebfe42af650311874321a5543",
     "critique_req_edge_cases": "65fcc56bd5b9430232c09a8e9c4336aa5f9fc84340d74ecb5dc192568c7be49b",
     "critique_req_nfr": "00f16928910f69d3258e4387410d3a61ff6ceeebc6937640d6a9f31701e55200",
     "critique_req_testability": "d1bdb6b1c30f11f1389a24d05d63ffe217fa64f785c1288bcdbf67eb1c444a95",
     "critique_req_user_value": "ef1d024e2d8c870d20ad9df3b938ab7872c897f28d3142fe000ef4c29fc1e082",
-    "extract_claims": "b619ef654aeafbdc4018a2fbfd29527d6a0c865499e5497f2ab84107b921e4f5",
+    "extract_claims": "b868b3300b202d252e9247cb5d61cf9e5df12fec18badee5f158c65b832e6184",
     "present_refined": "e2c8de60bf8103cf167dd652ceb088c173d528862628ca6ea1d949a4e01ec82f",
     "refute_closure": "61fc871f6ad797748d71cb499aa37f6e9996f2a6f1fe0df817e3a76771f6962c",
     "revise_req": "c6d943b7381fc1fd5ffaa91c48ccf3d1eef4f5c985ea8ccebc4d6d5bb275961f",
-    "synth_req": "539415357738fc014ff84e498f133f36463221c9bf6aac6547a4c5a054094f84",
-    "tally_closures": "ebfe53d316a1830aa1a53d1ce05088ae92b61c55817847e1c3a03b52bf5ae654",
+    "synth_req": "85a90caad1fe57b74c462a7779f74513bac4f611f7b9360489a465e4f7a03250",
+    "tally_closures": "8f815e460990b7df475e6926db0b01d03bec505315b24b6bfac8c2c1737742d4",
     "triage_reopened": "ab70dec695cab6b8f0e552f82fb952ac272233bcdbbf41c83192b62513f3121a"
   },
   "profile_used": "base"

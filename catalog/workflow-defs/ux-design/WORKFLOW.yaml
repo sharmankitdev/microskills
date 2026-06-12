@@ -169,7 +169,7 @@ nodes:
 
   # ── Block 4: T4 convergence loop body — [revise -> heuristic panel ×3 (expand) ->
   # collect -> synth]; every member background, contiguous in definition order.
-  # Round 1's revise is the journeys-reconciliation pass (known_findings null).
+  # Round 1's revise is the journeys-reconciliation pass (prior_findings_path null).
   - id: revise
     use: author-design-artifact
     customize: { profile: wireframe-revise }
@@ -177,7 +177,7 @@ nodes:
       primary_path: ${iterate.output.wireframes_path}
       context_path: ${journeys.output.document_path}
       revision_notes: ${workflow.inputs.revision_notes}
-      known_findings: ${loop.carry.findings}
+      prior_findings_path: ${loop.carry.findings_report}
       output_dir: ${workflow.inputs.output_dir}
     # rewrites <output_dir>/ux/wireframes.md IN PLACE; returns {document_path, summary}
 
@@ -224,7 +224,10 @@ nodes:
     when: ${!loop.output.converged}
     prompt: >
       The hardening loop hit its round cap and you accepted the unconverged wireframes
-      at the exhaustion gate. The still-open findings are ${synth.output.findings}.
+      at the exhaustion gate. The still-open findings (${synth.output.blocker_count}
+      blocker(s), ${synth.output.needs_human_count} needs_human) are recorded at
+      ${synth.output.report_path} — Read that report (and its .json sidecar) for the
+      full set; the prompt deliberately carries paths and counts only.
       Triage them WITH the user (AskUserQuestion): for each remaining blocker/major,
       either record it as an accepted escalation ({kind, ref, detail}), or fold it into
       AT MOST ONE bounded remediation round — re-invoke /microskill
@@ -319,7 +322,7 @@ loop:
   body: [revise, panel_ux_journey_coverage, panel_ux_requirements_fidelity,
          panel_ux_flow_consistency, collect, synth]
   carry:
-    findings: ${synth.output.findings}   # by VALUE through args — rubrics keep finding prose concise
+    findings_report: ${synth.output.report_path}   # by PATH — the loop hot path never carries finding prose through args (mirrors the technical-design HLD loop)
   on_exhaust:
     action: escalate                     # synthetic loop_exhaust human_approval gate
     prompt: >-

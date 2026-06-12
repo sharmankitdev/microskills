@@ -110,6 +110,15 @@ inputs:
       Independent refuter seats per (story x criterion) claim. A claim survives only on
       majority non-refute across seats; ties, shortfalls, and undecidables fall to
       needs_human (tally-votes majority rule — strict).
+  invest_pair_cap:
+    type: integer
+    required: false
+    default: 600
+    description: >-
+      Total-assignment scale guard for the INVEST cross-product (stories x lenses x
+      seats). expand-assignments stops loud with the counts and split guidance when the
+      computed pair_count exceeds this — a 100-story backlog never silently becomes
+      1200+ refuter invocations in one segment. Raise deliberately for big backlogs.
 
 nodes:
   # ── T4 convergence loop body — the leaf's opening block, its OWN segment ────────────
@@ -132,8 +141,9 @@ nodes:
   # Bidirectional traceability check; coverage_ok is the loop's convergence signal.
   # uncovered is a SMALL {kind, ref} id list (carry rides by VALUE — F8 budget; prose
   # detail lives in report_path, never in carry). The report lands under
-  # output_dir/evidence/backlog/ (the one full-match JS-expression ref builds the
-  # subpath — an embedded ref in a use:-node input would ride as an unresolved literal).
+  # output_dir/evidence/backlog/ — the full-match JS-expression ref builds the subpath
+  # as one typed value (an embedded ref would ALSO resolve — DAG-RULES §4 wraps each in
+  # __ref() — the full-match form is just the cleaner single-expression spelling).
   - id: verify
     use: verify-traceability
     customize: { profile: base }
@@ -204,6 +214,7 @@ nodes:
       items_path: ${generate.output.index_path}
       lenses: ${workflow.inputs.invest_lenses}
       seats: ${workflow.inputs.invest_seats}
+      pair_cap: ${workflow.inputs.invest_pair_cap}
 
   # Each refuter attacks ONE claim: "story S satisfies INVEST criterion C" — default
   # refuted when evidence is ambiguous. The expand-assignments item IS the story object

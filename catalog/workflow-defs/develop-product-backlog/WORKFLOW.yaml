@@ -203,14 +203,17 @@ nodes:
       classification_gate_mode: human
       output_dir: ${workflow.inputs.output_dir}
       github_repo: ${workflow.inputs.github_repo}
-    # S4 parent-side contract (leaf output).
+    # S4 parent-side contract (leaf output). The leaf's output.from: publish returns
+    # exactly {published_target, location, summary}; the consolidated ledger lands at
+    # <output_dir>/evidence/ledger.json BY THE DOCUMENTED CONVENTION (derive it from
+    # output_dir) — it is deliberately NOT schema-required here, because the child
+    # cannot emit it through its publish output node.
     output_schema:
       type: object
-      required: [published_target, location, ledger_path, summary]
+      required: [published_target, location, summary]
       properties:
         published_target: { type: string }
         location: { type: string }
-        ledger_path: { type: string }
         summary: { type: string }
 
 # ── Gates ─────────────────────────────────────────────────────────────────────────────────────
@@ -238,7 +241,7 @@ gates:
       - classify.output.confidence
       - classify.output.rationale
 
-# The terminal leaf's result {published_target, location, ledger_path, summary} is the
-# workflow's aggregate output.
+# The terminal leaf's result {published_target, location, summary} is the workflow's
+# aggregate output; the evidence ledger is read from <output_dir>/evidence/ by convention.
 output:
   from: backlog_publication

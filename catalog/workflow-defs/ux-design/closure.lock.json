@@ -1,5 +1,5 @@
 {
-  "manifest_hash": "c1fe807816d465d6a81a949cc9c68ab16f07a15e47a4d47130aced88e511bf7f",
+  "manifest_hash": "c4b8a1cdf44fdaa49eaf94ab2ecaffa3cb8232b3816e639da923bff1e7c2208f",
   "name": "ux-design",
   "node_fingerprints": {
     "candidate_hub_dashboard": "55ed178cfdab08a10a5f3154c6d3227ca7c626918a0cc2783ff159986186e846",
@@ -7,7 +7,7 @@
     "candidate_task_flow": "76b46489196663c131a032af50f62940d08210844c6d10bbc2423bb691e39c49",
     "collect": "b706adeba6f0d45aa0e07862e55c7262ebdecd66f4f74b710160ce9dc3277c09",
     "collect_candidates": "c1128e78cd8033eeefeb262d0b250b6fa634d3060c6c2cf84e8284cc9969046a",
-    "final_synthesize": "e2d088397c784585ad4b8548108b34ed854455f1c2c15c394ab879fc8424ff7e",
+    "final_synthesize": "d32fd7a8de62779205d9472e2544cd34a4e09aabd5ca26780d295200a40d8025",
     "finalize": "60b3d8168096b302b5901d6a426d9c331e7ffabff6ba973ba208eb2c275d5b5c",
     "iterate": "02b59e8635fc79c226b89251122911e03f7494b2cca4f2411a996411682b4de3",
     "journeys": "a5230cc49fd1d0867a26c10e433ba40e58f1bc03390e486b64e06b411ba10aab",
@@ -19,9 +19,9 @@
     "panel_ux_requirements_fidelity": "45b25b3ca3b1549808ade8d47b4801e2a12accf62a07c02a19379013e8ce40f9",
     "pick_winner": "33495e0aec34a34edd3c7871420413bdffc4b1050f26c951ef05334eaef7ead3",
     "refute": "8bacb35a75bafcef09f3314b96ddf487f14d5c7635caeaa68aa590414dbaf2dc",
-    "revise": "c30c5b45cc73053279ca68b245f0c89199cf8f23d000f4d2ee0bcdaac87af5fe",
-    "synth": "767fdfd06b98e9ac5dbdae32673fcf1c242583c0633b52c88fb7ecec5a2ecc3c",
-    "triage_unconverged": "858e15fd6cc51dc7fed04d3e13919c62be377da591e7ed04a63d39176730de89"
+    "revise": "48b7798e80d9bf295b33d91abc684d2fa9f2e55975a22ec3cb30c4ff0d715497",
+    "synth": "f00da3183dc395399cf84f9b18c364f3617b18ec7da5b4fd63126113fa196731",
+    "triage_unconverged": "698d716dcc0c6938b9afae6a8730e10cb2223520dd5126bb99b6bdd2467782c9"
   },
   "profile_used": "base"
 }

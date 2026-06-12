@@ -21,8 +21,13 @@ version: 1
 vars:
   ledger_scope: >-
     TECHNICAL-DESIGN STAGE SCOPE (technical-design leaf, seam S3). Expected
-    records: hld_path (the canonical HLD document path), product_kind and
-    has_ui (the HLD author's confirmed classification), components (the HLD's
+    records: hld_path (the canonical HLD document path), classification (the
+    upstream classification record as a WHOLE object or null; the emitted
+    product_kind and has_ui fields are mapped from it — classification
+    non-null = extract its product_kind and has_ui fields verbatim;
+    classification null (a standalone leaf run) = derive product_kind and
+    has_ui by Reading the HLD document's stated product scope and
+    user-interface sections), components (the HLD's
     component array, each {name, responsibility}), lld_set (the LLD fan-out
     results, each {document_path, component_name}), panel (the architecture
     judge-panel record — winner_label, winner_path, graft_notes,
@@ -75,8 +80,7 @@ vars:
 
 inputs:
   hld_path: {}
-  product_kind: {}
-  has_ui: {}
+  classification: {}
   components: {}
   lld_set: {}
   panel: {}

@@ -21,13 +21,13 @@ Given per-seat verdicts and the originating assignment object, deterministically
 | Name | Required | Type | Description | Default |
 |---|---|---|---|---|
 | verdicts | yes | array | Per-seat adversarial verdict objects, each echoing its finding_id and seat. Each verdict records one seat's judgment for one item-identity × lens pairing. | — |
-| assignment | yes | object | The expand-assignments whole output object — the originating set of seat assignments (item-identity × lens pairs keyed by finding_id) the verdicts are joined back to. Supplies pair_count and the expected seats per pair so shortfalls can be detected. | — |
+| assignment | yes | object | The expand-assignments whole output object — the originating set of seat assignments (item-identity × lens pairs, joined by the item id or its composite `<item id>:<lens>` form) the verdicts are joined back to. Supplies pair_count and the expected seats per pair so shortfalls can be detected. | — |
 | report_path | yes | string | Filesystem path where the full tally report is written. | — |
 
 ## Steps
 
 1. **Read inputs** — Read the verdicts array, the assignment object, and report_path.
-2. **Join and group** — Join each verdict to its assignment seat by its echoed finding_id key, grouping the joined seats by item-identity × lens.
+2. **Join and group** — Join each verdict to its assignment seat by its echoed finding_id key — matched against the pair's item id directly (a lens-less assignment, e.g. closure claims) and against the composite `<item id>:<lens>` form (a lensed assignment, e.g. story × criterion) — grouping the joined seats by item-identity × lens.
 3. **Tally each group** — Tally each group under the majority rule — majority non-refute → upheld, majority refute → refuted; treat each missing or null verdict (verdicts_received below the group's pair_count) as a counted shortfall and route ties, shortfalls, and undecidables → needs_human.
 4. **Partition and count** — Partition the groups into upheld, refuted, and needs_human lists, compute the counts (upheld_count, refuted_count, needs_human_count, attention_count, blocker_count, group_count, pair_count, verdicts_received), and assemble the seats list as the distinct seat numbers carried by the assignment object's pairs.
 5. **Derive verdict** — Derive the overall verdict from the surviving groups' severities — surviving blocker or major → request_changes, surviving minor only → comment, none → approve.

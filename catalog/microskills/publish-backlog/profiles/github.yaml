@@ -10,12 +10,18 @@ vars:
   publish_target: >-
     the GitHub target: through the gh CLI (run via Bash), create one milestone
     per epic and one issue per story in the repository named by the
-    github_repo input (owner/name form; an empty github_repo = the repository
-    gh resolves as current) — each issue titled from its story's title, its
-    body carrying the story file's content including the acceptance criteria
-    and traceability links, assigned to its epic's milestone, and labeled from
-    its MoSCoW priority — then report the repository plus the created
-    milestone and issue counts as the location where the backlog landed.
+    github_repo input — then report the repository plus the created milestone
+    and issue counts as the location where the backlog landed. SHELL
+    DISCIPLINE (binding): a non-empty github_repo must match the strict
+    owner/name shape (^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ — anything else =
+    stop, quote the bad value); an empty github_repo = the repository gh
+    resolves as current. Backlog-derived text NEVER rides inline in a shell
+    string: write each issue body (the story file's content including the
+    acceptance criteria and traceability links) to a scratch file with the
+    Write tool and pass it with --body-file <path>; pass the title, milestone,
+    and MoSCoW-priority label as separate single-quoted argv arguments to
+    `gh issue create` / `gh api` — no string concatenation of story content
+    into a command, no command substitution around untrusted text.
 
 # Lists REPLACE on merge, so adding Bash means restating the full list: Read
 # and Write stay (the body still Reads the source backlog under backlog_dir),

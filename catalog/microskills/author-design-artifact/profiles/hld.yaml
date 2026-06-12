@@ -40,6 +40,10 @@ output_schema:
     components:
       type: array
       minItems: 1
+      # Scale guard for the downstream per-component LLD fan-out (and its 3-dim
+      # review cross-product): an HLD that genuinely needs more than 12 top-level
+      # components should be split into subsystems, not fanned out unboundedly.
+      maxItems: 12
       items:
         type: object
         required: [name, responsibility]
