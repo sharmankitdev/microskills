@@ -93,3 +93,16 @@ workflows:
   # when-split, bounded gap-refinement loop driven by AskUserQuestion.
   - name: refine-requirements
     source: plugin
+  # domain: product-development — develop-product-backlog pipeline (MULTIAGENTIC-DESIGN.md).
+  - name: ux-design
+    source: custom
+    profiles: [base, autonomous]
+  - name: technical-design
+    source: custom
+    profiles: [base, autonomous]
+  - name: backlog-publication
+    source: custom
+    profiles: [base, autonomous, github, github-autonomous]
+  - name: develop-product-backlog
+    source: custom
+    profiles: [base, autonomous, github, github-autonomous]
