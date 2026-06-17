@@ -370,7 +370,9 @@ changes the recorded choice.
 
 **(b) Evidence core (VERBATIM — approval-integrity invariant).** Print each `evidence[]` entry in the
 digest, in order — never reorder, synthesize, or substitute (resolution happened in the bookkeeper;
-you only render). By the entry's `kind`:
+you only render). When a gate declares no `present`, the bookkeeper supplies the same `evidence[]`
+shape from the fallback it resolved out of `results[gate.after]` by the output rubric — you still
+render it verbatim, never re-resolving or substituting. By the entry's `kind`:
 - `scalar` → `**<label>**: <value>`.
 - `json` → the `value` in a fenced ```json block.
 - `file` → the `contents` in a fenced block, language from `lang` (show it in full — present is the

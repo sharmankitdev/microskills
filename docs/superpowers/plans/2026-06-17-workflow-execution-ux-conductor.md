@@ -709,7 +709,10 @@ mapping — copy the cited commands/flags/SECURITY text exactly, then add the di
 - `## op: prep` — from SKILL.md **segment step 1** (`run-step args … [--extend]`, 420–444),
   **gate conditional + present** (480–508: `run-step eval` for `when`; resolve each `present`
   entry — scalar→`{kind:"scalar",label,value}`, object/array→`{kind:"json",label,value}`,
-  `{read_file:}`→Read the file and return `{kind:"file",label,contents,lang}`), and **orch/nested
+  `{read_file:}`→Read the file and return `{kind:"file",label,contents,lang}`; the **no-`present`
+  case** resolves `results[gate.after]` by the output rubric — plan→`{kind:"file"}` (Read
+  `plan_path`), verdict→scalar `pass` + json `issues`, staging-paths/scope-advisory/default→json —
+  so a gate with no declared evidence still yields a non-empty `evidence[]`), and **orch/nested
   eval** (`run-step eval …`, 590–609 / 631–647). Return the per-kind digest:
   - segment → `{kind:"segment", script, args, label, node_labels, produces, is_loop}`
   - gate → `{kind:"gate", gate:{id,label,prompt,options,severity,default,on_headless,after}, when, skipped, evidence:[…ordered…], gate_mode}`

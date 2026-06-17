@@ -133,11 +133,17 @@ the third is new and *strengthens* the existing gate invariant.
 3. **Gate `present` resolves inside the bookkeeper.** The bookkeeper resolves each
    `present` entry **in declared order** — scalar (`**<field>**: <value>`),
    fenced-json, or `{read_file:}` file-contents — and returns a **render-ready,
-   ordered evidence payload**. The conductor prints it **verbatim**, wraps ephemeral
-   framing around it, and never reorders/summarizes/substitutes it. This both
-   preserves the approval-integrity invariant ("MECHANICAL, identical every run, no
-   synthesis; recorded choice committed verbatim") **and** hides the `{read_file:}`
-   `Read` calls that are visible today.
+   ordered evidence payload**. It resolves BOTH the declared `present` AND the
+   no-`present` output-rubric fallback into that payload: when a gate declares no
+   `present` (e.g. `approve_plan` / `approve_decomposition` after a `plan` node), the
+   bookkeeper resolves `results[gate.after]` by the output rubric (plan→file,
+   verdict→scalar+json, staging-paths/scope-advisory/default→json) so the conductor
+   always has evidence to print — the file-read stays in the bookkeeper, exactly like
+   `{read_file:}`. The conductor prints it **verbatim**, wraps ephemeral framing around
+   it, and never reorders/summarizes/substitutes it. This both preserves the
+   approval-integrity invariant ("MECHANICAL, identical every run, no synthesis;
+   recorded choice committed verbatim") **and** hides the file `Read` calls that are
+   visible today.
 
 ## 6. Determinism & resume (preserved by construction)
 

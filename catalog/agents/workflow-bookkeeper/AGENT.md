@@ -189,14 +189,34 @@ Parse `{gate, when, skipped}`.
 - `skipped: true` → return `{"kind": "gate", "gate": <gate>, "when": <when>, "skipped": true, "evidence": [], "gate_mode": "<manifest.gate_mode>"}`.
 - `skipped: false` → proceed to resolve evidence below.
 
-For gates without a `when` (or after confirming `skipped: false`), resolve each `gate.present`
-entry in declared order:
+For gates without a `when` (or after confirming `skipped: false`), build `evidence[]` by one of two
+branches — EITHER the declared `present` resolution OR, when `gate.present` is absent or empty, the
+no-`present` output-rubric fallback below. Both branches return `evidence[]` (the conductor renders it
+verbatim either way).
+
+**`gate.present` declared (non-empty)** → resolve each entry in declared order:
 - A string path `<id>.output[.<field>...]` → resolve against `results` in run-state. If the
   value is a scalar → `{"kind": "scalar", "label": "<last path segment>", "value": "<value>"}`.
   If object/array → `{"kind": "json", "label": "<last path segment>", "value": <value>}`.
   If undefined/null → `{"kind": "scalar", "label": "<last path segment>", "value": "(not produced)"}`.
 - `{read_file: <path>}` → resolve `<path>` against results to a file path, Read that file.
   Return `{"kind": "file", "label": "<last path segment>", "contents": "<contents>", "lang": "<ext>"}`.
+
+**No `present` (absent or empty)** → fall back to the output rubric: resolve `results[gate.after]`
+(the after-node's recorded output, already in the run-state you read) into `evidence[]` entries by its
+shape, so the conductor still has something to render. Read-the-file stays here in the bookkeeper,
+exactly as the `{read_file:}` present case does — the conductor never opens a file. Match the shape:
+- **plan** (`{plan_path, name, ...}`) → Read the file at `plan_path` and emit
+  `{"kind": "file", "label": "<name>", "contents": "<contents>", "lang": "<ext from plan_path>"}`
+  (the full contents; `lang` from the file extension, e.g. `yaml` for `.yaml`).
+- **verdict** (`{pass, issues[]}`) → a `{"kind": "scalar", "label": "pass", "value": "PASS" | "FAIL"}`
+  entry (from the boolean) followed by `{"kind": "json", "label": "issues", "value": <issues array>}`.
+- **staging paths** (`{staging_paths[]}`) → `{"kind": "json", "label": "staging_paths", "value": <the array>}`.
+- **scope advisory** (`{kind, reason, recommendation}` / `missing_microskills[]`) →
+  `{"kind": "json", "label": "scope_advisory", "value": <the object>}`.
+- **default** (any other shape) → `{"kind": "json", "label": "<gate.after>", "value": <the key fields>}`.
+If `results[gate.after]` is itself undefined/null → emit a single
+`{"kind": "scalar", "label": "<gate.after>", "value": "(not produced)"}` entry (never invent a value).
 
 Return:
 ```json
@@ -214,7 +234,10 @@ Return:
 
 Run ONE Bash call:
 `.claude/scripts/run-step eval --manifest '.claude/workflow-defs/<name>/.compiled/manifest.json' --run-state '<run_dir>/run-state.json' --step <step>`
-Parse `{skipped, prompt, iterations, io_schema}`. Non-zero exit → `{"ok": false, "error": "..."}`.
+Parse `{skipped, prompt, iterations}`. Non-zero exit → `{"ok": false, "error": "..."}`.
+The node's declared return contract is `io_schema = s.io[s.node].schema` from the manifest step
+record you already read (null when the node declares no schema) — NOT from the `eval` output, which
+never emits it.
 Return:
 ```json
 {
@@ -223,7 +246,7 @@ Return:
   "prompt": "<prompt or null>",
   "iterations": "<iterations or null>",
   "skipped": "<skipped>",
-  "io_schema": "<io_schema or null>",
+  "io_schema": "<s.io[s.node].schema or null>",
   "gate_mode": "<manifest.gate_mode>"
 }
 ```
