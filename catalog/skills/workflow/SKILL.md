@@ -34,6 +34,11 @@ checkpoint in the main loop (where `AskUserQuestion` works), and threads outputs
 
 ## Setup
 
+Setup commands are plumbing — run them without echoing command lines, JSON output, run-ids,
+manifest hashes, byte sizes, or `.cat` paths. On success they are silent; only their plain-language
+*outcome* surfaces (via the opening beat below and the per-step recaps). On error, surface the
+error readably and stop.
+
 1. **Name** — read `<name>` from invocation args (position 1 for `/workflow <name>`, or the first
    token from a shim). If no `.claude/workflow-defs/<name>/WORKFLOW.yaml` exists, stop and report.
 2. **Profile / overrides** — detect `<profile>` (slash position 2 or `"with <profile> profile"`) and
@@ -72,11 +77,13 @@ checkpoint in the main loop (where `AskUserQuestion` works), and threads outputs
    compile — and is continued via the **Pickup** mode instead.) **Under auto
    mode never ask: skip the offer and start fresh at step 6** (prior run dirs stay as provenance; an
    auto compile has a distinct manifest_hash anyway, so interactive state never matches). Parse the JSON:
-   - `found: true` → **offer to resume** via `AskUserQuestion` ("Resume run {run_id} from step
-     {step_index+1}, or start fresh?"). If the output carries a **non-null `failed_step`**, the
-     offer must say so: the run's last attempt at that step FAILED its post-step IO check (its
-     result was never committed), so resuming re-runs that step — e.g. "Resume run {run_id}? Its
-     last attempt at step {failed_step+1} failed the IO check; resuming re-runs it." (The scan
+   - `found: true` → **offer to resume**, in the conductor's voice — name where the prior run left
+     off and let the user decide — via `AskUserQuestion` ("Looks like run {run_id} stopped partway,
+     at step {step_index+1}. Pick it back up there, or start fresh?"). If the output carries a
+     **non-null `failed_step`**, the offer must say so: the run's last attempt at that step FAILED
+     its post-step IO check (its result was never committed), so resuming re-runs that step — e.g.
+     "Run {run_id}'s last attempt at step {failed_step+1} failed its IO check; picking it back up
+     re-runs that step. Resume, or start fresh?" (The scan
      itself never offers a poisoned record whose progress advanced past a `failed_step`.) On
      resume: adopt that `run_dir` as this run's directory, seed
      `inputs` and `results` from the `inputs` / `results` maps in `<run_dir>/run-state.json` — the
@@ -99,6 +106,22 @@ checkpoint in the main loop (where `AskUserQuestion` works), and threads outputs
    renders the journal human-readably for a post-mortem; `runs/` isolates *runtime* state only — two
    concurrent runs of the same def compiled with different profiles/overrides still race on the shared
    `.compiled/seg-*.js` + `manifest.json`, so never run those concurrently.)
+
+   **### Announce the run (conductor opening)**
+
+   The manifest is loaded and the run is minted — this is the main loop, never a segment, so it is
+   the one place to set the scene. Print one opening beat — the only place a watcher learns what the
+   whole run will do:
+   - **Title:** `🛠  <name> — <manifest.description>`. If `manifest.gate_mode == "auto"`, append
+     ` (headless — gates take their declared defaults)`.
+   - **Roadmap:** one compact line per `manifest.steps[i]`, numbered `1..M`, each showing the step's
+     label (resolved per the cursor rule in **Execute the manifest** below), tagging human gates with
+     `⏸ you decide` and nested workflows with `▸ nested`. A scannable list, not prose.
+   - **Inputs:** if inputs will be gathered, name them in one line.
+
+   Ephemeral: printed once, never journaled, never written to run-state. (You MAY mirror the
+   Preflight render logic in the **Preflight** section for consistency, but do not merge the modes —
+   Preflight halts before gathering; this opening proceeds to gather inputs and run.)
 7. **Gather inputs** — initialize `inputs = {}`. For each name in `manifest.required_inputs`: if the
    caller's prompt supplies a literal value, use it; otherwise gather via `AskUserQuestion`. Apply
    `manifest.input_defaults` for any non-required input not supplied. (Do not fall back to a default
@@ -228,7 +251,10 @@ requirement) needs a changed input, which is a NEW run, never a rerun.
 5. **Skip Setup steps 5-8 entirely** — the inputs are FROZEN from the record and already seeded,
    including materialized `run-inputs/` paths that point into the SOURCE run's dir (this is why
    finished run dirs are retained). Adopt `run_dir`, seed in-memory `inputs` / `results` from
-   `<run_dir>/run-state.json`, set `i = from.step_index`.
+   `<run_dir>/run-state.json`, set `i = from.step_index`. The conductor opening for a rerun reflects
+   *resuming partway*: announce that this is a rerun of run `<source run_id>` from step `{i+1}`, and
+   render the roadmap with the pre-from steps marked as already-recorded (the `replayed_gates` lines
+   from step 4 are part of that opening) — the cursor then starts at `Step {i+1}`, never at Step 1.
 6. **Execute the manifest** from `i` exactly as a normal run, with ONE addition: a step listed in
    `confirm_steps` (an orchestrator_node / nested_workflow checkpoint) **re-executes side
    effects** — filesystem writes, vendoring, nested child runs that already happened once in the
@@ -277,6 +303,9 @@ refuse with a nonzero outcome — a headless pickup is a contradiction in terms.
    rerun, nothing is replayed): seed in-memory `inputs` / `results` from
    `<run_dir>/run-state.json`, set `i = step_index`, and journal the mode transition:
    `.claude/scripts/run-journal append --run-dir '<run_dir>' --event pickup --step-index <i> --label 'interactive pickup of parked auto run'`.
+   The conductor opening for a pickup reflects *resuming partway*: announce that you're picking up
+   parked run `<run_id>` at step `{i+1}` (the parking gate), now interactive, and render the roadmap
+   with the already-committed prefix marked done — the cursor starts at `Step {i+1}`, never at Step 1.
 5. **Execute the manifest** from `i` with ONE override: **gate handling is interactive for this
    session.** `manifest.gate_mode: "auto"` stays stamped (the manifest — and its hash — are
    untouched), but the auto-mode gate rules are SUSPENDED: every remaining gate, starting with the
@@ -306,18 +335,35 @@ its results through the extend protocol, exactly as it would in any interactive 
 ## Execute the manifest
 
 Maintain `results = {}` (node id → that node's returned output object). Let `M = manifest.steps.length`
-and track the 0-based position `i` as you walk. **Before running each step, print a one-line header**
-`Step {i+1}/{M}: {label}`, synthesizing `{label}` from the step (the manifest has no label field):
-- segment → its node ids as an action — `plan` → "Plan", `implement, evaluate` (a loop) → "Implement & evaluate (loop)".
-- gate → "Approval: {gate.id}".
-- orchestrator_node → its node id as an action — `finalize` → "Finalize", `provision` → "Provision missing microskills".
-- nested_workflow → the child workflow as an action — `build` (running `build-workflow-from-plan`) → "Build (nested workflow)".
-A skipped step (a `warn` gate, an orchestrator node whose `when` is false, or the conditional
-`loop_exhaust` gate after a converged loop) still gets a header, marked skipped.
+and let `T` be the total step count of the journey announced at the opening (`T = M` for a top-level
+run; under nesting it is the parent's total — see the nested-workflow section). Track the 0-based
+position `i` as you walk.
+
+**Before running each step, print the cursor:** `▶ Step {g}/{T} · {label}`, advancing the user along
+the announced roadmap, where `{g}/{T}` is the GLOBAL position in the journey (`{g} = i+1` for a
+top-level run; under nesting it threads the parent ordinal — see the nested-workflow section).
+
+Resolve `{label}` (the manifest now stamps one on every step — the compiler always stamps an authored
+`name` or a humanized id):
+1. the step record's `label` field — use it.
+2. if absent, fall back to the kind→label synthesis: segment → its node ids as an action (`plan` →
+   "Plan", a loop → "Implement & evaluate (loop)"); gate → its label; orchestrator_node → its node
+   id as an action (`finalize` → "Finalize", `provision` → "Provision missing microskills");
+   nested_workflow → the child workflow as an action (`build` → "Build (nested workflow)").
+
+For a multi-node segment whose stamped `label` is a long ` & `-joined string, you MAY use the
+concise kind→label synthesis for the cursor header and save the per-dimension names (the step's
+`node_labels`) for the recap. A skipped step (a `warn` gate, an orchestrator node whose `when` is
+false, or the conditional `loop_exhaust` gate after a converged loop) still gets a cursor line,
+marked `(skipped)`.
 Walk `manifest.steps` in order (starting at the resume position `i` from the Setup resume check, default 0):
 
 **Check the step's IO, then persist run-state + journal — the check gates the commit.** After a
-step completes (and its output is stored into `results`), checkpoint in three moves:
+step completes (and its output is stored into `results`), checkpoint in three moves. On the SUCCESS
+path these three moves produce NO human-facing output — no tmp path, no "IO check passed", no byte
+sizes, no commit confirmation. The signal that a step landed is the recap (the segment recap, or a
+checkpoint's recap) plus the cursor advancing to the next step — the bookkeeping is plumbing. The
+FAILURE path stays LOUD (see move 2). The three moves:
 1. Use the **Write tool** to write
    `{ "manifest_hash": manifest.manifest_hash, "step_index": <the index of the NEXT step to run>, "inputs": inputs, "results": results }`
    to `<run_dir>/run-state.json.tmp` (a structured tool parameter — node outputs never ride a shell
@@ -333,7 +379,9 @@ step completes (and its output is stored into `results`), checkpoint in three mo
    required-props schema = probable native-engine truncation or subagent fabrication).
    **Non-zero exit → STOP WITHOUT COMMITTING** — the failed output must never enter the committed,
    resumable record (the committed run-state still points at step `<i>`, so a later resume re-runs
-   the failed step instead of threading the corrupt value forward). Surface the JSON `errors`
+   the failed step instead of threading the corrupt value forward). This is the LOUD path: say so in
+   plain language — "Step {i+1}'s output failed its contract: <reason> — stopping; it will re-run on
+   resume." — then surface the JSON `errors`
    readably, then journal the failure WITH the failure stamp, ONE Bash call:
    `.claude/scripts/run-journal append --run-dir '<run_dir>' --event run_error --step-index <i> --outcome error --label '<short reason>' --mark-failed-step <i>`
    (it stamps `failed_step: <i>` into the still-committed previous run-state — `latest` surfaces it
@@ -401,18 +449,25 @@ so retention costs nothing at resume time). Do not let journaling block the run.
    step's `produces` also lists `loop` — the pseudo-result `{converged, rounds, carry}`; store it
    like any node result (`results.loop = <returned>.loop` — the conditional `loop_exhaust` gate and
    any extend re-entry read it from the committed state).
-4. **Emit a recap** (2-4 lines, human-readable, no raw JSON) of what the segment produced, before the
-   next step. Build it from `step.produces` + the stored `results`, using the **output rubric** in the
-   gate block below:
-   - Non-loop segment → one clause per produced node — e.g. `Planned <name> — drafted a WORKFLOW.yaml (~N nodes).`
-     or `Implemented — wrote K staged files.` Never paste plan file contents or object arrays here.
-   - Loop segment (`step.is_loop`) → summarize the outcome, not each round: state the round count from
-     `<returned>.loop.rounds` when the step declares `on_exhaust: escalate` (`<returned>.__rounds`
-     otherwise — same number, one source of truth per mode) and the evaluator's final verdict — e.g.
-     `Implement/evaluate loop done in 2 round(s) — verdict PASS, K staged files.` or
-     `Implement/evaluate loop done in 3 round(s) — verdict FAIL at the round cap; N issues open.`
-     An extend re-run's recap names the extension explicitly (`extension 1: 3 more round(s) — ...`).
-   - A produced node that is `null` (a guarded/skipped node) → say so in one clause; don't invent output.
+4. **Recap the segment as a conductor** — when it returns, brief the user on what it produced and
+   what it means next, synthesizing `step.produces` + the stored `results` (using the **output
+   rubric** in the gate block below for shape). A real briefing, not a status line: say what was
+   accomplished and surface the judgment calls / what's worth attention — a plan's name + shape; the
+   files written and what they are; a loop's verdict + how it got there + open issues. For a
+   review/fan-out segment, name the dimensions from the step's `node_labels` (e.g. "across
+   User-value completeness, Edge-case coverage, NFRs, Testability") and summarize the findings.
+   - **Loop segments** (`step.is_loop`) → summarize the journey, not each round: the round count
+     (`<returned>.loop.rounds` when the step declares `on_exhaust: escalate`, else
+     `<returned>.__rounds` — same number, one source of truth per mode) and the evaluator's final
+     verdict — e.g. `Implement/evaluate loop done in 2 round(s) — verdict PASS, K staged files.` or
+     `Implement/evaluate loop done in 3 round(s) — verdict FAIL at the round cap; N issues open.` An
+     extend re-run names the extension ("extension 1: 3 more round(s) — …").
+   - **Guardrails (unchanged):** never paste raw JSON, plan-file contents, or object arrays —
+     synthesize them. A `null` produced node (a guarded/skipped node) → say so in one clause, don't
+     invent output. On a fail-loud error, skip the recap and report the failure (see move 5).
+
+   Ephemeral voice — printed, never journaled (the journal `--label` in the checkpoint above stays
+   the mechanical step-record label).
 5. If the segment errors (a fail-loud node), stop and surface the error in readable form — do not
    fabricate a result (skip the recap; report the failure instead).
 
@@ -428,7 +483,16 @@ convention — a later `${loop_exhaust.output.choice}` branch must sit behind a 
 `--outcome skipped`, print the header marked skipped, and continue — the gate never renders.
 `skipped: false` → the loop exhausted its cap unconverged; render and ask below.
 
-Render the gate's evidence:
+A gate is two layers — conductor framing AROUND a deterministic evidence core. Keep them distinct.
+
+**(a) Conductor framing (ephemeral, may vary run to run):** open with a brief intro that names the
+gate by its `label` — "We've reached the *{gate.label}* gate. Here's what was produced and what I'm
+asking you to decide." — then render the evidence core (b) UNCHANGED, then close with a one-line
+framing of the choice ("So: continue with this plan, send it back for revision, or stop?"). This
+framing layer NEVER alters, reorders, summarizes, or substitutes the evidence below, and never
+changes the recorded choice.
+
+**(b) Evidence core (UNCHANGED — approval-integrity invariant).** Render the gate's evidence:
 
 **`gate.present` declared → render it MECHANICALLY**, entries in declared order — no synthesis, so
 the approver sees the same evidence every run:
@@ -601,17 +665,32 @@ never in a segment.
    contains a `workflow:` node (and on an import cycle), and `validate-workflow --defs-root` blocks
    the same findings via the same shared helper — so the child contains no further nested call;
    recursion is bounded.
+
+   **Thread the cursor through the child (display only).** So the user reads ONE continuous journey,
+   not a child that restarts at "Step 1", pass a display-only cursor context into the child re-entry:
+   the current global ordinal (`{g}`) and the parent's total (`{T}`), or a `{parent}.{child}`
+   breadcrumb. The child's per-step cursor then continues the parent's count — render `▶ Step {g}/{T}`
+   advancing across the child's steps, or a dotted `▶ Step {parent}.{k} · {label}` form — instead of
+   restarting at `Step 1/{child M}`. The child's opening (the Announce-the-run beat) becomes an
+   "entering nested workflow *{child}*" beat UNDER the parent roadmap — a sub-heading on the parent's
+   journey, not a fresh top-level announcement. This cursor is **ephemeral display state only**: it is
+   passed in memory for rendering and must NOT touch the child's run-state, `manifest_hash`, or any
+   committed bytes — the child still mints its OWN run dir and records its own inputs exactly as above.
 3. **Store the child's result** — its `manifest.output.from` node output — into `results[node]`, and
-   emit a short recap (reuse the child's own wrap-up; don't replay its segments).
+   recap as a conductor (the segment-recap rubric above): brief the user on what the child produced
+   and what it means for the parent journey, reusing the child's own wrap-up — don't replay its segments.
 4. If the child fails or its evaluator never passes, **stop and surface the error** — do not claim
    success.
 
 ## Finish
-Close the journal: `.claude/scripts/run-journal append --run-dir '<run_dir>' --event run_complete
---outcome ok`. If `manifest.output.from` is set, report `results[<that node>]` as the workflow's
-result. Then print a one-line wrap-up: workflow name + final outcome and where the output landed
-(mention `run-journal report --run-dir '<run_dir>'` as the run's timeline). The per-segment recaps
-already covered the play-by-play — don't re-summarize each segment here.
+Close the journal silently (plumbing): `.claude/scripts/run-journal append --run-dir '<run_dir>'
+--event run_complete --outcome ok`. If `manifest.output.from` is set, report `results[<that node>]`
+as the workflow's result. Then sign off as the conductor — one beat that CLOSES the journey
+announced at the opening: the workflow name, the outcome, where the result landed, and that all N
+steps are complete (e.g. "🛠  {name} — done. All {N} steps complete; the result is at <where>."). For
+a full timeline, you MAY add an optional aside ("for the step-by-step, run `run-journal report
+--run-dir '<run_dir>'`"). The per-segment recaps already covered the play-by-play — don't
+re-summarize each segment here.
 
 ## Gate / delegation semantics (authoritative)
 - A node runs in a **background segment** unless it is an orchestrator checkpoint. The compiler already
