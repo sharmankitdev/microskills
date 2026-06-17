@@ -116,6 +116,7 @@ nodes:
 # of the microskills it lists under missing_microskills.
 gates:
   - id: approve_plan
+    name: "Approve workflow plan"
     after: plan
     type: human_approval
     severity: hard

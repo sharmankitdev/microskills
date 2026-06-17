@@ -172,6 +172,7 @@ nodes:
   # post-remediation core so remediated evidence re-commits through this node's own
   # result (run-state values are immutable post-commit).
   - id: triage_coverage
+    name: "Triage uncovered traceability links"
     delegation: orchestrator
     when: ${verify.output.needs_human_count > 0}
     prompt: >
@@ -230,6 +231,7 @@ nodes:
   # input. retry is per-ITEM on a fan-out — a still-failed thunk returns null (engine
   # contract) and tally counts the shortfall as needs_human, never silently dropped.
   - id: refute
+    name: "Refute INVEST story-quality claims"
     use: refute-story-quality
     for_each: ${assign.output.pairs}
     as: pair
@@ -247,6 +249,7 @@ nodes:
   # mapping: a REFUTED INVEST claim = a confirmed story-quality violation, so downstream
   # reads refuted_count as "violations confirmed".
   - id: tally
+    name: "Tally INVEST refute votes"
     # DESIGN CHOICE (review R3 performance-3, accepted): tally receives the whole
     # expand-assignments object — its declared contract — so each story object rides
     # once per (lens x seat) pair in-context. Bounded by invest_pair_cap (600) and
@@ -265,6 +268,7 @@ nodes:
 
   # ── T5 advisory-park #2: confirmed INVEST violations / undecidable claims ──────────
   - id: triage_quality
+    name: "Triage confirmed INVEST violations"
     delegation: orchestrator
     when: ${tally.output.verdict == 'request_changes' || tally.output.needs_human_count > 0}
     prompt: >
@@ -312,6 +316,7 @@ nodes:
   # records ride whole (null when the guard skipped = green), carrying the W2
   # pre/post-remediation values side by side into the ledger.
   - id: assemble_evidence
+    name: "Consolidate backlog evidence ledger"
     use: assemble-evidence
     inputs:
       requirements_evidence: ${workflow.inputs.requirements_evidence}
@@ -378,6 +383,7 @@ gates:
   # ran, the present: fields render committed PRE-remediation values by design — the
   # prompt names ledger.json as authoritative (W2).
   - id: approve_publish
+    name: "Approve backlog publication"
     after: assemble_evidence
     type: human_approval
     severity: hard
