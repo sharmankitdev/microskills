@@ -320,3 +320,90 @@ Run via Bash:
 Non-zero exit → `{"ok": false, "error": "..."}`.
 
 Return `{"ok": true}`.
+
+## op: preflight
+
+Inputs: `{name, profile?, overrides?, headless_from_args}`
+
+The dry-run planner — compute the full plan but write NOTHING (no run dir, no compiled
+artifacts). The headless signal is set when `headless_from_args` is true (the conductor
+detected `--gate-mode auto` or `--headless`) OR the env `MICROSKILLS_HEADLESS` is non-empty
+(check via Bash: `echo "${MICROSKILLS_HEADLESS:-}"`).
+
+1. **Compile the plan** — run via Bash:
+   `.claude/scripts/compile-workflow <name> --plan --explain [--profile "<profile>"] [--override <k>=<v> ...] [--gate-mode auto when the headless signal is set]`
+   `--plan` computes the full plan but writes NOTHING; `--explain` adds the per-node
+   `classification` carrying `executor: {profile, agent, model}`. Non-zero exit → return
+   `{"ok": false, "error": "<JSON error / schema_errors from stdout>"}`.
+
+2. Return digest:
+   `{"ok": true, "summary": <the full compile-workflow stdout summary object verbatim>}`
+
+   The summary embeds the FULL manifest object under `manifest` plus the executor entries
+   under `classification`. Return it verbatim — do NOT read
+   `.claude/workflow-defs/<name>/.compiled/manifest.json` (the `--plan` compile wrote nothing;
+   anything on disk is from an earlier compile and may not match these flags).
+
+## op: rerun-locate
+
+Inputs: `{name, run?}`
+
+Locate the RECORDED run to rerun and read back its provenance.
+
+1. **Find the run:**
+   - `run` supplied → it names `runs/<run>` directly. Read `<run_dir>/run-config.json` for the
+     provenance fields below; the `run_id` is `<run>`.
+   - Otherwise run via Bash:
+     `.claude/scripts/run-journal latest --runs-dir '.claude/workflow-defs/<name>/.compiled/runs'`
+     — no `--manifest-hash`, no `--steps`: the newest run with a committed run-state, FINISHED
+     runs included (a finished run is rerun's normal case). Parse the JSON: `found: false` →
+     return `{"ok": true, "found": false}` (nothing recorded to rerun). When found, build
+     `run_dir` as the runs-dir path joined with `run_id` and Read its `run-config.json`.
+
+2. Return digest:
+   `{"ok": true, "found": true, "run_id": "<run_id>", "manifest_hash": "<run-config.manifest_hash>", "profile_used": "<run-config.profile or null>", "overrides": <run-config.overrides or {}>, "gate_mode": "<run-config.gate_mode>", "failed_step": <run-config/run-state failed_step or null>}`
+
+Non-zero exit at any step → `{"ok": false, "error": "..."}`.
+
+## op: rerun-seed
+
+Inputs: `{name, source_run, from?}`
+
+Seed a NEW run dir from a recorded source run, in code.
+
+1. **Seed the rerun** — run via Bash:
+   `.claude/scripts/run-journal rerun --runs-dir '.claude/workflow-defs/<name>/.compiled/runs' --manifest '.claude/workflow-defs/<name>/.compiled/manifest.json' --source-run '<source_run>' [--from '<from>']`
+   It re-checks hash equality (the authoritative gate), resolves the from-point — an integer is
+   a 0-based manifest step index; a name matches a gate id, a checkpoint node id, or a node
+   INSIDE a segment, which **snaps to the segment start** (segments are atomic: the whole
+   segment re-runs) — requires the source run to have committed every step before it, and mints
+   a NEW run dir seeded with the recorded `inputs` and every pre-from result (results at/after
+   the from-point are dropped; the source run dir is provenance — never modified). Non-zero exit
+   → return `{"ok": false, "error": "<error from stdout>"}`.
+
+2. Parse the JSON output and return digest:
+   `{"ok": true, "run_dir": "<run_dir>", "from_step_index": <from.step_index>, "snapped": <from.snapped_to_segment or false>, "replayed_gates": <replayed_gates>, "confirm_steps": <confirm_steps>}`
+
+## op: pickup-locate
+
+Inputs: `{name, run?}`
+
+Locate the PARKED gate-mode=auto run to pick up; read both its provenance and its run-state.
+
+1. **Find the run:**
+   - `run` supplied → it names `runs/<run>` directly. Read BOTH `<run_dir>/run-config.json` (the
+     provenance: `manifest_hash`, `profile`, `overrides`, `gate_mode`) AND
+     `<run_dir>/run-state.json` (`step_index`, `failed_step` — these two live only in the state
+     file). The `run_id` is `<run>`.
+   - Otherwise run via Bash:
+     `.claude/scripts/run-journal latest --runs-dir '.claude/workflow-defs/<name>/.compiled/runs'`
+     — no `--manifest-hash`, no `--steps` (the newest committed run, ANY compile — a parked auto
+     run's hash never matches an interactive compile, which is exactly why the normal resume scan
+     cannot see it). Parse the JSON: `found: false` → return `{"ok": true, "found": false}`
+     (nothing to pick up). When found, build `run_dir` from the runs-dir path joined with
+     `run_id`, then Read its `run-config.json` and `run-state.json`.
+
+2. Return digest:
+   `{"ok": true, "found": true, "run_id": "<run_id>", "manifest_hash": "<run-config.manifest_hash>", "profile_used": "<run-config.profile or null>", "overrides": <run-config.overrides or {}>, "gate_mode": "<run-config.gate_mode>", "step_index": <run-state.step_index>, "failed_step": <run-state.failed_step or null>}`
+
+Non-zero exit at any step → `{"ok": false, "error": "..."}`.

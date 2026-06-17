@@ -99,15 +99,14 @@ A dry-run renderer: show what a run WOULD do — steps, gates, inputs, executors
 artifacts, minting a run, or gathering a single input. Run Setup steps 1-2 (name, profile /
 overrides, headless signal), then:
 
-1. **Compile the plan** — run via Bash: `.claude/scripts/compile-workflow <name> --plan --explain
-   [--profile "<profile>"] [--override <k>=<v> ...] [--gate-mode auto when the headless signal is
-   set]`. `--plan` computes the full plan but writes NOTHING; `--explain` adds the per-node
-   `classification` carrying `executor: {profile, agent, model}`. Non-zero exit → surface the JSON
-   `error` / `schema_errors` and stop — a preflight that fails to compile IS the useful answer.
-2. **Render EXCLUSIVELY from the printed summary.** It embeds the FULL manifest object under
-   `manifest` plus the executor entries under `classification` — never read
-   `.claude/workflow-defs/<name>/.compiled/manifest.json` here (the `--plan` compile wrote nothing;
-   anything on disk is from an earlier compile and may not match these flags). Render, in order:
+1. **Compile the plan (bookkeeper).** Dispatch `{op:"preflight", name, profile, overrides,
+   headless_from_args}`. It dry-run compiles and returns `{ok, summary}` carrying the full
+   plan; a preflight that fails to compile IS the useful answer, so `ok:false` → surface its
+   `error` in plain language and stop.
+2. **Render EXCLUSIVELY from the digest's `summary`.** It embeds the FULL manifest object under
+   `manifest` plus the executor entries under `classification` — render only from this digest,
+   never from any on-disk manifest (the dry-run compile wrote nothing; anything on disk is from
+   an earlier compile and may not match these flags). Render, in order:
    - **Header** — name, `profile_used`, `manifest_hash`, and the run mode:
      `manifest.gate_mode == "auto"` → "headless — gates take their declared defaults", else
      "interactive".
@@ -141,34 +140,30 @@ recorded inputs. **Scope honesty: rerun is NOT the fail→fix→re-review loop**
 recorded input set verbatim. Re-reviewing a *changed* artifact (a fixed diff, an edited
 requirement) needs a changed input, which is a NEW run, never a rerun.
 
-1. **Locate the recorded run** — `--run <run-id>` names `runs/<run-id>` directly (read its
-   `run-config.json` for the fields below); otherwise run via Bash:
-   `.claude/scripts/run-journal latest --runs-dir '.claude/workflow-defs/<name>/.compiled/runs'`
-   — no `--manifest-hash`, no `--steps`: the newest run with a committed run-state, FINISHED runs
-   included (a finished run is rerun's normal case). `found: false` → stop: nothing recorded to
-   rerun. Note its `run_id`, `manifest_hash`, `profile_used`, `overrides`, and `gate_mode`. A
-   non-null `failed_step` caps the from-point: that step failed its IO contract, so the seeder
-   (step 3) refuses any `--from` beyond it — tell the user up front.
-2. **Recompile with the RECORDED provenance** — the Setup step 3 compile, but passing
-   `--profile '<profile_used>'`, each recorded override verbatim, and `--gate-mode auto` when the
-   recorded `gate_mode` is `"auto"` (never this invocation's own flags — a rerun reproduces the
-   recorded compile, and `run-config.json` records every compile input including the gate mode).
-   If the fresh summary's `manifest_hash` differs from the recorded one → **STOP: rerun REQUIRES
-   manifest_hash equality.** The def, registry, or profile changed since the recorded run, so its
-   stored node outputs no longer line up — start a fresh run instead. Never improvise a partial
-   reuse, and never retry the compile with different flags to chase the hash.
-3. **Seed the rerun in code** — run via Bash:
-   `.claude/scripts/run-journal rerun --runs-dir '.claude/workflow-defs/<name>/.compiled/runs'
-   --manifest '.claude/workflow-defs/<name>/.compiled/manifest.json' --source-run '<run_id>'
-   [--from '<step|node>']`. It re-checks hash equality (the authoritative gate), resolves the
-   from-point — an integer is a 0-based manifest step index; a name matches a gate id, a
-   checkpoint node id, or a node INSIDE a segment, which **snaps to the segment start** (segments
-   are atomic: the whole segment re-runs) — requires the source run to have committed every step
-   before it, and mints a NEW run dir seeded with the recorded `inputs` and every pre-from result
-   (results at/after the from-point are dropped, so a stale later output can never leak forward;
-   the source run dir is provenance — never modified). Non-zero exit → stop and surface its
-   `error`. Parse the JSON: note `run_dir`, `from` (`step_index`; `snapped_to_segment: true` →
-   tell the user their node-level from-point widened to the whole segment), `replayed_gates`, and
+1. **Locate the recorded run (bookkeeper).** Dispatch `{op:"rerun-locate", name, run?}` (`run`
+   is the `--run <run-id>` value when the caller gave one, else omitted — it picks the newest
+   run with a committed run-state, FINISHED runs included, since a finished run is rerun's normal
+   case). `found:false` → stop: nothing recorded to rerun. Otherwise note the digest's `run_id`,
+   `manifest_hash`, `profile_used`, `overrides`, and `gate_mode`. A non-null `failed_step` caps
+   the from-point: that step failed its IO contract, so the seeder (step 3) refuses any `--from`
+   beyond it — tell the user up front. `ok:false` → surface `error` and stop.
+2. **Recompile with the RECORDED provenance (bookkeeper).** Dispatch `{op:"open", name,
+   profile: <profile_used>, overrides: <recorded overrides>, headless_from_args: <gate_mode ==
+   "auto">}` — the recorded provenance, never this invocation's own flags (a rerun reproduces
+   the recorded compile). If the digest's `manifest_hash` differs from the recorded one → **STOP:
+   rerun REQUIRES manifest_hash equality.** The def, registry, or profile changed since the
+   recorded run, so its stored node outputs no longer line up — start a fresh run instead. Never
+   improvise a partial reuse, and never retry the compile with different flags to chase the hash.
+3. **Seed the rerun (bookkeeper).** Dispatch `{op:"rerun-seed", name, source_run: <run_id>,
+   from?}` (`from` is the `--from <step|node>` value when given). It re-checks hash equality (the
+   authoritative gate), resolves the from-point — an integer is a 0-based manifest step index; a
+   name matches a gate id, a checkpoint node id, or a node INSIDE a segment, which **snaps to the
+   segment start** (segments are atomic: the whole segment re-runs) — requires the source run to
+   have committed every step before it, and mints a NEW run dir seeded with the recorded `inputs`
+   and every pre-from result (results at/after the from-point are dropped, so a stale later output
+   can never leak forward; the source run dir is provenance — never modified). `ok:false` → stop
+   and surface its `error`. Otherwise note `run_dir`, `from_step_index`, `snapped` (`true` → tell
+   the user their node-level from-point widened to the whole segment), `replayed_gates`, and
    `confirm_steps`.
 4. **Replay, never re-ask** — print one line per `replayed_gates` entry:
    `Gate <id>: replaying recorded choice '<choice>'`. Those gates sit BEFORE the from-point; their
@@ -176,22 +171,25 @@ requirement) needs a changed input, which is a NEW run, never a rerun.
    them — do not re-present them. A replayed `loop_exhaust` whose recorded choice was `extend` is a
    CHOICE replay only — never re-act on it (the seeded run-state already carries the
    post-extension `results.loop`/carry).
-5. **Skip Setup steps 5-8 entirely** — the inputs are FROZEN from the record and already seeded,
-   including materialized `run-inputs/` paths that point into the SOURCE run's dir (this is why
-   finished run dirs are retained). Adopt `run_dir`, seed in-memory `inputs` / `results` from
-   `<run_dir>/run-state.json`, set `i = from.step_index`. The conductor opening for a rerun reflects
-   *resuming partway*: announce that this is a rerun of run `<source run_id>` from step `{i+1}`, and
-   render the roadmap with the pre-from steps marked as already-recorded (the `replayed_gates` lines
-   from step 4 are part of that opening) — the cursor then starts at `Step {i+1}`, never at Step 1.
-6. **Execute the manifest** from `i` exactly as a normal run, with ONE addition: a step listed in
+5. **Skip the Setup input-gathering steps entirely** — the inputs are FROZEN from the record and
+   already seeded into the new run's state by `rerun-seed`, including materialized paths that
+   point into the SOURCE run's dir (this is why finished run dirs are retained). Adopt `run_dir`
+   as the opaque token (never printed) and set `i = from_step_index`; the seeded on-disk run-state
+   is authoritative, so the execute walk's `prep`/`commit` ops read and advance it — the conductor
+   holds no separate copy. The conductor opening for a rerun reflects *resuming partway*: announce
+   that this is a rerun of an earlier run from step `{i+1}`, and render the roadmap with the
+   pre-from steps marked as already-recorded (the `replayed_gates` lines from step 4 are part of
+   that opening) — the cursor then starts at `Step {i+1}`, never at Step 1.
+6. **Execute the manifest** from `i` exactly as a normal run (the Execute-the-manifest walk
+   below — same `prep`/segment/gate/`commit` loop), with ONE addition: a step listed in
    `confirm_steps` (an orchestrator_node / nested_workflow checkpoint) **re-executes side
    effects** — filesystem writes, vendoring, nested child runs that already happened once in the
    source run. Before executing such a step, confirm via `AskUserQuestion` ("Step {i+1} re-runs
-   '<node>', re-executing its side effects. Re-run it, or stop?"). A "stop" → journal a
-   `run_error` (`--label 'rerun declined at <node>'`) and stop cleanly. Under auto mode there is
-   no human: proceed WITHOUT the confirmation — the explicit `rerun` invocation is the consent —
-   and journal the step normally. Gates at/after the from-point re-present normally (fresh
-   choices).
+   '<node>', re-executing its side effects. Re-run it, or stop?"). A "stop" → dispatch
+   `{op:"fail", name, run_dir, step:<i>, label:'rerun declined at <node>'}` and stop cleanly.
+   Under auto mode there is no human: proceed WITHOUT the confirmation — the explicit `rerun`
+   invocation is the consent — and let the step commit normally. Gates at/after the from-point
+   re-present normally (fresh choices).
 
 ## Pickup — `/workflow <name> pickup [--run <run-id>]`
 
@@ -204,18 +202,16 @@ only the NOT-YET-RUN suffix executes in this session, with interactive gate hand
 **requires a human**: under a headless invocation (auto gate mode / `MICROSKILLS_HEADLESS`),
 refuse with a nonzero outcome — a headless pickup is a contradiction in terms.
 
-1. **Locate the parked run** — `--run <run-id>` names `runs/<run-id>` directly: read BOTH its
-   `run-config.json` (the provenance: `manifest_hash`, `profile_used`, `overrides`, `gate_mode`)
-   AND its `run-state.json` (`step_index`, `failed_step` — these two live only in the state file).
-   Otherwise run via Bash:
-   `.claude/scripts/run-journal latest --runs-dir '.claude/workflow-defs/<name>/.compiled/runs'`
-   — no `--manifest-hash`, no `--steps` (the newest committed run, ANY compile — a parked auto
-   run's hash never matches an interactive compile, which is exactly why the normal resume scan
-   cannot see it). `found: false` → stop: nothing to pick up. Note `run_id`, `manifest_hash`,
-   `profile_used`, `overrides`, `gate_mode`, `step_index`, `failed_step`.
-2. **Recompile with the RECORDED provenance** — same move as Rerun step 2: `--profile`, each
-   recorded override verbatim, and `--gate-mode auto` when the recorded `gate_mode` is `"auto"`.
-   Fresh `manifest_hash` must EQUAL the recorded one, else **STOP: the def, registry, or profile
+1. **Locate the parked run (bookkeeper).** Dispatch `{op:"pickup-locate", name, run?}` (`run`
+   is the `--run <run-id>` value when given, else omitted — it picks the newest committed run,
+   ANY compile, since a parked auto run's hash never matches an interactive compile, which is
+   exactly why the normal resume scan cannot see it). `found:false` → stop: nothing to pick up.
+   Otherwise note the digest's `run_id`, `manifest_hash`, `profile_used`, `overrides`,
+   `gate_mode`, `step_index`, and `failed_step`. `ok:false` → surface `error` and stop.
+2. **Recompile with the RECORDED provenance (bookkeeper).** Same move as Rerun step 2: dispatch
+   `{op:"open", name, profile: <profile_used>, overrides: <recorded overrides>,
+   headless_from_args: <gate_mode == "auto">}` — the recorded provenance. The digest's
+   `manifest_hash` must EQUAL the recorded one, else **STOP: the def, registry, or profile
    changed since the run parked** — its stored results no longer line up; start a fresh run.
    Never improvise a partial reuse.
 3. **Sanity-check the park** — `step_index >= manifest.steps.length` → the newest run already
@@ -227,13 +223,14 @@ refuse with a nonzero outcome — a headless pickup is a contradiction in terms.
    check, so the stored results beyond it are untrustworthy; continuing would thread forward
    exactly the values the IO gate quarantined. Use `rerun --from <failed_step>` (or earlier), or
    start fresh.
-4. **Adopt the run dir IN PLACE** — pickup continues the SAME run (no new run dir — unlike
-   rerun, nothing is replayed): seed in-memory `inputs` / `results` from
-   `<run_dir>/run-state.json`, set `i = step_index`, and journal the mode transition:
-   `.claude/scripts/run-journal append --run-dir '<run_dir>' --event pickup --step-index <i> --label 'interactive pickup of parked auto run'`.
-   The conductor opening for a pickup reflects *resuming partway*: announce that you're picking up
-   parked run `<run_id>` at step `{i+1}` (the parking gate), now interactive, and render the roadmap
-   with the already-committed prefix marked done — the cursor starts at `Step {i+1}`, never at Step 1.
+4. **Adopt the run dir IN PLACE (bookkeeper).** Pickup continues the SAME run (no new run dir —
+   unlike rerun, nothing is replayed): dispatch `{op:"resume", name, run_dir, mode:"pickup"}`,
+   which journals the pickup mode-transition event and returns `step_index`/`gate_mode`. Set
+   `i = step_index` and adopt `run_dir` as the opaque token; the on-disk run-state stays
+   authoritative, so the execute walk's `prep`/`commit` ops read and advance it. The conductor
+   opening for a pickup reflects *resuming partway*: announce that you're picking up a parked run
+   at step `{i+1}` (the parking gate), now interactive, and render the roadmap with the
+   already-committed prefix marked done — the cursor starts at `Step {i+1}`, never at Step 1.
 5. **Execute the manifest** from `i` with ONE override: **gate handling is interactive for this
    session.** `manifest.gate_mode: "auto"` stays stamped (the manifest — and its hash — are
    untouched), but the auto-mode gate rules are SUSPENDED: every remaining gate, starting with the
@@ -526,45 +523,58 @@ recaps already covered the play-by-play — don't re-summarize each segment here
   `AskUserQuestion` and will silently fabricate. All human interaction happens at checkpoints, here.
 
 ## Failure modes
-- **Unknown workflow** — no `WORKFLOW.yaml` at `.claude/workflow-defs/<name>/`. Stop.
-- **Compile error** — `compile-workflow` non-zero exit. Surface `error` / `schema_errors`, stop.
-- **Segment error** — a segment returns an error (fail-loud node). Stop, surface it, do not proceed.
+Every CLI named below runs inside the **bookkeeper**, never the conductor: the bookkeeper hits
+the non-zero exit, journals where the op specifies, and returns an `{ok:false, …}` digest carrying
+its reason/errors. The conductor's job at each is the same — surface that digest's meaning in plain
+language and STOP, never repairing, retrying, or fabricating a result. The taxonomy and stop
+semantics are unchanged from when the conductor ran these directly; only WHO runs the CLI moved.
+- **Unknown workflow** — no `WORKFLOW.yaml` for `<name>` (the `open`/`preflight` compile fails to
+  resolve it). Stop.
+- **Compile error** — the bookkeeper's `compile-workflow` (in `open` / `preflight`) exits non-zero;
+  the digest is `{ok:false, error}` carrying `error` / `schema_errors`. Surface it, stop.
+- **Segment error** — a segment returns an error (fail-loud node). This surfaces in the conductor
+  (the Workflow tool call is the conductor's own). Stop, surface it, do not proceed.
 - **Loop exhausted (`on_exhaust: fail`)** — the loop segment's post-cap throw is a segment error;
   surface it naming the loop and its round count. (`on_exhaust: escalate` is not a failure: the
   `loop_exhaust` gate handles it; extend declined / abandoned maps onto "Gate abandoned" below.)
-- **Step IO check failed** — `check-step-io` exits non-zero on the CANDIDATE state after a step
-  (schema violation, missing result, or the probable-truncation/fabrication signature). Stop
-  WITHOUT committing: journal `run_error` with `--mark-failed-step <i>`, surface the `errors`,
-  never synthesize a replacement output. The committed run-state still points at the failed step,
-  so a later resume re-runs it — the corrupt value can never thread forward.
-- **run-step failed** — `run-step args` or `run-step eval` exits non-zero (missing recorded result,
-  ungathered required input, oversized args payload, a throwing expression, an uncovered nested-child
-  required input, or a missing `node` binary). Journal `run_error`, surface its `errors`/`error`,
-  stop. Never substitute your own args assembly or expression evaluation for the kernel's.
+- **Step IO check failed** — the bookkeeper's `commit` op runs `check-step-io` on the candidate
+  state and it exits non-zero (schema violation, missing result, or the probable-truncation/
+  fabrication signature). The bookkeeper has already journaled `run_error` with the failed step
+  marked and returns `{ok:false, reason, errors}` WITHOUT committing. Surface the reason in plain
+  language, never synthesize a replacement output, stop. The committed run-state still points at
+  the failed step, so a later resume re-runs it — the corrupt value can never thread forward.
+- **Prep/args failed** — the bookkeeper's `prep` op runs `run-step args`/`run-step eval` and it
+  exits non-zero (missing recorded result, ungathered required input, oversized args payload, a
+  throwing expression, an uncovered nested-child required input, or a missing `node` binary),
+  returning `{ok:false, error}`. Surface it, stop. Never substitute your own args assembly or
+  expression evaluation — the kernel's is authoritative.
 - **Required input unresolved** — stop, name the input.
 - **Gate abandoned** — stop cleanly, report partial state.
-- **No recorded run (rerun)** — the `run-journal latest` source scan found nothing committed
-  under `runs/`. Stop: there is nothing to rerun.
-- **Rerun hash mismatch** — the fresh compile's `manifest_hash` differs from the recorded run's
-  (the recompile already used the recorded profile/overrides/gate_mode from `run-config.json`).
-  Stop — rerun requires equality; a changed def/registry/profile means the recorded outputs no
-  longer line up. Start a fresh run.
-- **Rerun seed failed** — `run-journal rerun` exits non-zero (unknown `--from` selector,
-  from-point beyond the recorded progress or past a recorded `failed_step`, a missing recorded
-  result, a pre-shape run-state). Surface its `error`, stop — never hand-assemble the seed.
-- **Rerun re-execution declined** — the human declined a `confirm_steps` re-execution. Journal
-  `run_error` naming the step, stop cleanly.
-- **Headless gate stop** — auto mode reached a gate with `on_headless: fail` (or a pausing gate with
-  no usable `default` in a hand-edited manifest). Journal `run_error` naming the gate, stop with a
-  nonzero outcome; a TOP-LEVEL park continues later via `/workflow <name> pickup` (a park inside a
-  nested child is out of pickup's scope through the parent — see Pickup step 5).
+- **No recorded run (rerun)** — the bookkeeper's `rerun-locate` source scan found nothing committed
+  and returns `{ok:true, found:false}`. Stop: there is nothing to rerun.
+- **Rerun hash mismatch** — the `open` recompile (with the recorded profile/overrides/gate_mode
+  the bookkeeper read from the run's config) returns a `manifest_hash` differing from the recorded
+  run's. Stop — rerun requires equality; a changed def/registry/profile means the recorded outputs
+  no longer line up. Start a fresh run.
+- **Rerun seed failed** — the bookkeeper's `rerun-seed` op (`run-journal rerun`) exits non-zero
+  (unknown `--from` selector, from-point beyond the recorded progress or past a recorded
+  `failed_step`, a missing recorded result, a pre-shape run-state) and returns `{ok:false, error}`.
+  Surface it, stop — never hand-assemble the seed.
+- **Rerun re-execution declined** — the human declined a `confirm_steps` re-execution. Dispatch
+  `{op:"fail", … label:'rerun declined at <node>'}` (the bookkeeper journals it), stop cleanly.
+- **Headless gate stop** — auto mode reached a gate with `on_headless: fail` (or a pausing gate
+  with no usable `default` in a hand-edited manifest). Dispatch `{op:"fail", …}` naming the gate
+  (the bookkeeper journals `run_error`), stop with a nonzero outcome; a TOP-LEVEL park continues
+  later via `/workflow <name> pickup` (a park inside a nested child is out of pickup's scope
+  through the parent — see Pickup step 5).
 - **Headless interaction required** — auto mode reached an orchestrator node whose prompt requires
-  `AskUserQuestion`: journal `run_error` naming the node, stop with a nonzero outcome — pickup
-  continues it interactively. A MISSING REQUIRED INPUT also stops the run, but there is nothing to
-  pick up: inputs are gathered before any step commits, so re-invoke fresh with the input supplied.
-  Never fabricate the human's side.
-- **Pickup hash mismatch** — the provenance recompile's `manifest_hash` differs from the parked
-  run's recorded one (def/registry/profile changed since the park). Stop: the parked state cannot
-  continue under a changed compile; start a fresh run. Never improvise a partial reuse.
+  `AskUserQuestion`: dispatch `{op:"fail", …}` naming the node (the bookkeeper journals it), stop
+  with a nonzero outcome — pickup continues it interactively. A MISSING REQUIRED INPUT also stops
+  the run, but there is nothing to pick up: inputs are gathered before any step commits (no run is
+  minted yet), so re-invoke fresh with the input supplied. Never fabricate the human's side.
+- **Pickup hash mismatch** — the `open` provenance recompile returns a `manifest_hash` differing
+  from the parked run's recorded one (def/registry/profile changed since the park). Stop: the
+  parked state cannot continue under a changed compile; start a fresh run. Never improvise a
+  partial reuse.
 - **Pickup without a human** — `pickup` invoked under auto/headless. Refuse with a nonzero
   outcome: the entire point of pickup is the human's interactive verdict.
