@@ -2822,3 +2822,41 @@ def test_present_path_on_loop_pseudo_result_accepted_and_typed(tmp_path):
     rc2, data2, err2 = run(write_wf(tmp_path, bad))
     assert any("records only {converged, rounds, carry}" in i["message"]
                for i in data2["issues"] if i["severity"] == "block")
+
+
+# --- Task 1: optional human-readable name on nodes and gates ---
+
+def test_node_name_accepted_by_schema(tmp_path):
+    body = VALID.replace(
+        "    agent: some-agent\n    prompt: do a\n",
+        "    agent: some-agent\n    name: Do The Thing\n    prompt: do a\n")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 0
+    assert data["pass"] is True
+    assert not any("name" in i["location"] for i in data["issues"] if i["severity"] == "block")
+
+
+GATE_NAME_OK = VALID + """\
+gates:
+  - id: g1
+    name: Plan approval
+    after: b
+    type: human_approval
+    prompt: approve?
+"""
+
+
+def test_gate_name_accepted_by_schema(tmp_path):
+    rc, data, _ = run(write_wf(tmp_path, GATE_NAME_OK))
+    assert rc == 0
+    assert data["pass"] is True
+
+
+def test_unknown_node_key_still_blocks(tmp_path):
+    # additionalProperties:false must remain intact: a typo'd key is a hard block.
+    body = VALID.replace(
+        "    agent: some-agent\n    prompt: do a\n",
+        "    agent: some-agent\n    nme: typo\n    prompt: do a\n")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert any(i["severity"] == "block" and i["location"].startswith("schema:nodes/")
+               for i in data["issues"])

@@ -53,6 +53,7 @@
         "required": ["id"],
         "properties": {
           "id": { "type": "string", "pattern": "^(?!wf_)[a-z][a-z0-9_-]*$", "description": "Unique node id within the workflow. The `wf_` prefix is RESERVED: ${workflow.inputs.<x>} rides as _args.wf_<x> in compiled segments and the run-step context, so a wf_-prefixed node id would silently clobber (or be clobbered by) a workflow input — compile-workflow hard-dies and validate-workflow blocks on it." },
+          "name": { "type": "string", "description": "Optional free-text human-readable display label for this node (progress roadmap, cursor, recaps). Cosmetic — not an identifier, does not obey the id pattern, never referenced by ${...}, and excluded from manifest_hash." },
           "use": { "type": "string", "description": "Bare microskill name (resolved via resolve-microskill)." },
           "agent": { "type": "string", "description": "Agent type to invoke for this node (e.g. microskill-planner)." },
           "workflow": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$", "description": "Bare child-workflow name (kebab-case) invoked as an orchestrator checkpoint. Must be listed in the top-level `imports` allowlist. Mutually exclusive with use:/agent:; carries inputs/depends_on/when/for_each/as." },
@@ -109,6 +110,7 @@
         "required": ["id", "after", "type"],
         "properties": {
           "id": { "type": "string", "pattern": "^[a-z][a-z0-9_-]*$" },
+          "name": { "type": "string", "description": "Optional free-text human-readable display label for this gate (rendered in the approval prompt header). Cosmetic; not an identifier and never referenced." },
           "after": { "type": "string", "description": "Node id this gate fires after." },
           "type": { "enum": ["human_approval", "verification", "tool_check"] },
           "severity": { "enum": ["warn", "hard"], "default": "hard" },
