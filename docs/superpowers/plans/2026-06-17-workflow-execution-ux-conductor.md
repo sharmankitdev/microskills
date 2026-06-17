@@ -507,3 +507,578 @@ Expected: PR opens with a conventional-commit title (squash-merge enforced). Do 
 **Type/name consistency:** Authored field `name` (T1 schema, T4 defs) vs computed `label` (T2 manifest, T3 dispatcher) kept distinct throughout; `humanize_id`, `node_labels`, `hashed_manifest` used identically across tasks; the hash-strip set (`label`, `node_labels`, nested gate `name`) is the same in T2 Step 6 and T2 Step 7.
 
 **Known risk carried into execution:** `test_real_*` golden assertions may need additive-key updates in T2 Step 8 and T4 Step 8 — both steps state the rule (update expectations for additive `label`/`name`; never move counts/ids/hash).
+
+---
+
+# Phase 2 — The bookkeeper split
+
+> **Spec:** `docs/superpowers/specs/2026-06-17-workflow-conductor-bookkeeper-design.md`.
+> Phase 1 (Tasks 1–5 above) shipped the conductor *voice* + authored names but tried to
+> hide plumbing by **instructing terseness** — which the live run disproved (the harness
+> renders every main-loop tool call regardless). Phase 2 hides plumbing **structurally**:
+> a dedicated locked-down `workflow-bookkeeper` agent runs every deterministic CLI call
+> off the main loop; the conductor skill keeps only human-facing narration, segments, and
+> gates. Phase 2 supersedes the *mechanism* of Phase 1's §5.4/§9.2; everything else stands.
+> Phase 1's Task 5 "open PR" is folded into Phase 2's Task 10 — one PR for the whole branch.
+
+**Goal:** Make a running `/workflow` show only conductor prose + one "working…" beat per
+segment + gate questions — no `Bash`/`Write`/`Read` plumbing blocks, no run-ids/paths/argv
+in the prose — by delegating all deterministic CLI work to a `workflow-bookkeeper` subagent.
+
+**Architecture:** Two roles. The **conductor** (`catalog/skills/workflow/SKILL.md`, main
+loop) owns the opening+roadmap, the `▶ Step` cursor, recaps, the `Workflow` segment calls,
+gates (`AskUserQuestion`), orchestrator-node prompt execution, and nested re-entry. The
+**bookkeeper** (`catalog/agents/workflow-bookkeeper/AGENT.md`, tools `Bash`/`Read`/`Write`)
+owns `compile-workflow`, `run-journal *`, `normalize-input`, `run-step args|eval`,
+`check-step-io`, and the run-state `Write`. The conductor dispatches it once per step
+boundary (commit-prior + prep-next) via `Agent(subagent_type:"workflow-bookkeeper")` and
+parses its fenced-JSON digest. No run-scripts change — the same commands/flags, relocated.
+
+**Tech Stack:** Markdown prose (skill + agent def); Python 3.11+ (`pyyaml`, `pytest`) for
+the one new hermetic test. Agents + dispatcher skills are part of the **engine** bundle
+(`ENGINE_SUBDIRS = ["scripts","skills","agents","commands"]` in `initialize-harness`), so a
+new agent under `catalog/agents/` needs **no `harness.yaml` entry** — it rides the engine and
+registers on the next session restart.
+
+## Phase 2 Global Constraints
+
+Every Phase 2 task implicitly includes these (in addition to the Phase 1 Global Constraints):
+
+- **Edit source only** — `catalog/agents/workflow-bookkeeper/AGENT.md` and
+  `catalog/skills/workflow/SKILL.md`. Never hand-edit `.claude/`.
+- **No run-script changes.** `compile-workflow`, `run-step`, `check-step-io`, `run-journal`,
+  `normalize-input` keep byte-identical flags/argv. The bookkeeper calls them exactly as the
+  current SKILL.md does — the plumbing prose is *moved verbatim*, not rewritten.
+- **Determinism preserved.** On-disk run-state/journal/compiled bytes unchanged (same commands,
+  different caller). The full suite (`catalog/scripts/tests/ scripts/tests/ hooks/tests/`) stays
+  green; the only new test is the engine-inclusion + frontmatter guard in Task 6.
+- **Approval-integrity invariant.** Gate `present` is resolved by the bookkeeper into a
+  render-ready ordered payload; the conductor prints it **verbatim** (no reorder/synthesis) and
+  layers ephemeral framing around it; the recorded choice stays the author-declared label verbatim.
+- **Relay verbatim.** The conductor passes a step's produced result(s) to the bookkeeper's
+  `commit` op **verbatim** (no summarization); the bookkeeper merges them into the on-disk
+  results map and writes run-state. (Lower transcription risk than today: the conductor relays
+  only the *fresh* result, not the whole accumulated map.)
+- **Locked toolset.** The bookkeeper declares `tools: Bash, Read, Write` — enforced, so it
+  cannot `AskUserQuestion` or launch a `Workflow`. All human/segment actions stay in the conductor.
+- **Conventional Commits, PR not push.** Scope `workflow`; branch `workflow-conductor-ux`;
+  `Co-Authored-By` trailer.
+
+## The bookkeeper dispatch protocol (canonical interface — all Phase 2 tasks key off this)
+
+The conductor dispatches `Agent(subagent_type: "workflow-bookkeeper", prompt: <one JSON object {op, ...}>)`.
+The bookkeeper runs the op's pinned CLI and returns its **final message as a single fenced
+` ```json ` digest** (and nothing else). Ops and their digests:
+
+| op | conductor passes | bookkeeper does (pinned CLI) | digest |
+|---|---|---|---|
+| `open` | `{name, profile?, overrides?, headless_from_args}` | check env `MICROSKILLS_HEADLESS`; `compile-workflow` (gate-mode auto iff headless); read manifest; `run-journal latest …` resume-scan | `{ok, manifest_hash, gate_mode, description, output_from, required_inputs, materialize_inputs, input_defaults, steps:[{i,kind,checkpoint_type,label,is_loop,severity,workflow,conditional}], resume:{found,run_id,step_index,failed_step}}` \| `{ok:false,error}` |
+| `record` | `{name, manifest_hash, profile?, overrides?, gate_mode, inputs, materialize:[{name,provenance,value}]}` | `run-journal init`; per materialize input write inline content via **Write** then `normalize-input` (SECURITY rules); `run-journal record-inputs` (seeds run-state) | `{ok, run_dir, inputs}` \| `{ok:false,error}` |
+| `resume` | `{name, run_dir, mode:"resume"\|"pickup"}` | journal the resume/pickup event; read run-state | `{ok, step_index, failed_step, gate_mode}` |
+| `prep` | `{name, run_dir, step, extend?}` | by step kind: `run-step args` (segment, `--extend` iff extend); `run-step eval` + resolve `present` evidence incl. `{read_file}` Reads (gate); `run-step eval` (orch/nested) | per-kind (see Task 6 Step 4) \| `{kind:"done"}` \| `{ok:false,error}` |
+| `commit` | `{name, run_dir, step, results:{<nodeid>:<value>}, gate?:{id,choice}, outcome?, label}` | read run-state; merge `results`; **Write** candidate (`step_index=step+1`); `check-step-io --step`; on pass `run-journal append --commit-state`; on fail `run-journal append … --mark-failed-step` | `{ok}` \| `{ok:false, reason, errors}` |
+| `fold-guidance` | `{name, run_dir, notes_input, notes, extension_n}` | append notes to the materialized file (copy-if-outside-run_dir) or string input; commit inputs-only run-state | `{ok, inputs}` |
+| `finish` | `{name, run_dir}` | `run-journal append --event run_complete --outcome ok` | `{ok}` |
+| `fail` | `{name, run_dir, step?, label, mark_failed_step?}` | `run-journal append --event run_error …` | `{ok}` |
+| `preflight` | `{name, profile?, overrides?, headless_from_args}` | `compile-workflow --plan --explain` | `{ok, summary}` (full `manifest`+`classification`) \| `{ok:false,error}` |
+| `rerun-locate` | `{name, run?}` | `run-journal latest …` (no hash) / read `run-config` | `{ok, run_id, manifest_hash, profile_used, overrides, gate_mode, failed_step}` |
+| `rerun-seed` | `{name, source_run, from?}` | `run-journal rerun …` | `{ok, run_dir, from_step_index, snapped, replayed_gates, confirm_steps}` \| `{ok:false,error}` |
+| `pickup-locate` | `{name, run?}` | `run-journal latest …` (no hash); read run-config + run-state | `{ok, run_id, manifest_hash, profile_used, overrides, gate_mode, step_index, failed_step}` |
+
+The conductor NEVER issues a raw orchestration CLI call; the bookkeeper NEVER calls
+`AskUserQuestion` or `Workflow`. A `{ok:false,error}` / `{ok:false,reason,errors}` digest →
+the conductor surfaces it in plain language and stops (the bookkeeper already journaled it
+where the op specifies `--mark-failed-step`).
+
+---
+
+### Task 6: Create the `workflow-bookkeeper` agent (execute-mode ops)
+
+**Files:**
+- Create: `catalog/agents/workflow-bookkeeper/AGENT.md`
+- Create: `catalog/scripts/tests/test_workflow_bookkeeper_agent.py`
+
+**Interfaces:**
+- Produces: the `workflow-bookkeeper` agent def (frontmatter `name`, `description`,
+  `model: sonnet`, `tools: Bash, Read, Write`) implementing ops `open`, `record`, `resume`,
+  `prep`, `commit`, `fold-guidance`, `finish`, `fail` per the protocol table. Consumed by
+  Tasks 7–8 (conductor dispatches these ops). The mode ops (`preflight`, `rerun-*`,
+  `pickup-*`) are added in Task 9 alongside their consumers.
+
+- [ ] **Step 1: Write the failing test**
+
+Create `catalog/scripts/tests/test_workflow_bookkeeper_agent.py` (mirror the loader pattern in
+`test_initialize_harness.py`):
+
+```python
+import importlib.machinery, importlib.util
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[3]
+INIT = REPO / "catalog" / "scripts" / "initialize-harness"
+AGENT = REPO / "catalog" / "agents" / "workflow-bookkeeper" / "AGENT.md"
+
+
+def _load_init():
+    loader = importlib.machinery.SourceFileLoader("initialize_harness", str(INIT))
+    spec = importlib.util.spec_from_loader("initialize_harness", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def _frontmatter(path):
+    import yaml
+    text = path.read_text()
+    assert text.startswith("---\n"), "AGENT.md must open with YAML frontmatter"
+    fm = text.split("---\n", 2)[1]
+    return yaml.safe_load(fm)
+
+
+def test_bookkeeper_frontmatter_locks_toolset(tmp_path):
+    fm = _frontmatter(AGENT)
+    assert fm["name"] == "workflow-bookkeeper"
+    tools = [t.strip() for t in fm["tools"].split(",")] if isinstance(fm["tools"], str) else fm["tools"]
+    assert sorted(tools) == ["Bash", "Read", "Write"], "locked toolset: no AskUserQuestion/Workflow"
+
+
+def test_bookkeeper_rides_engine_bundle(tmp_path):
+    mod = _load_init()
+    outs = mod.engine_outputs(REPO / "catalog", tmp_path / ".claude")
+    srcs = [str(s) for s, _ in outs]
+    assert any(s.endswith("catalog/agents/workflow-bookkeeper/AGENT.md") for s in srcs), \
+        "bookkeeper must materialize via the engine bundle (no harness.yaml entry)"
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `python3 -m pytest catalog/scripts/tests/test_workflow_bookkeeper_agent.py -v`
+Expected: FAIL — `AGENT.md` does not exist yet (`FileNotFoundError` in `_frontmatter` / the
+`endswith` assertion is False).
+
+- [ ] **Step 3: Write the agent frontmatter + role intro**
+
+Create `catalog/agents/workflow-bookkeeper/AGENT.md` starting with:
+
+```markdown
+---
+name: workflow-bookkeeper
+description: Deterministic plumbing worker for the workflow conductor. Runs the pinned orchestration CLI (compile-workflow, run-journal, run-step, check-step-io, normalize-input) and the run-state Write off the main loop, returning a single fenced-JSON digest. Never speaks to the user, never launches a segment — its locked toolset (Bash/Read/Write) cannot. Dispatched once per step boundary by the workflow skill.
+model: sonnet
+tools: Bash, Read, Write
+---
+
+You are the workflow **bookkeeper** — the conductor's deterministic plumbing worker. The
+`workflow` skill (the conductor, in the main loop) handles everything the human sees or
+decides; you run the orchestration CLI and persist run-state so none of it clutters the
+user's transcript.
+
+**You receive ONE JSON object** `{op, ...}` as your task and **return exactly ONE fenced
+` ```json ` block** as your final message — the op's digest, nothing else (no prose, no
+command echoes). On any CLI non-zero exit, return `{"ok": false, "error": "<readable>"}`
+(or `{"ok": false, "reason": ..., "errors": ...}` for `commit`) — do NOT retry, improvise,
+hand-assemble args, summarize a result, or repair a failed output. You have no
+`AskUserQuestion` and no `Workflow` tool — never attempt human interaction or segment launch.
+
+Pin every command and flag EXACTLY as written below. Node outputs and input values ride only
+in files / stdin-free paths, never in argv.
+```
+
+- [ ] **Step 4: Write the execute-mode op bodies (move the plumbing verbatim)**
+
+Below the intro, add one `## op: <name>` section per execute-mode op. The CLI in each is
+**lifted verbatim** from the current `catalog/skills/workflow/SKILL.md` (read it first; line
+refs are the pre-Phase-2 file), reframed from a conductor step into a bookkeeper op. Use this
+mapping — copy the cited commands/flags/SECURITY text exactly, then add the digest it returns:
+
+- `## op: open` — from SKILL.md **Setup steps 2–5** (lines 46–96): the env headless check
+  (`echo "${MICROSKILLS_HEADLESS:-}"`), `compile-workflow … [--gate-mode auto]` (50–57), read
+  the manifest (65–66), `run-journal latest --manifest-hash … --steps …` (71). Build the digest
+  from the manifest (`manifest_hash`, `gate_mode`, `description`, `output.from`,
+  `required_inputs`, `materialize_inputs`, `input_defaults`, and a `steps[]` list of
+  `{i, kind, checkpoint_type, label, is_loop, severity, workflow, conditional}` read from each
+  step record) and the resume scan (`resume:{found, run_id, step_index, failed_step}`).
+- `## op: record` — from SKILL.md **Setup step 6** (`run-journal init …`, 97–104) + **step 7**
+  normalization incl. the **full SECURITY block verbatim** (131–157: inline→Write tool,
+  path→single-quote + metachar reject, `normalize-input --value '<path>' --out …`) + **step 8**
+  (`Write inputs.tmp` + `run-journal record-inputs …`, 158–166). Digest `{ok, run_dir, inputs}`.
+- `## op: resume` — from SKILL.md **Setup step 5 resume branch** (88–94: seed from run-state,
+  `run-journal append --event resume --step-index <i>`) and **Pickup step 4** (302–305:
+  `--event pickup … --label 'interactive pickup of parked auto run'`) per the `mode` arg.
+  Digest `{ok, step_index, failed_step, gate_mode}`.
+- `## op: prep` — from SKILL.md **segment step 1** (`run-step args … [--extend]`, 420–444),
+  **gate conditional + present** (480–508: `run-step eval` for `when`; resolve each `present`
+  entry — scalar→`{kind:"scalar",label,value}`, object/array→`{kind:"json",label,value}`,
+  `{read_file:}`→Read the file and return `{kind:"file",label,contents,lang}`), and **orch/nested
+  eval** (`run-step eval …`, 590–609 / 631–647). Return the per-kind digest:
+  - segment → `{kind:"segment", script, args, label, node_labels, produces, is_loop}`
+  - gate → `{kind:"gate", gate:{id,label,prompt,options,severity,default,on_headless,after}, when, skipped, evidence:[…ordered…], gate_mode}`
+  - orchestrator_node → `{kind:"orchestrator_node", node, prompt|iterations, skipped, io_schema, gate_mode}`
+  - nested_workflow → `{kind:"nested_workflow", node, workflow, profile, child_inputs|iterations, skipped}`
+  - `step >= M` → `{kind:"done"}`
+- `## op: commit` — from SKILL.md **the three-move checkpoint** (370–405): read the current
+  `<run_dir>/run-state.json`, merge the passed `results` into its `results` map, **Write** the
+  four-key candidate to `run-state.json.tmp` with `step_index = step+1`, `check-step-io …
+  --step <step>`; on exit 0 → `run-journal append --event step_complete --commit-state
+  run-state.json.tmp` (+ `--gate/--choice`, `--outcome skipped` as passed) → `{ok:true}`; on
+  non-zero → `run-journal append --event run_error … --mark-failed-step <step>`, leave the tmp
+  in place → `{ok:false, reason, errors}`.
+- `## op: fold-guidance` — from SKILL.md **extend step 1** (557–566): append notes under a
+  `## Loop-extension guidance (extension N)` heading to the materialized `notes_input` file
+  (copy into `run_dir/run-inputs/` first if it lives outside `run_dir`, update `inputs[name]`),
+  or append to the string input; commit the inputs-only run-state (Write tmp → `run-journal
+  append --commit-state`, no step advance). Digest `{ok, inputs}`.
+- `## op: finish` — SKILL.md **Finish** (689): `run-journal append --event run_complete
+  --outcome ok`. Digest `{ok}`.
+- `## op: fail` — SKILL.md **stop form** (416): `run-journal append --event run_error
+  --step-index <step> --outcome error --label '<reason>' [--mark-failed-step <step>]`. Digest `{ok}`.
+
+- [ ] **Step 5: Run the test to verify it passes**
+
+Run: `python3 -m pytest catalog/scripts/tests/test_workflow_bookkeeper_agent.py -v`
+Expected: PASS (both tests). If `test_bookkeeper_rides_engine_bundle` fails, the file is not
+under `catalog/agents/` or `engine_outputs` skips it — confirm the path and that the dir name
+is exactly `workflow-bookkeeper`.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add catalog/agents/workflow-bookkeeper/AGENT.md catalog/scripts/tests/test_workflow_bookkeeper_agent.py
+git commit -m "feat(workflow): add locked-down workflow-bookkeeper plumbing agent
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
+### Task 7: Conductor — voice ban-list + Setup delegation
+
+**Files:**
+- Modify: `catalog/skills/workflow/SKILL.md` (the `## Setup` section, lines 35–166, and the
+  intro at 15–33)
+
+**Interfaces:**
+- Consumes: bookkeeper ops `open`, `record`, `resume` (Task 6).
+- Produces: a Setup that issues zero raw CLI calls — it dispatches the bookkeeper for
+  compile/resume-scan/mint/normalize/record, and keeps announce + input-gather +
+  resume-offer (the only human-facing setup work) in the conductor. Establishes the voice
+  ban-list consumed by Tasks 8–9.
+
+- [ ] **Step 1: Add the conductor voice ban-list.** Replace the soft directive at SKILL.md
+  lines 37–40 ("Setup commands are plumbing — run them without echoing…") with a hard
+  ban-list block:
+
+  > **Conductor voice (applies to ALL conductor output, every mode).** You are the conductor;
+  > the **bookkeeper** subagent runs the plumbing and its tool calls never reach this
+  > transcript. Your prose must never contain: run-ids, manifest hashes; `run_dir` / `.tmp` /
+  > `.cat` / `.compiled` / `seg-N.js` paths; CLI command names or argv (`run-step`,
+  > `check-step-io`, `run-journal …`, `--commit-state`, `--mark-failed-step`); process phrases
+  > ("Committing state", "IO check passed", "Minting the run", "Recording inputs", "Building
+  > the segment args", "Resolving … against committed run-state"); raw JSON, byte counts, or
+  > schema field names; an internal node id when the step carries a `label`. **Do** emit: plain
+  > outcomes ("Saved.", "Ready.", "Done."); the `▶ Step g/T · <label>` cursor; artifact
+  > references by purpose **with the user-facing product path** they'd open (a `/tmp/...`
+  > output path is fine — it is the user's artifact, not runtime plumbing); recaps that
+  > synthesize. A bookkeeper digest with `ok:false` → surface its meaning in plain language and
+  > stop (don't paste the JSON).
+
+- [ ] **Step 2: Rework Setup steps 1–5 into the `open` dispatch.** Replace SKILL.md lines
+  42–96 with:
+
+  > 1. **Name / profile / overrides** — parse `<name>` (position 1), `<profile>` (slash
+  >    position 2 or "with <profile> profile"), `override workflow-config:` clauses, and the
+  >    args headless signal (`--gate-mode auto` / `--headless`). No `WORKFLOW.yaml` for `<name>`
+  >    → stop and report.
+  > 2. **Open the run (bookkeeper).** Dispatch the bookkeeper with
+  >    `{op:"open", name, profile, overrides, headless_from_args}`. It compiles, reads the
+  >    manifest, and scans for a resumable run. Note the digest's `manifest_hash`, `gate_mode`
+  >    (authoritative for the whole run — auto means no `AskUserQuestion` anywhere; the Pickup
+  >    exception below still applies), the roadmap fields, and `resume`. `ok:false` → surface
+  >    `error` and stop.
+  > 3. **Resume offer.** `resume.found` and not auto mode → offer via `AskUserQuestion` in the
+  >    conductor's voice ("Looks like a previous run stopped at step {step_index+1}…"; if
+  >    `failed_step` is non-null, say that step's last attempt failed and resuming re-runs it).
+  >    On resume → dispatch `{op:"resume", name, run_dir, mode:"resume"}`, set `i = step_index`,
+  >    skip steps 4–6, go to Execute. Under auto mode never offer — start fresh.
+
+  (Keep the auto-mode authority + Pickup-exception wording from the old step 3, folded into the
+  step-2 note above.)
+
+- [ ] **Step 3: Rework the Announce beat (unchanged content, now after `open`).** Keep the
+  existing "Announce the run (conductor opening)" block (lines 110–124) verbatim — it already
+  reads the roadmap from the manifest fields, which now come from the `open` digest. It renders
+  after step 2 (open) and before input gathering.
+
+- [ ] **Step 4: Rework Setup steps 7–8 into gather + `record`.** Replace lines 125–166 with:
+
+  > 4. **Gather inputs** — `inputs = {}`; for each `required_inputs` name use the caller's
+  >    literal value or `AskUserQuestion`; apply `input_defaults` for unsupplied non-required.
+  >    Auto mode + a missing required input → dispatch `{op:"fail", …}` and stop (never invent).
+  >    Build the `materialize` list: for each `materialize_inputs` name with a value, an entry
+  >    `{name, provenance:"inline"|"path", value}` (inline = a literal string/pasted content;
+  >    path = a filesystem path the caller gave).
+  > 5. **Record the run (bookkeeper).** Dispatch `{op:"record", name, manifest_hash, profile,
+  >    overrides, gate_mode, inputs, materialize}`. It mints the run, materializes/normalizes,
+  >    and records inputs (seeding run-state). Note `run_dir` and the returned `inputs` (with
+  >    materialized paths). `ok:false` → surface `error` and stop.
+
+- [ ] **Step 5: Verify Setup reads coherently.** Read the reworked `## Setup` end-to-end.
+  Confirm: no raw CLI argv remains in conductor prose; the SECURITY guidance now lives only in
+  the bookkeeper (Task 6); `inputs`/`run_dir` flow from the `record` digest; the conductor holds
+  no in-memory `results` map (the bookkeeper reads run-state from disk thereafter).
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add catalog/skills/workflow/SKILL.md
+git commit -m "feat(workflow): conductor delegates Setup plumbing to the bookkeeper; hard voice ban-list
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
+### Task 8: Conductor — Execute-the-manifest + Finish delegation
+
+**Files:**
+- Modify: `catalog/skills/workflow/SKILL.md` (lines 335–417 framing + 419–686 kind subsections
+  + 688–696 Finish)
+
+**Interfaces:**
+- Consumes: bookkeeper ops `prep`, `commit`, `fold-guidance`, `finish`, `fail` (Task 6).
+- Produces: an execute loop where the conductor does ONLY the `Workflow` segment call,
+  `AskUserQuestion` gates, orchestrator-node prompt execution, nested re-entry, cursor, and
+  recaps; every CLI step is a bookkeeper dispatch. The gate evidence core is the `prep` digest's
+  `evidence[]`, printed verbatim.
+
+- [ ] **Step 1: Rework the loop framing (335–417).** Keep the cursor rule (342–361) and the
+  `label` resolution verbatim. Replace the three-move checkpoint prose (364–417) with:
+
+  > **After a step's main-loop work, persist via the bookkeeper.** Dispatch
+  > `{op:"commit", name, run_dir, step:<i>, results:<the produced node(s) verbatim>, gate?, outcome?, label}`.
+  > On the SUCCESS path (`{ok:true}`) print NOTHING — the recap + the cursor advancing are the
+  > signal. On `{ok:false}` the step's output failed its contract: say so in plain language
+  > ("Step {i+1}'s output didn't meet its contract — stopping; it'll re-run on resume."), do
+  > NOT continue, do NOT repair it (the bookkeeper already stamped the failed step). Then, for
+  > the NEXT step, dispatch `{op:"prep", name, run_dir, step:<i+1>}` and branch on the digest
+  > `kind` (sections below). After Setup (or resume), the first step is reached with one initial
+  > `{op:"prep", step:i}`.
+
+- [ ] **Step 2: Rework `### kind: "segment"` (419–475).** Replace with:
+
+  > 1. The `prep` digest gave `{script, args, label, node_labels, produces, is_loop}`.
+  > 2. Print the cursor + a one-line "working…" intent; invoke the **Workflow tool** with
+  >    `scriptPath = .claude/workflow-defs/<name>/<script>` and `args` **verbatim**.
+  > 3. On return, its value is keyed by `produces`. **Recap as a conductor** (keep the rubric at
+  >    455–470 verbatim — synthesize, never dump; loop segments summarize rounds + verdict).
+  > 4. Dispatch `{op:"commit", step:<i>, results:<returned, verbatim>, label}`. A loop step's
+  >    `produces` includes `loop` — pass it too.
+  > 5. A `Workflow` error (fail-loud node) → skip the recap, surface it, stop.
+
+- [ ] **Step 3: Rework `### gate` (477–586).** Replace the mechanics, keep the invariant:
+
+  > The `prep` digest gave `{gate, when, skipped, evidence[], gate_mode}`. `skipped:true`
+  > (converged `loop_exhaust`) → `{op:"commit", step:<i>, results:{<gate.id>:null}, outcome:"skipped", label}`,
+  > print the skipped cursor line, continue.
+  > **(a) Framing (ephemeral):** intro naming `gate.label`, then the evidence core (b)
+  > UNCHANGED, then a one-line choice framing.
+  > **(b) Evidence core (verbatim):** print each `evidence[]` entry in order — `scalar` →
+  > `**<label>**: <value>`; `json` → fenced ```json; `file` → fenced block of `contents` (lang
+  > from `lang`). Never reorder/synthesize/substitute. (Resolution happened in the bookkeeper;
+  > you only render.)
+  > **Auto mode** (keep 521–535 semantics): `on_headless:"fail"` → `{op:"fail", label:'gate <id> on_headless:fail'}` and STOP; else record `gate.default` verbatim and `{op:"commit", … gate:{id,choice:default}, label}`, print `Gate <id>: auto — taking declared default '<default>'`, then act per the choice; a `revise`/`extend` default → `{op:"fail"}` + stop.
+  > **Interactive:** `AskUserQuestion` (`gate.prompt`, `gate.options`, per-option consequence
+  > descriptions). Record `{op:"commit", … gate:{id, choice:<pick>}, label}`, then act:
+  > - approve/confirm → continue.
+  > - revise → ask what to change; `{op:"prep", step:<segment i>, …}` to rebuild args, fold the
+  >   notes into the relevant `args` value (conductor-side), re-invoke the segment, recap,
+  >   re-`commit`, re-present.
+  > - extend (`loop_exhaust`) → `{op:"fold-guidance", notes_input, notes, extension_n}`; then
+  >   `{op:"prep", step:<loop i>, extend:true}`; re-invoke the loop segment; recap ("extension
+  >   N"); `{op:"commit", step:<loop i>, results:<refreshed incl. loop>}`; unconverged →
+  >   re-present, converged → continue (choice stays `extend`).
+  > - abandon/stop → stop cleanly.
+  > **warn gates:** render evidence, record `{choice:default|null}` via `{op:"commit", … outcome:"skipped"}`, continue.
+
+- [ ] **Step 4: Rework `### orchestrator_node` (588–626).** Replace with:
+
+  > The `prep` digest gave `{node, prompt|iterations, skipped, io_schema, gate_mode}`.
+  > `skipped:true` → `{op:"commit", step:<i>, results:{<node>:null}, outcome:"skipped", label}`,
+  > continue. Else **execute the resolved `prompt` here in the main loop** (this is the node's
+  > work — file side effects / `AskUserQuestion` as the node needs; these tool calls are work,
+  > not plumbing, and legitimately show). `for_each` → run each `iterations[k].prompt`, collect
+  > an array. When `io_schema` is non-null, the result must be an object with exactly those
+  > fields. Then `{op:"commit", step:<i>, results:{<node>:<result>}, label}`. Auto mode + a
+  > prompt that requires asking → `{op:"fail", label:'<node> needs a human'}` + stop. (Keep the
+  > nested-workflow-from-orch-node note at 624–626.)
+
+- [ ] **Step 5: Rework `### nested_workflow` (628–686).** Replace the eval/normalize plumbing
+  with the `prep` digest, keep the re-entry + cursor-threading verbatim:
+
+  > The `prep` digest gave `{node, workflow, profile, child_inputs|iterations, skipped}`.
+  > `skipped:true` → `{op:"commit", step:<i>, results:{<node>:null}, outcome:"skipped", label}`,
+  > continue. Else **re-enter this `workflow` skill for `workflow`**, passing `--profile` when
+  > carried and (auto mode, non-Pickup) `--gate-mode auto`; supply `child_inputs` as the child's
+  > gathered inputs — the child runs its OWN conductor+bookkeeper pair (its `record` op
+  > materializes any raw-string child materialize inputs). Thread the parent cursor (display
+  > only — keep 672–681 verbatim). Store the child's `output.from` result; recap as a conductor;
+  > `{op:"commit", step:<i>, results:{<node>:<child result>}, label}`. `for_each` → once per
+  > `iterations` entry, collect an array. Child failure → stop, surface it.
+
+- [ ] **Step 6: Rework `## Finish` (688–696).** Replace the `run-journal` call with
+  `{op:"finish", name, run_dir}`; keep the conductor sign-off + the `output.from` result report
+  + the optional "for a full timeline…" aside, all verbatim.
+
+- [ ] **Step 7: Verify the execute walk reads coherently** against
+  `catalog/workflow-defs/microskill-create/.compiled/manifest.json` (Read it). Trace each step:
+  the conductor only `Workflow`/`AskUserQuestion`/executes-prompt/re-enters; every CLI is a
+  bookkeeper op; gate evidence is `prep`-resolved and printed verbatim; no banned prose remains.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add catalog/skills/workflow/SKILL.md
+git commit -m "feat(workflow): conductor delegates execute-loop + finish plumbing to the bookkeeper
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
+### Task 9: Conductor — Preflight / Rerun / Pickup + their bookkeeper ops
+
+**Files:**
+- Modify: `catalog/agents/workflow-bookkeeper/AGENT.md` (add ops `preflight`, `rerun-locate`,
+  `rerun-seed`, `pickup-locate`)
+- Modify: `catalog/skills/workflow/SKILL.md` (Preflight 168–207, Rerun 209–266, Pickup 268–333)
+
+**Interfaces:**
+- Consumes: Task 6 ops + Task 7/8 conductor patterns.
+- Produces: the three non-execute modes converted to the same split — no raw CLI in the
+  conductor; their bespoke plumbing (compile --plan, locate, seed, recompile-with-provenance)
+  runs in the bookkeeper.
+
+- [ ] **Step 1: Add the mode ops to the agent def.** Append to `AGENT.md`: `## op: preflight`
+  (`compile-workflow --plan --explain …`, return `{ok, summary}` with the full
+  `manifest`+`classification`); `## op: rerun-locate` and `## op: pickup-locate`
+  (`run-journal latest` with no `--manifest-hash`/`--steps`, read `run-config`(+`run-state` for
+  pickup), return the provenance fields); `## op: rerun-seed` (`run-journal rerun
+  --runs-dir … --manifest … --source-run … [--from …]`, return
+  `{ok, run_dir, from_step_index, snapped, replayed_gates, confirm_steps}`). Lift the exact
+  commands from SKILL.md Preflight step 1 (174–176), Rerun steps 1/3 (217–244), Pickup step 1
+  (279–287). The recompile-with-recorded-provenance is an `open`-style call with the recorded
+  profile/overrides/gate_mode — reuse `op:"open"` with those args.
+
+- [ ] **Step 2: Rework Preflight (168–207).** Replace the inline `compile-workflow --plan`
+  (step 1) with `{op:"preflight", …}`; render EXCLUSIVELY from the digest `summary` (the same
+  render rules at 179–205, verbatim). STOP before any run (unchanged).
+
+- [ ] **Step 3: Rework Rerun (209–266).** Replace: locate → `{op:"rerun-locate", name, run?}`;
+  recompile-with-provenance → `{op:"open", … recorded profile/overrides/gate_mode}` and compare
+  `manifest_hash` (mismatch → stop, verbatim rule); seed → `{op:"rerun-seed", …}`. Keep the
+  replay-never-re-ask lines (245–250), the conductor opening-for-rerun (start at `i =
+  from_step_index`), and the confirm_steps re-exec `AskUserQuestion` (258–266) in the conductor.
+  The from-step execute walk reuses Task 8.
+
+- [ ] **Step 4: Rework Pickup (268–333).** Replace: locate → `{op:"pickup-locate", …}`;
+  recompile → `{op:"open", … recorded provenance}` + hash-equality check; adopt-in-place →
+  `{op:"resume", name, run_dir, mode:"pickup"}`. Keep the sanity-checks (293–301), the
+  interactive-gate-override semantics (309–324), and the soundness note (326–333) verbatim.
+
+- [ ] **Step 5: Verify all four modes** read coherently (Preflight/Rerun/Pickup + the execute
+  walk they share). Confirm no raw CLI in conductor prose anywhere in SKILL.md; the bookkeeper
+  agent def now carries every op the conductor references.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add catalog/skills/workflow/SKILL.md catalog/agents/workflow-bookkeeper/AGENT.md
+git commit -m "feat(workflow): convert preflight/rerun/pickup modes to the bookkeeper split
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
+```
+
+---
+
+### Task 10: Integration — reconcile, suite, determinism, real run, PR
+
+**Files:** none (verification + any additive golden reconcile surfaced here)
+
+**Interfaces:** Consumes Tasks 6–9. Produces a green suite, a registered bookkeeper, and a
+verified clean-transcript run.
+
+- [ ] **Step 1: Materialize the runtime.** Run
+  `catalog/scripts/initialize-harness --apply --project-root . --catalog ./catalog`.
+  Expected: the engine action is `update` (the new agent + edited skill changed the engine
+  hash); `.claude/agents/workflow-bookkeeper/AGENT.md` and the reworked
+  `.claude/skills/workflow/SKILL.md` are materialized. Never hand-edit `.claude/`.
+
+- [ ] **Step 2: Full suite.** Run
+  `python3 -m pytest catalog/scripts/tests/ scripts/tests/ hooks/tests/ -v`.
+  Expected: GREEN, including Task 6's new tests. If a test asserts a literal engine **file
+  count** or a golden engine listing, it now sees +1 file (the bookkeeper) — update that
+  expectation to include it (additive). Do NOT change any run-state/journal/manifest_hash
+  assertion; if one moved, a run-script was disturbed — stop and fix (no script was supposed to
+  change).
+
+- [ ] **Step 3: Prove determinism.** Run
+  `catalog/scripts/compile-workflow refine-requirements && cp -r catalog/workflow-defs/refine-requirements/.compiled /tmp/c1 && catalog/scripts/compile-workflow refine-requirements && diff -r /tmp/c1 catalog/workflow-defs/refine-requirements/.compiled`.
+  Expected: no diff (the run-scripts and compiler are untouched).
+
+- [ ] **Step 4: Restart, then verify the conductor experience.** The new agent + skill register
+  on the **next session restart** — note this for the human running the verification. After
+  restart, run a small real workflow (e.g. `/workflow review-changes --plan` for a no-side-effect
+  preflight, then a real `/workflow microskill-create` with a throwaway requirement). Assert the
+  transcript shows ONLY: opening + roadmap, `▶ Step` cursors, per-segment "working…" beats,
+  conductor recaps, gate questions, finish — and collapsed `workflow-bookkeeper` agent lines —
+  with NO `Bash`/`Write`/`Read` plumbing blocks and NO run-ids/paths/argv in the prose. Confirm a
+  gate renders its evidence and the recorded choice is verbatim.
+
+- [ ] **Step 5: Open the PR (covers Phase 1 + Phase 2).**
+
+```bash
+git push -u origin workflow-conductor-ux
+gh pr create --title "feat(workflow): conductor-voice execution UX + bookkeeper plumbing split" \
+  --body "Implements docs/superpowers/specs/2026-06-17-workflow-execution-ux-design.md (Phase 1: conductor voice + authored names) and docs/superpowers/specs/2026-06-17-workflow-conductor-bookkeeper-design.md (Phase 2: the bookkeeper split that actually hides plumbing). Plan: docs/superpowers/plans/2026-06-17-workflow-execution-ux-conductor.md.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)"
+```
+
+Expected: PR opens with a conventional-commit title (squash-merge enforced). Do not merge to
+`main` directly.
+
+---
+
+## Phase 2 Self-Review
+
+**Spec coverage** (bookkeeper-design §3–§12):
+- §3 split (conductor vs bookkeeper) → the protocol table + Tasks 7–9 (conductor) + Task 6 (agent).
+- §4 rhythm (commit-prior + prep-next per boundary) → Task 8 Step 1 + the `prep`/`commit` ops.
+- §5 integrity contracts → relay-verbatim (Global Constraints + Task 8 Steps 2/4/5), exact-CLI
+  (Task 6 "lift verbatim" + no-script-change constraint), present-in-bookkeeper (Task 6 `prep` +
+  Task 8 Step 3).
+- §6 determinism/resume → no-script-change constraint, `resume` op (Task 6), Task 10 Step 3;
+  loud failures stay in the conductor (Task 8 Step 1).
+- §7 prose ban-list → Task 7 Step 1.
+- §8 the agent (component, locked tools, contract, dedicated) → Task 6 (+ its test).
+- §9 decisions / §10 YAGNI (no Workflow-in-subagent, no script/engine change) → honored
+  throughout; modes converted (Task 9), not deferred.
+- §11 success criteria → Task 10 Step 4 (clean transcript), Step 2 (suite), Step 3 (determinism).
+- §12 testing → Task 6 hermetic test; Task 10 suite + trace-throughs (Tasks 7/8/9 verify steps)
+  + real run.
+
+**Placeholder scan:** none — the agent-def op bodies cite exact SKILL.md line ranges to lift
+verbatim (DRY, not "similar to"); the one new test is shown in full; every conductor edit gives
+the replacement prose and the exact lines it replaces.
+
+**Type/name consistency:** the op names (`open`/`record`/`resume`/`prep`/`commit`/
+`fold-guidance`/`finish`/`fail`/`preflight`/`rerun-locate`/`rerun-seed`/`pickup-locate`) and
+their digest fields are used identically in the protocol table, Task 6 (producer), and Tasks
+7–9 (consumers). Authored field `tools: Bash, Read, Write` matches the Task 6 test assertion.
+
+**Known risk carried into execution:** the bookkeeper is dispatched per step boundary, so a
+long nested run makes many dispatches (cost, accepted per §9). The conductor↔bookkeeper result
+relay is verbatim text in an Agent prompt — same transcription class as today's run-state
+`Write`, but smaller (fresh result only); `check-step-io` remains the schema guard. The new
+agent + skill are co-dependent and only live after `initialize-harness --apply` + a session
+restart (Task 10 Steps 1/4) — do not attempt a real run before both.
