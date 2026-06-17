@@ -107,7 +107,7 @@ error readably and stop.
    concurrent runs of the same def compiled with different profiles/overrides still race on the shared
    `.compiled/seg-*.js` + `manifest.json`, so never run those concurrently.)
 
-   **### Announce the run (conductor opening)**
+   **Announce the run (conductor opening):**
 
    The manifest is loaded and the run is minted — this is the main loop, never a segment, so it is
    the one place to set the scene. Print one opening beat — the only place a watcher learns what the
@@ -342,6 +342,9 @@ position `i` as you walk.
 **Before running each step, print the cursor:** `▶ Step {g}/{T} · {label}`, advancing the user along
 the announced roadmap, where `{g}/{T}` is the GLOBAL position in the journey (`{g} = i+1` for a
 top-level run; under nesting it threads the parent ordinal — see the nested-workflow section).
+Choose ONE cursor form at the opening — the global `{g}/{T}` counter or the dotted `{parent}.{k}`
+breadcrumb — and keep it for the whole journey, top level and nested alike; never switch schemes
+mid-run, so the user always reads one consistent "where am I".
 
 Resolve `{label}` (the manifest now stamps one on every step — the compiler always stamps an authored
 `name` or a humanized id):
