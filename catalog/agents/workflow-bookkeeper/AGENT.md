@@ -40,7 +40,9 @@ Inputs: `{name, profile?, overrides?, headless_from_args}`
 
 4. **Resume scan** — run via Bash:
    `.claude/scripts/run-journal latest --runs-dir '.claude/workflow-defs/<name>/.compiled/runs' --manifest-hash '<manifest.manifest_hash>' --steps <manifest.steps.length>`
-   Parse the JSON: note `found`, `run_id`, `step_index`, `failed_step`.
+   Parse the JSON: note `found`, `run_id`, `step_index`, `failed_step`. When `found` is true,
+   build `run_dir` as the runs-dir path joined with `run_id`:
+   `.claude/workflow-defs/<name>/.compiled/runs/<run_id>`.
 
 5. **Build and return the digest:**
 
@@ -69,6 +71,7 @@ Inputs: `{name, profile?, overrides?, headless_from_args}`
   "resume": {
     "found": false,
     "run_id": null,
+    "run_dir": null,
     "step_index": null,
     "failed_step": null
   }

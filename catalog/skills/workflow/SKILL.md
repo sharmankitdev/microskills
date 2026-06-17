@@ -61,7 +61,7 @@ stop (don't paste the JSON).
 3. **Resume offer.** `resume.found` and not auto mode → offer via `AskUserQuestion` in the
    conductor's voice ("Looks like a previous run stopped at step {step_index+1}…"; if
    `failed_step` is non-null, say that step's last attempt failed and resuming re-runs it).
-   On resume → dispatch `{op:"resume", name, run_dir: resume.run_id, mode:"resume"}`, set
+   On resume → dispatch `{op:"resume", name, run_dir: resume.run_dir, mode:"resume"}`, set
    `i = step_index`, skip steps 4–5, go to Execute. Under auto mode never offer — start
    fresh.
 
@@ -82,7 +82,9 @@ stop (don't paste the JSON).
    Preflight halts before gathering; this opening proceeds to gather inputs and run.)
 4. **Gather inputs** — `inputs = {}`; for each `required_inputs` name use the caller's
    literal value or `AskUserQuestion`; apply `input_defaults` for unsupplied non-required.
-   Auto mode + a missing required input → dispatch `{op:"fail", …}` and stop (never invent).
+   Auto mode + a missing required input → stop immediately with a clear plain-language error
+   naming the missing input (no run has been minted yet, so there is nothing to journal — do
+   not dispatch `op:fail`).
    Build the `materialize` list: for each `materialize_inputs` name with a value, an entry
    `{name, provenance:"inline"|"path", value}` (inline = a literal string/pasted content;
    path = a filesystem path the caller gave).
