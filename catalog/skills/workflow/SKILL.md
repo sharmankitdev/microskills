@@ -34,82 +34,40 @@ checkpoint in the main loop (where `AskUserQuestion` works), and threads outputs
 
 ## Setup
 
-Setup commands are plumbing — run them without echoing command lines, JSON output, run-ids,
-manifest hashes, byte sizes, or `.cat` paths. On success they are silent; only their plain-language
-*outcome* surfaces (via the opening beat below and the per-step recaps). On error, surface the
-error readably and stop.
+**Conductor voice (applies to ALL conductor output, every mode).** You are the conductor;
+the **bookkeeper** subagent runs the plumbing and its tool calls never reach this
+transcript. Your prose must never contain: run-ids, manifest hashes; `run_dir` / `.tmp` /
+`.cat` / `.compiled` / `seg-N.js` paths; CLI command names or argv (`run-step`,
+`check-step-io`, `run-journal …`, `--commit-state`, `--mark-failed-step`); process phrases
+("Committing state", "IO check passed", "Minting the run", "Recording inputs", "Building
+the segment args", "Resolving … against committed run-state"); raw JSON, byte counts, or
+schema field names; an internal node id when the step carries a `label`. **Do** emit: plain
+outcomes ("Saved.", "Ready.", "Done."); the `▶ Step g/T · <label>` cursor; artifact
+references by purpose **with the user-facing product path** they'd open (a `/tmp/...`
+output path is fine — it is the user's artifact, not runtime plumbing); recaps that
+synthesize. A bookkeeper digest with `ok:false` → surface its meaning in plain language and
+stop (don't paste the JSON).
 
-1. **Name** — read `<name>` from invocation args (position 1 for `/workflow <name>`, or the first
-   token from a shim). If no `.claude/workflow-defs/<name>/WORKFLOW.yaml` exists, stop and report.
-2. **Profile / overrides** — detect `<profile>` (slash position 2 or `"with <profile> profile"`) and
-   any `override workflow-config: <field>=<value>` clauses.
-   **Headless signal** — the run is headless when the invocation args carry `--gate-mode auto` (or
-   `--headless`), OR the environment sets `MICROSKILLS_HEADLESS=1` (check once via Bash:
-   `echo "${MICROSKILLS_HEADLESS:-}"`). The signal only feeds the compile flag in step 3 — at run
-   time the MANIFEST is authoritative.
-3. **Compile** — run via Bash: `.claude/scripts/compile-workflow <name> [--profile "<profile>"]
-   [--override <k>=<v> ...] [--gate-mode auto when the headless signal is set]`. The compile summary
-   and the written manifest always carry `manifest_hash` (the resume check in step 5 needs it);
-   `--explain` is optional diagnostics only. Non-zero exit → stop and surface the JSON `error` /
-   `schema_errors` — under a headless signal this includes the fail-loud "hard gate declares no
-   'default'" error: never retry without the flag to sneak past it. (Never pass `--plan` on this
-   EXECUTION path — a dry-run writes nothing, so there would be no fresh manifest to run; `--plan`
-   belongs to the Preflight mode only.)
-   **`manifest.gate_mode == "auto"` is the authoritative runtime mode** for everything below (a
-   def/profile may declare `gate_mode: auto` with no flag at all, and a profile-declared mode wins
-   over the flag inside compile). Auto mode means: no human is present — `AskUserQuestion` must
-   never be called anywhere in the run; every gate takes its author-declared `default` verbatim.
-   **One exception: a Pickup session** (the Pickup mode below) — the human's explicit `pickup`
-   invocation suspends the auto GATE rules for the remaining steps while the manifest stays
-   stamped auto; every gate asks.
-4. **Read the manifest** — read the `manifest_path` from the compile summary
-   (`.claude/workflow-defs/<name>/.compiled/manifest.json`). Note `manifest.manifest_hash`.
-5. **Resume check** — all runtime state is namespaced per run under
-   `.claude/workflow-defs/<name>/.compiled/runs/<run-id>/` (dispatcher runtime state, NOT a compiled
-   artifact; the compiler's stale-clean only globs `seg-*.js` and `resolved/*.json` and never touches
-   `runs/`). Run via Bash:
-   `.claude/scripts/run-journal latest --runs-dir '.claude/workflow-defs/<name>/.compiled/runs' --manifest-hash '<manifest.manifest_hash>' --steps <manifest.steps.length>`
-   It scans `runs/*/run-state.json` for the newest unfinished run (greatest run id) whose stored
-   `manifest_hash` equals the current one — a mismatched hash means the workflow was recompiled /
-   changed, so stored node outputs no longer line up and that run is simply not offered. (A
-   FINISHED run is never offered here — re-rolling part of one is the Rerun mode; a PARKED
-   gate-mode=auto run is invisible to this scan by design — its hash never matches an interactive
-   compile — and is continued via the **Pickup** mode instead.) **Under auto
-   mode never ask: skip the offer and start fresh at step 6** (prior run dirs stay as provenance; an
-   auto compile has a distinct manifest_hash anyway, so interactive state never matches). Parse the JSON:
-   - `found: true` → **offer to resume**, in the conductor's voice — name where the prior run left
-     off and let the user decide — via `AskUserQuestion` ("Looks like run {run_id} stopped partway,
-     at step {step_index+1}. Pick it back up there, or start fresh?"). If the output carries a
-     **non-null `failed_step`**, the offer must say so: the run's last attempt at that step FAILED
-     its post-step IO check (its result was never committed), so resuming re-runs that step — e.g.
-     "Run {run_id}'s last attempt at step {failed_step+1} failed its IO check; picking it back up
-     re-runs that step. Resume, or start fresh?" (The scan
-     itself never offers a poisoned record whose progress advanced past a `failed_step`.) On
-     resume: adopt that `run_dir` as this run's directory, seed
-     `inputs` and `results` from the `inputs` / `results` maps in `<run_dir>/run-state.json` — the
-     committed state carries both, and it is the record the `run-step` kernel reads (skip Setup
-     steps 6-8 — the run's inputs were already gathered and recorded; re-using completed work avoids
-     re-running expensive opus planner segments; `run-config.json` stays the provenance record), set
-     the start position `i = step_index`, and journal the pickup:
-     `.claude/scripts/run-journal append --run-dir '<run_dir>' --event resume --step-index <i>`.
-   - `found: false`, or the user picks "start fresh" → continue with Setup step 6 (start at `i = 0`;
-     any prior run dirs are left in place as provenance).
-6. **Mint the run** — run via Bash:
-   `.claude/scripts/run-journal init --runs-dir '.claude/workflow-defs/<name>/.compiled/runs' --manifest-hash '<manifest.manifest_hash>' [--profile '<profile>'] [--override '<k>=<v>' ...] [--gate-mode auto when manifest.gate_mode == "auto"]`
-   (pass `--profile` / each `--override` exactly as passed to compile in step 3, and `--gate-mode
-   auto` when the manifest carries `gate_mode: "auto"`, so the run's FULL compile provenance —
-   gate mode included — is recorded verbatim). It mints a fresh `run_id`, creates
-   `<run_dir>/` + `<run_dir>/run-inputs/`, writes `<run_dir>/run-config.json`
-   (`{run_id, manifest_hash, profile_used, overrides, gate_mode, inputs}`), and opens `<run_dir>/journal.jsonl`
-   with a `run_start` event. Parse the JSON output and note `run_dir` — every runtime file below
-   (run-state, run-inputs, journal) lives under it. (`run-journal report --run-dir '<run_dir>'`
-   renders the journal human-readably for a post-mortem; `runs/` isolates *runtime* state only — two
-   concurrent runs of the same def compiled with different profiles/overrides still race on the shared
-   `.compiled/seg-*.js` + `manifest.json`, so never run those concurrently.)
+1. **Name / profile / overrides** — parse `<name>` (position 1), `<profile>` (slash
+   position 2 or "with <profile> profile"), `override workflow-config:` clauses, and the
+   args headless signal (`--gate-mode auto` / `--headless`). No `WORKFLOW.yaml` for `<name>`
+   → stop and report.
+2. **Open the run (bookkeeper).** Dispatch the bookkeeper with
+   `{op:"open", name, profile, overrides, headless_from_args}`. It compiles, reads the
+   manifest, and scans for a resumable run. Note the digest's `manifest_hash`, `gate_mode`
+   (authoritative for the whole run — auto means no `AskUserQuestion` anywhere; the Pickup
+   exception below still applies), the roadmap fields, and `resume`. `ok:false` → surface
+   `error` and stop.
+3. **Resume offer.** `resume.found` and not auto mode → offer via `AskUserQuestion` in the
+   conductor's voice ("Looks like a previous run stopped at step {step_index+1}…"; if
+   `failed_step` is non-null, say that step's last attempt failed and resuming re-runs it).
+   On resume → dispatch `{op:"resume", name, run_dir: resume.run_id, mode:"resume"}`, set
+   `i = step_index`, skip steps 4–5, go to Execute. Under auto mode never offer — start
+   fresh.
 
    **Announce the run (conductor opening):**
 
-   The manifest is loaded and the run is minted — this is the main loop, never a segment, so it is
+   The manifest is loaded — this is the main loop, never a segment, so it is
    the one place to set the scene. Print one opening beat — the only place a watcher learns what the
    whole run will do:
    - **Title:** `🛠  <name> — <manifest.description>`. If `manifest.gate_mode == "auto"`, append
@@ -122,48 +80,16 @@ error readably and stop.
    Ephemeral: printed once, never journaled, never written to run-state. (You MAY mirror the
    Preflight render logic in the **Preflight** section for consistency, but do not merge the modes —
    Preflight halts before gathering; this opening proceeds to gather inputs and run.)
-7. **Gather inputs** — initialize `inputs = {}`. For each name in `manifest.required_inputs`: if the
-   caller's prompt supplies a literal value, use it; otherwise gather via `AskUserQuestion`. Apply
-   `manifest.input_defaults` for any non-required input not supplied. (Do not fall back to a default
-   for a required input.) **Under auto mode `AskUserQuestion` is unavailable**: a required input the
-   caller did not supply → journal a `run_error` naming the input and stop with a nonzero outcome —
-   never invent a value.
-   **Then normalize each large / multi-shape input by reference.** For every name in
-   `manifest.materialize_inputs` that has a gathered value `v` (skip an optional one with no value),
-   produce ONE canonical file and set `inputs[name]` to its **absolute** path — so only a short path
-   ever rides in `args` (a large inline value would be silently truncated by the native engine,
-   breaking `JSON.parse(args)`).
-   **SECURITY — never put the value's CONTENT into a shell command.** A materialize value may be
-   untrusted (a diff is attacker-controlled PR content; a requirement may come from an untrusted
-   source). In a shell command even inside double quotes, `$(...)`, backticks, and `$var` still expand
-   and a stray `"` breaks the quoting — so interpolating raw content (in `--value "<content>"`, a
-   `printf`/`echo` pipe, or even a `test -e "<content>"` shape check) is a command-injection vector.
-   Therefore decide the shape by the value's **provenance**, and never shell its bytes:
-   - **`v` is a literal string / inline content** (a requirement, a pasted diff — e.g. the provision
-     case) → use the **Write tool** (NOT Bash) to write `v` verbatim to `<run_dir>/run-inputs/<name>`;
-     the content is a structured tool parameter, never a shell argument. That file's path is `<path>`.
-   - **`v` is a filesystem path the caller supplied** (a file or directory) → that path is `<path>`
-     (short and caller-chosen).
-   Pass `<path>` to Bash in **single quotes** (`'<path>'`) — single quotes suppress `$(...)`, backtick,
-   and `$var` expansion that double quotes do NOT — and first **reject any path containing a shell
-   metacharacter** (`$`, backtick, `"`, `'`, `\`, or a newline): refuse it rather than interpolate, so
-   even a trusted-but-odd path can never expand. (Dispatcher-written run-inputs paths never contain these.)
-   Then run `.claude/scripts/normalize-input --value '<path>' --out '<run_dir>/run-inputs/<name>.cat'`
-   via Bash (it `mkdir -p`s as needed). It receives only PATHS, never content: a **directory** → a
-   byte-stable concatenation (codepoint-sorted relpaths under `=== <relpath> ===` headers, self-excluding
-   `--out`); a **file** → its absolute path (pass-through, no copy). Parse the JSON `{path, shape, bytes,
-   warning}`: set `inputs[name] = .path`; if `.warning` is non-null surface it (a file beyond the consuming
-   node's context window needs upstream distillation — warn and proceed, never truncate). The file CONTENTS
-   remain untrusted data for the consuming microskill — normalization only relocates them.
-8. **Record the gathered inputs** — use the **Write tool** to write the final `inputs` object as JSON
-   to `<run_dir>/inputs.tmp.json` (a structured tool parameter — input values never ride a shell
-   command), then run via Bash:
-   `.claude/scripts/run-journal record-inputs --run-dir '<run_dir>' --inputs-file inputs.tmp.json`.
-   It folds the inputs into `run-config.json` (so the run's full provenance — profile, overrides, and
-   the exact input set — is one record), **seeds `<run_dir>/run-state.json` with
-   `{manifest_hash, step_index: 0, inputs, results: {}}`** (the `run-step` kernel below builds every
-   segment's args — including the first — from this committed state, never from memory), journals an
-   `inputs_recorded` event with per-input byte sizes, and consumes the scratch file.
+4. **Gather inputs** — `inputs = {}`; for each `required_inputs` name use the caller's
+   literal value or `AskUserQuestion`; apply `input_defaults` for unsupplied non-required.
+   Auto mode + a missing required input → dispatch `{op:"fail", …}` and stop (never invent).
+   Build the `materialize` list: for each `materialize_inputs` name with a value, an entry
+   `{name, provenance:"inline"|"path", value}` (inline = a literal string/pasted content;
+   path = a filesystem path the caller gave).
+5. **Record the run (bookkeeper).** Dispatch `{op:"record", name, manifest_hash, profile,
+   overrides, gate_mode, inputs, materialize}`. It mints the run, materializes/normalizes,
+   and records inputs (seeding run-state). Note `run_dir` and the returned `inputs` (with
+   materialized paths). `ok:false` → surface `error` and stop.
 
 ## Preflight — `/workflow <name> [profile] --plan`
 
