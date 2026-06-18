@@ -23,3 +23,6 @@ __pycache__/
 
 # Node dev tooling (release automation only; the plugin ships no JS)
 node_modules/
+
+# Superpowers plugin scratch (brainstorming specs / writing-plans output) — not catalog
+docs/superpowers/
