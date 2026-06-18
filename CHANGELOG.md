@@ -1,3 +1,9 @@
+## [0.18.0](https://github.com/sharmankitdev/microskills/compare/v0.17.0...v0.18.0) (2026-06-18)
+
+### Features
+
+* **workflow:** conductor UX refinements — clean dispatch cards, contractual one-card cadence, honest roadmap ([#22](https://github.com/sharmankitdev/microskills/issues/22)) ([92697e1](https://github.com/sharmankitdev/microskills/commit/92697e1fc98e44f593e95ca7b350d6a375b602d5)), closes [PR#20](https://github.com/sharmankitdev/PR/issues/20)
+
 ## [0.17.0](https://github.com/sharmankitdev/microskills/compare/v0.16.0...v0.17.0) (2026-06-18)
 
 ### Features
