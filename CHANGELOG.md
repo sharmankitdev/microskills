@@ -1,3 +1,9 @@
+## [0.17.0](https://github.com/sharmankitdev/microskills/compare/v0.16.0...v0.17.0) (2026-06-18)
+
+### Features
+
+* **workflow:** readable gate evidence — render structured values, never a raw JSON wall ([#21](https://github.com/sharmankitdev/microskills/issues/21)) ([70509e4](https://github.com/sharmankitdev/microskills/commit/70509e4ed3edc1ae013e4d27af5d76da687bc9be)), closes [PR#20](https://github.com/sharmankitdev/PR/issues/20)
+
 ## [0.16.0](https://github.com/sharmankitdev/microskills/compare/v0.15.0...v0.16.0) (2026-06-18)
 
 ### Features
