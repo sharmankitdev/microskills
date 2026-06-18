@@ -35,18 +35,38 @@ checkpoint in the main loop (where `AskUserQuestion` works), and threads outputs
 ## Setup
 
 **Conductor voice (applies to ALL conductor output, every mode).** You are the conductor;
-the **bookkeeper** subagent runs the plumbing and its tool calls never reach this
-transcript. Your prose must never contain: run-ids, manifest hashes; `run_dir` / `.tmp` /
-`.cat` / `.compiled` / `seg-N.js` paths; CLI command names or argv (`run-step`,
-`check-step-io`, `run-journal …`, `--commit-state`, `--mark-failed-step`); process phrases
-("Committing state", "IO check passed", "Minting the run", "Recording inputs", "Building
-the segment args", "Resolving … against committed run-state"); raw JSON, byte counts, or
-schema field names; an internal node id when the step carries a `label`. **Do** emit: plain
-outcomes ("Saved.", "Ready.", "Done."); the `▶ Step g/T · <label>` cursor; artifact
-references by purpose **with the user-facing product path** they'd open (a `/tmp/...`
-output path is fine — it is the user's artifact, not runtime plumbing); recaps that
-synthesize. A bookkeeper digest with `ok:false` → surface its meaning in plain language and
-stop (don't paste the JSON).
+the **bookkeeper** subagent runs the plumbing and its OWN tool calls never reach this
+transcript. **The principle: no process / plumbing / bookkeeping vocabulary or internal
+identifier appears on ANY user-visible surface** — neither your prose NOR the human-readable
+`description` you author for each bookkeeper Agent dispatch (both render as transcript text).
+That bans naming the run-open / record / manifest-walk / arg-build / state-commit machinery in
+any phrasing, however contracted — not only the literal terms but near-misses of the same
+family. Concretely, never surface (non-exhaustive): run-ids, manifest hashes; `run_dir` /
+`.tmp` / `.cat` / `.compiled` / `seg-N.js` paths; CLI command names or argv (`run-step`,
+`check-step-io`, `run-journal …`, `--commit-state`, `--mark-failed-step`); op names (`open` /
+`record` / `prep` / `commit`) and bare or 0-based step indices ("step 0"); process phrases
+("Committing state", "IO check passed", "Minting the run", "Recording inputs" / "Recording
+run" / "Run recorded", "Building the segment args", "Walking the manifest", a bare "manifest",
+"Resolving … against committed run-state"); raw JSON, byte counts, or schema field names; an
+internal node id when the step carries a `label`. **The Preflight (`--plan`) technical render is
+exempt wholesale** — it exists precisely to expose the compiled plan, so it legitimately shows
+`manifest_hash`, node ids, and the `by reference (materialize: file)` markers; this ban governs the
+execute / rerun / pickup narrative beats, never that dry-run render.
+
+**Pin every bookkeeper dispatch's card `description` to the fixed constant
+`"workflow bookkeeping"`** — the SAME opaque label for `open`, `record`, `prep`, `commit`,
+`commit_and_prep`, `fold-guidance`, `fail`, `finish`, and the resume / rerun / pickup ops (and
+every other bookkeeper op).
+NEVER derive it from the op name, the step index, or the step label (a setup dispatch has no
+label yet, and a fused commit-and-prep spans two steps — either would re-leak exactly what this
+constant buries). The card's `workflow-bookkeeper` agent-name token is the ONE accepted residual
+plumbing marker; **do not rename** it.
+
+**Do** emit: plain outcomes ("Saved.", "Ready.", "Done."); the `▶ Step g/T · <label>` cursor;
+artifact references by purpose **with the user-facing product path** they'd open (a `/tmp/...`
+output path is fine — it is the user's artifact, not runtime plumbing); recaps that synthesize.
+A bookkeeper digest with `ok:false` → surface its meaning in plain language and stop (don't
+paste the JSON).
 
 1. **Name / profile / overrides** — parse `<name>` (position 1), `<profile>` (slash
    position 2 or "with <profile> profile"), `override workflow-config:` clauses, and the
@@ -74,8 +94,16 @@ stop (don't paste the JSON).
      ` (headless — gates take their declared defaults)`.
    - **Roadmap:** one compact line per `manifest.steps[i]`, numbered `1..M`, each showing the step's
      label (resolved per the cursor rule in **Execute the manifest** below), tagging human gates with
-     `⏸ you decide` and nested workflows with `▸ nested`. A scannable list, not prose.
-   - **Inputs:** if inputs will be gathered, name them in one line.
+     `⏸ you decide`, nested workflows with `▸ nested`, and any step whose `conditional` field is
+     non-null (carried per-step in the open digest) with a FIXED `◇ may be skipped` marker. That
+     marker is a CONSTANT — never translate the authored `when` into domain prose ("(only if scope
+     advisory)" is forbidden: the conductor cannot evaluate a guard, only flag that one exists). The
+     lone exception needs no machinery — a `conditional` GATE step is always the compiler's
+     `loop_exhaust` gate (authored gates carry no `when`), so render the canned
+     `◇ may be skipped — fires only when the loop exits unconverged`. A scannable list, not prose.
+   - **Inputs:** if inputs will be gathered, name them in one line — each by its PURPOSE and value
+     only, **never its storage mechanism** (no "by reference", "inline", "materialized", or
+     "materialize: file"; that marker belongs only to the Preflight technical render below).
 
    Ephemeral: printed once, never journaled, never written to run-state. (You MAY mirror the
    Preflight render logic in the **Preflight** section for consistency, but do not merge the modes —
@@ -90,8 +118,10 @@ stop (don't paste the JSON).
    path = a filesystem path the caller gave).
 5. **Record the run (bookkeeper).** Dispatch `{op:"record", name, manifest_hash, profile,
    overrides, gate_mode, inputs, materialize}`. It mints the run, materializes/normalizes,
-   and records inputs (seeding run-state). Note `run_dir` and the returned `inputs` (with
-   materialized paths). `ok:false` → surface `error` and stop.
+   records inputs (seeding run-state), and folds in step 0's prep as `next`. Note `run_dir`, the
+   returned `inputs` (with materialized paths), and `next`. A top-level `ok:false` (mint /
+   normalize / record-inputs) → surface `error` and stop; a `next.ok:false` (step 0's prep failed)
+   → surface it and stop exactly as a prep failure (nothing has run yet).
 
 ## Preflight — `/workflow <name> [profile] --plan`
 
@@ -304,26 +334,45 @@ concise kind→label synthesis for the cursor header and save the per-dimension 
 false, or the conditional `loop_exhaust` gate after a converged loop) still gets a cursor line,
 marked `(skipped)`.
 Walk the steps in order, starting at the resume position `i` from Setup (default 0). You hold
-`run_dir` as an opaque token (never printed) and pass it to every bookkeeper op. After Setup (or a
-resume), reach the first step with one initial `{op:"prep", name, run_dir, step:i}`.
+`run_dir` as an opaque token (never printed) and pass it to every bookkeeper op. For a FRESH run,
+step 0 is already prepped — the `record` digest carried its prep as `next`, so branch on that
+straight away (no separate `prep` dispatch). After a RESUME (or a rerun / pickup), reach the first
+step with one initial `{op:"prep", name, run_dir, step:i}`.
 
-**After a step's main-loop work, persist via the bookkeeper.** Dispatch
-`{op:"commit", name, run_dir, step:<i>, results:<the produced node(s) verbatim>, gate?, outcome?, label}`
+**After a step's main-loop work, persist AND advance in ONE dispatch.** At a LINEAR-ADVANCE boundary
+(the default — a segment, orchestrator_node, nested_workflow, a skipped step, or a gate's TERMINAL
+continue), dispatch ONE
+`{op:"commit_and_prep", name, run_dir, step:<i>, results:<the produced node(s) verbatim>, gate?, outcome?, label, next_step:<i+1>}`
 — `results` is the fresh node output(s) this step produced (the bookkeeper merges them into the
 on-disk results map; you do not relay the whole accumulated map), `gate:{id,choice}` only at a gate,
-`outcome:"skipped"` only for a skipped step, `label` the resolved step label.
-- **SUCCESS (`{ok:true}`) → print NOTHING.** The recap and the cursor advancing to the next step are
-  the signal that the step landed; the bookkeeping is plumbing the user never sees.
-- **`{ok:false}` → the step's output failed its contract.** Say so in plain language — "Step {i+1}'s
-  output didn't meet its contract — stopping; it'll re-run on resume." — and STOP. Do NOT continue,
-  do NOT repair or re-synthesize the output (re-running the producing step after a fix is the human's
-  call; the bookkeeper has already stamped the failed step so a later resume re-runs it, never
-  threading the corrupt value forward). Loud failures stay in the conductor.
+`outcome:"skipped"` only for a skipped step, `label` the resolved step label. This fused op is the
+**one bookkeeper card per linear step boundary** — never split it back into a separate commit and prep.
+- **SUCCESS (`{ok:true}`) → print NOTHING**, then branch on the digest's `next` (its `kind` —
+  `segment` / `gate` / `orchestrator_node` / `nested_workflow` in the subsections below, or
+  `{kind:"done"}` → go to **Finish**). The recap and the cursor advancing are the only signal the
+  step landed; the bookkeeping is plumbing the user never sees.
+- **`{ok:false}` → the step's output failed its contract** (the commit short-circuited BEFORE prep).
+  Say so in plain language — "Step {i+1}'s output didn't meet its contract — stopping; it'll re-run
+  on resume." — and STOP. Do NOT continue, repair, or re-synthesize the output (re-running the
+  producing step after a fix is the human's call; the bookkeeper has already stamped the failed step
+  so a later resume re-runs it, never threading the corrupt value forward). Loud failures stay in
+  the conductor.
+- A `next` digest carrying `ok:false` (the commit landed but the next step's prep failed) → surface
+  its meaning in plain language and stop.
 
-Then, for the NEXT step, dispatch `{op:"prep", name, run_dir, step:<i+1>}` and branch on the digest's
-`kind` — `segment` / `gate` / `orchestrator_node` / `nested_workflow` (the subsections below), or
-`{kind:"done"}` (no more steps → go to **Finish**). A `prep` digest with `ok:false` → surface its
-meaning in plain language and stop.
+**Normalizing the subsections:** throughout the `kind:`-specific subsections below, every instruction
+to "dispatch `{op:"commit", …}`" for an ADVANCING step (a segment, orchestrator_node,
+nested_workflow, skipped step, or a gate's terminal continue **or terminal stop**) means this one
+fused `commit_and_prep` dispatch — commit that step AND prep `step + 1` — and "branch on the digest's
+`kind`" / "continue to the next step" means branch on the returned `next` (at a terminal stop you
+commit, then stop and ignore `next`). You issue the bare `op:commit` / `op:prep` primitives separately
+ONLY in the gate revise/extend sub-loop, which is explicitly not an advance.
+
+That sub-loop is the ONE place that does NOT linearly advance — it commits a segment/loop step and
+then re-presents the SAME gate. There the conductor issues a standalone `{op:"commit", …}` for that
+segment/loop step and a standalone `{op:"prep", …}` to rebuild the **segment/loop** args; then, to
+re-present the gate on fresh evidence, a standalone `{op:"prep", …}` for the **gate** step —
+**never `commit_and_prep`** (see the gate section).
 
 This in-memory `results` is checkpointed to disk by each `commit` so a run that dies mid-way can
 resume (see the Setup resume offer) instead of restarting from step 0 and re-running expensive
@@ -447,9 +496,10 @@ branch never runs until the gate has terminally continued). Branch on the pick:
   notes into the relevant `args` value conductor-side** (e.g. append them to the `requirement` arg),
   re-invoke the segment's script with the folded args, recap, dispatch the segment's
   `{op:"commit", …}` for the refreshed result (that commit lands on the SEGMENT's earlier step, not
-  the gate step), then **re-present this gate** (loop back to the pick). The gate step stays
-  uncommitted — `step_index` stays AT the gate — until a terminal `approve`, so an interrupted
-  revise resumes by re-presenting the gate, never past it.
+  the gate step), then **re-prep this gate** — a standalone `{op:"prep", name, run_dir, step:<gate i>}`
+  so its evidence reflects the REVISED result, never the stale pre-revision output — and re-present it
+  (loop back to the pick). The gate step stays uncommitted — `step_index` stays AT the gate — until a
+  terminal `approve`, so an interrupted revise resumes by re-presenting the gate, never past it.
 - An `extend` choice (the `loop_exhaust` gate) → re-run the LOOP segment with the committed carry and
   a fresh round budget, in this order (every fold lands on disk first):
   1. **Fold guidance first** — when the loop step declares `on_exhaust.notes_input`, ask the user (a
@@ -469,7 +519,8 @@ branch never runs until the gate has terminally continued). Branch on the pick:
      `{op:"commit", name, run_dir, step:<i>, results:{<gate.id>:{choice:'extend'}}, gate:{id:<gate.id>, choice:'extend'}, label}`
      (choice stays `extend`, never overwritten with a skip-null), and continue to the next step.
 - An `abandon`/`stop` choice → stop the run cleanly (clean up any staging the segments created); the
-  gate step stays uncommitted, so the run remains resumable at the gate.
+  gate step stays uncommitted, so the run remains resumable at the gate. Sign off with the
+  **Closing the roadmap** beat — name the stop step and that the remaining steps did not run.
 For `severity: warn` gates (any mode), render the evidence + emit the prompt, then continue without
 pausing — dispatch `{op:"commit", name, run_dir, step:<i>, results:{<gate.id>:{choice:<gate.default>}},
 gate:{id:<gate.id>, choice:<gate.default>}, outcome:"skipped", label}` when the gate declares a
@@ -552,13 +603,36 @@ inputs** (the bookkeeper did this; an uncovered required child input would have 
    success, do not commit.
 
 ## Finish
-When the next `prep` returns `{kind:"done"}`, dispatch `{op:"finish", name, run_dir}` to close the
-run (plumbing — print nothing for it). If `output.from` is set, report that node's result as the
-workflow's result. Then sign off as the conductor — one beat that CLOSES the journey announced at the
-opening: the workflow name, the outcome, where the result landed, and that all N steps are complete
-(e.g. "🛠  {name} — done. All {N} steps complete; the result is at <where>."). For a full timeline,
+When the next prep (the `record`/`commit_and_prep` `next`, or a standalone `prep`) returns
+`{kind:"done"}`, dispatch `{op:"finish", name, run_dir}` to close the run (plumbing — print nothing
+for it). If `output.from` is set, report that node's result as the workflow's result. Then sign off
+as the conductor — one beat that CLOSES the journey announced at the opening (the workflow name, the
+outcome, where the result landed), reconciled per **Closing the roadmap** below. For a full timeline,
 you MAY add an optional aside ("for the step-by-step, ask me for the run journal"). The per-segment
 recaps already covered the play-by-play — don't re-summarize each segment here.
+
+### Closing the roadmap
+The opening announced an N-step journey; every terminal path MUST close that promise honestly, using
+ONLY the conductor's own ephemeral journey state — the announced total `N`, the stop ordinal, and the
+top-level `(skipped)` cursor lines you already printed during the walk. NEVER re-evaluate a `when`,
+read a bookkeeper digest, or assert what an un-reached step "would" have done. Count only against
+`N`'s own steps: when the run nests, `N` is the parent's step count, so a nested child's breadcrumb
+skips (`▶ Step 3.7 · … (skipped)`) were already narrated in the child recap and are NOT part of the
+parent's tally — count only the top-level (un-breadcrumbed) `(skipped)` lines.
+- **Clean finish (above):** if you printed any top-level `(skipped)` cursor lines, close with
+  `K of N steps complete (M skipped: <their labels>)` — the literal counts you observed; only when
+  ZERO were skipped may you say `All N steps complete` (e.g. "🛠  {name} — done. K of N steps complete
+  (1 skipped: Loop Exhaust); the result is at <where>."). Hardcoding "All N steps complete" is a lie
+  on any run that skipped a conditional step — the converged-loop happy path always skips its
+  `loop_exhaust` gate. (A `warn` gate also prints `(skipped)` though it rendered and continued; if one
+  is in the tally, word it as "1 advisory gate" rather than implying work was cut.)
+- **Abandon / stop (a non-clean terminal END):** close with the run name, the stop step (its label +
+  ordinal `i+1/N`), and that the remaining steps **did not run** because the run stopped — bound
+  STRICTLY to "did not run", NEVER "would (not) have run" (you cannot know an un-reached conditional
+  step's fate). E.g. "🛠  {name} — stopped at step 2/6 (Approve microskill plan); steps 3–6 did not
+  run." A headless **park** is NOT an end — it is a resumable hand-off — so close it by naming the
+  park step and that the run can be picked up there (`/workflow <name> pickup`), not with a did-not-run
+  finality.
 
 ## Gate / delegation semantics (authoritative)
 - A node runs in a **background segment** unless it is an orchestrator checkpoint. The compiler already
@@ -593,7 +667,8 @@ semantics are unchanged from when the conductor ran these directly; only WHO run
   returning `{ok:false, error}`. Surface it, stop. Never substitute your own args assembly or
   expression evaluation — the kernel's is authoritative.
 - **Required input unresolved** — stop, name the input.
-- **Gate abandoned** — stop cleanly, report partial state.
+- **Gate abandoned** — stop cleanly, close via **Closing the roadmap** (the stop step + that the
+  remaining steps did not run).
 - **No recorded run (rerun)** — the bookkeeper's `rerun-locate` source scan found nothing committed
   and returns `{ok:true, found:false}`. Stop: there is nothing to rerun.
 - **Rerun hash mismatch** — the `open` recompile (with the recorded profile/overrides/gate_mode
