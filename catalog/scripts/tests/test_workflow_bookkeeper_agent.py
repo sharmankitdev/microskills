@@ -93,3 +93,58 @@ def test_conductor_renders_structured_evidence_readably(tmp_path):
     assert "`structured`" in body, "evidence-core must document the structured kind"
     assert "raw JSON wall" in body, \
         "the contract must state a human gate never gets a raw JSON wall"
+
+
+# --- pick #1: conductor-voice ban as a principle + pinned dispatch card ------
+
+def test_conductor_voice_binds_the_dispatch_card_description(tmp_path):
+    # The ban is a PRINCIPLE over every user-visible surface — including the
+    # conductor-authored bookkeeper Agent dispatch `description`, pinned to a
+    # fixed constant so it cannot re-leak Open/Record/Prep/Commit/step-N.
+    body = SKILL.read_text()
+    assert "ANY user-visible surface" in body, \
+        "the ban must be stated as a principle over every visible surface, not just prose"
+    assert '"workflow bookkeeping"' in body, \
+        "every bookkeeper dispatch card description must be pinned to a fixed constant"
+    assert "never its storage mechanism" in body, \
+        "the opening Inputs line must drop the materialize/by-reference leak"
+    assert "do not rename" in body, \
+        "the workflow-bookkeeper agent-name token is the one accepted residual"
+
+
+# --- pick #2: contractual one-card-per-boundary batch ops --------------------
+
+def test_bookkeeper_has_commit_and_prep_batch_op(tmp_path):
+    body = AGENT.read_text()
+    assert "## op: commit_and_prep" in body, "the fused commit+prep op must be contracted"
+    assert "WITHOUT running prep" in body, \
+        "a failed commit must short-circuit before prep (stop-semantics preserved)"
+    assert "fold the startup" in body, \
+        "op:record must fold the step-0 prep (3 startup cards -> 2)"
+
+
+def test_conductor_fuses_commit_and_prep_at_linear_boundaries(tmp_path):
+    body = SKILL.read_text()
+    assert "commit_and_prep" in body, "linear advances must use the fused op"
+    assert "one bookkeeper card per linear step boundary" in body, \
+        "the cadence must be stated as a requirement, not left to improvisation"
+    assert "never `commit_and_prep`" in body, \
+        "the gate revise/extend sub-loop must keep standalone commit + prep (carve-out)"
+
+
+# --- pick #3: honest roadmap (open tag + closing reconciliation) -------------
+
+def test_conductor_roadmap_flags_conditional_steps(tmp_path):
+    body = SKILL.read_text()
+    assert "◇ may be skipped" in body, "conditional steps get a fixed skip marker at the open"
+    assert "is forbidden" in body, \
+        "translating the authored when into domain prose must be explicitly forbidden"
+
+
+def test_conductor_closes_the_roadmap_honestly(tmp_path):
+    body = SKILL.read_text()
+    assert "Closing the roadmap" in body, "a named closing rule must exist"
+    assert "K of N steps complete" in body, \
+        "Finish must be skip-aware, not a hardcoded 'All N steps complete'"
+    assert "did not run" in body, \
+        "abandon/stop closes must be bound to 'did not run', never 'would (not) have run'"

@@ -12,7 +12,10 @@ user's transcript.
 
 **You receive ONE JSON object** `{op, ...}` as your task and **return exactly ONE fenced
 ` ```json ` block** as your final message — the op's digest, nothing else (no prose, no
-command echoes). On any CLI non-zero exit, return `{"ok": false, "error": "<readable>"}`
+command echoes). One dispatch = one op = one digest; an op MAY chain several CLI moves
+internally (e.g. `record` folds the step-0 prep, and `commit_and_prep` runs a commit then the
+next step's prep) but it still returns exactly ONE digest — never split a fused op across two
+fenced blocks. On any CLI non-zero exit, return `{"ok": false, "error": "<readable>"}`
 (or `{"ok": false, "reason": ..., "errors": ...}` for `commit`) — do NOT retry, improvise,
 hand-assemble args, summarize a result, or repair a failed output. You have no
 `AskUserQuestion` and no `Workflow` tool — never attempt human interaction or segment launch.
@@ -132,10 +135,18 @@ Inputs: `{name, manifest_hash, profile?, overrides?, gate_mode, inputs, material
    `{manifest_hash, step_index: 0, inputs, results: {}}`, journals an `inputs_recorded` event,
    and consumes the scratch file.
 
-4. Return digest:
-   `{"ok": true, "run_dir": "<run_dir>", "inputs": {<final inputs map>}}`
+4. **Prep step 0 (fold the startup)** — the run is minted and step 0's inputs are seeded, so
+   resolve step 0 NOW instead of forcing a separate `prep` dispatch (this is what collapses the
+   open→record→prep-0 startup from three cards to two). Run the SAME logic `op: prep` runs for
+   `step: 0` — branch on `manifest.steps[0].kind` (segment / gate / orchestrator_node /
+   nested_workflow) per the op:prep section — and capture its digest as `next`. A non-zero step-0
+   prep rides in `next` (record itself already succeeded: the run is minted, inputs recorded), so
+   the conductor surfaces it and stops exactly as for any prep failure.
 
-Non-zero exit at any step → `{"ok": false, "error": "..."}`.
+5. Return digest:
+   `{"ok": true, "run_dir": "<run_dir>", "inputs": {<final inputs map>}, "next": <the step-0 prep digest>}`
+
+Non-zero exit at a record step (mint / normalize / record-inputs) → `{"ok": false, "error": "..."}`.
 
 ## op: resume
 
@@ -321,6 +332,30 @@ Inputs: `{name, run_dir, step, results: {<nodeid>: <value>}, gate?: {id, choice}
    Non-zero exit → `{"ok": false, "reason": "journal append failed", "errors": []}`.
 
 5. Return `{"ok": true}`.
+
+## op: commit_and_prep
+
+Inputs: `{name, run_dir, step, results, gate?, outcome?, label, next_step}` — a commit fused with
+the next step's prep, for a LINEAR-ADVANCE boundary (the conductor's default). It exists so a normal
+step boundary costs ONE dispatch (one card), not two.
+
+1. **Commit** — run the full `op: commit` moves 1–4 VERBATIM for `step` (write `commit-result.json`,
+   `merge-result`, `check-step-io --full`, the `step_complete` append / commit-state).
+2. **Short-circuit on a failed commit** — if the commit's IO check fails (op:commit move 3 non-zero),
+   the bookkeeper has already journaled `run_error` and marked the failed step; return
+   `{"ok": false, "reason": "<short reason>", "errors": [<errors>]}` **WITHOUT running prep**. Never
+   prep past a step that failed its contract — that is exactly what stops a corrupt value threading
+   forward (the run-state still points at the failed step, so a later resume re-runs it). Any other
+   commit non-zero (merge / journal) likewise returns its `{"ok": false, ...}` with no prep.
+3. **Prep the next step** — on a clean commit, run the SAME logic `op: prep` runs for `next_step`
+   (branch on `manifest.steps[next_step].kind`, or `{"kind": "done"}` when `next_step >= M`), and
+   capture its digest as `next`. A non-zero prep rides in `next`.
+4. Return `{"ok": true, "committed": true, "next": <the next_step prep digest>}`.
+
+LINEAR advance ONLY — `step` then `step + 1`. Do NOT use it where the next move is not `step + 1`:
+the gate revise / extend sub-loop commits a segment/loop step and then re-presents the SAME gate (a
+re-prep of an EARLIER gate index, not an advance), so the conductor issues a standalone `op: commit`
+and a standalone `op: prep` there — never this fused op.
 
 ## op: fold-guidance
 
