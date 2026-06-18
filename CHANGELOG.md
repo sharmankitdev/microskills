@@ -1,3 +1,9 @@
+## [0.16.0](https://github.com/sharmankitdev/microskills/compare/v0.15.0...v0.16.0) (2026-06-18)
+
+### Features
+
+* **workflow:** conductor/bookkeeper execution-UX split with human-readable labels ([#20](https://github.com/sharmankitdev/microskills/issues/20)) ([cc7a6b6](https://github.com/sharmankitdev/microskills/commit/cc7a6b6c1e315945b0f0a86d9735a3ffc8cf96cf))
+
 ## [0.15.0](https://github.com/sharmankitdev/microskills/compare/v0.14.0...v0.15.0) (2026-06-12)
 
 ### Features
