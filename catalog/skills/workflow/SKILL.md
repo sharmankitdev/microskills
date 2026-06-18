@@ -385,7 +385,9 @@ gate by its `gate.label` — "We've reached the *{gate.label}* gate. Here's what
 I'm asking you to decide." — then render the evidence core (b) UNCHANGED, then close with a one-line
 framing of the choice ("So: continue with this plan, send it back for revision, or stop?"). This
 framing layer NEVER alters, reorders, summarizes, or substitutes the evidence below, and never
-changes the recorded choice.
+changes the recorded choice. Because a `structured` evidence entry (below) is already human-readable,
+do NOT re-explain or paraphrase it in your framing — the readable evidence stands on its own; the
+framing adds only the gate name and the one-line choice, never a prose retelling of the evidence.
 
 **(b) Evidence core (VERBATIM — approval-integrity invariant).** Print each `evidence[]` entry in the
 digest, in order — never reorder, synthesize, or substitute (resolution happened in the bookkeeper;
@@ -393,7 +395,14 @@ you only render). When a gate declares no `present`, the bookkeeper supplies the
 shape from the fallback it resolved out of `results[gate.after]` by the output rubric — you still
 render it verbatim, never re-resolving or substituting. By the entry's `kind`:
 - `scalar` → `**<label>**: <value>`.
-- `json` → the `value` in a fenced ```json block.
+- `structured` → print the entry's `render` VERBATIM under a `**<label>**` heading. `render` is a
+  readable key/value markdown block the bookkeeper produced deterministically via a tested formatter —
+  this is the DEFAULT for any object/array evidence, so a human gate never gets a raw JSON wall. The
+  render is lossless (every field + value survives), so printing it unchanged keeps the integrity
+  invariant intact; never re-summarize it in framing, and never fall back to pasting the entry's raw
+  `value`.
+- `json` → the `value` in a fenced ```json block — the RAW rendering, only when an entry arrives as
+  `json` (an author's explicit opt-in); the resolver emits `structured` for objects/arrays by default.
 - `file` → the `contents` in a fenced block, language from `lang` (show it in full — present is the
   author's explicit ask). A `scalar` with value `(not produced)` prints as-is — never invent a value.
 
