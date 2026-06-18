@@ -203,6 +203,7 @@ nodes:
 # creation of the microskills listed under missing_microskills.
 gates:
   - id: approve_decomposition
+    name: "Approve decomposition plan"
     after: plan
     type: human_approval
     severity: hard

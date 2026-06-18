@@ -271,6 +271,16 @@ def _expand_suffix(item):
     return item.replace("-", "_")
 
 
+def humanize_id(s):
+    """Deterministic id -> human-readable display label fallback.
+
+    snake/kebab -> Title Case. id-only, no env -> stays deterministic so the
+    label never perturbs byte-identical output. Used only when a node/gate
+    declares no authored `name`.
+    """
+    return s.replace("_", " ").replace("-", " ").strip().title()
+
+
 def expand_static_fanout(wf):
     """SHARED compile-time `expand:` desugar used by BOTH compile and validate.
     Runs immediately AFTER apply_workflow_vars and BEFORE schema validation —
@@ -2303,6 +2313,7 @@ def main():
             # result onward.
             if node.get("spill_outputs"):
                 chk["spill"] = {nid: list(node["spill_outputs"])}
+            chk["label"] = node.get("name") or humanize_id(nid)
             steps.append(chk)
         else:
             seg.append(nid)
@@ -2317,6 +2328,7 @@ def main():
                 # converged) skips the gate.
                 if synth_gate is not None and g is synth_gate:
                     gstep["when"] = "${!(loop.output.converged)}"
+                gstep["label"] = g.get("name") or humanize_id(g["id"])
                 steps.append(gstep)
     flush_segment()
 
@@ -2449,6 +2461,10 @@ def main():
                         oe_rec["notes_input"] = _oe["notes_input"]
                     manifest_step["io"][LOOP_RESULT_ID] = LOOP_RESULT_IO
                 manifest_step["on_exhaust"] = oe_rec
+            _seg_labels = {nid: (node_by_id[nid].get("name") or humanize_id(nid))
+                           for nid in step["nodes"]}
+            manifest_step["label"] = " & ".join(_seg_labels[nid] for nid in step["nodes"])
+            manifest_step["node_labels"] = _seg_labels
             manifest_steps.append(manifest_step)
         else:
             manifest_steps.append(step)
@@ -2559,8 +2575,15 @@ def main():
     # any fingerprinted node semantic — changes it. The dispatcher compares it
     # against stored run-state before resuming; --check compares it against the
     # committed closure.lock.json.
+    hashed_manifest = copy.deepcopy(manifest)
+    for _s in hashed_manifest["steps"]:
+        _s.pop("label", None)
+        _s.pop("node_labels", None)
+        _g = _s.get("gate")
+        if isinstance(_g, dict):
+            _g.pop("name", None)   # authored gate name rides inside the stored gate dict
     manifest_hash = hashlib.sha256(
-        json.dumps({"manifest": manifest, "node_fingerprints": node_fingerprints},
+        json.dumps({"manifest": hashed_manifest, "node_fingerprints": node_fingerprints},
                    sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
 

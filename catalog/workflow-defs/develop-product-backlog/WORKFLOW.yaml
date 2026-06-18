@@ -188,6 +188,7 @@ nodes:
   # PROFILE-LITERAL mode signal for the ledger's gates_taken[].mode (a gate record is {choice}
   # only, §8): the autonomous overlays patch it to auto-default atomically with gate_mode.
   - id: backlog_publication
+    name: "Generate & publish backlog"
     workflow: backlog-publication
     customize: { profile: base }
     inputs:
@@ -225,6 +226,7 @@ nodes:
 # a mismatch surfaces as a red HLD verdict and parks at that leaf's loop_exhaust).
 gates:
   - id: confirm_classification
+    name: "Confirm product classification"
     after: classify
     type: human_approval
     severity: hard

@@ -72,16 +72,19 @@ nodes:
     expand:
       over:
         - item: task-flow
+          name: "Task-flow layout"
           inputs:
             stance: >-
               One focused linear screen path per journey — dedicate a flow to each
               task and keep it free of unrelated controls.
         - item: hub-dashboard
+          name: "Hub & dashboard layout"
           inputs:
             stance: >-
               A central overview hub radiating out to task screens — every journey
               starts from, and returns to, the hub.
         - item: progressive-wizard
+          name: "Progressive wizard layout"
           inputs:
             stance: >-
               Staged step-by-step disclosure — split each task into a short wizard of
@@ -122,6 +125,7 @@ nodes:
   # inputs_each keys (journey_fit / cognitive_load / flow_efficiency) are exactly the
   # ux profile's declared judge inputs; explicit entries coexist (no key collision).
   - id: pick_winner
+    name: "Pick winning wireframe"
     use: synthesize-panel
     customize: { profile: ux }
     inputs_each: judge
@@ -192,7 +196,10 @@ nodes:
     customize: { profile: "{{each.item}}" }
     phase_group: ux-panel
     expand:
-      over: [ux-journey-coverage, ux-requirements-fidelity, ux-flow-consistency]
+      over:
+        - { item: ux-journey-coverage, name: "Journey coverage" }
+        - { item: ux-requirements-fidelity, name: "Requirements fidelity" }
+        - { item: ux-flow-consistency, name: "Flow consistency" }
     inputs:
       artifact_path: ${revise.output.document_path}
       change_summary: ${journeys.output}
@@ -208,6 +215,7 @@ nodes:
   # Per-round synthesis (no refute verdicts yet — verifications stays null = "every
   # finding stands"). Writes the per-round report; the last round's stands.
   - id: synth
+    name: "Synthesize heuristic-panel verdict"
     use: synthesize-review
     customize: { profile: design }
     inputs:
@@ -222,6 +230,7 @@ nodes:
   # Reachable ONLY interactively: headless-unconverged parks at loop_exhaust
   # (on_headless: fail) BEFORE this node; converged runs skip it (guard false -> null).
   - id: triage_unconverged
+    name: "Triage unconverged wireframe findings"
     delegation: orchestrator
     when: ${!loop.output.converged}
     prompt: >
@@ -285,6 +294,7 @@ nodes:
   # Final synthesis: joins refute verdicts to findings, drops refuted/false-positive
   # ones, writes the FINAL report — the signoff gate's anchor.
   - id: final_synthesize
+    name: "Synthesize final UX review"
     use: synthesize-review
     customize: { profile: design }
     spill_outputs: [findings, red_items, red_findings]
@@ -302,6 +312,7 @@ nodes:
   # gates_mode is the W1 profile-literal convention: the autonomous overlay patches it
   # to auto-default in the same patch set that flips the iterate prompt.
   - id: finalize
+    name: "Assemble UX stage evidence"
     use: assemble-evidence
     customize: { profile: ux-stage }
     inputs:
@@ -349,6 +360,7 @@ gates:
   # node. Its take_default approve is floor-guarded by construction: an unconverged
   # headless loop parks at loop_exhaust BEFORE this gate is ever reached.
   - id: signoff
+    name: "Sign off UX design"
     after: final_synthesize
     type: human_approval
     severity: hard

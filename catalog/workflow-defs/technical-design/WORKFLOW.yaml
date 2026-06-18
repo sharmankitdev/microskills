@@ -71,7 +71,10 @@ nodes:
     customize: { profile: hld-candidate }
     phase_group: candidates
     expand:
-      over: [simplicity-first, scale-first, delivery-first]
+      over:
+        - { item: simplicity-first, name: "Simplicity-first" }
+        - { item: scale-first, name: "Scale-first" }
+        - { item: delivery-first, name: "Delivery-first" }
     inputs:
       primary_path: ${workflow.inputs.requirements_path}
       label: "{{each.item}}"
@@ -96,7 +99,10 @@ nodes:
     customize: { profile: "{{each.item}}" }
     phase_group: judges
     expand:
-      over: [requirements-fit, simplicity, evolvability]
+      over:
+        - { item: requirements-fit, name: "Requirements-fit judge" }
+        - { item: simplicity, name: "Simplicity judge" }
+        - { item: evolvability, name: "Evolvability judge" }
     inputs:
       candidates: ${collect_candidates.output.candidates}
       requirements_path: ${workflow.inputs.requirements_path}
@@ -108,6 +114,7 @@ nodes:
   # inputs_each keys (requirements_fit / simplicity / evolvability) are the design
   # profile's declared judge-input names and coexist with the explicit entries.
   - id: synthesize_winner
+    name: "Pick winning architecture"
     use: synthesize-panel
     customize: { profile: design }
     inputs_each: judge
@@ -126,6 +133,7 @@ nodes:
   # Registry contract (hld profile): primary_path = the winning candidate design,
   # context_path = the grounding requirements document.
   - id: author_hld
+    name: "Author the high-level design"
     use: author-design-artifact
     customize: { profile: hld }
     inputs:
@@ -145,23 +153,26 @@ nodes:
   # grounding object — its rubric carries the classification cross-check that
   # discharges the design-classification-consistency obligation (B4).
   - id: review_hld
+    name: "Adversarial HLD review panel"
     use: review-dimension
     customize: { profile: "{{each.item}}" }
     phase_group: hld-review
     expand:
       over:
         - item: internal-consistency
+          name: "Internal consistency"
           inputs:
             change_summary: ${workflow.inputs.classification}
-        - requirements-fidelity
-        - nfr-coverage
-        - feasibility
-        - security-architecture
+        - { item: requirements-fidelity, name: "Requirements fidelity" }
+        - { item: nfr-coverage, name: "NFR coverage" }
+        - { item: feasibility, name: "Technical feasibility" }
+        - { item: security-architecture, name: "Security architecture" }
     inputs:
       artifact_path: ${author_hld.output.document_path}
       context_path: ${workflow.inputs.requirements_path}
 
   - id: collect_hld
+    name: "Collect HLD findings"
     use: collect-findings
     customize: { profile: design-hld }
     inputs_each: review_hld
@@ -170,6 +181,7 @@ nodes:
   # hard block inside loop.body); `verifications` is OMITTED — the design profile
   # treats an absent verdict set as "join nothing, keep all findings".
   - id: synth_hld
+    name: "Synthesize HLD loop verdict"
     use: synthesize-review
     customize: { profile: design }
     inputs:
@@ -183,6 +195,7 @@ nodes:
   # file = the reviewed artifact's path). Post-loop placement can only remove
   # false positives — sound.
   - id: refute_hld
+    name: "Refute surviving HLD findings"
     use: verify-finding
     customize: { profile: document }
     # Fans over the SYNTHESIZED (duplicate-merged) finding set — refuting the
@@ -206,6 +219,7 @@ nodes:
   # budget (never silent truncation). Engine-level by-reference field readers
   # are the recorded roadmap fix.
   - id: synth_final_hld
+    name: "Synthesize refute-verified HLD verdict"
     use: synthesize-review
     customize: { profile: design }
     inputs:
@@ -224,6 +238,7 @@ nodes:
   # Any future post-loop node whose only refs point INTO the loop body needs the
   # same anchoring edge onto the last pre-existing post-loop node.
   - id: lld
+    name: "Author per-component low-level designs"
     use: author-design-artifact
     customize: { profile: lld }
     depends_on: [synth_final_hld]
@@ -242,11 +257,15 @@ nodes:
   # so max_parallel is honored per sibling. The HLD is each review's contract
   # source (context_path).
   - id: review_lld
+    name: "Review LLDs across dimensions"
     use: review-dimension
     customize: { profile: "{{each.item}}" }
     phase_group: lld-review
     expand:
-      over: [lld-fidelity, lld-completeness, lld-feasibility]
+      over:
+        - { item: lld-fidelity, name: "LLD fidelity" }
+        - { item: lld-completeness, name: "LLD completeness" }
+        - { item: lld-feasibility, name: "LLD feasibility" }
     for_each: ${lld.items}
     as: lld_doc
     max_parallel: 4
@@ -259,6 +278,7 @@ nodes:
   # arrives ARRAY-shaped (one {dimension, findings} result per LLD doc); the
   # design-lld profile's concatenation step flattens arrays.
   - id: collect_lld
+    name: "Collect LLD findings"
     use: collect-findings
     customize: { profile: design-lld }
     inputs:
@@ -269,6 +289,7 @@ nodes:
   # Refute votes over the collected cross-product findings; each finding cites the
   # LLD doc it was raised against (file), so the skeptic reads the right artifact.
   - id: refute_lld
+    name: "Refute LLD findings"
     use: verify-finding
     customize: { profile: document }
     # Scoped to blocker/major findings — the only severities that drive red_items,
@@ -285,6 +306,7 @@ nodes:
   # Pre-fix LLD verdict: refute-verified, red_items grouped by cited document —
   # the fix fan-out driver.
   - id: synth_lld
+    name: "Synthesize initial LLD verdict"
     use: synthesize-review
     customize: { profile: design }
     inputs:
@@ -298,6 +320,7 @@ nodes:
   # text but are CHAINED (different effective dependency sets), so the
   # sibling-exclusivity lint never pairs them.
   - id: fix_lld
+    name: "Fix red LLD findings"
     use: author-design-artifact
     customize: { profile: lld-fix }
     when: ${synth_lld.output.verdict == 'request_changes'}
@@ -316,6 +339,7 @@ nodes:
   # docs (same paths — in-place fix). Refuted-on-recheck = fixed; confirmed = still
   # red. depends_on is PURE ORDERING (the fix must land before the recheck reads).
   - id: recheck_lld
+    name: "Re-verify fixed LLD findings"
     use: verify-finding
     customize: { profile: document }
     when: ${synth_lld.output.verdict == 'request_changes'}
@@ -336,6 +360,7 @@ nodes:
   # recheck_lld skipped → ${recheck_lld.items} is null → the design profile joins
   # an empty verdict set → the verdict re-derives unchanged. One path, no branch.
   - id: synth_lld_final
+    name: "Synthesize final LLD verdict"
     use: synthesize-review
     customize: { profile: design }
     inputs:
@@ -350,6 +375,7 @@ nodes:
   # false → stored null, no pause in either mode. RETURN carries the uniform T5
   # post-remediation core (W2) — check-step-io enforced.
   - id: triage_lld
+    name: "Triage remaining LLD blockers"
     delegation: orchestrator
     when: ${synth_lld_final.output.verdict == 'request_changes'}
     prompt: >-
@@ -413,6 +439,7 @@ nodes:
   # Gate-id refs imply no edges; gates_mode is the W1 profile-literal mode record
   # (patched to auto-default by the autonomous overlay).
   - id: finalize_design
+    name: "Assemble design stage evidence"
     use: assemble-evidence
     customize: { profile: design }
     inputs:
@@ -438,6 +465,7 @@ gates:
   # T7 take-default mid-gate; ALSO the leading checkpoint the on_exhaust
   # own-segment rule requires between the panel segment and the loop body.
   - id: confirm_architecture
+    name: "Confirm winning architecture"
     after: synthesize_winner
     type: human_approval
     severity: hard
@@ -464,6 +492,7 @@ gates:
   # Headless: safe to take approve — an unconverged loop already parked at
   # loop_exhaust (on_headless: fail) before this gate fires.
   - id: confirm_hld
+    name: "Confirm high-level design"
     after: synth_hld
     type: human_approval
     severity: hard
@@ -486,6 +515,7 @@ gates:
   # vibes. Headless: a red floor can never reach this default — an unconverged
   # loop parks at loop_exhaust before this gate fires.
   - id: approve_hld
+    name: "Approve refute-verified design"
     after: synth_final_hld
     type: human_approval
     severity: hard

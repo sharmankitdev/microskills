@@ -64,7 +64,10 @@ nodes:
     customize: { profile: "{{each.item}}" }
     phase_group: review
     expand:
-      over: [correctness, security, performance]
+      over:
+        - { item: correctness, name: "Correctness" }
+        - { item: security, name: "Security" }
+        - { item: performance, name: "Performance" }
     inputs:
       # The microskill's generalized input is artifact_path ({{artifact_kind}} =
       # unified git diff in every code dimension profile); this workflow's public
@@ -97,6 +100,7 @@ nodes:
   # summarize-diff summary, the collected findings, and the per-finding verify-finding verdicts
   # (the whole fan-out array via ${verify.items}). This node's result is the workflow output.
   - id: synthesize
+    name: "Synthesize prioritized review"
     use: synthesize-review
     inputs:
       change_summary: ${summarize.output}

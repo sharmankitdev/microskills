@@ -1189,6 +1189,7 @@ def test_manifest_hash_excludes_itself_and_schema_sha(tmp_path):
     # --explain fingerprint digests, must reproduce the stored value (so a
     # schema-bytes-only or template-provenance-only change never invalidates
     # resume). This also pins the fingerprint fold recipe.
+    # label/node_labels are cosmetic and also excluded from the hash.
     import hashlib
     d = make_flow(tmp_path, "gated-flow", GATED.replace("name: linear-flow", "name: gated-flow"))
     rc, data, out, err = run(tmp_path, "gated-flow", "--explain")
@@ -1197,6 +1198,12 @@ def test_manifest_hash_excludes_itself_and_schema_sha(tmp_path):
     stored = m.pop("manifest_hash")
     m.pop("schema_sha256")
     m.pop("schema_source")
+    for s in m["steps"]:
+        s.pop("label", None)
+        s.pop("node_labels", None)
+        g = s.get("gate")
+        if isinstance(g, dict):
+            g.pop("name", None)
     node_fps = {f["node"]: f["sha256"] for f in data["fingerprints"]}
     recomputed = hashlib.sha256(
         json.dumps({"manifest": m, "node_fingerprints": node_fps},
@@ -4583,3 +4590,73 @@ def test_on_exhaust_escalate_empty_body_dies_via_shared_helper(tmp_path):
     rc, data, out, err = run(tmp_path, "ox-flow")
     assert rc == 1
     assert "escalate requires a non-empty loop.body" in data["error"]
+
+
+# --- TASK 2: resolved step labels in manifest, excluded from manifest_hash ---
+
+ORCH_LABELED = """\
+version: 1
+name: orch-label
+nodes:
+  - id: a
+    agent: ag
+    prompt: do a
+  - id: fin
+    delegation: orchestrator
+    depends_on: [a]
+    name: Finalize Everything
+    prompt: finalize ${a.output.x}
+"""
+
+
+def test_node_name_recorded_as_step_label(tmp_path):
+    make_flow(tmp_path, "orch-label", ORCH_LABELED)
+    rc, data, out, err = run(tmp_path, "orch-label")
+    assert rc == 0, err
+    m = _manifest(tmp_path, "orch-label")
+    chk = next(s for s in m["steps"] if s.get("checkpoint_type") == "orchestrator_node")
+    assert chk["label"] == "Finalize Everything"
+
+
+def test_unlabeled_id_gets_humanized_label(tmp_path):
+    body = ORCH_LABELED.replace("    name: Finalize Everything\n", "").replace(
+        "id: fin\n", "id: fin_review\n")
+    make_flow(tmp_path, "humanize", body)
+    rc, data, out, err = run(tmp_path, "humanize")
+    assert rc == 0, err
+    m = _manifest(tmp_path, "humanize")
+    chk = next(s for s in m["steps"] if s.get("checkpoint_type") == "orchestrator_node")
+    assert chk["label"] == "Fin Review"
+
+
+def test_manifest_hash_stable_when_only_name_changes(tmp_path):
+    plain = """\
+version: 1
+name: hash-label
+nodes:
+  - id: a
+    agent: ag
+    prompt: do a
+  - id: fin
+    delegation: orchestrator
+    depends_on: [a]
+    prompt: finalize ${a.output.x}
+"""
+    make_flow(tmp_path / "one", "hash-label", plain)
+    rc1, d1, _, e1 = run(tmp_path / "one", "hash-label", "--explain")
+    assert rc1 == 0, e1
+    labeled = plain.replace("    prompt: finalize ${a.output.x}\n",
+                            "    name: Finalize\n    prompt: finalize ${a.output.x}\n")
+    make_flow(tmp_path / "two", "hash-label", labeled)
+    rc2, d2, _, e2 = run(tmp_path / "two", "hash-label", "--explain")
+    assert rc2 == 0, e2
+    assert d1["manifest_hash"] == d2["manifest_hash"]
+
+
+def test_segment_node_labels_map_present(tmp_path):
+    make_flow(tmp_path, "orch-label", ORCH_LABELED)
+    rc, data, out, err = run(tmp_path, "orch-label")
+    assert rc == 0, err
+    m = _manifest(tmp_path, "orch-label")
+    seg = next(s for s in m["steps"] if s["kind"] == "segment")
+    assert seg["node_labels"]["a"] == "A"  # humanize_id('a')

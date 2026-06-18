@@ -154,6 +154,7 @@ nodes:
   # returns the document unchanged): the loop grammar has no round-conditional,
   # and one cheap unchanged-return dispatch beats splitting the loop body.
   - id: revise_req
+    name: "Apply prior findings to the requirements"
     use: apply-findings-to-document
     depends_on: [clarify]                    # pure ordering; tolerates the guarded skip
     inputs:
@@ -167,12 +168,17 @@ nodes:
   # Loop bodies stay SERIAL — the four critics run one-after-another per round;
   # acceptable (bounded by max_iters), stated honestly.
   - id: critique
+    name: "Adversarial completeness critic panel"
     use: review-dimension
     customize: { profile: "{{each.item}}" }
     phase_group: critique
     depends_on: [revise_req]                 # pure ordering (no ref) — critics read the revised doc
     expand:
-      over: [req-user-value, req-edge-cases, req-nfr, req-testability]
+      over:
+        - { item: req-user-value, name: "User-value completeness" }
+        - { item: req-edge-cases, name: "Edge-case & failure-mode coverage" }
+        - { item: req-nfr, name: "Non-functional requirements" }
+        - { item: req-testability, name: "Testability & acceptance criteria" }
     inputs:
       artifact_path: ${assemble.output.document_path}
 
@@ -180,6 +186,7 @@ nodes:
   # explicit depends_on per sibling). The `requirements` profile of collect-findings declares
   # the four dimension input names.
   - id: collect_req
+    name: "Collect critic findings"
     use: collect-findings
     customize: { profile: requirements }
     inputs_each: critique
@@ -191,6 +198,7 @@ nodes:
   # none → approve. The profile's REPLACED schema RETAINS `findings` — the load-bearing
   # loop-carry seed — and DROPS base's report_markdown (the report rides by path).
   - id: synth_req
+    name: "Synthesize critic verdict"
     use: synthesize-review
     customize: { profile: design }
     # Findings detail crosses checkpoints by REFERENCE (handoff paths); the
@@ -211,6 +219,7 @@ nodes:
   # NO depends_on: the ${synth_req.output.*} refs in the prompt already imply the
   # synth_req → present_refined edge.
   - id: present_refined
+    name: "Present refined requirements for review"
     delegation: orchestrator
     prompt: >
       Present the refined requirements document at ${assemble.output.document_path} to the
@@ -237,6 +246,7 @@ nodes:
   # never deref a field of it). Each claim carries a stable `id` (claim-<gap_id>) that
   # verify-finding echoes as finding_id — the pinned tally join key.
   - id: extract_claims
+    name: "Extract gap-closure claims"
     use: extract-closure-claims
     depends_on: [present_refined]            # pure ordering — claims read the post-remediation doc
     inputs:
@@ -249,6 +259,7 @@ nodes:
   # lenses → the single null lens; empty claims → empty pairs (clean no-gaps path by
   # construction).
   - id: assign_refuters
+    name: "Assign closure refuter seats"
     use: expand-assignments
     inputs:
       items: ${extract_claims.output.claims}
@@ -259,6 +270,7 @@ nodes:
   # segment. Same segment as extract/assign/tally → the pairs array rides in-memory, never
   # across the args boundary.
   - id: refute_closure
+    name: "Refute each gap-closure claim"
     use: verify-finding
     customize: { profile: document }
     for_each: ${assign_refuters.output.pairs}
@@ -277,6 +289,7 @@ nodes:
   # refute → refuted (a REOPENED gap-closure); ties, shortfalls, undecidables → needs_human.
   # attention_count = refuted + needs_human (one small unspilled guard field).
   - id: tally_closures
+    name: "Tally closure refute votes"
     use: tally-votes
     spill_outputs: [upheld, refuted, needs_human]
     inputs:
@@ -289,6 +302,7 @@ nodes:
   # honest park, pickup-able. Green: guard false → stored null, no pause. The autonomous
   # profile MUST NOT patch this prompt (quality floor, not an interaction nicety).
   - id: triage_reopened
+    name: "Triage reopened gap closures"
     delegation: orchestrator
     when: ${tally_closures.output.attention_count > 0}
     prompt: >
@@ -334,6 +348,7 @@ nodes:
   # from the conditional gate record: converged==false ∧ this node ran ⇒ the human (or
   # pickup) chose accept — avoiding the ${loop_exhaust.output.choice} null-deref trap.
   - id: assemble_req_evidence
+    name: "Consolidate requirements evidence ledger"
     use: assemble-evidence
     customize: { profile: requirements }
     # The HEAVY fields (findings / vote-group arrays) are declared spill_outputs
@@ -384,6 +399,7 @@ gates:
   # the closure tally is green (else triage_reopened parked) — the default can never wave
   # a red floor through.
   - id: approve_requirements
+    name: "Approve requirements"
     after: assemble_req_evidence
     type: human_approval
     severity: hard

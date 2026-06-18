@@ -457,3 +457,31 @@ def test_escalate_loop_result_sized_as_self_threaded(tmp_path):
     rc, data, out, err = run_check(mp, sp, 0, "--budget", "32")
     assert rc == 0  # warning-only, like every look-ahead size check
     assert any("'loop'" in w and "threaded" in w for w in data["warnings"])
+
+
+# --- --full: re-validate every prior committed step's results (DRI-1 backstop) -
+# Belt-and-suspenders for the deterministic merge: a future bug or a hand-edit
+# that corrupts an EARLIER result (schema-valid for its own step but now stale)
+# is caught instead of threading forward unseen.
+
+def test_full_revalidates_prior_step_results(tmp_path):
+    s0 = seg_step({"a": {"schema": SCHEMA, "guarded": False, "fan_out": False}})
+    s1 = seg_step({"b": {"schema": SCHEMA, "guarded": False, "fan_out": False}})
+    # step 0's stored 'a' is corrupt (missing required x); step 1's 'b' is valid.
+    mp, sp = world(tmp_path, [s0, s1], {"a": {"wrong": 1}, "b": {"x": "ok"}})
+    # default: checking step 1 only -> passes (its own node 'b' is valid)
+    rc, data, *_ = run_check(mp, sp, 1)
+    assert rc == 0, "default validates only the current step's nodes"
+    # --full: re-validates step 0's 'a' too -> catches the prior corruption
+    rc, data, out, err = run_check(mp, sp, 1, "--full")
+    assert rc == 1, out
+    assert any("'a'" in e for e in data["errors"])
+
+
+def test_full_passes_when_all_prior_results_valid(tmp_path):
+    s0 = seg_step({"a": {"schema": SCHEMA, "guarded": False, "fan_out": False}})
+    s1 = seg_step({"b": {"schema": SCHEMA, "guarded": False, "fan_out": False}})
+    mp, sp = world(tmp_path, [s0, s1], {"a": {"x": "ok"}, "b": {"x": "ok"}})
+    rc, data, out, err = run_check(mp, sp, 1, "--full")
+    assert rc == 0, out + err
+    assert data["verdict"] == "ok"

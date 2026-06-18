@@ -113,6 +113,7 @@ nodes:
 # Human-approval gate after `plan`.
 gates:
   - id: approve_plan
+    name: "Approve microskill plan"
     after: plan
     type: human_approval
     severity: hard
