@@ -71,3 +71,25 @@ def test_bookkeeper_commit_uses_deterministic_merge(tmp_path):
         "op:commit must use the deterministic merge helper (no LLM whole-state re-serialize)"
     assert "check-step-io" in body and "--full" in body, \
         "the pre-commit IO check must run --full (prior-result corruption backstop)"
+
+
+def test_bookkeeper_renders_structured_evidence_via_script(tmp_path):
+    # A human gate must never get a raw JSON wall: object/array evidence is
+    # rendered readable by the tested render-evidence formatter, NOT hand-built.
+    body = AGENT.read_text()
+    assert ".claude/scripts/render-evidence" in body, \
+        "the bookkeeper must own the render-evidence CLI (deterministic readable render)"
+    assert '"kind": "structured"' in body, \
+        "object/array evidence must resolve to a structured entry (value + render)"
+    # the render is delegated to tested code, never summarized by the LLM
+    assert "NEVER hand-write, summarize" in body or "never hand-write, summarize" in body.lower(), \
+        "the render must come from the script verbatim, never hand-built by the bookkeeper"
+
+
+def test_conductor_renders_structured_evidence_readably(tmp_path):
+    # The conductor prints the structured render verbatim; raw json is opt-in,
+    # not the default for a human approval gate.
+    body = SKILL.read_text()
+    assert "`structured`" in body, "evidence-core must document the structured kind"
+    assert "raw JSON wall" in body, \
+        "the contract must state a human gate never gets a raw JSON wall"

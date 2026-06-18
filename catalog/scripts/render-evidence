@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""render-evidence — turn a gate's structured evidence VALUE (an object/array
+recorded in run-state) into a deterministic, lossless, human-readable markdown
+block, printed to stdout.
+
+WHY: a human approval gate must never default to a raw JSON wall. The conductor
+renders the gate evidence core VERBATIM (the approval-integrity invariant), so a
+readable rendering of structured evidence cannot be hand-built by the LLM
+bookkeeper — that would be neither byte-deterministic nor guaranteed lossless,
+which would UNDERMINE the very invariant it serves. This script is the lossless
+pretty-printer: every key (humanized for reading, never dropped), every value in
+full (no truncation), nulls explicit as `(none)`, key order preserved, same
+input -> byte-identical output. The bookkeeper runs it on a structured value and
+puts the result in the evidence entry's `render`; the conductor prints `render`
+unchanged. Because the transform is mechanical and total, "render verbatim" still
+preserves approval integrity — it is a format change, not a summary.
+
+This script receives a PATH to a JSON value the dispatcher already holds in
+run-state; it never receives untrusted content on argv. Output is markdown text
+(NOT JSON) on stdout; a malformed/missing value file is a non-zero exit with the
+reason on stderr and nothing on stdout.
+
+Usage: render-evidence --value-file <path-to-json-value>
+"""
+import argparse
+import json
+import sys
+
+
+def _humanize(key):
+    """A JSON key -> a readable label: word-separators to spaces, sentence case.
+    Cosmetic only — applied to the LABEL, never to a value, so it drops nothing."""
+    s = str(key).replace("_", " ").replace("-", " ").strip()
+    return (s[:1].upper() + s[1:]) if s else s
+
+
+def _is_empty_container(v):
+    return isinstance(v, (dict, list)) and len(v) == 0
+
+
+def _scalar(v):
+    """A leaf value as display text. Lossless: full value, nulls/empties explicit."""
+    if v is None or _is_empty_container(v):
+        return "(none)"
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    return str(v)
+
+
+def render_lines(value, indent=0):
+    """Depth-first, total rendering. Every key and every leaf is emitted; the
+    only transform is layout. Nested non-empty objects/arrays recurse one indent
+    level deeper (2 spaces); array items get `-` bullets."""
+    pad = "  " * indent
+    out = []
+    if isinstance(value, dict) and value:
+        for k, v in value.items():
+            label = _humanize(k)
+            if isinstance(v, (dict, list)) and v:
+                out.append(f"{pad}**{label}:**")
+                out += render_lines(v, indent + 1)
+            else:
+                out.append(f"{pad}**{label}:** {_scalar(v)}")
+    elif isinstance(value, list) and value:
+        for item in value:
+            if isinstance(item, (dict, list)) and item:
+                out.append(f"{pad}-")
+                out += render_lines(item, indent + 1)
+            else:
+                out.append(f"{pad}- {_scalar(item)}")
+    else:
+        out.append(f"{pad}{_scalar(value)}")
+    return out
+
+
+def render(value):
+    return "\n".join(render_lines(value))
+
+
+def main():
+    ap = argparse.ArgumentParser(description="lossless markdown render of a structured evidence value")
+    ap.add_argument("--value-file", required=True,
+                    help="path to a JSON file holding the evidence value")
+    a = ap.parse_args()
+    try:
+        with open(a.value_file, encoding="utf-8") as f:
+            value = json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"render-evidence: cannot read JSON value from {a.value_file!r}: {e}",
+              file=sys.stderr)
+        sys.exit(1)
+    sys.stdout.write(render(value) + "\n")
+
+
+if __name__ == "__main__":
+    main()

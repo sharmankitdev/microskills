@@ -198,10 +198,23 @@ branches — EITHER the declared `present` resolution OR, when `gate.present` is
 no-`present` output-rubric fallback below. Both branches return `evidence[]` (the conductor renders it
 verbatim either way).
 
+**Structured values render READABLE, never a raw JSON wall.** A human approval gate must never be
+handed a raw JSON dump. Whenever a resolved evidence value is an object or array, do NOT emit
+`kind: json`. Instead: use the Write tool to write the value verbatim to
+`<run_dir>/evidence-value.tmp.json`, then run ONE Bash call
+`.claude/scripts/render-evidence --value-file '<run_dir>/evidence-value.tmp.json'`, and emit
+`{"kind": "structured", "label": "<label>", "value": <the value>, "render": "<the script's stdout>"}`.
+`render` is the script's deterministic, lossless markdown — NEVER hand-write, summarize, reorder, or
+otherwise alter it. Delegating the FORMAT to tested code is exactly what lets the conductor render the
+evidence verbatim AND readably without breaking the approval-integrity invariant (the transform is
+total — every key and value survives — so it is a layout change, not a summary). `kind: json` stays in
+the contract only as the raw rendering for a value an author explicitly wants raw; the
+present-resolution and fallback below always take the `structured` path for objects/arrays.
+
 **`gate.present` declared (non-empty)** → resolve each entry in declared order:
 - A string path `<id>.output[.<field>...]` → resolve against `results` in run-state. If the
   value is a scalar → `{"kind": "scalar", "label": "<last path segment>", "value": "<value>"}`.
-  If object/array → `{"kind": "json", "label": "<last path segment>", "value": <value>}`.
+  If object/array → a **structured** entry per the rule above (label `<last path segment>`).
   If undefined/null → `{"kind": "scalar", "label": "<last path segment>", "value": "(not produced)"}`.
 - `{read_file: <path>}` → resolve `<path>` against results to a file path, Read that file.
   Return `{"kind": "file", "label": "<last path segment>", "contents": "<contents>", "lang": "<ext>"}`.
@@ -214,11 +227,11 @@ exactly as the `{read_file:}` present case does — the conductor never opens a 
   `{"kind": "file", "label": "<name>", "contents": "<contents>", "lang": "<ext from plan_path>"}`
   (the full contents; `lang` from the file extension, e.g. `yaml` for `.yaml`).
 - **verdict** (`{pass, issues[]}`) → a `{"kind": "scalar", "label": "pass", "value": "PASS" | "FAIL"}`
-  entry (from the boolean) followed by `{"kind": "json", "label": "issues", "value": <issues array>}`.
-- **staging paths** (`{staging_paths[]}`) → `{"kind": "json", "label": "staging_paths", "value": <the array>}`.
+  entry (from the boolean) followed by a **structured** entry (label `issues`) for the issues array.
+- **staging paths** (`{staging_paths[]}`) → a **structured** entry (label `staging_paths`) for the array.
 - **scope advisory** (`{kind, reason, recommendation}` / `missing_microskills[]`) →
-  `{"kind": "json", "label": "scope_advisory", "value": <the object>}`.
-- **default** (any other shape) → `{"kind": "json", "label": "<gate.after>", "value": <the key fields>}`.
+  a **structured** entry (label `scope_advisory`) for the object.
+- **default** (any other shape) → a **structured** entry (label `<gate.after>`) for the key fields.
 If `results[gate.after]` is itself undefined/null → emit a single
 `{"kind": "scalar", "label": "<gate.after>", "value": "(not produced)"}` entry (never invent a value).
 
