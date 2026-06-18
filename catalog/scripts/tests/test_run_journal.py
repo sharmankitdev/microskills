@@ -858,3 +858,128 @@ def test_append_pickup_event_accepted(tmp_path):
              (rd / "journal.jsonl").read_text().splitlines()]
     assert any(l.get("event") == "pickup" and l.get("step_index") == 4
                for l in lines)
+
+
+# ------------------------------------------------------ merge-result (DRI-1)
+# The deterministic results-merge: op:commit no longer Read-merges-reWrites the
+# whole run-state in an LLM (which could corrupt an untouched prior result the
+# per-step IO check would not catch). The helper overlays ONE step's results
+# into the committed state in Python and writes the candidate tmp.
+
+def _seed_committed_state(run_dir, results, step_index=1,
+                          manifest_hash="sha256:h1", inputs=None):
+    (run_dir / "run-state.json").write_text(json.dumps({
+        "manifest_hash": manifest_hash, "step_index": step_index,
+        "inputs": inputs if inputs is not None else {"src": "/tmp/x"},
+        "results": results}, indent=2) + "\n")
+
+
+def test_merge_result_overlays_into_committed_results(tmp_path):
+    run_dir, _ = init_run(tmp_path)
+    _seed_committed_state(run_dir, {"a": {"x": 1}}, step_index=1)
+    (run_dir / "rf.json").write_text(json.dumps({"b": {"y": 2}}))
+    rc, data, out, err = run("merge-result", "--run-dir", str(run_dir),
+                             "--step", "1", "--results-file", "rf.json")
+    assert rc == 0, out + err
+    tmp = json.loads((run_dir / "run-state.json.tmp").read_text())
+    assert tmp["results"] == {"a": {"x": 1}, "b": {"y": 2}}
+    assert tmp["step_index"] == 2
+    assert tmp["inputs"] == {"src": "/tmp/x"}
+    assert tmp["manifest_hash"] == "sha256:h1"
+
+
+def test_merge_result_new_key_wins_over_prior(tmp_path):
+    run_dir, _ = init_run(tmp_path)
+    _seed_committed_state(run_dir, {"a": {"x": 1}}, step_index=2)
+    (run_dir / "rf.json").write_text(json.dumps({"a": {"x": 99}}))
+    rc, data, out, err = run("merge-result", "--run-dir", str(run_dir),
+                             "--step", "2", "--results-file", "rf.json")
+    assert rc == 0, out + err
+    tmp = json.loads((run_dir / "run-state.json.tmp").read_text())
+    assert tmp["results"]["a"] == {"x": 99}
+    assert tmp["step_index"] == 3
+
+
+def test_merge_result_preserves_prior_result_bytes_exactly(tmp_path):
+    # the anti-corruption guarantee: prior results are byte-preserved by the
+    # deterministic Python merge, never re-serialized by an LLM.
+    run_dir, _ = init_run(tmp_path)
+    big = {"report": "x" * 5000, "nested": {"deep": [1, 2, {"k": "v"}]},
+           "unicode": "café"}
+    _seed_committed_state(run_dir, {"prior": big}, step_index=3)
+    (run_dir / "rf.json").write_text(json.dumps({"new": 1}))
+    rc, data, out, err = run("merge-result", "--run-dir", str(run_dir),
+                             "--step", "3", "--results-file", "rf.json")
+    assert rc == 0, out + err
+    tmp = json.loads((run_dir / "run-state.json.tmp").read_text())
+    assert tmp["results"]["prior"] == big
+
+
+def test_merge_result_leaves_committed_state_untouched(tmp_path):
+    # writes the CANDIDATE tmp only; the commit promote is a later append step.
+    run_dir, _ = init_run(tmp_path)
+    _seed_committed_state(run_dir, {"a": 1}, step_index=1)
+    before = (run_dir / "run-state.json").read_text()
+    (run_dir / "rf.json").write_text(json.dumps({"b": 2}))
+    rc, *_ = run("merge-result", "--run-dir", str(run_dir),
+                 "--step", "1", "--results-file", "rf.json")
+    assert rc == 0
+    assert (run_dir / "run-state.json").read_text() == before
+
+
+# --------------------------------------------- rerun replayed-gates hygiene
+# A pre-from gate that recorded a NULL choice (a skipped/converged loop_exhaust)
+# must not produce a 'replaying recorded choice None' line; a real replayed gate
+# carries its human label so the dispatcher names it by label, not a bare id.
+
+SKIP_GATE_STEPS = [
+    {"kind": "segment", "index": 1, "nodes": ["a"], "produces": ["a"],
+     "needs": {}, "io": {}},
+    {"kind": "checkpoint", "checkpoint_type": "gate", "label": "Approve plan",
+     "gate": {"id": "g_real", "type": "human_approval", "after": "a",
+              "prompt": "ok?", "options": ["approve", "abandon"]}},
+    {"kind": "checkpoint", "checkpoint_type": "gate", "label": "Loop Exhaust",
+     "gate": {"id": "g_skip", "type": "human_approval", "after": "a",
+              "prompt": "x?", "options": ["accept", "extend"]}},
+    {"kind": "segment", "index": 2, "nodes": ["z"], "produces": ["z"],
+     "needs": {}, "io": {}},
+]
+SKIP_GATE_RESULTS = {"a": {"x": 1}, "g_real": {"choice": "approve"},
+                     "g_skip": None, "z": {"w": 9}}
+
+
+def _skip_gate_rerun(tmp_path):
+    mh = "sha256:skip"
+    run_dir, _ = init_run(tmp_path, "20260610T100000Z-source", mh)
+    (run_dir / "in.json").write_text(json.dumps({"src": "/x"}))
+    rc, *_ = run("record-inputs", "--run-dir", str(run_dir),
+                 "--inputs-file", "in.json")
+    assert rc == 0
+    (run_dir / "s.tmp").write_text(json.dumps({
+        "manifest_hash": mh, "step_index": 4, "inputs": {"src": "/x"},
+        "results": SKIP_GATE_RESULTS}))
+    rc, *_ = run("append", "--run-dir", str(run_dir), "--event", "step_complete",
+                 "--step-index", "3", "--commit-state", "s.tmp")
+    assert rc == 0
+    manifest = tmp_path / "m.json"
+    manifest.write_text(json.dumps({"name": "f", "manifest_hash": mh,
+                                    "steps": SKIP_GATE_STEPS}))
+    return run("rerun", "--runs-dir", str(tmp_path / "runs"),
+               "--manifest", str(manifest),
+               "--source-run", "20260610T100000Z-source",
+               "--run-id", "20260610T200000Z-rr", "--from", "3")
+
+
+def test_rerun_omits_null_choice_gate_from_replayed(tmp_path):
+    rc, data, out, err = _skip_gate_rerun(tmp_path)
+    assert rc == 0, out + err
+    gates = {g["gate"] for g in data["replayed_gates"]}
+    assert "g_skip" not in gates  # null recorded choice -> not replayed
+    assert "g_real" in gates
+
+
+def test_rerun_replayed_gate_carries_step_label(tmp_path):
+    rc, data, out, err = _skip_gate_rerun(tmp_path)
+    assert rc == 0, out + err
+    entry = next(g for g in data["replayed_gates"] if g["gate"] == "g_real")
+    assert entry["label"] == "Approve plan"

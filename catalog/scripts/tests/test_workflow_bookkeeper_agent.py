@@ -35,3 +35,39 @@ def test_bookkeeper_rides_engine_bundle(tmp_path):
     srcs = [str(s) for s, _ in outs]
     assert any(s.endswith("catalog/agents/workflow-bookkeeper/AGENT.md") for s in srcs), \
         "bookkeeper must materialize via the engine bundle (no harness.yaml entry)"
+
+
+SKILL = REPO / "catalog" / "skills" / "workflow" / "SKILL.md"
+
+
+def _body(path):
+    """Component body with the YAML frontmatter stripped."""
+    text = path.read_text()
+    return text.split("---\n", 2)[2] if text.startswith("---\n") else text
+
+
+def test_conductor_body_issues_no_orchestration_cli(tmp_path):
+    # §11.1 success criterion: every deterministic CLI call lives in the
+    # bookkeeper (off the main transcript). The conductor body must invoke none
+    # of the scripts directly — a `.claude/scripts/<x>` string in the body would
+    # mean a raw Bash/Read tool block leaking into the user-facing transcript.
+    assert ".claude/scripts/" not in _body(SKILL), \
+        "conductor body must issue no script CLI — all of it lives in the bookkeeper"
+
+
+def test_bookkeeper_owns_the_orchestration_cli(tmp_path):
+    # the flip side: the CLI did not vanish — it MOVED to the bookkeeper.
+    body = AGENT.read_text()
+    for cli in ("compile-workflow", "run-journal", "run-step",
+                "check-step-io", "normalize-input"):
+        assert f".claude/scripts/{cli}" in body, f"bookkeeper must own the {cli} CLI"
+
+
+def test_bookkeeper_commit_uses_deterministic_merge(tmp_path):
+    # DRI-1: op:commit overlays via the helper + checks with --full, never an
+    # LLM Read-merge-reWrite of the whole accumulated run-state.
+    body = AGENT.read_text()
+    assert "run-journal merge-result" in body, \
+        "op:commit must use the deterministic merge helper (no LLM whole-state re-serialize)"
+    assert "check-step-io" in body and "--full" in body, \
+        "the pre-commit IO check must run --full (prior-result corruption backstop)"

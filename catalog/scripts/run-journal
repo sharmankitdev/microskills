@@ -335,6 +335,45 @@ def cmd_append(args):
     print(json.dumps({"ok": True, "event": args.event, "journal": str(journal)}, indent=2))
 
 
+def cmd_merge_result(args):
+    """Deterministically overlay ONE step's produced results into the committed
+    run-state and write the CANDIDATE run-state.json.tmp — so the dispatcher's
+    bookkeeper never Read-merges-reWrites the whole accumulated results map in an
+    LLM (which could silently corrupt an untouched prior result the per-step IO
+    check would not catch). The merge is a plain Python dict overlay: prior
+    results are byte-preserved verbatim; only the passed node(s) change, and
+    step_index advances to step+1. This writes the tmp ONLY — `append
+    --commit-state` does the IO-checked os.replace promote afterward."""
+    run_dir = require_run_dir(args.run_dir)
+    p = run_paths(run_dir)
+    state = load_json(p["state"], "run-state.json")
+    if not isinstance(state, dict) or not isinstance(state.get("results"), dict):
+        die("committed run-state.json must be the four-key {manifest_hash, "
+            "step_index, inputs, results} shape with a results object")
+    results_file = Path(args.results_file)
+    if not results_file.is_absolute():
+        results_file = run_dir / results_file
+    new_results = load_json(results_file, "results file")
+    if not isinstance(new_results, dict):
+        die("results file must hold a JSON object {<node-id>: <value>} of the "
+            f"step's produced node(s): {results_file}")
+    merged = dict(state["results"])
+    merged.update(new_results)  # new keys win; every untouched prior key verbatim
+    candidate = {
+        "manifest_hash": state.get("manifest_hash"),
+        "step_index": args.step + 1,
+        "inputs": state.get("inputs"),
+        "results": merged,
+    }
+    out_path = Path(args.out) if args.out else (p["state"].parent / "run-state.json.tmp")
+    if not out_path.is_absolute():
+        out_path = run_dir / out_path
+    out_path.write_text(json.dumps(candidate, indent=2, sort_keys=True) + "\n")
+    print(json.dumps({"ok": True, "out": str(out_path),
+                      "step_index": candidate["step_index"],
+                      "merged_keys": sorted(new_results)}, indent=2))
+
+
 def cmd_latest(args):
     runs_dir = Path(args.runs_dir).resolve()
     candidates, skipped = [], []
@@ -531,9 +570,17 @@ def cmd_rerun(args):
         if step.get("checkpoint_type") == "gate":
             gid = (step.get("gate") or {}).get("id")
             rec = results.get(gid)
-            replayed_gates.append({
-                "step_index": i, "gate": gid,
-                "choice": rec.get("choice") if isinstance(rec, dict) else None})
+            choice = rec.get("choice") if isinstance(rec, dict) else None
+            # A pre-from gate with NO recorded choice (a skipped / converged
+            # loop_exhaust whose result is a guarded null) has nothing to
+            # replay — omit it so the dispatcher never prints "replaying
+            # recorded choice None". A real replay carries the step's human
+            # label so the dispatcher names the gate by label, not a bare id.
+            if choice is not None:
+                entry = {"step_index": i, "gate": gid, "choice": choice}
+                if step.get("label"):
+                    entry["label"] = step["label"]
+                replayed_gates.append(entry)
     if missing:
         die("the source run-state is missing recorded results for: "
             + "; ".join(missing) + " — every produced node must be stored in "
@@ -712,6 +759,23 @@ def main():
                          "refuses to seed past it). Never combinable with "
                          "--commit-state.")
     sp.set_defaults(fn=cmd_append)
+
+    sp = sub.add_parser("merge-result",
+                        help="overlay one step's produced results into the "
+                             "committed run-state and write the candidate "
+                             "run-state.json.tmp (deterministic Python merge — "
+                             "prior results byte-preserved, no LLM re-serialize)")
+    sp.add_argument("--run-dir", required=True)
+    sp.add_argument("--step", required=True, type=int,
+                    help="0-based index of the step being committed; the "
+                         "candidate's step_index is this + 1")
+    sp.add_argument("--results-file", required=True,
+                    help="JSON object {<node-id>: <value>} of the step's "
+                         "produced node(s) (relative paths resolve against "
+                         "--run-dir)")
+    sp.add_argument("--out", default=None,
+                    help="candidate output path (default <run-dir>/run-state.json.tmp)")
+    sp.set_defaults(fn=cmd_merge_result)
 
     sp = sub.add_parser("latest",
                         help="newest run under runs/ whose run-state matches --manifest-hash")

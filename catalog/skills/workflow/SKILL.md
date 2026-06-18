@@ -149,11 +149,14 @@ requirement) needs a changed input, which is a NEW run, never a rerun.
    beyond it — tell the user up front. `ok:false` → surface `error` and stop.
 2. **Recompile with the RECORDED provenance (bookkeeper).** Dispatch `{op:"open", name,
    profile: <profile_used>, overrides: <recorded overrides>, headless_from_args: <gate_mode ==
-   "auto">}` — the recorded provenance, never this invocation's own flags (a rerun reproduces
-   the recorded compile). If the digest's `manifest_hash` differs from the recorded one → **STOP:
-   rerun REQUIRES manifest_hash equality.** The def, registry, or profile changed since the
-   recorded run, so its stored node outputs no longer line up — start a fresh run instead. Never
-   improvise a partial reuse, and never retry the compile with different flags to chase the hash.
+   "auto">, provenance_pure: true}` — the recorded provenance, never this invocation's own flags (a
+   rerun reproduces the recorded compile). `provenance_pure: true` makes the recompile's gate mode
+   come ONLY from the recorded `gate_mode`, never this session's `MICROSKILLS_HEADLESS` env — else a
+   set env would flip the gate mode and spuriously break the hash-equality gate below. If the
+   digest's `manifest_hash` differs from the recorded one → **STOP: rerun REQUIRES manifest_hash
+   equality.** The def, registry, or profile changed since the recorded run, so its stored node
+   outputs no longer line up — start a fresh run instead. Never improvise a partial reuse, and never
+   retry the compile with different flags to chase the hash.
 3. **Seed the rerun (bookkeeper).** Dispatch `{op:"rerun-seed", name, source_run: <run_id>,
    from?}` (`from` is the `--from <step|node>` value when given). It re-checks hash equality (the
    authoritative gate), resolves the from-point — an integer is a 0-based manifest step index; a
@@ -166,9 +169,12 @@ requirement) needs a changed input, which is a NEW run, never a rerun.
    the user their node-level from-point widened to the whole segment), `replayed_gates`, and
    `confirm_steps`.
 4. **Replay, never re-ask** — print one line per `replayed_gates` entry:
-   `Gate <id>: replaying recorded choice '<choice>'`. Those gates sit BEFORE the from-point; their
-   recorded `{choice}` results are already seeded into the run-state, so downstream branches read
-   them — do not re-present them. A replayed `loop_exhaust` whose recorded choice was `extend` is a
+   `Gate <label>: replaying recorded choice '<choice>'` (each entry carries the gate's human
+   `label` — use it; fall back to the gate id only if an entry has none). The seeder already drops
+   entries with no recorded choice (a skipped/converged gate), so there is never a "replaying
+   recorded choice None" line. Those gates sit BEFORE the from-point; their recorded `{choice}`
+   results are already seeded into the run-state, so downstream branches read them — do not
+   re-present them. A replayed `loop_exhaust` whose recorded choice was `extend` is a
    CHOICE replay only — never re-act on it (the seeded run-state already carries the
    post-extension `results.loop`/carry).
 5. **Skip the Setup input-gathering steps entirely** — the inputs are FROZEN from the record and
@@ -206,14 +212,22 @@ refuse with a nonzero outcome — a headless pickup is a contradiction in terms.
    is the `--run <run-id>` value when given, else omitted — it picks the newest committed run,
    ANY compile, since a parked auto run's hash never matches an interactive compile, which is
    exactly why the normal resume scan cannot see it). `found:false` → stop: nothing to pick up.
-   Otherwise note the digest's `run_id`, `manifest_hash`, `profile_used`, `overrides`,
-   `gate_mode`, `step_index`, and `failed_step`. `ok:false` → surface `error` and stop.
+   Otherwise note the digest's `run_id`, **`run_dir`** (pickup continues this SAME run IN PLACE —
+   `run_dir` is the authoritative dir for every later `resume`/`prep`/`commit`; never reconstruct
+   it from `run_id`, and never scavenge step 2's recompile scan, which for a `--run`-targeted older
+   run names a DIFFERENT run), `manifest_hash`, `profile_used`, `overrides`, `gate_mode`,
+   `step_index`, `failed_step`, and **`env_headless`**. `env_headless: true` (this session has
+   `MICROSKILLS_HEADLESS` set — only the bookkeeper can see the env, so the args-flag check is not
+   enough) → **REFUSE with a nonzero outcome**: pickup requires a human. `ok:false` → surface
+   `error` and stop.
 2. **Recompile with the RECORDED provenance (bookkeeper).** Same move as Rerun step 2: dispatch
    `{op:"open", name, profile: <profile_used>, overrides: <recorded overrides>,
-   headless_from_args: <gate_mode == "auto">}` — the recorded provenance. The digest's
-   `manifest_hash` must EQUAL the recorded one, else **STOP: the def, registry, or profile
-   changed since the run parked** — its stored results no longer line up; start a fresh run.
-   Never improvise a partial reuse.
+   headless_from_args: <gate_mode == "auto">, provenance_pure: true}` — the recorded provenance
+   (`provenance_pure` keeps this session's `MICROSKILLS_HEADLESS` env out of the recompiled gate
+   mode, so the hash-equality check below compares like with like). The digest's `manifest_hash`
+   must EQUAL the recorded one, else **STOP: the def, registry, or profile changed since the run
+   parked** — its stored results no longer line up; start a fresh run. Never improvise a partial
+   reuse.
 3. **Sanity-check the park** — `step_index >= manifest.steps.length` → the newest run already
    finished: report that and suggest `--run` for an older parked run. The recorded `gate_mode`
    not `"auto"` → this is an ordinary interrupted interactive run: hand off to the normal resume
@@ -267,9 +281,14 @@ position `i` as you walk.
 **Before running each step, print the cursor:** `▶ Step {g}/{T} · {label}`, advancing the user along
 the announced roadmap, where `{g}/{T}` is the GLOBAL position in the journey (`{g} = i+1` for a
 top-level run; under nesting it threads the parent ordinal — see the nested-workflow section).
-Choose ONE cursor form at the opening — the global `{g}/{T}` counter or the dotted `{parent}.{k}`
-breadcrumb — and keep it for the whole journey, top level and nested alike; never switch schemes
-mid-run, so the user always reads one consistent "where am I".
+Choose the cursor form at the opening **by whether the run nests**: a run with NO `nested_workflow`
+step uses the global `{g}/{T}` counter (`{g} = i+1`, `{T} = M`). A run that CONTAINS a
+`nested_workflow` step MUST use the dotted `{parent}.{k}` breadcrumb instead — the global counter is
+**illegal** there, because a child's step count is not known when the opening prints, so a fixed
+`{T}` would be a lie the moment a child expands. The breadcrumb is monotonic and needs no pre-known
+total: parent steps `1..M`, the child's steps render `3.1, 3.2, …` under the nested ordinal, and
+sibling `4` follows. Keep the chosen form for the whole journey, top level and nested alike; never
+switch schemes mid-run, so the user always reads one consistent "where am I".
 
 Resolve `{label}` (the manifest now stamps one on every step — the compiler always stamps an authored
 `name` or a humanized id):
@@ -384,13 +403,16 @@ render it verbatim, never re-resolving or substituting. By the entry's `kind`:
   on_headless:fail'}` and **STOP with a nonzero outcome, naming the gate**. The committed run-state is
   resumable interactively later — that is the declared "do the work, then hand off to a human" pattern.
 - otherwise take **`gate.default`** (compile guarantees a pausing gate declares one under auto) — the
-  author-declared label **VERBATIM**, never a re-phrasing. Print one line `Gate <id>: auto — taking
-  declared default '<default>'`, dispatch `{op:"commit", name, run_dir, step:<i>,
-  results:{<gate.id>:{choice:<gate.default>}}, gate:{id:<gate.id>, choice:<gate.default>}, label}`,
-  then act on that recorded choice per the mapping below — with one exception: a `revise`/`extend`
-  default cannot run headless (revise can't gather notes; an `extend` default would re-enter the loop
-  unboundedly — compile refuses `on_exhaust.default: extend`, so only a hand-edited manifest yields
-  one) → dispatch `{op:"fail", …}` and stop, naming the gate.
+  author-declared label **VERBATIM**, never a re-phrasing. **Check feasibility BEFORE committing:** a
+  `revise`/`extend` default cannot run headless (revise can't gather notes; an `extend` default would
+  re-enter the loop unboundedly — compile refuses `on_exhaust.default: extend`, so only a hand-edited
+  manifest yields one) → dispatch `{op:"fail", name, run_dir, step:<i>, label:'gate <id> default
+  <default> needs a human'}` and stop WITHOUT committing — leaving `step_index` AT the gate so a later
+  pickup resumes there; committing first would advance past an un-acted choice and pickup would
+  mis-resume. For a TERMINAL default (`approve`/`confirm` → continue; `abandon`/`stop` → stop): print
+  one line `Gate <id>: auto — taking declared default '<default>'`, dispatch `{op:"commit", name,
+  run_dir, step:<i>, results:{<gate.id>:{choice:<gate.default>}}, gate:{id:<gate.id>, choice:<gate.default>}, label}`,
+  then act on that recorded choice per the mapping below.
 - a pausing gate with NO `default` (a hand-edited manifest — compile never emits this) → dispatch
   `{op:"fail", …}` and stop. **Never pick an option yourself.**
 
@@ -399,19 +421,26 @@ choices (default `confirm / stop`). **Give each option a one-line `description` 
 — `approve`/`confirm` → "Continue to the next step."; `revise` → "Re-run this segment with your
 notes."; `abandon`/`stop` → "Stop the run and clean up staging." (map other labels to the nearest).
 
-**Record the human's pick** via `{op:"commit", name, run_dir, step:<i>,
-results:{<gate.id>:{choice:<pick>}}, gate:{id:<gate.id>, choice:<pick>}, label}` — the chosen option's
-label, verbatim. A gate id is a legal `${...}` ref target: a later node/segment whose `when` or
-`inputs` reads `${<gate-id>.output.choice}` resolves against this stored object (the gate-choice
-branching feature validate-workflow accepts). Always record the pick, then act:
-- An `approve`/`confirm` choice → continue to the next step.
+**Get the human's pick** via `AskUserQuestion` — but **do NOT commit the gate step yet.** Committing
+advances `step_index` PAST the gate; for a `revise`/`extend` pick not yet resolved to a terminal
+continue, a crash there would resume PAST the gate with the un-revised/un-extended result silently
+threaded forward. So the gate step commits at the TERMINAL transition out of the gate ONLY (below),
+never up front. A gate id is still a legal `${...}` ref target: a later node/segment whose `when` or
+`inputs` reads `${<gate-id>.output.choice}` resolves against the `{choice}` object recorded by that
+terminal commit (the gate-choice branching feature validate-workflow accepts — and a downstream
+branch never runs until the gate has terminally continued). Branch on the pick:
+- An `approve`/`confirm` choice (terminal) → **commit the gate step now**: dispatch
+  `{op:"commit", name, run_dir, step:<i>, results:{<gate.id>:{choice:<pick>}}, gate:{id:<gate.id>, choice:<pick>}, label}`
+  — the chosen option's label, verbatim — then continue to the next step.
 - A `revise`-style choice → **ask the user what to change** (a follow-up `AskUserQuestion` or their
   free-text note), then re-run the segment that produced the gate's `after` node: dispatch
   `{op:"prep", name, run_dir, step:<that segment's i>}` to rebuild its args, **fold the revision
   notes into the relevant `args` value conductor-side** (e.g. append them to the `requirement` arg),
   re-invoke the segment's script with the folded args, recap, dispatch the segment's
-  `{op:"commit", …}` for the refreshed result, then re-present this gate (re-recording the choice on
-  the re-presented pick).
+  `{op:"commit", …}` for the refreshed result (that commit lands on the SEGMENT's earlier step, not
+  the gate step), then **re-present this gate** (loop back to the pick). The gate step stays
+  uncommitted — `step_index` stays AT the gate — until a terminal `approve`, so an interrupted
+  revise resumes by re-presenting the gate, never past it.
 - An `extend` choice (the `loop_exhaust` gate) → re-run the LOOP segment with the committed carry and
   a fresh round budget, in this order (every fold lands on disk first):
   1. **Fold guidance first** — when the loop step declares `on_exhaust.notes_input`, ask the user (a
@@ -424,11 +453,14 @@ branching feature validate-workflow accepts). Always record the pick, then act:
      only under extend.
   3. Re-invoke the loop segment's script, recap (cumulative extensions are bookkeeping: say
      "extension N"), then dispatch `{op:"commit", name, run_dir, step:<loop i>, results:<the refreshed
-     returned object incl. loop, verbatim>, label}` for the loop step's refreshed results.
-  4. **Exit by verdict** — still unconverged → re-present this gate. Converged → the human's real pick
-     stays recorded (choice stays `extend`, never overwritten with a skip-null), and continue to the
-     next step.
-- An `abandon`/`stop` choice → stop the run cleanly (clean up any staging the segments created).
+     returned object incl. loop, verbatim>, label}` for the loop step's refreshed results (the LOOP
+     step, NOT the gate step).
+  4. **Exit by verdict** — still unconverged → re-present this gate (the gate step stays
+     uncommitted). Converged → NOW **commit the gate step** with the human's real pick:
+     `{op:"commit", name, run_dir, step:<i>, results:{<gate.id>:{choice:'extend'}}, gate:{id:<gate.id>, choice:'extend'}, label}`
+     (choice stays `extend`, never overwritten with a skip-null), and continue to the next step.
+- An `abandon`/`stop` choice → stop the run cleanly (clean up any staging the segments created); the
+  gate step stays uncommitted, so the run remains resumable at the gate.
 For `severity: warn` gates (any mode), render the evidence + emit the prompt, then continue without
 pausing — dispatch `{op:"commit", name, run_dir, step:<i>, results:{<gate.id>:{choice:<gate.default>}},
 gate:{id:<gate.id>, choice:<gate.default>}, outcome:"skipped", label}` when the gate declares a
@@ -493,10 +525,11 @@ inputs** (the bookkeeper did this; an uncovered required child input would have 
 
    **Thread the cursor through the child (display only).** So the user reads ONE continuous journey,
    not a child that restarts at "Step 1", pass a display-only cursor context into the child re-entry:
-   the current global ordinal (`{g}`) and the parent's total (`{T}`), or a `{parent}.{child}`
-   breadcrumb. The child's per-step cursor then continues the parent's count — render `▶ Step {g}/{T}`
-   advancing across the child's steps, or a dotted `▶ Step {parent}.{k} · {label}` form — instead of
-   restarting at `Step 1/{child M}`. The child's opening (the Announce-the-run beat) becomes an
+   the parent ordinal of this nested step as the breadcrumb prefix. Because this run nests, the
+   cursor form is the dotted `{parent}.{k}` breadcrumb (the global `{g}/{T}` counter is illegal once
+   a run nests — see the cursor rule above — since the child's step count is unknown when the parent
+   opening prints). The child's per-step cursor renders `▶ Step {parent}.{k} · {label}` advancing
+   across the child's steps, instead of restarting at `Step 1/{child M}`. The child's opening (the Announce-the-run beat) becomes an
    "entering nested workflow *{child}*" beat UNDER the parent roadmap — a sub-heading on the parent's
    journey, not a fresh top-level announcement. This cursor is **ephemeral display state only**: it is
    passed in memory for rendering and must NOT touch the child's run-state, `manifest_hash`, or any

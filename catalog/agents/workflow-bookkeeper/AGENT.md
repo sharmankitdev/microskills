@@ -22,12 +22,16 @@ in files / stdin-free paths, never in argv.
 
 ## op: open
 
-Inputs: `{name, profile?, overrides?, headless_from_args}`
+Inputs: `{name, profile?, overrides?, headless_from_args, provenance_pure?}`
 
-1. **Check headless signal** — run via Bash:
-   `echo "${MICROSKILLS_HEADLESS:-}"`
-   The run is headless when `headless_from_args` is true (the conductor detected `--gate-mode
-   auto` or `--headless` in the invocation) OR the env returns a non-empty value.
+1. **Check headless signal** — when `provenance_pure` is true (a rerun / pickup recompile that
+   must reproduce the RECORDED compile), the headless signal is EXACTLY `headless_from_args` and
+   you do **NOT** probe the env: this session's `MICROSKILLS_HEADLESS` must never perturb the
+   recorded gate mode, or the recompiled `manifest_hash` could diverge from the recorded one and a
+   valid rerun/pickup would be spuriously refused at the hash-equality gate. Otherwise (a normal
+   run), run via Bash `echo "${MICROSKILLS_HEADLESS:-}"`; the run is headless when
+   `headless_from_args` is true (the conductor detected `--gate-mode auto` or `--headless` in the
+   invocation) OR the env returns a non-empty value.
 
 2. **Compile** — run via Bash:
    `.claude/scripts/compile-workflow <name> [--profile "<profile>"] [--override <k>=<v> ...]
@@ -218,11 +222,13 @@ exactly as the `{read_file:}` present case does — the conductor never opens a 
 If `results[gate.after]` is itself undefined/null → emit a single
 `{"kind": "scalar", "label": "<gate.after>", "value": "(not produced)"}` entry (never invent a value).
 
-Return:
+Return (the gate `label` is the STEP record's `s.label` — the compiler stamps the authored gate
+`name` or a humanized gate id there; the gate dict itself carries no `label` key, so sourcing it
+from `gate.label` would always be null):
 ```json
 {
   "kind": "gate",
-  "gate": {"id": "<gate.id>", "label": "<gate.label>", "prompt": "<gate.prompt>", "options": "<gate.options>", "severity": "<gate.severity>", "default": "<gate.default>", "on_headless": "<gate.on_headless>", "after": "<gate.after>"},
+  "gate": {"id": "<gate.id>", "label": "<s.label>", "prompt": "<gate.prompt>", "options": "<gate.options>", "severity": "<gate.severity>", "default": "<gate.default>", "on_headless": "<gate.on_headless>", "after": "<gate.after>"},
   "when": null,
   "skipped": false,
   "evidence": ["<...resolved present entries in order>"],
@@ -273,17 +279,24 @@ Return:
 
 Inputs: `{name, run_dir, step, results: {<nodeid>: <value>}, gate?: {id, choice}, outcome?, label}`
 
-1. **Read current run-state** — Read `<run_dir>/run-state.json`. Merge the passed `results`
-   into its `results` map (overlay: new keys win, existing keys untouched unless also in the
-   passed map).
+1. **Write ONLY this step's produced result(s)** — use the **Write tool** to write the passed
+   `results` object verbatim (just this step's node(s), e.g. `{"plan": {...}}` — NEVER the
+   accumulated results map) to `<run_dir>/commit-result.json` (a structured tool parameter —
+   node outputs never ride a shell command). You do NOT Read or re-write the accumulated
+   run-state: the merge below preserves every prior result byte-for-byte, so you never
+   re-serialize a value you were not handed (a value you re-type is a value you can corrupt).
 
-2. **Write the candidate state** — use the **Write tool** to write
-   `{"manifest_hash": <manifest_hash>, "step_index": <step + 1>, "inputs": <inputs>, "results": <merged results>}`
-   to `<run_dir>/run-state.json.tmp` (a structured tool parameter — node outputs never ride a
-   shell command). All four keys are required.
+2. **Merge into the candidate state (deterministic)** — run ONE Bash call:
+   `.claude/scripts/run-journal merge-result --run-dir '<run_dir>' --step <step> --results-file 'commit-result.json'`
+   It Reads the committed run-state, overlays your node(s) in Python (new keys win; every
+   untouched prior result byte-preserved), and writes `<run_dir>/run-state.json.tmp` with
+   `step_index` = `<step> + 1`. Non-zero exit → `{"ok": false, "reason": "merge failed",
+   "errors": []}`.
 
 3. **Pre-commit IO check** — run ONE Bash call:
-   `.claude/scripts/check-step-io --manifest '.claude/workflow-defs/<name>/.compiled/manifest.json' --run-state '<run_dir>/run-state.json.tmp' --step <step>`
+   `.claude/scripts/check-step-io --manifest '.claude/workflow-defs/<name>/.compiled/manifest.json' --run-state '<run_dir>/run-state.json.tmp' --step <step> --full`
+   (`--full` re-validates every PRIOR committed result too — a corruption backstop on top of
+   the byte-preserving merge.)
    - Exit 0 → continue to commit.
    - Non-zero exit → run ONE Bash call:
      `.claude/scripts/run-journal append --run-dir '<run_dir>' --event run_error --step-index <step> --outcome error --label '<short reason from errors>' --mark-failed-step <step>`
@@ -374,17 +387,20 @@ Inputs: `{name, run?}`
 Locate the RECORDED run to rerun and read back its provenance.
 
 1. **Find the run:**
-   - `run` supplied → it names `runs/<run>` directly. Read `<run_dir>/run-config.json` for the
-     provenance fields below; the `run_id` is `<run>`.
+   - `run` supplied → it names `runs/<run>` directly. Read BOTH `<run_dir>/run-config.json` (the
+     provenance fields below) AND `<run_dir>/run-state.json` (`failed_step` — it lives ONLY in the
+     state file, never in run-config, so reading only run-config would report it as null and the
+     from-point-cap warning would silently never fire); the `run_id` is `<run>`.
    - Otherwise run via Bash:
      `.claude/scripts/run-journal latest --runs-dir '.claude/workflow-defs/<name>/.compiled/runs'`
      — no `--manifest-hash`, no `--steps`: the newest run with a committed run-state, FINISHED
      runs included (a finished run is rerun's normal case). Parse the JSON: `found: false` →
-     return `{"ok": true, "found": false}` (nothing recorded to rerun). When found, build
-     `run_dir` as the runs-dir path joined with `run_id` and Read its `run-config.json`.
+     return `{"ok": true, "found": false}` (nothing recorded to rerun). When found, the `latest`
+     JSON already carries `failed_step` and the provenance; `run_dir` is the runs-dir path joined
+     with `run_id`.
 
 2. Return digest:
-   `{"ok": true, "found": true, "run_id": "<run_id>", "manifest_hash": "<run-config.manifest_hash>", "profile_used": "<run-config.profile or null>", "overrides": <run-config.overrides or {}>, "gate_mode": "<run-config.gate_mode>", "failed_step": <run-config/run-state failed_step or null>}`
+   `{"ok": true, "found": true, "run_id": "<run_id>", "manifest_hash": "<run-config.manifest_hash>", "profile_used": "<run-config.profile or null>", "overrides": <run-config.overrides or {}>, "gate_mode": "<run-config.gate_mode>", "failed_step": <run-state.failed_step — or the `latest` JSON's failed_step — or null>}`
 
 Non-zero exit at any step → `{"ok": false, "error": "..."}`.
 
@@ -414,19 +430,25 @@ Inputs: `{name, run?}`
 Locate the PARKED gate-mode=auto run to pick up; read both its provenance and its run-state.
 
 1. **Find the run:**
-   - `run` supplied → it names `runs/<run>` directly. Read BOTH `<run_dir>/run-config.json` (the
-     provenance: `manifest_hash`, `profile`, `overrides`, `gate_mode`) AND
-     `<run_dir>/run-state.json` (`step_index`, `failed_step` — these two live only in the state
-     file). The `run_id` is `<run>`.
+   - `run` supplied → it names `runs/<run>` directly: `run_dir` is
+     `.claude/workflow-defs/<name>/.compiled/runs/<run>` and `run_id` is `<run>`. Read BOTH
+     `<run_dir>/run-config.json` (the provenance: `manifest_hash`, `profile`, `overrides`,
+     `gate_mode`) AND `<run_dir>/run-state.json` (`step_index`, `failed_step` — these two live
+     only in the state file).
    - Otherwise run via Bash:
      `.claude/scripts/run-journal latest --runs-dir '.claude/workflow-defs/<name>/.compiled/runs'`
      — no `--manifest-hash`, no `--steps` (the newest committed run, ANY compile — a parked auto
      run's hash never matches an interactive compile, which is exactly why the normal resume scan
      cannot see it). Parse the JSON: `found: false` → return `{"ok": true, "found": false}`
-     (nothing to pick up). When found, build `run_dir` from the runs-dir path joined with
-     `run_id`, then Read its `run-config.json` and `run-state.json`.
+     (nothing to pick up). When found, `run_dir` is the runs-dir path joined with `run_id`; Read
+     its `run-config.json` and `run-state.json`.
 
-2. Return digest:
-   `{"ok": true, "found": true, "run_id": "<run_id>", "manifest_hash": "<run-config.manifest_hash>", "profile_used": "<run-config.profile or null>", "overrides": <run-config.overrides or {}>, "gate_mode": "<run-config.gate_mode>", "step_index": <run-state.step_index>, "failed_step": <run-state.failed_step or null>}`
+2. **Check the env headless signal** — run via Bash `echo "${MICROSKILLS_HEADLESS:-}"`. A
+   non-empty value means this session is headless. Pickup REQUIRES a human, but only the
+   bookkeeper can see the env, so surface it as `env_headless` for the conductor to refuse on.
+
+3. Return digest (pickup continues the SAME run IN PLACE — the conductor needs `run_dir` to drive
+   resume/prep/commit and is barred from building it itself):
+   `{"ok": true, "found": true, "run_id": "<run_id>", "run_dir": "<run_dir>", "manifest_hash": "<run-config.manifest_hash>", "profile_used": "<run-config.profile or null>", "overrides": <run-config.overrides or {}>, "gate_mode": "<run-config.gate_mode>", "step_index": <run-state.step_index>, "failed_step": <run-state.failed_step or null>, "env_headless": <true|false>}`
 
 Non-zero exit at any step → `{"ok": false, "error": "..."}`.

@@ -207,6 +207,11 @@ def main():
                     help=f"Threaded-value warning budget in compact-JSON bytes "
                          f"(default {DEFAULT_BUDGET}). Warning only — "
                          f"enforcement lives in the compiled args guard.")
+    ap.add_argument("--full", action="store_true",
+                    help="also re-validate every PRIOR committed step's stored "
+                         "results against their schemas (a backstop that catches "
+                         "an earlier result corrupted after its own step "
+                         "committed); default validates only the current step.")
     args = ap.parse_args()
 
     manifest = load_json(args.manifest, "manifest")
@@ -250,6 +255,21 @@ def main():
     step_spill = step.get("spill") if isinstance(step.get("spill"), dict) else {}
 
     checked, errors, warnings = [], [], []
+    # --full (DRI-1 backstop): re-validate EVERY prior committed step's stored
+    # results against their own schemas before checking the current step. The
+    # deterministic merge already byte-preserves prior results, so this is
+    # belt-and-suspenders — it catches an earlier value corrupted after its own
+    # step committed (a future bug or a hand-edit) instead of threading it
+    # forward unseen. Prior steps get schema validation only (no look-ahead
+    # size warning — that is a property of the step about to thread its value).
+    if args.full:
+        for prior in range(args.step):
+            pstep = steps[prior]
+            for nid in produced_ids(pstep):
+                entry = check_node(nid, (pstep.get("io") or {}).get(nid) or {}, results)
+                entry["step"] = prior
+                checked.append(entry)
+                errors.extend(entry.get("errors") or [])
     for nid in produced_ids(step):
         entry = check_node(nid, io.get(nid) or {}, results)
         if nid in results and nid in threaded:
