@@ -60,6 +60,9 @@ Nothing.
 - **Anything** — stop.
 """
 
+GATE_BODY = MINIMAL_BODY.replace(
+    "## Output", "<!-- gate-id: approve -->\n\n## Output")
+
 
 def write_skill(tmp_path, name, body=None):
     p = tmp_path / "MICROSKILL.md"
@@ -91,6 +94,34 @@ def test_empty_output_schema_blocks(tmp_path):
     cfg = write_cfg(tmp_path, "base.yaml", "version: 1\noutput_schema: {}\n")
     rc, data, out, err = run(str(skill), str(cfg))
     assert rc == 1 and data["pass"] is False
+
+
+def test_malformed_output_schema_blocks(tmp_path):
+    skill = write_skill(tmp_path, "os-bad")
+    cfg = write_cfg(tmp_path, "base.yaml",
+                    "version: 1\noutput_schema:\n  type: not-a-real-type\n")
+    code, data, _, err = run(str(skill), str(cfg))
+    assert code == 1, err
+    assert any(i["severity"] == "block" and "not a valid JSON Schema" in i["message"]
+               for i in data["issues"]), data
+
+
+def test_output_schema_non_object_warns(tmp_path):
+    skill = write_skill(tmp_path, "os-arr")
+    cfg = write_cfg(tmp_path, "base.yaml",
+                    "version: 1\noutput_schema:\n  type: array\n  items: { type: string }\n")
+    code, data, _, err = run(str(skill), str(cfg))
+    assert any(i["severity"] == "warn" and "not 'object'" in i["message"]
+               for i in data["issues"]), data
+
+
+def test_output_schema_required_not_in_properties_warns(tmp_path):
+    skill = write_skill(tmp_path, "os-req")
+    cfg = write_cfg(tmp_path, "base.yaml",
+                    "version: 1\noutput_schema:\n  type: object\n  properties:\n    a: { type: string }\n  required: [b]\n")
+    code, data, _, err = run(str(skill), str(cfg))
+    assert any(i["severity"] == "warn" and "not in properties" in i["message"]
+               for i in data["issues"]), data
 
 
 REQUIRED_BODY = """\
@@ -259,6 +290,30 @@ def test_inputs_table_pipe_in_description_blocks(tmp_path):
     assert pipe, data
 
 
+def test_required_cell_non_vocabulary_blocks(tmp_path):
+    body = MINIMAL_BODY.format(name="bad-required").replace(
+        "| dummy | no | string | placeholder | — |",
+        "| dummy | maybe | string | placeholder | — |",
+    )
+    skill = write_skill(tmp_path, "bad-required", body)
+    code, data, _, err = run(str(skill))
+    assert code == 1, err
+    assert any(i["severity"] == "block" and "Required column" in i["message"]
+               and "yes` or `no" in i["message"] for i in data["issues"]), data
+
+
+def test_duplicate_input_names_block(tmp_path):
+    body = MINIMAL_BODY.format(name="dup-input").replace(
+        "| dummy | no | string | placeholder | — |",
+        "| dummy | no | string | placeholder | — |\n| dummy | no | string | again | — |",
+    )
+    skill = write_skill(tmp_path, "dup-input", body)
+    code, data, _, err = run(str(skill))
+    assert code == 1, err
+    assert any(i["severity"] == "block" and "duplicate input name" in i["message"]
+               for i in data["issues"]), data
+
+
 def test_word_count_cap_blocks(tmp_path):
     long_desc = " ".join(["word"] * 110)
     body = MINIMAL_BODY.format(name="too-many-words").replace(
@@ -365,3 +420,162 @@ def test_unknown_step_in_config_warns(tmp_path):
         if i["severity"] == "warn" and "step 9" in i["message"]
     ]
     assert warnings, data
+
+
+def test_gates_add_id_collision_blocks(tmp_path):
+    skill = write_skill(tmp_path, "gate-collide", GATE_BODY.format(name="gate-collide"))
+    cfg = write_cfg(tmp_path, "base.yaml",
+                    'version: 1\ngates:\n  add:\n    - id: approve\n      after: "1"\n      type: human_approval\n      prompt: Approve?\n')
+    code, data, _, err = run(str(skill), str(cfg))
+    assert code == 1, err
+    assert any(i["severity"] == "block" and "collides with a gate already declared" in i["message"]
+               for i in data["issues"]), data
+
+
+def test_gates_add_duplicate_id_blocks(tmp_path):
+    skill = write_skill(tmp_path, "gate-dup", MINIMAL_BODY.format(name="gate-dup"))
+    cfg = write_cfg(tmp_path, "base.yaml",
+                    'version: 1\ngates:\n  add:\n    - id: g1\n      after: "1"\n      type: verification\n    - id: g1\n      after: "2"\n      type: verification\n')
+    code, data, _, err = run(str(skill), str(cfg))
+    assert code == 1, err
+    assert any(i["severity"] == "block" and "duplicate id" in i["message"]
+               for i in data["issues"]), data
+
+
+def test_gates_add_new_id_no_block(tmp_path):
+    skill = write_skill(tmp_path, "gate-new", MINIMAL_BODY.format(name="gate-new"))
+    cfg = write_cfg(tmp_path, "base.yaml",
+                    'version: 1\ngates:\n  add:\n    - id: fresh\n      after: "1"\n      type: verification\n')
+    code, data, _, err = run(str(skill), str(cfg))
+    assert not any("collides with a gate" in i["message"] or "duplicate id" in i["message"]
+                   for i in data["issues"]), data
+
+
+# ---------------------------------------------------------------------------
+# steps restructure target-existence checks
+# ---------------------------------------------------------------------------
+
+
+def test_steps_remove_unknown_blocks(tmp_path):
+    skill = write_skill(tmp_path, "sr", MINIMAL_BODY.format(name="sr"))
+    cfg = write_cfg(tmp_path, "base.yaml", "version: 1\nsteps:\n  remove: [9]\n")
+    code, data, _, err = run(str(skill), str(cfg))
+    assert code == 1, err
+    assert any(i["severity"] == "block" and "steps.remove" in i["message"] and "does not exist" in i["message"]
+               for i in data["issues"]), data
+
+
+def test_steps_patch_unknown_blocks(tmp_path):
+    skill = write_skill(tmp_path, "sp", MINIMAL_BODY.format(name="sp"))
+    cfg = write_cfg(tmp_path, "base.yaml",
+                    "version: 1\nsteps:\n  patch:\n    \"9\":\n      text: replaced\n")
+    code, data, _, err = run(str(skill), str(cfg))
+    assert code == 1, err
+    assert any(i["severity"] == "block" and "steps.patch" in i["message"] and "does not exist" in i["message"]
+               for i in data["issues"]), data
+
+
+def test_steps_add_after_unknown_blocks(tmp_path):
+    skill = write_skill(tmp_path, "sa", MINIMAL_BODY.format(name="sa"))
+    cfg = write_cfg(tmp_path, "base.yaml",
+                    "version: 1\nsteps:\n  add:\n    - after: 9\n      text: new step\n")
+    code, data, _, err = run(str(skill), str(cfg))
+    assert code == 1, err
+    assert any(i["severity"] == "block" and "steps.add" in i["message"] and "does not exist" in i["message"]
+               for i in data["issues"]), data
+
+
+def test_profile_step_add_branching_blocks(tmp_path):
+    skill = write_skill(tmp_path, "psb", MINIMAL_BODY.format(name="psb"))
+    cfg = write_cfg(tmp_path, "strict.yaml",
+                    "version: 1\nsteps:\n  add:\n    - after: 1\n      text: if the file exists then read it\n")
+    code, data, _, err = run(str(skill), str(cfg))
+    assert code == 1, err
+    assert any(i["severity"] == "block" and "branching language" in i["message"] and ".text" in i["message"]
+               for i in data["issues"]), data
+
+
+def test_profile_step_patch_branching_blocks(tmp_path):
+    skill = write_skill(tmp_path, "psp", MINIMAL_BODY.format(name="psp"))
+    cfg = write_cfg(tmp_path, "strict.yaml",
+                    "version: 1\nsteps:\n  patch:\n    \"1\":\n      text: for each commit, process it\n")
+    code, data, _, err = run(str(skill), str(cfg))
+    assert code == 1, err
+    assert any(i["severity"] == "block" and "branching language" in i["message"]
+               for i in data["issues"]), data
+
+
+# ---------------------------------------------------------------------------
+# allowed_values + inject_from coherence checks
+# ---------------------------------------------------------------------------
+
+
+def test_default_not_in_allowed_values_warns(tmp_path):
+    skill = write_skill(tmp_path, "av")
+    cfg = write_cfg(tmp_path, "base.yaml",
+                    "version: 1\ninputs:\n  dummy:\n    allowed_values: [a, b]\n    default: c\n")
+    code, data, _, err = run(str(skill), str(cfg))
+    assert any(i["severity"] == "warn" and "not in allowed_values" in i["message"]
+               for i in data["issues"]), data
+
+
+def test_inject_from_with_required_warns(tmp_path):
+    skill = write_skill(tmp_path, "if1")
+    cfg = write_cfg(tmp_path, "base.yaml",
+                    "version: 1\ninputs:\n  dummy:\n    required: true\n    inject_from:\n      env: X\n")
+    code, data, _, err = run(str(skill), str(cfg))
+    assert any(i["severity"] == "warn" and "inject_from with required" in i["message"]
+               for i in data["issues"]), data
+
+
+def test_inject_from_with_materialize_warns(tmp_path):
+    skill = write_skill(tmp_path, "if2")
+    cfg = write_cfg(tmp_path, "base.yaml",
+                    "version: 1\ninputs:\n  dummy:\n    materialize: file\n    inject_from:\n      env: X\n")
+    code, data, _, err = run(str(skill), str(cfg))
+    assert any(i["severity"] == "warn" and "inject_from and materialize" in i["message"]
+               for i in data["issues"]), data
+
+
+def test_inject_from_with_default_warns(tmp_path):
+    skill = write_skill(tmp_path, "if3")
+    cfg = write_cfg(tmp_path, "base.yaml",
+                    "version: 1\ninputs:\n  dummy:\n    default: somevalue\n    inject_from:\n      env: X\n")
+    code, data, _, err = run(str(skill), str(cfg))
+    assert any(i["severity"] == "warn" and "inject_from with a default" in i["message"]
+               for i in data["issues"]), data
+
+
+# ---------------------------------------------------------------------------
+# vars token undeclared checks
+# ---------------------------------------------------------------------------
+
+
+def test_undeclared_var_token_warns(tmp_path):
+    body = MINIMAL_BODY.format(name="vary").replace(
+        "Test fixture.", "Test fixture using {{contract_doc}}.")
+    skill = write_skill(tmp_path, "vary", body)
+    cfg = write_cfg(tmp_path, "base.yaml", "version: 1\n")
+    code, data, _, err = run(str(skill), str(cfg))
+    assert any(i["severity"] == "warn" and "contract_doc" in i["message"]
+               and "resolves from no config" in i["message"] for i in data["issues"]), data
+
+
+def test_declared_var_token_no_warn(tmp_path):
+    body = MINIMAL_BODY.format(name="vary2").replace(
+        "Test fixture.", "Test fixture using {{contract_doc}}.")
+    skill = write_skill(tmp_path, "vary2", body)
+    cfg = write_cfg(tmp_path, "base.yaml", "version: 1\nvars:\n  contract_doc: ./x.md\n")
+    code, data, _, err = run(str(skill), str(cfg))
+    assert not any("contract_doc" in i["message"] and "resolves from no config" in i["message"]
+                   for i in data["issues"]), data
+
+
+def test_undeclared_hyphenated_var_token_warns(tmp_path):
+    body = MINIMAL_BODY.format(name="hyvar").replace(
+        "Test fixture.", "Test fixture using {{my-var}}.")
+    skill = write_skill(tmp_path, "hyvar", body)
+    cfg = write_cfg(tmp_path, "base.yaml", "version: 1\n")
+    code, data, _, err = run(str(skill), str(cfg))
+    assert any(i["severity"] == "warn" and "my-var" in i["message"]
+               and "resolves from no config" in i["message"] for i in data["issues"]), data

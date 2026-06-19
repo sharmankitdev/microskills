@@ -49,6 +49,7 @@ except ImportError:
 
 REQUIRED_SECTIONS = ["## Purpose", "## Inputs", "## Steps", "## Output", "## Failure modes"]
 NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
+PLACEHOLDER_RE = re.compile(r"\{\{([\w-]+)\}\}")
 
 SCRIPT = Path(__file__).resolve()
 
@@ -181,6 +182,7 @@ def check_skill(path, issues):
     if m_inputs:
         inputs_body = m_inputs.group(1)
         data_row_count = 0
+        seen_input_names = set()
         for line in inputs_body.splitlines():
             stripped = line.strip()
             if not stripped.startswith("|"):
@@ -202,6 +204,16 @@ def check_skill(path, issues):
             data_row_count += 1
             name_cell = parts[1].strip()
             default_cell = parts[5].strip()
+            required_cell = parts[2].strip().lower()
+            if required_cell not in ("yes", "no"):
+                add(issues, "block", "inputs",
+                    f"Inputs row '{name_cell}' Required column is {parts[2].strip()!r}; "
+                    f"must be literally `yes` or `no` (any other token is silently treated as not-required).")
+            if name_cell and name_cell in seen_input_names:
+                add(issues, "block", "inputs",
+                    f"Inputs table has a duplicate input name '{name_cell}'; input names must be unique.")
+            if name_cell:
+                seen_input_names.add(name_cell)
             if default_cell not in ("—", ""):
                 add(issues, "block", "inputs",
                     f"Inputs row '{name_cell}' Default column is {default_cell!r}; must be literally `—`. "
@@ -234,6 +246,42 @@ def check_config(path, issues):
         path_str = "/".join(str(part) for part in err.path) or "<root>"
         add(issues, "block", "config", f"{p.name}@{path_str}: {err.message}")
 
+    os_frag = doc.get("output_schema") if isinstance(doc, dict) else None
+    if isinstance(os_frag, dict) and os_frag:
+        try:
+            Draft202012Validator.check_schema(os_frag)
+        except Exception as e:
+            add(issues, "block", "config",
+                f"{p.name}: output_schema is not a valid JSON Schema — {e}")
+        else:
+            if os_frag.get("type") != "object":
+                add(issues, "warn", "config",
+                    f"{p.name}: output_schema type is {os_frag.get('type')!r}, not 'object'; "
+                    f"the resolver appends a 'return ONLY a JSON object' directive, so a non-object contract is incoherent.")
+            props = os_frag.get("properties") or {}
+            for req in (os_frag.get("required") or []):
+                if req not in props:
+                    add(issues, "warn", "config",
+                        f"{p.name}: output_schema.required lists '{req}' which is not in properties — "
+                        f"a dead field that dead-ends downstream .output.{req} refs.")
+
+    steps_block = doc.get("steps") if isinstance(doc, dict) else None
+    if isinstance(steps_block, dict):
+        frags = []
+        patch = steps_block.get("patch")
+        if isinstance(patch, dict):
+            for k, v in patch.items():
+                if isinstance(v, dict) and isinstance(v.get("text"), str):
+                    frags.append((f"steps.patch.{k}", v["text"]))
+        for i, entry in enumerate(steps_block.get("add") or []):
+            if isinstance(entry, dict) and isinstance(entry.get("text"), str):
+                frags.append((f"steps.add[{i}]", entry["text"]))
+        for loc, text in frags:
+            for snippet, _span in _steps_mod.find_branch_language(text):
+                add(issues, "block", "config",
+                    f"{p.name}: {loc}.text contains branching language: \"…{snippet}…\" — "
+                    f"profile-supplied steps must form a single linear path (same rule as the body Steps).")
+
     if p.name != "base.yaml" and isinstance(doc, dict) and "profile" in doc:
         add(issues, "block", "config",
             f"{p.name}: top-level 'profile' block is only allowed in base.yaml")
@@ -245,6 +293,30 @@ def check_config(path, issues):
         if overlay_defaults:
             add(issues, "block", "config",
                 f"{p.name}: inputs.<name>.default is base-only; found in: {overlay_defaults}")
+
+    cfg_inputs = doc.get("inputs") if isinstance(doc, dict) else None
+    if isinstance(cfg_inputs, dict):
+        for iname, spec in cfg_inputs.items():
+            if not isinstance(spec, dict):
+                continue
+            av = spec.get("allowed_values")
+            if isinstance(av, list) and "default" in spec and spec["default"] not in av:
+                add(issues, "warn", "config",
+                    f"{p.name}: input '{iname}' default {spec['default']!r} is not in allowed_values {av}; "
+                    f"the declared default guarantees a runtime allowed-values block.")
+            if "inject_from" in spec:
+                if spec.get("required") is True:
+                    add(issues, "warn", "config",
+                        f"{p.name}: input '{iname}' declares inject_from with required: true — a declared-inject "
+                        f"input is never added to required_inputs, so required is inert.")
+                if "default" in spec:
+                    add(issues, "warn", "config",
+                        f"{p.name}: input '{iname}' declares inject_from with a default — the default is dead "
+                        f"(the value comes from the inject source).")
+                if spec.get("materialize") == "file":
+                    add(issues, "warn", "config",
+                        f"{p.name}: input '{iname}' declares both inject_from and materialize: file — "
+                        f"contradictory (environment-injected vs caller-by-reference).")
 
 
 def extract_skill_identifiers(skill_path):
@@ -305,8 +377,44 @@ def cross_check(skill_meta, config_path, issues):
         if n not in skill_meta["steps"]:
             add(issues, "warn", "config",
                 f"{p.name}: steps.\"{key}\" references step {n} which does not exist in MICROSKILL.md")
+    steps_doc = doc.get("steps") or {}
+    if isinstance(steps_doc, dict):
+        for n in (steps_doc.get("remove") or []):
+            if isinstance(n, int) and n not in skill_meta["steps"]:
+                add(issues, "block", "config",
+                    f"{p.name}: steps.remove references step {n} which does not exist in MICROSKILL.md")
+        patch = steps_doc.get("patch")
+        if isinstance(patch, dict):
+            for k in patch.keys():
+                try:
+                    n = int(k)
+                except (TypeError, ValueError):
+                    continue
+                if n not in skill_meta["steps"]:
+                    add(issues, "block", "config",
+                        f"{p.name}: steps.patch.\"{k}\" references step {n} which does not exist in MICROSKILL.md")
+        for entry in (steps_doc.get("add") or []):
+            if isinstance(entry, dict):
+                after = entry.get("after")
+                if isinstance(after, int) and after != 0 and after not in skill_meta["steps"]:
+                    add(issues, "block", "config",
+                        f"{p.name}: steps.add[].after references step {after} which does not exist in MICROSKILL.md")
     for key in (doc.get("gates") or {}).keys():
         if key == "add":
+            seen_add_ids = set()
+            for entry in (doc["gates"].get("add") or []):
+                if not isinstance(entry, dict):
+                    continue
+                gid = entry.get("id")
+                if gid in skill_meta["gates"]:
+                    add(issues, "block", "config",
+                        f"{p.name}: gates.add id '{gid}' collides with a gate already declared in MICROSKILL.md "
+                        f"(<!-- gate-id: {gid} -->).")
+                if gid is not None and gid in seen_add_ids:
+                    add(issues, "block", "config",
+                        f"{p.name}: gates.add has a duplicate id '{gid}'.")
+                if gid is not None:
+                    seen_add_ids.add(gid)
             continue
         if key not in skill_meta["gates"]:
             add(issues, "warn", "config",
@@ -329,6 +437,37 @@ def cross_check(skill_meta, config_path, issues):
                     f"gather it at runtime. Add inputs.{name}.required: true (or an inject_from source).")
 
 
+def check_vars(skill_path, config_paths, issues):
+    p = Path(skill_path)
+    if not p.exists():
+        return
+    _, body = parse_frontmatter(p.read_text())
+    if not isinstance(body, str):
+        return
+    tokens = set(PLACEHOLDER_RE.findall(body))
+    if not tokens:
+        return
+    declared = set()
+    have_config = False
+    for cfg in config_paths:
+        cp = Path(cfg)
+        if not cp.exists():
+            continue
+        try:
+            doc = yaml.safe_load(cp.read_text())
+        except yaml.YAMLError:
+            continue
+        have_config = True
+        if isinstance(doc, dict) and isinstance(doc.get("vars"), dict):
+            declared.update(doc["vars"].keys())
+    if not have_config:
+        return
+    for tok in sorted(tokens - declared):
+        add(issues, "warn", "structure",
+            f"body references {{{{{tok}}}}} which resolves from no config `vars` key "
+            f"(runtime-gathered, or a typo).")
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Validate a microskill MICROSKILL.md (and optional config files)."
@@ -343,6 +482,7 @@ def main():
     for cfg in args.configs:
         check_config(cfg, issues)
         cross_check(skill_meta, cfg, issues)
+    check_vars(args.skill, args.configs, issues)
 
     blocks = [i for i in issues if i["severity"] == "block"]
     passed = len(blocks) == 0
