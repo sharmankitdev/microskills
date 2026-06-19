@@ -328,9 +328,10 @@ Resolve `{label}` (the manifest now stamps one on every step — the compiler al
    id as an action (`finalize` → "Finalize", `provision` → "Provision missing microskills");
    nested_workflow → the child workflow as an action (`build` → "Build (nested workflow)").
 
-For a multi-node segment whose stamped `label` is a long ` & `-joined string, you MAY use the
-concise kind→label synthesis for the cursor header and save the per-dimension names (the step's
-`node_labels`) for the recap. A skipped step (a `warn` gate, an orchestrator node whose `when` is
+The stamped `label` is already concise — a 1-2 node segment shows the readable node-name join, a 3+
+node segment shows a `<first> … +N more` slug, and a single-phase segment shows its humanized
+`phase_group` — so print it directly for the cursor header and keep the per-dimension names (the
+step's `node_labels`) for the recap. A skipped step (a `warn` gate, an orchestrator node whose `when` is
 false, or the conditional `loop_exhaust` gate after a converged loop) still gets a cursor line,
 marked `(skipped)`.
 Walk the steps in order, starting at the resume position `i` from Setup (default 0). You hold

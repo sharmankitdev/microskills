@@ -4867,6 +4867,117 @@ def test_segment_node_labels_map_present(tmp_path):
     assert seg["node_labels"]["a"] == "A"  # humanize_id('a')
 
 
+# --- segment display label: shared phase_group (curated) else concise slug ------
+# A multi-node background segment must NOT label itself with the run-on join of
+# every node name. Tier 1: all nodes share one phase_group -> the humanized group
+# name. Tier 2: a concise "<first> … +N more" slug. (label is cosmetic, popped
+# from manifest_hash.)
+
+SEG_SHARED_PG = """\
+version: 1
+name: seg-shared-pg
+nodes:
+  - id: summarize
+    agent: ag
+    phase_group: review-changes
+    prompt: do a
+  - id: review_bugs
+    agent: ag
+    phase_group: review-changes
+    depends_on: [summarize]
+    prompt: do b ${summarize.output.v}
+  - id: collect
+    agent: ag
+    phase_group: review-changes
+    depends_on: [review_bugs]
+    prompt: do c ${review_bugs.output.v}
+"""
+
+SEG_NO_PG = SEG_SHARED_PG.replace("    phase_group: review-changes\n", "")
+SEG_MIXED_PG = SEG_SHARED_PG.replace(
+    "  - id: collect\n    agent: ag\n    phase_group: review-changes\n",
+    "  - id: collect\n    agent: ag\n    phase_group: other\n")
+
+
+def _seg(tmp_path, name):
+    return next(s for s in _manifest(tmp_path, name)["steps"]
+               if s["kind"] == "segment")
+
+
+def test_segment_label_from_shared_phase_group(tmp_path):
+    make_flow(tmp_path, "seg-shared-pg", SEG_SHARED_PG)
+    rc, data, out, err = run(tmp_path, "seg-shared-pg")
+    assert rc == 0, err
+    assert _seg(tmp_path, "seg-shared-pg")["label"] == "Review Changes"
+
+
+def test_segment_label_concise_slug_when_no_phase_group(tmp_path):
+    make_flow(tmp_path, "seg-no-pg", SEG_NO_PG)
+    rc, data, out, err = run(tmp_path, "seg-no-pg")
+    assert rc == 0, err
+    assert _seg(tmp_path, "seg-no-pg")["label"] == "Summarize … +2 more"
+
+
+def test_segment_label_concise_slug_when_phase_group_mixed(tmp_path):
+    make_flow(tmp_path, "seg-mixed-pg", SEG_MIXED_PG)
+    rc, data, out, err = run(tmp_path, "seg-mixed-pg")
+    assert rc == 0, err
+    assert _seg(tmp_path, "seg-mixed-pg")["label"] == "Summarize … +2 more"
+
+
+SEG_TWO_NO_PG = """\
+version: 1
+name: seg-two
+nodes:
+  - id: implement
+    agent: ag
+    prompt: do a
+  - id: evaluate
+    agent: ag
+    depends_on: [implement]
+    prompt: do b ${implement.output.v}
+"""
+
+
+def test_two_node_segment_keeps_readable_join(tmp_path):
+    # A 2-node segment is NOT a run-on — keep the " & " join, do not collapse it.
+    make_flow(tmp_path, "seg-two", SEG_TWO_NO_PG)
+    rc, data, out, err = run(tmp_path, "seg-two")
+    assert rc == 0, err
+    assert _seg(tmp_path, "seg-two")["label"] == "Implement & Evaluate"
+
+
+def test_two_node_shared_phase_group_uses_curated_label(tmp_path):
+    # Tier 1 (uniform phase_group) wins over the 2-node join: both nodes share
+    # one group, so the humanized group is the label, not "Implement & Evaluate".
+    make_flow(tmp_path, "seg-two-pg", SEG_TWO_NO_PG.replace(
+        "  - id: implement\n    agent: ag\n",
+        "  - id: implement\n    agent: ag\n    phase_group: build-loop\n").replace(
+        "  - id: evaluate\n    agent: ag\n",
+        "  - id: evaluate\n    agent: ag\n    phase_group: build-loop\n"))
+    rc, data, out, err = run(tmp_path, "seg-two-pg")
+    assert rc == 0, err
+    assert _seg(tmp_path, "seg-two-pg")["label"] == "Build Loop"
+
+
+def test_single_node_segment_label_is_node_name(tmp_path):
+    make_flow(tmp_path, "one-node", """\
+version: 1
+name: one-node
+nodes:
+  - id: solo
+    agent: ag
+    prompt: do solo
+  - id: fin
+    delegation: orchestrator
+    depends_on: [solo]
+    prompt: finalize ${solo.output.v}
+""")
+    rc, data, out, err = run(tmp_path, "one-node")
+    assert rc == 0, err
+    assert _seg(tmp_path, "one-node")["label"] == "Solo"
+
+
 # ===================================================== schemaless-truncation WARN
 # A when-less BACKGROUND producer that is CONSUMED DOWNSTREAM but has NO effective
 # output_schema (neither inline nor a resolved microskill _exec_schema) cannot
