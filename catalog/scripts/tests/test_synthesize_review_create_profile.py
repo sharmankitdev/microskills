@@ -40,3 +40,24 @@ def test_create_profile_validates_clean():
     data = json.loads(p.stdout)
     blocks = [i for i in data.get("issues", []) if i["severity"] == "block"]
     assert not blocks, blocks            # the steps.add fold step must carry NO branching vocab
+
+
+def test_verdict_mapping_covers_floor_and_review_tiers():
+    r = _resolve("create")
+    body = r["rendered_skill_body"].lower()
+    # request_changes tier names floor blocker + review blocker + review major
+    assert "request_changes" in body and "major" in body
+    # comment tier names review minor/nit AND the floor warn tier
+    assert "warn" in body and "comment" in body
+    # the fold normalizes floor shape into the common finding fields
+    assert "location to the file" in body and "message to the title" in body
+
+
+def test_base_and_design_unchanged_by_create_profile():
+    # The create profile is a NEW file; base/design must resolve exactly as on main.
+    for prof in ("base", "design"):
+        cur = _resolve(prof)
+        # The create profile did not touch the shared body — base/design's rendered
+        # body must NOT contain the create-only floor fold.
+        assert "floor_findings" not in cur["rendered_skill_body"], \
+            f"{prof} body leaked the create-only floor fold — base body was modified"
