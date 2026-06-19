@@ -1,0 +1,38 @@
+version: 1
+
+# ms-failure-modes-coverage lens overlay for review-dimension (create pipeline, §8
+# step 4). Overrides the active dimension, the artifact kind, and the rubric snippet —
+# a plain list REPLACES base's correctness snippet wholesale (resolver list-replace
+# rule). output_schema, inputs, runtime, and the body inherit from base. The caller
+# threads the approved plan/requirement as context_path (grounding, Read by path).
+vars:
+  dimension: ms-failure-modes-coverage
+  artifact_kind: microskill draft bundle (MICROSKILL.md + profiles/base.yaml, concatenated)
+
+context:
+  snippets:
+    - name: ms-failure-modes-coverage-rubric
+      text: >-
+        Failure-modes-coverage rubric for a microskill draft bundle — answer "do the
+        Failure modes cover the inputs that can go wrong plus the requirement's
+        domain-specific risk, each with a stop behavior?". Read the approved
+        plan/requirement from context_path as ground truth; an absent context_path = a
+        missing grounding basis: raise exactly one blocker finding naming the missing
+        grounding and review nothing blind. The deterministic floor (validate-microskill)
+        checks only that the Failure modes section is present and correctly cased among
+        the five required sections; it never reads the failure-mode CONTENT — do not
+        re-raise section presence or casing. Flag only failure-coverage defects: a
+        missing-required-input failure mode for a declared required input; a
+        malformed-or-unparseable-input failure mode for any input the skill must parse;
+        no failure behavior for the domain-specific risk the requirement implies (a
+        write target that already exists, an external call that can fail); a failure
+        mode that names a condition but states no stop behavior or recovery; a critical
+        operation the Steps perform that has no corresponding failure mode at all.
+        Severity mapping: a stated critical operation with no failure behavior whatsoever
+        = blocker; a missing standard failure mode (required-input or malformed-input)
+        or an uncovered domain risk = major; a failure mode present but vaguely worded =
+        minor. Set each finding's file to the real source file the issue lives in per the
+        bundle's provenance markers (MICROSKILL.md) and line to that file's real line
+        number — the downstream refute pass and fix step read the real source at the
+        finding's file. Do not raise ms-inputs-contract-adequacy (whether the input SET
+        is complete) concerns under this rubric — that sibling lens owns them.

@@ -1,0 +1,37 @@
+version: 1
+
+# ms-single-linear-path-semantic lens overlay for review-dimension (create pipeline, §8
+# step 4). Overrides the active dimension, the artifact kind, and the rubric snippet —
+# a plain list REPLACES base's correctness snippet wholesale (resolver list-replace
+# rule). output_schema, inputs, runtime, and the body inherit from base.
+vars:
+  dimension: ms-single-linear-path-semantic
+  artifact_kind: microskill draft bundle (MICROSKILL.md + profiles/base.yaml, concatenated)
+
+context:
+  snippets:
+    - name: ms-single-linear-path-semantic-rubric
+      text: >-
+        Single-linear-path rubric for a microskill draft bundle — answer "is this one
+        single-entry, single-exit straight path with no branch or loop the keyword scan
+        missed?". The deterministic floor (validate-microskill) already blocks the
+        lexical branching keywords (if/else/for each/repeat/retry/when…then/based
+        on/depending on/either/go to step/otherwise/or if/unless) in Steps and in
+        steps.patch/.add overlay text — do not re-raise a keyword the floor already
+        catches. Flag only semantic-fork defects the keyword scan misses: a conditional
+        Output phrased as a choice ("output A for the matching case, otherwise B") that
+        selects between results without a banned keyword; branching prose that evades the
+        keyword list while still describing two paths ("handle the empty set
+        differently"); a macro-flow fork where two distinct paths run the skill
+        differently from end to end; a step sequence whose order is actually data-dependent
+        rather than fixed. Severity mapping: a real branch or loop that dodges the
+        keyword list = blocker (the single-linear-path contract is violated — linearity
+        defects are always blocker); a passage that probably encodes a fork but reads
+        ambiguously = major; an awkward phrasing that merely looks branchy but resolves
+        to one path = minor. Set each finding's file to the real source file the issue
+        lives in per the bundle's provenance markers (MICROSKILL.md) and line to that
+        file's real line number — the downstream refute pass and fix step read the real
+        source at the finding's file. Do not raise ms-step-atomicity-linearity (whether
+        a single step bundles actions or hides intra-step control flow such as a concealed
+        per-item loop) or unanalyzable-fork-guard-no-signal (genuinely undecidable cases)
+        concerns under this rubric — sibling lenses own them.

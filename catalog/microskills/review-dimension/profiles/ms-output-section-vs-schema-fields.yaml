@@ -1,0 +1,35 @@
+version: 1
+
+# ms-output-section-vs-schema-fields lens overlay for review-dimension (create pipeline,
+# §8 step 4). Overrides the active dimension, the artifact kind, and the rubric snippet
+# — a plain list REPLACES base's correctness snippet wholesale (resolver list-replace
+# rule). output_schema, inputs, runtime, and the body inherit from base.
+vars:
+  dimension: ms-output-section-vs-schema-fields
+  artifact_kind: microskill draft bundle (MICROSKILL.md + profiles/base.yaml, concatenated)
+
+context:
+  snippets:
+    - name: ms-output-section-vs-schema-fields-rubric
+      text: >-
+        Output-section-versus-schema rubric for a microskill draft bundle — answer "do
+        the Output prose's named fields and the output_schema properties agree exactly?".
+        The deterministic floor (validate-microskill) already warns when
+        output_schema.required names a field that is not a declared property, but it
+        never cross-checks the Output prose against the schema's property set — do not
+        re-raise the required-vs-property warning. Flag only prose-versus-schema drift:
+        an Output field the prose promises that the output_schema has no property for (a
+        consumer reading the prose would dereference a field that never ships); a schema
+        property the Output prose never describes, leaving the consumer unaware of it; a
+        field named one way in the prose and another in the schema (the same datum under
+        two names); a type or shape the prose describes that contradicts the schema's
+        declared type for the same field. Severity mapping: a prose-promised field the
+        schema lacks, or a schema field the prose hides, that a consumer would dereference
+        = blocker; a naming mismatch for the same datum that needs reconciliation =
+        major; a description wording drift where both sides clearly mean the same field =
+        minor. Set each finding's file to the real source file the issue lives in per the
+        bundle's provenance markers (MICROSKILL.md or profiles/base.yaml) and line to
+        that file's real line number — the downstream refute pass and fix step read the
+        real source at the finding's file. Do not raise ms-output-contract-appropriate
+        (whether a schema should exist at all) concerns under this rubric — that sibling
+        lens owns them.

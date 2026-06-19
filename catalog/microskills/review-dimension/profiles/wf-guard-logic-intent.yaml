@@ -1,0 +1,45 @@
+version: 1
+
+# wf-guard-logic-intent lens overlay for review-dimension (create pipeline, §8 step 4).
+# Overrides the active dimension, the artifact kind, and the rubric snippet — a plain
+# list REPLACES base's correctness snippet wholesale (resolver list-replace rule).
+# output_schema, inputs, runtime, and the body inherit from base. The caller threads the
+# approved plan/requirement as context_path (grounding, Read by path).
+vars:
+  dimension: wf-guard-logic-intent
+  artifact_kind: workflow draft bundle (WORKFLOW.yaml + profiles/*.yaml, concatenated)
+
+context:
+  snippets:
+    - name: wf-guard-logic-intent-rubric
+      text: >-
+        Guard-logic-intent rubric for a workflow draft bundle — answer "do the
+        when/for_each/loop guards express the intended branch and iteration, and converge
+        on the right signal?". Read the approved plan/requirement from context_path as
+        ground truth; an absent context_path = a missing grounding basis: raise exactly
+        one blocker finding naming the missing grounding and review nothing blind. The
+        deterministic floor (validate-workflow + compile-workflow --defs-root) already
+        blocks sibling fork guards that provably both fire, dead/constant-false when,
+        gate-choice, and for_each enum literals, the typed existence of while/carry
+        fields, and the exactly-one-of while|until, max_iters, and body-membership loop
+        rules (and warns on a non-iteration-local loop.while reference) — do not re-raise
+        those.
+        Flag only guard-intent defects above that floor: a when guard whose comparison
+        selects the wrong branch for the case the plan describes (right grammar, valid
+        literal, wrong predicate); a multi-field or method-chain condition the author
+        meant that has been collapsed into a single bounded comparison, silently dropping
+        part of the intended logic; a loop.while or loop.until that converges on the
+        wrong signal — it terminates on a field that does not measure the work the loop is
+        meant to drain; a loop whose max_iters is implausibly small or large for the
+        convergence it claims; a for_each iterating the wrong collection for the fan-out
+        the plan intends; a guard and its sibling that express overlapping intent the
+        author did not mean (short of provably both firing, which the floor owns).
+        Severity mapping: a guard that selects the wrong branch, or a loop that converges
+        on the wrong signal = blocker; a guard whose intent is plausibly wrong or whose
+        multi-field meaning was collapsed and needs a decision = major; a guard that is
+        correct but awkwardly expressed = minor. Set each finding's file to the real
+        source file the issue lives in per the bundle's provenance markers (WORKFLOW.yaml
+        or profiles/<p>.yaml) and line to that file's real line number — the downstream
+        refute pass and fix step read the real source at the finding's file. Do not raise
+        wf-dag-decomposition-correctness (node granularity, dispatch form, and
+        segmentation) concerns under this rubric — sibling lenses own them.

@@ -1,0 +1,40 @@
+version: 1
+
+# ms-purpose-contract-fidelity lens overlay for review-dimension (create pipeline, §8
+# step 4). Overrides the active dimension, the artifact kind, and the rubric snippet —
+# a plain list REPLACES base's correctness snippet wholesale (resolver list-replace
+# rule). output_schema, inputs, runtime, and the body inherit from base. The caller
+# threads the approved plan/requirement as context_path (grounding, Read by path).
+vars:
+  dimension: ms-purpose-contract-fidelity
+  artifact_kind: microskill draft bundle (MICROSKILL.md + profiles/base.yaml, concatenated)
+
+context:
+  snippets:
+    - name: ms-purpose-contract-fidelity-rubric
+      text: >-
+        Purpose-contract-fidelity rubric for a microskill draft bundle — answer "do the
+        Purpose, Steps, and Output actually do what the requirement asked?". Read the
+        approved plan/requirement from context_path as ground truth; an absent
+        context_path = a missing grounding basis: raise exactly one blocker finding
+        naming the missing grounding and review nothing blind. The deterministic floor
+        (validate-microskill) checks the five-section structure, the name regex, and the
+        combined name+description word cap, but never reads whether the Purpose and Steps
+        actually realize the requirement's intent — do not re-raise structural or
+        word-count issues. Flag only requirement-fidelity defects: a Purpose whose
+        given-X / do-Y / produce-Z does not match what the requirement states the skill
+        should accomplish; Steps that solve a materially different problem than the
+        requirement describes; an Output that delivers something other than what the
+        requirement asked the skill to produce; a requirement-stated behavior that the
+        Purpose or Steps silently drop; scope the Steps build that the requirement never
+        asked for (invented behavior). Severity mapping: Purpose, Steps, or Output that
+        diverge from the requirement so the skill does the wrong job = blocker; a dropped
+        or reinterpreted sub-behavior needing a human decision = major; a wording nuance
+        where the intent is clearly preserved = minor. Set each finding's file to the
+        real source file the issue lives in per the bundle's provenance markers
+        (MICROSKILL.md) and line to that file's real line number — the downstream refute
+        pass and fix step read the real source at the finding's file. Do not raise
+        ms-description-trigger-quality (the description's routing clause),
+        ms-output-contract-appropriate (whether a schema should exist), or
+        shape-not-faithfulness-fabrication-passes (hollow-but-valid steps) concerns under
+        this rubric — sibling lenses own them.

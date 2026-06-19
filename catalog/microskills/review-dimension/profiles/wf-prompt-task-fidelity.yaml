@@ -1,0 +1,38 @@
+version: 1
+
+# wf-prompt-task-fidelity lens overlay for review-dimension (create pipeline, §8 step 4).
+# Overrides the active dimension, the artifact kind, and the rubric snippet — a plain
+# list REPLACES base's correctness snippet wholesale (resolver list-replace rule).
+# output_schema, inputs, runtime, and the body inherit from base.
+vars:
+  dimension: wf-prompt-task-fidelity
+  artifact_kind: workflow draft bundle (WORKFLOW.yaml + profiles/*.yaml, concatenated)
+
+context:
+  snippets:
+    - name: wf-prompt-task-fidelity-rubric
+      text: >-
+        Prompt-task-fidelity rubric for a workflow draft bundle — answer "does each
+        agent/orchestrator node's prompt actually instruct its task and would it produce
+        the node's declared output_schema?". The deterministic floor (validate-workflow +
+        compile-workflow --defs-root) already validates node kinds, that at most one of
+        use/agent/workflow is set, that every downstream ${id.output.field} reference
+        resolves against the producer's effective schema — but it never reads prompt
+        prose, so its silence on a prompt is not approval. Flag only prompt-fidelity defects: a prompt whose instructions cannot
+        produce the fields the node's own output_schema declares (it asks for free prose
+        while the schema requires a structured array of objects); a prompt that omits or
+        contradicts a required output field; a prompt instructing a materially different
+        task than the node's role and its downstream consumers assume; a prompt that
+        leaves the output format unspecified where a structured schema is declared; a
+        prompt that names inputs the node does not receive, or ignores an input the node
+        is given. Severity mapping: a prompt that cannot produce the declared schema (a
+        consumer will dereference a field the prompt never emits) = blocker; a prompt
+        whose task drifts from its role and needs a decision = major; an
+        underspecified-but-recoverable prompt = minor. Set each finding's file to the
+        real source file the issue lives in per the bundle's provenance markers
+        (WORKFLOW.yaml or profiles/<p>.yaml) and line to that file's real line number —
+        the downstream refute pass and fix step read the real source at the finding's
+        file. Do not raise wf-output-schema-downstream-fit (whether a node's output
+        fields are the right ones for its consumers) or wf-gate-prompt-options-quality
+        (human-gate prompt and option-set quality) concerns under this rubric — sibling
+        lenses own them.

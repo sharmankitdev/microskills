@@ -1,0 +1,40 @@
+version: 1
+
+# wf-spill-materialize-judgment lens overlay for review-dimension (create pipeline, §8
+# step 4). Overrides the active dimension, the artifact kind, and the rubric snippet — a
+# plain list REPLACES base's correctness snippet wholesale (resolver list-replace rule).
+# output_schema, inputs, runtime, and the body inherit from base.
+vars:
+  dimension: wf-spill-materialize-judgment
+  artifact_kind: workflow draft bundle (WORKFLOW.yaml + profiles/*.yaml, concatenated)
+
+context:
+  snippets:
+    - name: wf-spill-materialize-judgment-rubric
+      text: >-
+        Spill-and-materialize-judgment rubric for a workflow draft bundle — answer "are
+        spill_outputs and materialize:file applied to exactly the payloads that need
+        by-reference threading?". The deterministic floor (validate-workflow +
+        compile-workflow --defs-root) already blocks spill on a for_each node, spill
+        naming a field absent from the node's schema, and spill referenced in a guard, and
+        warns when a materialize:file input name does not end in _path — do not re-raise
+        those; it never judges whether a given payload is large enough to warrant
+        by-reference threading. Flag only spill-and-materialize-judgment defects: a node
+        output field large enough to threaten the 32 KiB inter-node args budget that is
+        threaded inline rather than spilled or materialized by reference; spill_outputs or
+        materialize:file applied to a trivially small field, where by-reference threading
+        buys nothing and only adds a file hop; a large payload a downstream node merely
+        Reads passed inline rather than as a _path input; a cumulative fan-in (collected
+        findings, expanded assignments) whose combined inline size will overflow the
+        budget while no field is spilled; an over-eager by-reference choice that forces a
+        downstream consumer through an extra Read for a value small enough to thread
+        directly. Severity mapping: a payload that will overflow the 32 KiB args budget
+        threaded inline, so the run truncates its args and breaks = blocker; a large field
+        at budget risk left un-spilled, or spill/materialize applied to a trivial field,
+        needing a decision = major; a defensible-but-suboptimal by-reference choice =
+        minor. Set each finding's file to the real source file the issue lives in per the
+        bundle's provenance markers (WORKFLOW.yaml or profiles/<p>.yaml) and line to that
+        file's real line number — the downstream refute pass and fix step read the real
+        source at the finding's file. Do not raise wf-output-schema-downstream-fit (the
+        semantic shape of a node's output fields) concerns under this rubric — sibling
+        lenses own them.

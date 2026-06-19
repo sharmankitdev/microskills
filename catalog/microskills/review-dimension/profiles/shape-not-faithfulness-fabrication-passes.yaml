@@ -1,0 +1,43 @@
+version: 1
+
+# shape-not-faithfulness-fabrication-passes lens overlay for review-dimension (create
+# pipeline, §8 step 4). Overrides the active dimension, the artifact kind, and the rubric
+# snippet — a plain list REPLACES base's correctness snippet wholesale (resolver
+# list-replace rule). output_schema, inputs, runtime, and the body inherit from base.
+# Guard/meta lens: it reasons about ABSENCE (a structurally valid yet hollow bundle), so
+# it leans confidence medium/low and frames findings as uncertainty for a human rather
+# than asserted defects.
+vars:
+  dimension: shape-not-faithfulness-fabrication-passes
+  artifact_kind: microskill draft bundle (MICROSKILL.md + profiles/base.yaml, concatenated)
+
+context:
+  snippets:
+    - name: shape-not-faithfulness-fabrication-passes-rubric
+      text: >-
+        Shape-not-faithfulness rubric for a microskill draft bundle — answer "could this
+        bundle satisfy every structural check and still be hollow — steps that merely
+        NAME the task or would fabricate the output instead of performing it?". The
+        deterministic floor (validate-microskill + config-schema.json) confirms only that
+        all five sections are present and correctly cased, the YAML keys obey the closed grammar,
+        and output_schema is valid JSON Schema — a bundle can pass every one of those and
+        still not do the work — do not re-raise any structural check. Flag only
+        faithfulness-gap signals, and lean toward flagging uncertainty rather than
+        asserting a defect: a step that restates the task title instead of describing an
+        action that performs it ("summarize the document" with no method); Steps that,
+        read literally, would let an executor fabricate or guess the Output rather than
+        derive it from the inputs; a Purpose that promises analysis the Steps never
+        actually carry out; an Output described as produced by work the Steps do not
+        contain. Treat structural validity as no evidence of faithfulness, but raise these
+        as questions for a human, not confident verdicts. Severity mapping: a step set
+        that would plausibly fabricate the declared output rather than perform it = major
+        (flagged for human confirmation, confidence medium or low); a step that merely
+        names its task and needs fleshing out = minor; a stylistic thinness with the
+        intent still clear = nit. Lean confidence medium or low across this lens — it
+        reasons about absence, which is rarely certain. Set each finding's file to the
+        real source file the issue lives in per the bundle's provenance markers
+        (MICROSKILL.md or profiles/base.yaml) and line to that file's real line number —
+        the downstream refute pass and fix step read the real source at the finding's
+        file. Do not raise ms-purpose-contract-fidelity (divergence from the requirement)
+        or additionalprops-and-empty-content-permissive (structurally-present but empty
+        content) concerns under this rubric — sibling lenses own them.

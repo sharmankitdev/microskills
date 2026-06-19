@@ -1,0 +1,15 @@
+version: 1
+
+# Workflow-create review fan-in overlay for collect-findings (§8 step 4). Registers the
+# 7 artifact-stage dimension input names the create-pipeline review panel wires
+# (review-dimension profiles wf-*). Base's six code-review inputs deep-merge in unused.
+# Each entry is an empty map (declaring the name is the whole point). Names = the
+# review-dimension fan-out item names with hyphen→underscore.
+inputs:
+  wf_dag_decomposition_correctness: {}
+  wf_guard_logic_intent: {}
+  wf_prompt_task_fidelity: {}
+  wf_gate_prompt_options_quality: {}
+  wf_profile_overlay_coherence: {}
+  wf_spill_materialize_judgment: {}
+  wf_output_schema_downstream_fit: {}

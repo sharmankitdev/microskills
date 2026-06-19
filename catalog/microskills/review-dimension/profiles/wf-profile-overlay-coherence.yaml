@@ -1,0 +1,42 @@
+version: 1
+
+# wf-profile-overlay-coherence lens overlay for review-dimension (create pipeline, §8
+# step 4). Overrides the active dimension, the artifact kind, and the rubric snippet — a
+# plain list REPLACES base's correctness snippet wholesale (resolver list-replace rule).
+# output_schema, inputs, runtime, and the body inherit from base.
+vars:
+  dimension: wf-profile-overlay-coherence
+  artifact_kind: workflow draft bundle (WORKFLOW.yaml + profiles/*.yaml, concatenated)
+
+context:
+  snippets:
+    - name: wf-profile-overlay-coherence-rubric
+      text: >-
+        Profile-overlay-coherence rubric for a workflow draft bundle — answer "is each
+        profile overlay a coherent, contract-preserving, minimal delta on the base?". The
+        deterministic floor (validate-workflow + compile-workflow --defs-root) already
+        blocks list-verb errors (remove/patch naming an absent id, add id collisions), a
+        top-level profile key inside an overlay, references orphaned after a remove, a
+        gate_mode:auto overlay whose pausing gate declares no default (or on_headless:fail)
+        or a default outside the gate's effective options, and enforces the output_schema
+        replace-wholesale merge rule — do not re-raise those;
+        it never judges whether the delta is coherent, minimal, or true to the variant it
+        names. Flag only overlay-coherence defects: a delta that changes more than the
+        variant it names requires (it touches keys unrelated to its stated purpose); an
+        autonomous or gate-mode overlay that sets gate_mode to auto with a default that
+        points the unattended run at the wrong branch (the floor catches a MISSING default;
+        this is a present-but-wrong one); an overlay that re-states base values unchanged
+        (an inert, no-op delta);
+        an overlay whose purpose comment and its actual edits disagree — the comment
+        promises one variant while the keys implement another; an overlay that tunes one
+        side of a coupled setting and leaves its partner stale, so the resolved component
+        is internally at odds. Severity mapping: an overlay that breaks the base contract
+        so the resolved component is non-functional and cannot run = blocker; an overlay
+        whose delta silently diverges from the base intent and needs a decision = major; a
+        non-minimal but harmless overlay (a redundant or cosmetic delta) = minor. Set each
+        finding's file to the real source file the issue lives in per the bundle's
+        provenance markers (the profiles/<p>.yaml overlay, or WORKFLOW.yaml for the base
+        contract it overlays) and line to that file's real line number — the downstream
+        refute pass and fix step read the real source at the finding's file. Do not raise
+        wf-output-schema-downstream-fit (whether a node's declared output fields fit its
+        consumers) concerns under this rubric — sibling lenses own them.
