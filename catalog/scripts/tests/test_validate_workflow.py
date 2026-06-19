@@ -3110,3 +3110,71 @@ def test_non_enum_field_literal_clean(tmp_path):
     rc, data, err = run(wf)
     assert rc == 0, err
     assert not any("enum" in i["message"] for i in data["issues"]), data
+
+
+def test_bare_ref_unknown_blocks(tmp_path):
+    wf = write_wf(tmp_path, """
+version: 1
+name: br
+description: d
+nodes:
+  - id: a
+    agent: ag
+    prompt: do a
+  - id: b
+    agent: ag
+    depends_on: [a]
+    prompt: use ${mystery}
+""")
+    rc, data, err = run(wf)
+    assert rc == 1, err
+    assert any(i["severity"] == "block" and i["location"] == "nodes/b"
+               and "mystery" in i["message"] for i in data["issues"]), data
+
+
+def test_bare_ref_own_as_var_clean(tmp_path):
+    # LOUD #2 regression guard: ${finding} == this node's own `as: finding`
+    wf = write_wf(tmp_path, """
+version: 1
+name: br2
+description: d
+nodes:
+  - id: src
+    agent: ag
+    output_schema: {type: object, properties: {findings: {type: array}}}
+    prompt: src
+  - id: fan
+    agent: ag
+    depends_on: [src]
+    for_each: ${src.output.findings}
+    as: finding
+    prompt: verify ${finding}
+""")
+    rc, data, err = run(wf)
+    assert rc == 0, err
+    assert not any("resolves to no" in i["message"] for i in data["issues"]), data
+
+
+def test_bare_ref_carry_key_clean(tmp_path):
+    wf = write_wf(tmp_path, """
+version: 1
+name: br3
+description: d
+nodes:
+  - id: seed
+    agent: ag
+    prompt: seed
+  - id: work
+    agent: ag
+    depends_on: [seed]
+    prompt: continue from ${prev}
+loop:
+  body: [work]
+  max_iters: 3
+  while: ${work.output.go}
+  carry:
+    prev: ${work.output}
+""")
+    rc, data, err = run(wf)
+    assert rc == 0, err
+    assert not any("resolves to no" in i["message"] for i in data["issues"]), data

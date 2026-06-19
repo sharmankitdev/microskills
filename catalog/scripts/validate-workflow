@@ -678,6 +678,36 @@ def main():
                 f"'{prod_id}' declares '{field}' as type '{fld.get('type')}', not array "
                 f"— fan-out needs an array source")
 
+    # --- bare-identifier ref existence (block) ---
+    # A ${ident} with no dot (e.g. ${finding}) is a runtime lookup that resolves only
+    # to: the CONTAINING node's own for_each `as` var, OR a loop.carry var. Anything
+    # else (workflow inputs ride ${workflow.inputs.x}; node outputs ride
+    # ${id.output...}; both have dots) is undefined at run time. We scope the scan to
+    # node ref-bearing fields (inputs/prompt/when/for_each), matching the S-INFER
+    # node-ref scan, and only flag a lowercase identifier (as/carry naming) so a
+    # capitalized template token is left alone.
+    _BARE_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+    _loop_carry_keys = set(((merged.get("loop") or {}).get("carry") or {}).keys()) \
+        if isinstance(merged.get("loop"), dict) else set()
+    for nid, n in node_by_id.items():
+        own_as = n.get("as") if n.get("for_each") else None
+        legal_bare = _loop_carry_keys | ({own_as} if own_as else set())
+        scoped = {k: n.get(k) for k in ("inputs", "prompt", "when", "for_each") if k in n}
+        reported = set()
+        for s in collect_strings(scoped):
+            for inner in REF_RE.findall(s):
+                tok = inner.strip()
+                if "." in tok or not _BARE_RE.match(tok):
+                    continue  # dotted refs + non-identifier tokens handled elsewhere
+                if tok in legal_bare or tok in reported:
+                    continue
+                reported.add(tok)
+                add(issues, "block", f"nodes/{nid}",
+                    f"bare reference ${{{tok}}} resolves to no for_each binding "
+                    f"(this node's `as`) or loop carry var; node outputs ride "
+                    f"${{<id>.output...}} and workflow inputs ride "
+                    f"${{workflow.inputs.<name>}} — both require a dotted path")
+
     # --- spill_outputs: declared node-output-by-reference (shared checks) ---
     # Mirrors compile EXACTLY (same shared helpers — the two tools can never
     # disagree): (a) placement — spill_outputs on a for_each fan-out node is a
