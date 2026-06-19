@@ -1,0 +1,12 @@
+version: 1
+
+# Cross-artifact review fan-in overlay for collect-findings (§8 step 5 / D2).
+# Registers the 3 cross-artifact dimension input names the DEDICATED cross-artifact
+# fan-out wires. Shared by both create domains (ms + wf) — the cross-artifact dims are
+# catalog-membership checks, domain-agnostic. Base's six code-review inputs deep-merge
+# in unused. Each entry is an empty map (declaring the name is the whole point). Names
+# = the fan-out item names with hyphen→underscore (the inputs_each desugar contract).
+inputs:
+  duplicate_capability: {}
+  naming_collision: {}
+  reverse_consumer: {}

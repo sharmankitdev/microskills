@@ -1,0 +1,11 @@
+version: 1
+# Cross-artifact adversarial-verify overlay for verify-finding (§8 step 5 / D2).
+# A cross-artifact finding cites a CATALOG relationship, so the caller threads the
+# draft bundle AND the same frozen catalog-index.json, concatenated, as the single
+# artifact_path the verifier reads — keeping the refute reproducible (verify reads
+# the same index the review panel saw). verify-finding has no context_path slot, so
+# the index rides inside artifact_path (mirrors the draft-bundle idiom). Var-only:
+# inputs (finding + artifact_path materialize:file + seat), runtime, and
+# output_schema deep-merge in from base untouched.
+vars:
+  artifact_kind: component draft bundle followed by the catalog index (catalog-index.json), concatenated

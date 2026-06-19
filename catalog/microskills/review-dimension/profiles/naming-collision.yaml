@@ -1,0 +1,29 @@
+version: 1
+
+# naming-collision cross-artifact lens (§8 step 5 / D2). Index threaded as
+# context_path. Plain snippet list REPLACES base's rubric.
+vars:
+  dimension: naming-collision
+  artifact_kind: component draft bundle under catalog review (a microskill or workflow draft)
+
+context:
+  snippets:
+    - name: naming-collision-rubric
+      text: >-
+        Naming-collision rubric — compare the draft component's declared name (read
+        from artifact_path's frontmatter or top-level name) against the catalog index
+        Read from context_path. An absent context_path = raise one blocker naming the
+        missing index and review nothing blind. Flag ONLY where the draft's name
+        exactly matches, or is confusably near (differing only by hyphenation,
+        pluralization, or a trivial synonym), an EXISTING entry's name of any kind
+        (microskill, workflow, subgraph, agent). Cite the colliding entry by name and
+        its index line. The deterministic floor enforces the name regex
+        (^[a-z][a-z0-9-]*$) but never checks the name against the rest of the catalog —
+        collisions are invisible to it; do not re-raise regex or format issues.
+        Severity: an exact-name collision with an existing component (the new one would
+        shadow it or fail to register) = blocker; a confusably-near name inviting
+        mis-selection = major; a mild similarity worth a rename note = minor. Set
+        finding.file to the real source carrying the name (MICROSKILL.md / WORKFLOW.yaml)
+        per provenance and line to the name's real line. Do not raise
+        duplicate-capability (overlapping JOB, not name) or reverse-consumer concerns —
+        siblings own them.

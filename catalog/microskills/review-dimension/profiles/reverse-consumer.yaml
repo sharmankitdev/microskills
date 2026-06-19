@@ -1,0 +1,32 @@
+version: 1
+
+# reverse-consumer cross-artifact lens (§8 step 5 / D2). Index threaded as
+# context_path; each entry's consumers list is the load-bearing grounding. Plain
+# snippet list REPLACES base's rubric.
+vars:
+  dimension: reverse-consumer
+  artifact_kind: component draft bundle under catalog review (a microskill or workflow draft)
+
+context:
+  snippets:
+    - name: reverse-consumer-rubric
+      text: >-
+        Reverse-consumer rubric — using the catalog index Read from context_path (each
+        entry's consumers lists the components that reference it), check whether
+        introducing or naming the draft component (read from artifact_path) would BREAK
+        existing consumers. An absent context_path = raise one blocker naming the
+        missing index and review nothing blind. This fires when the draft shares a name
+        with, or is intended to supersede, an EXISTING entry that HAS consumers: those
+        consumers were written against the existing contract, so a drop-in with a
+        different input or output contract silently breaks them. For each at-risk
+        consumer cite the existing entry, the consumer name, and the index line. The
+        deterministic floor validates the draft in isolation — it has no view of who
+        consumes the name it takes, so this breakage is invisible to it. Severity: the
+        draft replaces an existing consumed component with an incompatible contract
+        (named consumers would break) = blocker; a plausible incompatibility a human
+        should confirm against the consumer = major; a forward-compatible change worth
+        noting = minor. Set finding.file to the real draft source per provenance and
+        line to the real line. If the draft takes a brand-new name with no existing
+        entry (so no consumers exist), raise nothing. Do not raise duplicate-capability
+        or naming-collision in isolation — those siblings flag the overlap or the name;
+        THIS lens flags the downstream consumer breakage.
