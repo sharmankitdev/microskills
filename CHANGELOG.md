@@ -1,3 +1,9 @@
+## [0.19.0](https://github.com/sharmankitdev/microskills/compare/v0.18.0...v0.19.0) (2026-06-19)
+
+### Features
+
+* **scripts:** harden validate-microskill deterministic floor ([#23](https://github.com/sharmankitdev/microskills/issues/23)) ([655e1a1](https://github.com/sharmankitdev/microskills/commit/655e1a1d2c681aa8eefbe5ae9bd0aee0429e0ee5))
+
 ## [0.18.0](https://github.com/sharmankitdev/microskills/compare/v0.17.0...v0.18.0) (2026-06-18)
 
 ### Features
