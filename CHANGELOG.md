@@ -1,3 +1,9 @@
+## [0.30.0](https://github.com/sharmankitdev/microskills/compare/v0.29.0...v0.30.0) (2026-06-19)
+
+### Features
+
+* **microskill:** synthesize-review create profile (floor∪review reconciliation) ([#34](https://github.com/sharmankitdev/microskills/issues/34)) ([8705928](https://github.com/sharmankitdev/microskills/commit/87059286811a8bb564359768162fe7a87249dd9b))
+
 ## [0.29.0](https://github.com/sharmankitdev/microskills/compare/v0.28.0...v0.29.0) (2026-06-19)
 
 ### Features
