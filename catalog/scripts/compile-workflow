@@ -2592,7 +2592,23 @@ def main():
                 manifest_step["on_exhaust"] = oe_rec
             _seg_labels = {nid: (node_by_id[nid].get("name") or humanize_id(nid))
                            for nid in step["nodes"]}
-            manifest_step["label"] = " & ".join(_seg_labels[nid] for nid in step["nodes"])
+            # Segment display label (cosmetic — popped from manifest_hash below, so
+            # it never perturbs byte-identical output / resume). Tier 1: when every
+            # node in the segment shares ONE phase_group, that authored group name
+            # IS the segment's name (humanized) — the author-curated label (note
+            # phase_group is ALSO the /workflows progress group, so this fires only
+            # for a genuinely single-phase segment; mixed grouping deliberately
+            # falls through). Tier 2 fallback: a short segment keeps the readable
+            # " & " join (1-2 nodes), but a 3+-node segment collapses to a CONCISE
+            # "<first> … +N more" slug instead of a run-on of every node name.
+            _ids = step["nodes"]
+            _pgs = {node_by_id[nid].get("phase_group") for nid in _ids}
+            if len(_pgs) == 1 and None not in _pgs:
+                manifest_step["label"] = humanize_id(next(iter(_pgs)))
+            elif len(_ids) <= 2:
+                manifest_step["label"] = " & ".join(_seg_labels[nid] for nid in _ids)
+            else:
+                manifest_step["label"] = f"{_seg_labels[_ids[0]]} … +{len(_ids) - 1} more"
             manifest_step["node_labels"] = _seg_labels
             manifest_steps.append(manifest_step)
         else:

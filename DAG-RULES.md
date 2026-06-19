@@ -1147,9 +1147,18 @@ per-call opt is what groups them — the compiler emits **no** inline `phase()` 
 (the global `phase()` marker races inside a `parallel([...])` batch); a single-node rank keeps its
 `phase(<group>)` marker.
 
-`phase_group` is **emit-only**: it changes the segment's phase markers / `meta.phases`, never the manifest,
-so it leaves `manifest.json` and `manifest_hash` untouched (recompiling with vs without it yields the same
-hash). A `phase_group` whose value equals a node id is a **warn** (the two boxes would merge), never a block.
+`phase_group` is **emit-only**: it changes the segment's phase markers / `meta.phases`, never the
+`manifest_hash` (recompiling with vs without it yields the same hash). A `phase_group` whose value equals a
+node id is a **warn** (the two boxes would merge), never a block.
+
+It also names the **segment**: the conductor shows each step by a human-readable `label`, and when *every*
+node in a background segment shares one `phase_group`, the humanized group becomes that segment's label
+(e.g. a segment whose nodes all carry `phase_group: invest` shows as **Invest**). When the segment's nodes
+do **not** all share one group, the label falls back to the node-name join for a 1-2 node segment, or a
+concise `<first> … +N more` slug for a 3+ node segment (never a run-on of every node name). This segment
+label rides in `manifest.json` but is popped before `manifest_hash`, so it never perturbs the hash either.
+(Because the group must be uniform across the whole segment, do **not** flatten a deliberately fine-grained
+progress grouping just to curate a label — the fallback already keeps a clean name.)
 
 ### Bounded node retry — `retry: { max_attempts: N }`
 
