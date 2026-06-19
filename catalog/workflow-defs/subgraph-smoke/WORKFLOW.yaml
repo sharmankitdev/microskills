@@ -1,0 +1,41 @@
+version: 1
+name: subgraph-smoke
+description: >-
+  Smoke def for the `subgraph:` primitive — splices the minimal review-synthesize subgraph
+  so the splice is exercised end to end over the REAL catalog registry (the CI closure-drift
+  + full-registry-validate gates compile/validate this def every run). Not base-tagged: it is
+  a regression anchor, never seeded into a consumer's harness.yaml.
+
+# Splices the subgraph at <defs-root>/_subgraphs/review-synthesize/SUBGRAPH.yaml (resolved by
+# name at compile time — there is no `imports:` entry for a subgraph; the `subgraph: <name>`
+# node IS the reference).
+#
+# author -> [subgraph rev] -> publish. The subgraph node carries ONLY id/subgraph/with/inputs;
+# it desugars in place into rev__review + rev__synthesize, all plain agent: nodes, so the whole
+# def collapses into ONE background segment (the in-segment promise of the primitive). The
+# downstream ${rev.output.report} ref re-points at the subgraph's exit (rev__synthesize).
+nodes:
+  - id: author
+    agent: writer
+    prompt: >-
+      Draft a short high-level design document, write it to a file, and return its path as
+      document_path.
+    output_schema:
+      type: object
+      required: [document_path]
+      properties:
+        document_path: { type: string }
+
+  - id: rev
+    subgraph: review-synthesize
+    with:
+      artifact_kind: high-level design document
+    inputs:
+      artifact_path: ${author.output.document_path}
+
+  # The ${rev.output.report} ref re-points at the subgraph exit (rev__synthesize) and
+  # implies the ordering edge, so no depends_on is needed.
+  - id: publish
+    agent: publisher
+    prompt: >-
+      Publish the synthesized report found at ${rev.output.report}.

@@ -171,6 +171,26 @@ def test_scoped_ownership_untouched(tmp_path):
     assert all("preexisting" not in p and "other.md" not in p for p in paths)
 
 
+def test_subgraphs_engine_dir_untouched(tmp_path):
+    # The `subgraph:` registry under .claude/workflow-defs/_subgraphs/ is ENGINE-owned
+    # (vendored by initialize-harness, never a manifest entry). harness-sync reconciles
+    # ONLY source:custom manifest components, so a path with no custom ledger entry is
+    # never modified — _subgraphs survives a sync byte-for-byte and never becomes a
+    # component.
+    make_microskill(tmp_path, "greet-user")
+    write_manifest(tmp_path, [{"name": "greet-user"}])
+    sg = (tmp_path / ".claude" / "workflow-defs" / "_subgraphs"
+          / "review-synthesize" / "SUBGRAPH.yaml")
+    sg.parent.mkdir(parents=True)
+    sg.write_text("version: 1\noutput: x\nnodes:\n  - id: x\n    agent: a\n")
+    rc, data, out, err = run(tmp_path, "--apply")
+    assert rc == 0, err
+    assert sg.read_text() == "version: 1\noutput: x\nnodes:\n  - id: x\n    agent: a\n"
+    assert "review-synthesize" not in state_of(tmp_path)["components"]
+    paths = state_of(tmp_path)["components"]["greet-user"]["installed_paths"]
+    assert all("_subgraphs" not in p for p in paths)
+
+
 def test_collision_skip_then_overwrite(tmp_path):
     make_microskill(tmp_path, "greet-user")
     write_manifest(tmp_path, [{"name": "greet-user"}])
