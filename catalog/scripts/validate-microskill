@@ -337,6 +337,20 @@ def cross_check(skill_meta, config_path, issues):
                 f"{p.name}: steps.\"{key}\" references step {n} which does not exist in MICROSKILL.md")
     for key in (doc.get("gates") or {}).keys():
         if key == "add":
+            seen_add_ids = set()
+            for entry in (doc["gates"].get("add") or []):
+                if not isinstance(entry, dict):
+                    continue
+                gid = entry.get("id")
+                if gid in skill_meta["gates"]:
+                    add(issues, "block", "config",
+                        f"{p.name}: gates.add id '{gid}' collides with a gate already declared in MICROSKILL.md "
+                        f"(<!-- gate-id: {gid} -->).")
+                if gid is not None and gid in seen_add_ids:
+                    add(issues, "block", "config",
+                        f"{p.name}: gates.add has a duplicate id '{gid}'.")
+                if gid is not None:
+                    seen_add_ids.add(gid)
             continue
         if key not in skill_meta["gates"]:
             add(issues, "warn", "config",

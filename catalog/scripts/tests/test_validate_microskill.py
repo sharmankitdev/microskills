@@ -60,6 +60,9 @@ Nothing.
 - **Anything** — stop.
 """
 
+GATE_BODY = MINIMAL_BODY.replace(
+    "## Output", "<!-- gate-id: approve -->\n\n## Output")
+
 
 def write_skill(tmp_path, name, body=None):
     p = tmp_path / "MICROSKILL.md"
@@ -417,3 +420,32 @@ def test_unknown_step_in_config_warns(tmp_path):
         if i["severity"] == "warn" and "step 9" in i["message"]
     ]
     assert warnings, data
+
+
+def test_gates_add_id_collision_blocks(tmp_path):
+    skill = write_skill(tmp_path, "gate-collide", GATE_BODY.format(name="gate-collide"))
+    cfg = write_cfg(tmp_path, "base.yaml",
+                    'version: 1\ngates:\n  add:\n    - id: approve\n      after: "1"\n      type: human_approval\n      prompt: Approve?\n')
+    code, data, _, err = run(str(skill), str(cfg))
+    assert code == 1, err
+    assert any(i["severity"] == "block" and "collides with a gate already declared" in i["message"]
+               for i in data["issues"]), data
+
+
+def test_gates_add_duplicate_id_blocks(tmp_path):
+    skill = write_skill(tmp_path, "gate-dup", MINIMAL_BODY.format(name="gate-dup"))
+    cfg = write_cfg(tmp_path, "base.yaml",
+                    'version: 1\ngates:\n  add:\n    - id: g1\n      after: "1"\n      type: verification\n    - id: g1\n      after: "2"\n      type: verification\n')
+    code, data, _, err = run(str(skill), str(cfg))
+    assert code == 1, err
+    assert any(i["severity"] == "block" and "duplicate id" in i["message"]
+               for i in data["issues"]), data
+
+
+def test_gates_add_new_id_no_block(tmp_path):
+    skill = write_skill(tmp_path, "gate-new", MINIMAL_BODY.format(name="gate-new"))
+    cfg = write_cfg(tmp_path, "base.yaml",
+                    'version: 1\ngates:\n  add:\n    - id: fresh\n      after: "1"\n      type: verification\n')
+    code, data, _, err = run(str(skill), str(cfg))
+    assert not any("collides with a gate" in i["message"] or "duplicate id" in i["message"]
+                   for i in data["issues"]), data
