@@ -456,29 +456,32 @@ def test_gates_add_new_id_no_block(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_steps_remove_unknown_warns(tmp_path):
+def test_steps_remove_unknown_blocks(tmp_path):
     skill = write_skill(tmp_path, "sr", MINIMAL_BODY.format(name="sr"))
     cfg = write_cfg(tmp_path, "base.yaml", "version: 1\nsteps:\n  remove: [9]\n")
     code, data, _, err = run(str(skill), str(cfg))
-    assert any(i["severity"] == "warn" and "steps.remove" in i["message"] and "does not exist" in i["message"]
+    assert code == 1, err
+    assert any(i["severity"] == "block" and "steps.remove" in i["message"] and "does not exist" in i["message"]
                for i in data["issues"]), data
 
 
-def test_steps_patch_unknown_warns(tmp_path):
+def test_steps_patch_unknown_blocks(tmp_path):
     skill = write_skill(tmp_path, "sp", MINIMAL_BODY.format(name="sp"))
     cfg = write_cfg(tmp_path, "base.yaml",
                     "version: 1\nsteps:\n  patch:\n    \"9\":\n      text: replaced\n")
     code, data, _, err = run(str(skill), str(cfg))
-    assert any(i["severity"] == "warn" and "steps.patch" in i["message"] and "does not exist" in i["message"]
+    assert code == 1, err
+    assert any(i["severity"] == "block" and "steps.patch" in i["message"] and "does not exist" in i["message"]
                for i in data["issues"]), data
 
 
-def test_steps_add_after_unknown_warns(tmp_path):
+def test_steps_add_after_unknown_blocks(tmp_path):
     skill = write_skill(tmp_path, "sa", MINIMAL_BODY.format(name="sa"))
     cfg = write_cfg(tmp_path, "base.yaml",
                     "version: 1\nsteps:\n  add:\n    - after: 9\n      text: new step\n")
     code, data, _, err = run(str(skill), str(cfg))
-    assert any(i["severity"] == "warn" and "steps.add" in i["message"] and "does not exist" in i["message"]
+    assert code == 1, err
+    assert any(i["severity"] == "block" and "steps.add" in i["message"] and "does not exist" in i["message"]
                for i in data["issues"]), data
 
 
@@ -566,3 +569,13 @@ def test_declared_var_token_no_warn(tmp_path):
     code, data, _, err = run(str(skill), str(cfg))
     assert not any("contract_doc" in i["message"] and "resolves from no config" in i["message"]
                    for i in data["issues"]), data
+
+
+def test_undeclared_hyphenated_var_token_warns(tmp_path):
+    body = MINIMAL_BODY.format(name="hyvar").replace(
+        "Test fixture.", "Test fixture using {{my-var}}.")
+    skill = write_skill(tmp_path, "hyvar", body)
+    cfg = write_cfg(tmp_path, "base.yaml", "version: 1\n")
+    code, data, _, err = run(str(skill), str(cfg))
+    assert any(i["severity"] == "warn" and "my-var" in i["message"]
+               and "resolves from no config" in i["message"] for i in data["issues"]), data
