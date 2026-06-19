@@ -3324,3 +3324,106 @@ nodes:
     assert rc == 0, err
     assert any(i["severity"] == "warn" and i["location"] == "nodes/fan/max_parallel"
                and "orchestrator" in i["message"] for i in data["issues"]), data
+
+
+def _child_with_profile(defs_root, name="child-flow"):
+    make_def(defs_root, name, """
+version: 1
+name: child-flow
+imports: []
+inputs:
+  seed:
+    type: string
+    required: false
+nodes:
+  - id: work
+    agent: ag
+    prompt: work ${workflow.inputs.seed}
+output:
+  from: work
+""")
+    pdir = defs_root / name / "profiles"
+    pdir.mkdir(parents=True, exist_ok=True)
+    (pdir / "strict.yaml").write_text(
+        "inputs:\n  seed:\n    required: true\n")
+
+
+def test_child_required_input_via_profile_blocks(tmp_path):
+    defs_root = tmp_path / "workflow-defs"
+    _child_with_profile(defs_root)
+    parent = make_def(defs_root, "parent", """
+version: 1
+name: parent
+imports: [child-flow]
+nodes:
+  - id: a
+    agent: ag
+    prompt: a
+  - id: build
+    workflow: child-flow
+    depends_on: [a]
+    customize:
+      profile: strict
+""")
+    rc, data, err = run_defs(defs_root, parent)
+    assert rc == 1, err
+    assert any(i["severity"] == "block" and i["location"] == "nodes/build"
+               and "seed" in i["message"] for i in data["issues"]), data
+
+
+def test_child_required_input_base_not_required_clean(tmp_path):
+    # same child WITHOUT the strict profile -> seed is required:false -> no block
+    defs_root = tmp_path / "workflow-defs"
+    _child_with_profile(defs_root)
+    parent = make_def(defs_root, "parent", """
+version: 1
+name: parent
+imports: [child-flow]
+nodes:
+  - id: a
+    agent: ag
+    prompt: a
+  - id: build
+    workflow: child-flow
+    depends_on: [a]
+""")
+    rc, data, err = run_defs(defs_root, parent)
+    assert rc == 0, err
+    assert not any("seed" in i["message"] and "requires input" in i["message"]
+                   for i in data["issues"]), data
+
+
+def test_child_output_field_via_resolved_schema_warns(tmp_path):
+    # child output.from is a use: node with NO inline schema; its resolved schema
+    # declares {result}; a parent ref to ${build.output.ghost} should warn.
+    defs_root = tmp_path / "workflow-defs"
+    _mk_ms(tmp_path, "producer", base_yaml=(
+        "version: 1\noutput_schema:\n  type: object\n  properties:\n    result: {type: string}\n"))
+    make_def(defs_root, "child-flow", """
+version: 1
+name: child-flow
+imports: []
+nodes:
+  - id: make
+    use: producer
+    prompt: make
+output:
+  from: make
+""")
+    parent = make_def(defs_root, "parent", """
+version: 1
+name: parent
+imports: [child-flow]
+nodes:
+  - id: build
+    workflow: child-flow
+    inputs: {}
+  - id: read
+    agent: ag
+    depends_on: [build]
+    prompt: got ${build.output.ghost}
+""")
+    rc, data, err = run_defs(defs_root, parent)
+    assert rc == 0, err
+    assert any(i["severity"] == "warn" and "ghost" in i["message"]
+               and "child workflow" in i["message"] for i in data["issues"]), data

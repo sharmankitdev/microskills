@@ -1470,6 +1470,30 @@ def main():
                 child_cache[name] = load_child_doc(defs_root, name)
             return child_cache[name]
 
+        def child_required(target, doc, profile):
+            """Required child inputs computed on the child's base.yaml + the parent
+            node's customize.profile overlay (mirrors runtime profile resolution),
+            not the raw child WORKFLOW.yaml. Falls back to the raw doc when no
+            overlay files are present."""
+            merged_child = doc
+            base_p = defs_root / target / "profiles" / "base.yaml"
+            if base_p.exists():
+                try:
+                    b = yaml.safe_load(base_p.read_text()) or {}
+                    b.pop("version", None)
+                    merged_child = deep_merge(merged_child, b)
+                except (yaml.YAMLError, ValueError):
+                    merged_child = doc
+            if isinstance(profile, str) and profile not in (None, "", "base"):
+                prof_p = defs_root / target / "profiles" / f"{profile}.yaml"
+                if prof_p.exists():
+                    try:
+                        o = yaml.safe_load(prof_p.read_text()) or {}
+                        merged_child = deep_merge(merged_child, o)
+                    except (yaml.YAMLError, ValueError):
+                        pass
+            return required_inputs_of(merged_child)
+
         for nid, n in wf_nodes:
             target = n["workflow"]
             # (a) target must be declared in the imports allowlist.
@@ -1489,7 +1513,8 @@ def main():
             # (d) N4 child contract (PURE, from child WORKFLOW.yaml): every
             # required child input must be supplied by this node's inputs.
             supplied = set((n.get("inputs") or {}).keys())
-            for req in sorted(required_inputs_of(doc)):
+            _child_prof = (n.get("customize") or {}).get("profile")
+            for req in sorted(child_required(target, doc, _child_prof)):
                 if req not in supplied:
                     add(issues, "block", f"nodes/{nid}",
                         f"workflow: '{target}' requires input '{req}' but the node's inputs omit it")
@@ -1512,6 +1537,13 @@ def main():
                 producer = cby.get(child_out["from"])
                 if isinstance(producer, dict):
                     osch = producer.get("output_schema")
+                    if osch is None and producer.get("use"):
+                        # resolve the child producer's microskill schema (inheritance)
+                        rc_ = resolve_microskill_directives(
+                            producer["use"],
+                            producer.get("customize") if isinstance(producer.get("customize"), dict) else None,
+                            defs_root)
+                        osch = rc_.get("output_schema")
                     if isinstance(osch, dict) and isinstance(osch.get("properties"), dict):
                         child_fields = set(osch["properties"].keys())
             if child_fields is not None:
