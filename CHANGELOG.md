@@ -1,3 +1,9 @@
+## [0.20.0](https://github.com/sharmankitdev/microskills/compare/v0.19.0...v0.20.0) (2026-06-19)
+
+### Features
+
+* **scripts:** harden validate-workflow deterministic floor (14 checks) ([#24](https://github.com/sharmankitdev/microskills/issues/24)) ([ca3a040](https://github.com/sharmankitdev/microskills/commit/ca3a04016b5f0e9396509bf4508b2364187ceff7))
+
 ## [0.19.0](https://github.com/sharmankitdev/microskills/compare/v0.18.0...v0.19.0) (2026-06-19)
 
 ### Features
