@@ -6,9 +6,13 @@ compiles the real microskill-create.
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
+
+import pytest
 
 REPO = Path(__file__).resolve().parents[3]
 SCRIPT = REPO / "catalog" / "scripts" / "compile-workflow"
@@ -34,6 +38,34 @@ def make_flow(defs_root, name, wf_yaml, base="version: 1\n"):
     (d / "WORKFLOW.yaml").write_text(wf_yaml)
     (d / "profiles" / "base.yaml").write_text(base)
     return d
+
+
+def assert_seg_parses(seg_js):
+    """REAL JS parse gate over an emitted segment (the check the substring-only
+    tests lacked — it would have caught the ASI-glued `[...] = await parallel([`
+    destructuring: `SyntaxError: Invalid left-hand side in assignment`).
+
+    A seg body has a top-level `return` AND top-level `await`, so it only parses
+    INSIDE a function: neutralize the single top-level `export` (illegal in a
+    function) and wrap the body in an async function, then `node --check`. Free
+    globals (agent/parallel/phase) are fine — `--check` validates syntax, not
+    bindings. Skips when node is unavailable. Proven to REJECT the pre-fix ASI
+    shape and ACCEPT the fixed shape (both directions verified)."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not on PATH")
+    body = seg_js.replace("export const meta", "const meta", 1)
+    wrapped = "(async function(args){\n" + body + "\n})\n"
+    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+        f.write(wrapped)
+        path = f.name
+    try:
+        p = subprocess.run([node, "--check", path], capture_output=True, text=True)
+    finally:
+        os.unlink(path)
+    assert p.returncode == 0, (
+        "emitted segment failed `node --check` (syntax error in compiled JS):\n"
+        + p.stderr)
 
 
 LINEAR = """\
@@ -1773,17 +1805,20 @@ loop:
 """
 
 
-def test_loop_body_siblings_stay_serial(tmp_path):
-    # SCOPE BOUNDARY: independent siblings inside a loop body are NOT parallelized —
-    # the do/while scaffold stays a sequential body (v1 only fans out non-loop segments).
+def test_loop_body_siblings_parallelize(tmp_path):
+    # KEYSTONE: independent siblings inside an UNGUARDED loop body now fan out — x and
+    # y both depend only on p (outside the body) so they share rank 0 and compile into
+    # ONE parallel([...]) batch (reassignment form) INSIDE the do/while. The do/while
+    # scaffold is unchanged.
     d = make_flow(tmp_path, "loopsib-flow", LOOP_SIBLINGS)
     rc, data, out, err = run(tmp_path, "loopsib-flow")
     assert rc == 0, err
     seg2 = (d / ".compiled" / "seg-2.js").read_text()   # loop segment, after the gate
     assert "do {" in seg2 and "} while (" in seg2
-    assert "n_x = await runAgent" in seg2               # sequential body assignment
-    assert "n_y = await runAgent" in seg2
-    assert "await parallel([" not in seg2               # no sibling batch in the loop
+    do_idx = seg2.index("do {"); while_idx = seg2.index("} while (")
+    batch_idx = seg2.index("[n_x, n_y] = await parallel([")
+    assert do_idx < batch_idx < while_idx               # sibling batch INSIDE the loop
+    assert "const n_x" not in seg2                       # reassignment, pre-declared lets
 
 
 def test_review_changes_dimension_reviews_parallelize(tmp_path):
@@ -5899,3 +5934,334 @@ def test_subgraph_schema_file_present():
     assert os.path.isfile(p), p
     import json as _json
     _json.loads(open(p).read())  # valid JSON
+
+
+# --- rank-parallel do/while loop bodies (engine keystone) ---
+# A loop body with TWO mutually-independent siblings (r1, r2 both depend only on
+# impl) -> same dependency rank -> must compile to ONE parallel([...]) batch INSIDE
+# the do/while. col depends on both, so it is a later (serial) rank.
+PARALLEL_LOOP = """\
+version: 1
+name: pal-flow
+nodes:
+  - id: p
+    agent: ag
+    prompt: plan
+  - id: impl
+    agent: ag
+    depends_on: [p]
+    prompt: impl ${loop.carry.last}
+  - id: r1
+    agent: ag
+    depends_on: [impl]
+    prompt: review one ${impl.output.x}
+  - id: r2
+    agent: ag
+    depends_on: [impl]
+    prompt: review two ${impl.output.x}
+  - id: col
+    agent: ag
+    depends_on: [r1, r2]
+    prompt: collect ${r1.output} ${r2.output}
+gates:
+  - id: g
+    after: p
+    type: human_approval
+    prompt: ok?
+loop:
+  while: ${!col.output.pass}
+  max_iters: 2
+  body: [impl, r1, r2, col]
+  carry:
+    last: ${col.output}
+"""
+
+
+def test_parallel_loop_body_emits_batch(tmp_path):
+    d = make_flow(tmp_path, "pal-flow", PARALLEL_LOOP)
+    rc, data, out, err = run(tmp_path, "pal-flow")
+    assert rc == 0, err
+    seg2 = (d / ".compiled" / "seg-2.js").read_text()   # seg-1 = pre-gate (p); seg-2 = loop body
+    # r1 + r2 are an independent rank -> one parallel batch, reassigning pre-declared lets.
+    assert "[n_r1, n_r2] = await parallel([" in seg2
+    # The batch is INSIDE the do/while (the loop scaffold), not before it.
+    do_idx = seg2.index("do {")
+    while_idx = seg2.index("} while (")
+    batch_idx = seg2.index("await parallel([")
+    assert do_idx < batch_idx < while_idx
+    # impl and col stay serial (single-node ranks).
+    assert "n_impl = await runAgent" in seg2
+    assert "n_col = await runAgent" in seg2
+
+
+def test_parallel_loop_body_parses(tmp_path):
+    # THE ASI BLOCKER GATE. PARALLEL_LOOP's body emits a SINGLE-node rank (impl)
+    # immediately BEFORE a MULTI-node rank ([r1, r2]) — the exact trigger: a bare
+    # `[n_r1, n_r2] = await parallel([` reassignment glued onto the preceding
+    # `)`-terminated `n_impl = await runAgent(...)` parses as a computed-member
+    # access → `SyntaxError: Invalid left-hand side in assignment`, failing the whole
+    # segment to load. The leading `;` ASI guard defeats it. A REAL `node --check`
+    # (not a substring assert) is what catches this — proven to REJECT the pre-fix
+    # emit and ACCEPT the fixed emit (see assert_seg_parses).
+    d = make_flow(tmp_path, "pal-flow", PARALLEL_LOOP)
+    rc, data, out, err = run(tmp_path, "pal-flow")
+    assert rc == 0, err
+    seg2 = (d / ".compiled" / "seg-2.js").read_text()
+    assert_seg_parses(seg2)
+
+
+def test_serial_loop_body_shape_unchanged(tmp_path):
+    # Shape check (NOT a byte-identity proof — it asserts only the reassignment-form
+    # SHAPE: no parallel batch, no const, reassignment of pre-declared lets). The
+    # hard byte-for-byte proof is the closure-lock / catalog `--check` CI gate, which
+    # fails if any pure-serial-body loop's emitted bytes move. Both are deliberate:
+    # this localizes a regression to one fixture; `--check` proves it catalog-wide.
+    d = make_flow(tmp_path, "pl-flow", PLAIN_LOOP)
+    rc, data, out, err = run(tmp_path, "pl-flow")
+    assert rc == 0, err
+    seg2 = (d / ".compiled" / "seg-2.js").read_text()
+    # Serial body keeps reassignment form, no parallel batch, no const, no leading phase().
+    assert "await parallel([" not in seg2
+    assert "n_impl = await runAgent" in seg2
+    assert "n_ev = await runAgent" in seg2
+    assert "const n_impl" not in seg2   # loop vars are pre-declared lets, reassigned
+    assert_seg_parses(seg2)             # serial body must also be valid JS
+
+
+# A for_each node in an UNGUARDED loop body emits its fan-out as its own rank inside
+# the do/while — `await parallel((coll||[]).map(...))`. (The validate guard that
+# forbade this is lifted for unguarded bodies in this PR.)
+FOREACH_LOOP = """\
+version: 1
+name: fel-flow
+inputs:
+  seed: { type: string, required: true }
+nodes:
+  - id: p
+    agent: ag
+    prompt: plan
+  - id: impl
+    agent: ag
+    depends_on: [p]
+    prompt: impl
+  - id: col
+    agent: ag
+    depends_on: [impl]
+    prompt: collect ${impl.output.x}
+    output_schema:
+      type: object
+      required: [findings, pass]
+      properties: { findings: { type: array }, pass: { type: boolean } }
+  - id: verify
+    agent: ag
+    depends_on: [col]
+    for_each: ${col.output.findings}
+    as: f
+    prompt: verify ${f}
+gates:
+  - id: g
+    after: p
+    type: human_approval
+    prompt: ok?
+loop:
+  while: ${!col.output.pass}
+  max_iters: 2
+  body: [impl, col, verify]
+  carry:
+    last: ${col.output}
+"""
+
+
+def test_for_each_in_loop_body_emits_parallel_fanout(tmp_path):
+    d = make_flow(tmp_path, "fel-flow", FOREACH_LOOP)
+    rc, data, out, err = run(tmp_path, "fel-flow")
+    assert rc == 0, err
+    seg2 = (d / ".compiled" / "seg-2.js").read_text()
+    do_idx = seg2.index("do {"); while_idx = seg2.index("} while (")
+    fan_idx = seg2.index(".map((f) => () => runAgent")
+    assert do_idx < fan_idx < while_idx        # fan-out is INSIDE the do/while
+    assert "n_verify = await parallel((" in seg2
+    assert_seg_parses(seg2)                     # the emitted fan-out must be valid JS
+
+
+# A for_each node (verify) and an INDEPENDENT plain-agent node (sib) SHARE a rank in
+# an UNGUARDED loop body — both depend only on col, neither on the other. The headline
+# new shape: the destructured batch must hold BOTH a plain `() => runAgent` thunk AND a
+# nested `() => parallel((…||[]).map(...))` fan-out thunk, inside the do/while — and it
+# must PARSE (this also exercises the ASI `;` guard on the nested-fanout-in-batch form).
+FOREACH_CORESIDENT_LOOP = """\
+version: 1
+name: fcl-flow
+nodes:
+  - id: p
+    agent: ag
+    prompt: plan
+  - id: impl
+    agent: ag
+    depends_on: [p]
+    prompt: impl
+  - id: col
+    agent: ag
+    depends_on: [impl]
+    prompt: collect ${impl.output.x}
+    output_schema:
+      type: object
+      required: [findings, pass]
+      properties: { findings: { type: array }, pass: { type: boolean } }
+  - id: sib
+    agent: ag
+    depends_on: [col]
+    prompt: sibling work ${col.output.pass}
+  - id: verify
+    agent: ag
+    depends_on: [col]
+    for_each: ${col.output.findings}
+    as: f
+    prompt: verify ${f}
+gates:
+  - id: g
+    after: p
+    type: human_approval
+    prompt: ok?
+loop:
+  while: ${!col.output.pass}
+  max_iters: 2
+  body: [impl, col, sib, verify]
+  carry:
+    last: ${col.output}
+"""
+
+
+def test_foreach_coresident_with_sibling_parallelizes_and_parses(tmp_path):
+    d = make_flow(tmp_path, "fcl-flow", FOREACH_CORESIDENT_LOOP)
+    rc, data, out, err = run(tmp_path, "fcl-flow")
+    assert rc == 0, err
+    seg2 = (d / ".compiled" / "seg-2.js").read_text()
+    do_idx = seg2.index("do {"); while_idx = seg2.index("} while (")
+    batch_idx = seg2.index("= await parallel([")
+    assert do_idx < batch_idx < while_idx       # the shared-rank batch is INSIDE the do/while
+    # sib + verify share one rank → ONE batch holding BOTH a plain thunk AND a
+    # nested for_each fan-out thunk (order = declaration order).
+    assert ("[n_sib, n_verify] = await parallel([" in seg2
+            or "[n_verify, n_sib] = await parallel([" in seg2)
+    assert "() => runAgent" in seg2                              # plain sibling thunk
+    assert "() => parallel((" in seg2 and ".map((f) =>" in seg2  # nested fan-out thunk
+    assert_seg_parses(seg2)                                      # ASI fix on the nested form
+
+
+# A BOUNDED subgraph whose group has TWO mutually-independent siblings (reva, revb
+# both read ${inputs.artifact_path}; synthesize depends on both). After unifying the
+# bounded-group emit with the rank emitter, reva+revb fan out as ONE parallel([...])
+# batch INSIDE the local do/while.
+SG_BOUNDED_PAR = """\
+version: 1
+params:
+  artifact_kind: { required: true }
+inputs:
+  artifact_path: { required: true }
+output: synthesize
+convergence:
+  mode: bounded
+  max_iters: 3
+  until: ${synthesize.output.converged}
+nodes:
+  - id: reva
+    agent: reviewer
+    prompt: review A this {{artifact_kind}}
+    inputs:
+      artifact_path: ${inputs.artifact_path}
+  - id: revb
+    agent: reviewer
+    prompt: review B this {{artifact_kind}}
+    inputs:
+      artifact_path: ${inputs.artifact_path}
+  - id: synthesize
+    agent: synthesizer
+    depends_on: [reva, revb]
+    prompt: synthesize
+    inputs:
+      a: ${reva.output}
+      b: ${revb.output}
+    output_schema:
+      type: object
+      required: [converged]
+      properties:
+        converged: { type: boolean }
+"""
+
+
+def test_bounded_group_parallelizes_independent_siblings(tmp_path):
+    _setup_subgraph_world(tmp_path, sg=SG_BOUNDED_PAR)
+    rc, data, out, err = run(tmp_path, "host-flow")
+    assert rc == 0, out + err
+    seg = (tmp_path / "host-flow" / ".compiled" / "seg-1.js").read_text()
+    do_idx = seg.index("do {"); while_idx = seg.index("} while (")
+    batch_idx = seg.index("[n_rev__reva, n_rev__revb] = await parallel([")
+    assert do_idx < batch_idx < while_idx          # the batch is INSIDE the group do/while
+    assert "n_rev__synthesize = await runAgent" in seg   # exit stays a serial later rank
+    assert "const n_rev__reva" not in seg          # reassignment, pre-declared lets
+    assert_seg_parses(seg)                         # the bounded-group batch must be valid JS
+
+
+# A GUARDED loop body whose two members (ga, gb) are mutually independent (both depend
+# only on p) — i.e. the same dependency rank. Guarded bodies stay SERIAL (the __ran
+# bookkeeping can't ride a concurrent batch), so NO parallel batch may appear in the
+# loop body AND each guarded member must still emit `__ran = true`. Pins BOTH halves of
+# the `if has_guarded_body:` branch — mutating the guard to `if False:` would break (a)
+# (the siblings would batch) and re-routing past the serial emit would drop (b).
+GUARDED_PARALLEL_LOOP = """\
+version: 1
+name: gpl-flow
+nodes:
+  - id: p
+    agent: ag
+    prompt: plan
+    output_schema:
+      type: object
+      properties:
+        adv: { type: ["object", "null"] }
+  - id: ga
+    agent: ag
+    when: ${p.output.adv == null}
+    depends_on: [p]
+    prompt: guarded a ${loop.carry.last}
+  - id: gb
+    agent: ag
+    when: ${p.output.adv == null}
+    depends_on: [p]
+    prompt: guarded b
+  - id: col
+    agent: ag
+    depends_on: [ga, gb]
+    prompt: collect
+    output_schema:
+      type: object
+      required: [pass]
+      properties: { pass: { type: boolean } }
+gates:
+  - id: g
+    after: p
+    type: human_approval
+    prompt: ok?
+loop:
+  while: ${!col.output.pass}
+  max_iters: 2
+  body: [ga, gb, col]
+  carry:
+    last: ${col.output}
+"""
+
+
+def test_guarded_loop_body_independent_siblings_stay_serial(tmp_path):
+    d = make_flow(tmp_path, "gpl-flow", GUARDED_PARALLEL_LOOP)
+    rc, data, out, err = run(tmp_path, "gpl-flow")
+    assert rc == 0, err
+    seg2 = (d / ".compiled" / "seg-2.js").read_text()
+    # (a) guarded siblings stay SERIAL — no parallel batch despite being one rank.
+    assert "await parallel([" not in seg2
+    # (b) __ran tracking survives on each member (guarded → if/else; col → trailing).
+    assert "{ n_ga = await runAgent" in seg2 and "__ran = true" in seg2
+    assert "{ n_gb = await runAgent" in seg2
+    assert seg2.count("__ran = true") >= 3          # ga, gb, col each set it
+    assert "let __ran = false" in seg2 and "if (!__ran) break" in seg2
+    assert_seg_parses(seg2)

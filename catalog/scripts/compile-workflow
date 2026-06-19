@@ -2292,6 +2292,49 @@ def emit_local_do_while(body_js, while_js, iter_var, max_var, carry=None):
             f"}} while (({while_js}) && {iter_var} < {max_var})\n\n")
 
 
+def emit_rank_calls(seg_node_objs, seg_var_ids, declare=True, phase_line=True, indent=""):
+    """Rank-partition a run of node objects and emit each dependency layer. A
+    single-node layer emits the serial form (an awaited assignment, optionally
+    preceded by an inline phase() marker); a layer of >=2 mutually-independent
+    siblings emits ONE parallel([...]) batch with destructuring — concurrent
+    instead of serial. ONE emitter feeds three call sites:
+
+      - the non-loop segment (declare=True, phase_line=True, indent="") — emits
+        `const` decls + the inline phase() marker, byte-identical to the old
+        emit_plain;
+      - the top-level do/while loop body (declare=False, phase_line=False,
+        indent="    ") — bare reassignment into pre-declared lets, no phase line;
+      - a subgraph bounded group's do/while body (same flags as the loop body).
+
+    A single-node layer routes through node_call_js so a for_each / when node keeps
+    its EXACT existing emission — which is why a for_each node composes as just
+    another (already-parallel `await parallel(map(...))`) rank inside a do/while
+    body. Single-node ranks therefore stay byte-for-byte identical to the prior
+    serial emit; only layers with genuinely independent siblings change."""
+    out = ""
+    node_by_id = {n["id"]: n for n in seg_node_objs}
+    for layer in rank_partition(seg_node_objs):
+        if len(layer) == 1:
+            n = node_by_id[layer[0]]
+            if phase_line:
+                out += f"{indent}phase({json.dumps(n.get('phase_group') or n['id'])})\n"
+            out += node_call_js(n, seg_var_ids, indent=indent, declare=declare)
+        else:
+            thunks = ",\n  ".join(
+                node_call_js(node_by_id[nid], seg_var_ids, thunk=True)
+                for nid in layer)
+            vars_js = ", ".join(jsvar(nid) for nid in layer)
+            # declare=True (non-loop): `const [` — a keyword safely begins a statement
+            # after a )-terminated line. declare=False (loop / bounded-group body): a BARE
+            # `[` reassigning pre-declared lets would be ASI-glued to the preceding
+            # )-terminated statement as a computed-member access (SyntaxError: invalid LHS).
+            # A leading `;` defeats ASI; harmless when the batch is the first body statement.
+            lead = "const " if declare else ";"
+            out += (f"{indent}{lead}[{vars_js}] = await parallel([\n"
+                    f"{indent}  {thunks},\n{indent}])\n")
+    return out
+
+
 def emit_segment_js(seg_nodes, wf, loop, seg_index, converge_groups=None):
     """Emit a Workflow-JS file for one background segment. Returns (js, needs, produces).
 
@@ -2396,9 +2439,20 @@ def emit_segment_js(seg_nodes, wf, loop, seg_index, converge_groups=None):
         # this iteration; an all-skipped iteration breaks out (avoids spinning to
         # the cap and reading a skipped node's null output in the while condition).
         has_guarded_body = any(n.get("when") for n in seg_nodes)
-        loop_calls = "".join(
-            node_call_js(n, seg_var_ids, indent="    ", declare=False, track_ran=has_guarded_body)
-            for n in seg_nodes)
+        if has_guarded_body:
+            # A guarded body tracks __ran to break on an all-skipped iteration; that
+            # bookkeeping can't ride a concurrent batch, so it stays the serial emit.
+            loop_calls = "".join(
+                node_call_js(n, seg_var_ids, indent="    ", declare=False, track_ran=True)
+                for n in seg_nodes)
+        else:
+            # Unguarded body → route through the shared rank emitter: independent
+            # same-rank siblings fan out as ONE parallel([...]) batch, dependency
+            # chains stay serial. Single-node ranks emit byte-identically to the old
+            # serial loop body (the byte-identity floor); a for_each node composes as
+            # its own already-parallel rank inside the do/while.
+            loop_calls = emit_rank_calls(seg_nodes, seg_var_ids, declare=False,
+                                         phase_line=False, indent="    ")
         ran_init = "    let __ran = false\n" if has_guarded_body else ""
         break_line = "    if (!__ran) break\n" if has_guarded_body else ""
         carry_assign = "".join(
@@ -2457,20 +2511,11 @@ def emit_segment_js(seg_nodes, wf, loop, seg_index, converge_groups=None):
             """Rank-partition + emit a run of NON-group node ids (byte-identical to the
             no-group path when called with the whole segment). Edges restrict to the
             run's own ids, so a post-group node's edge to the group exit is dropped —
-            correct, since the exit var is already declared before the post run."""
-            out = ""
-            for layer in rank_partition([node_by_id[i] for i in node_ids]):
-                if len(layer) == 1:
-                    n = node_by_id[layer[0]]
-                    out += f"phase({json.dumps(n.get('phase_group') or n['id'])})\n"
-                    out += node_call_js(n, seg_var_ids, indent="").lstrip()
-                else:
-                    thunks = ",\n  ".join(
-                        node_call_js(node_by_id[nid], seg_var_ids, thunk=True)
-                        for nid in layer)
-                    vars_js = ", ".join(jsvar(nid) for nid in layer)
-                    out += f"const [{vars_js}] = await parallel([\n  {thunks},\n])\n"
-            return out
+            correct, since the exit var is already declared before the post run.
+            Delegates to the shared emit_rank_calls with the non-loop flag set
+            (const decls + the inline phase() marker)."""
+            return emit_rank_calls([node_by_id[i] for i in node_ids], seg_var_ids,
+                                   declare=True, phase_line=True, indent="")
 
         if not converge_groups:
             # No bounded group → the original whole-segment rank emit (byte-identical).
@@ -2503,10 +2548,13 @@ def emit_segment_js(seg_nodes, wf, loop, seg_index, converge_groups=None):
                     gids = [g for g in seg_ids if g in set(grp["nodes"])]
                     iter_var, max_var = f"__cv{cv_idx}_iter", f"__cv{cv_idx}_max"
                     while_js = translate_ref(grp["while"], seg_var_ids)
-                    group_calls = "".join(
-                        node_call_js(node_by_id[gid], seg_var_ids, indent="    ",
-                                     declare=False)
-                        for gid in gids)
+                    # Route the bounded group's do/while body through the SAME rank
+                    # emitter as the top-level loop body (D2 — one emit path): independent
+                    # group siblings fan out as a parallel([...]) batch, dependency chains
+                    # and single-node ranks stay byte-identical to the prior serial emit.
+                    group_calls = emit_rank_calls(
+                        [node_by_id[g] for g in gids], seg_var_ids,
+                        declare=False, phase_line=False, indent="    ")
                     group_body = f"{group_calls}  {iter_var}++\n"
                     calls += (f"let {', '.join(jsvar(g) for g in gids)}\n"
                               f"let {iter_var} = 0\nconst {max_var} = {grp['max_iters']}\n")
