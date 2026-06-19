@@ -105,6 +105,7 @@ desugar_loop_until = _cw.desugar_loop_until
 loop_max_parallel_errors = _cw.loop_max_parallel_errors
 apply_workflow_vars = _cw.apply_workflow_vars
 expand_static_fanout = _cw.expand_static_fanout
+desugar_subgraphs = _cw.desugar_subgraphs
 scoped_ref_ids = _cw.scoped_ref_ids
 resolve_microskill_directives = _cw.resolve_microskill_directives
 wire_auto_placement_error = _cw.wire_auto_placement_error
@@ -274,6 +275,24 @@ def main():
         for ee in expand_errors:
             add(issues, "block", "expand", ee)
         if expand_errors:
+            print(json.dumps({"pass": False, "issues": issues}, indent=2))
+            sys.exit(1)
+
+    # --- COMPILE-TIME SUBGRAPH: splice reusable node-groups (shared desugar) ---
+    # Mirror compile-workflow EXACTLY (ONE shared desugar_subgraphs → no parity
+    # drift): consume the `subgraph: <name>` node kind immediately after expand and
+    # BEFORE the wf_-prefix check + schema validation, splicing it into the host DAG
+    # as ordinary namespaced nodes the checks below validate. The registry root is
+    # --defs-root when given, else derived from the standard
+    # <defs-root>/<name>/WORKFLOW.yaml layout (same as the snippets root). A desugar
+    # error is a HARD block (the half-spliced doc is structurally unusable).
+    if isinstance(merged, dict):
+        sg_root = (Path(args.defs_root) if args.defs_root
+                   else wf_path.resolve().parent.parent)
+        merged, subgraph_errors = desugar_subgraphs(merged, sg_root / "_subgraphs")
+        for se in subgraph_errors:
+            add(issues, "block", "subgraph", se)
+        if subgraph_errors:
             print(json.dumps({"pass": False, "issues": issues}, indent=2))
             sys.exit(1)
 

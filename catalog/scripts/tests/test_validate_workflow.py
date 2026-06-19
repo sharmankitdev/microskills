@@ -3586,3 +3586,184 @@ nodes:
     assert rc == 0, err
     assert any(i["severity"] == "warn" and "ghost" in i["message"]
                and "child workflow" in i["message"] for i in data["issues"]), data
+
+
+# --- subgraph: parity — validate desugars via the SAME shared desugar_subgraphs
+# as compile (imported by validate via SourceFileLoader), so the SAME fixtures
+# accept/reject identically. The fixtures are imported from the compile test
+# module so there is ONE definition (no parity drift between the two suites).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from test_compile_workflow import SG_HOST, SG_REVIEW, SG_LOOP_HOST  # noqa: E402
+
+
+def _setup_sg(tmp_path, host=SG_HOST, sg=SG_REVIEW, sg_name="adversarial-review"):
+    (tmp_path / "host-flow").mkdir()
+    (tmp_path / "host-flow" / "WORKFLOW.yaml").write_text(host)
+    d = tmp_path / "_subgraphs" / sg_name
+    d.mkdir(parents=True)
+    (d / "SUBGRAPH.yaml").write_text(sg)
+    return tmp_path / "host-flow" / "WORKFLOW.yaml"
+
+
+def _sg_blocks(data):
+    return [i["message"] for i in (data or {}).get("issues", [])
+            if i["severity"] == "block" and i["location"] == "subgraph"]
+
+
+def test_subgraph_valid_passes(tmp_path):
+    wf = _setup_sg(tmp_path)
+    rc, data, _ = run(wf, "--defs-root", tmp_path)
+    assert rc == 0, data
+    assert data["pass"] is True
+    assert not any(i["severity"] == "block" for i in data["issues"]), data
+
+
+def test_subgraph_unresolved_name_blocks(tmp_path):
+    # No _subgraphs dir → the named subgraph does not resolve.
+    (tmp_path / "host-flow").mkdir()
+    wf = tmp_path / "host-flow" / "WORKFLOW.yaml"
+    wf.write_text(SG_HOST)
+    rc, data, _ = run(wf, "--defs-root", tmp_path)
+    assert rc == 1, data
+    assert any("not found" in m for m in _sg_blocks(data)), data
+
+
+def test_subgraph_bounded_convergence_blocks(tmp_path):
+    sg = SG_REVIEW.replace("convergence: { mode: single_pass }",
+                           "convergence: { mode: bounded, max_iters: 3 }")
+    wf = _setup_sg(tmp_path, sg=sg)
+    rc, data, _ = run(wf, "--defs-root", tmp_path)
+    assert rc == 1, data
+    assert any("bounded" in m and "PR3" in m for m in _sg_blocks(data)), data
+
+
+def test_subgraph_missing_required_param_blocks(tmp_path):
+    host = SG_HOST.replace(
+        "    with:\n      artifact_kind: high-level design document\n", "")
+    wf = _setup_sg(tmp_path, host=host)
+    rc, data, _ = run(wf, "--defs-root", tmp_path)
+    assert rc == 1, data
+    assert any("required param" in m and "artifact_kind" in m
+               for m in _sg_blocks(data)), data
+
+
+def test_subgraph_unknown_with_key_blocks(tmp_path):
+    host = SG_HOST.replace(
+        "      artifact_kind: high-level design document\n",
+        "      artifact_kind: high-level design document\n      bogus: x\n")
+    wf = _setup_sg(tmp_path, host=host)
+    rc, data, _ = run(wf, "--defs-root", tmp_path)
+    assert rc == 1, data
+    assert any("unknown with key" in m and "bogus" in m for m in _sg_blocks(data)), data
+
+
+def test_subgraph_missing_required_input_blocks(tmp_path):
+    host = SG_HOST.replace(
+        "    inputs:\n      artifact_path: ${author.output.document_path}\n", "")
+    wf = _setup_sg(tmp_path, host=host)
+    rc, data, _ = run(wf, "--defs-root", tmp_path)
+    assert rc == 1, data
+    assert any("required input" in m and "artifact_path" in m
+               for m in _sg_blocks(data)), data
+
+
+def test_subgraph_unknown_inputs_key_blocks(tmp_path):
+    host = SG_HOST.replace(
+        "      artifact_path: ${author.output.document_path}\n",
+        "      artifact_path: ${author.output.document_path}\n"
+        "      bogus: ${author.output.x}\n")
+    wf = _setup_sg(tmp_path, host=host)
+    rc, data, _ = run(wf, "--defs-root", tmp_path)
+    assert rc == 1, data
+    assert any("unknown inputs key" in m and "bogus" in m for m in _sg_blocks(data)), data
+
+
+def test_subgraph_inner_orchestrator_blocks(tmp_path):
+    sg = SG_REVIEW.replace("  - id: synthesize\n    agent: synthesizer\n",
+                           "  - id: synthesize\n    delegation: orchestrator\n")
+    wf = _setup_sg(tmp_path, sg=sg)
+    rc, data, _ = run(wf, "--defs-root", tmp_path)
+    assert rc == 1, data
+    assert any("orchestrator" in m for m in _sg_blocks(data)), data
+
+
+def test_subgraph_nested_subgraph_blocks(tmp_path):
+    sg = SG_REVIEW.replace(
+        "  - id: synthesize\n    agent: synthesizer\n    prompt: synthesize the review\n",
+        "  - id: synthesize\n    subgraph: other\n")
+    wf = _setup_sg(tmp_path, sg=sg)
+    rc, data, _ = run(wf, "--defs-root", tmp_path)
+    assert rc == 1, data
+    assert any("nested" in m for m in _sg_blocks(data)), data
+
+
+def test_subgraph_author_id_with_double_underscore_blocks(tmp_path):
+    host = SG_HOST.replace("author", "au__thor")
+    wf = _setup_sg(tmp_path, host=host)
+    rc, data, _ = run(wf, "--defs-root", tmp_path)
+    assert rc == 1, data
+    assert any("__" in m and "reserved" in m for m in _sg_blocks(data)), data
+
+
+def test_subgraph_non_self_contained_ref_blocks(tmp_path):
+    sg = SG_REVIEW.replace("      artifact_path: ${inputs.artifact_path}\n",
+                           "      artifact_path: ${workflow.inputs.secret}\n")
+    wf = _setup_sg(tmp_path, sg=sg)
+    rc, data, _ = run(wf, "--defs-root", tmp_path)
+    assert rc == 1, data
+    assert any("self-contained" in m and "workflow.inputs.secret" in m
+               for m in _sg_blocks(data)), data
+
+
+def test_subgraph_no_nodes_blocks(tmp_path):
+    sg = "version: 1\noutput: synthesize\n"
+    wf = _setup_sg(tmp_path, sg=sg)
+    rc, data, _ = run(wf, "--defs-root", tmp_path)
+    assert rc == 1, data
+    assert any("schema" in m and "nodes" in m for m in _sg_blocks(data)), data
+
+
+def test_subgraph_output_names_no_inner_node_blocks(tmp_path):
+    sg = SG_REVIEW.replace("output: synthesize", "output: ghost")
+    wf = _setup_sg(tmp_path, sg=sg)
+    rc, data, _ = run(wf, "--defs-root", tmp_path)
+    assert rc == 1, data
+    assert any("output 'ghost' names no inner node" in m for m in _sg_blocks(data)), data
+
+
+def test_subgraph_surviving_undeclared_token_blocks(tmp_path):
+    sg = SG_REVIEW.replace("prompt: review this {{artifact_kind}}",
+                           "prompt: review this {{artifact_kind}} with {{undeclared_tok}}")
+    wf = _setup_sg(tmp_path, sg=sg)
+    rc, data, _ = run(wf, "--defs-root", tmp_path)
+    assert rc == 1, data
+    assert any("undeclared_tok" in m and "unresolved" in m for m in _sg_blocks(data)), data
+
+
+# PR1-remediation parity (same shared desugar -> same blocks in validate):
+
+def test_subgraph_in_top_level_loop_blocks(tmp_path):
+    wf = _setup_sg(tmp_path, host=SG_LOOP_HOST)
+    rc, data, _ = run(wf, "--defs-root", tmp_path)
+    assert rc == 1, data
+    assert any("top-level loop" in m for m in _sg_blocks(data)), data
+
+
+def test_subgraph_non_string_input_binding_blocks(tmp_path):
+    host = SG_HOST.replace("      artifact_path: ${author.output.document_path}\n",
+                           "      artifact_path: 42\n")
+    wf = _setup_sg(tmp_path, host=host)
+    rc, data, _ = run(wf, "--defs-root", tmp_path)
+    assert rc == 1, data
+    assert any("binding must" in m and "string" in m for m in _sg_blocks(data)), data
+
+
+def test_subgraph_convergence_scalar_shorthand_blocks(tmp_path):
+    host = SG_HOST.replace(
+        "    with:\n      artifact_kind: high-level design document\n",
+        "    with:\n      artifact_kind: high-level design document\n"
+        "      convergence: bounded\n")
+    wf = _setup_sg(tmp_path, host=host)
+    rc, data, _ = run(wf, "--defs-root", tmp_path)
+    assert rc == 1, data
+    assert any("convergence must be a mapping" in m for m in _sg_blocks(data)), data
