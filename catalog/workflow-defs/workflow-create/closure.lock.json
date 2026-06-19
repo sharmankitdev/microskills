@@ -7,5 +7,8 @@
     "plan": "eabb5b513fe554ac8d0ce30a81f47f6cb6b08b2c1f836ef06495097b20a5bb6d",
     "provision": "1af50352a7a13433d8dd330ebab36fa1c4766e970d14be9d915a59e1df6d0f76"
   },
-  "profile_used": "base"
+  "profile_used": "base",
+  "segment_digests": {
+    "seg-1.js": "269cb6e7f3db4ef4c54e3b1252971faef1946dfdad036e541d545683a0128e86"
+  }
 }

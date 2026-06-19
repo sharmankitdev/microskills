@@ -176,6 +176,53 @@ def test_args_manifest_hash_mismatch_is_environment_error(tmp_path):
     assert "manifest_hash" in data["error"]
 
 
+def test_args_manifest_hash_present_state_hash_absent_is_env_error(tmp_path):
+    # manifest carries manifest_hash; run-state OMITS the key. The old 3-way AND
+    # silently passed (s_hash falsy), threading an incompatible/older run-state
+    # forward — the integrity gate must now fail loud (exit 2). world() defaults
+    # state_hash to the manifest hash, so this run-state is hand-built to omit it.
+    man = tmp_path / "manifest.json"
+    man.write_text(json.dumps({
+        "manifest_hash": "sha256:h1",
+        "steps": [seg_step({"wf_inputs": [], "nodes": [], "carry": []})],
+        "required_inputs": [], "input_defaults": {}}))
+    st = tmp_path / "run-state.json"
+    st.write_text(json.dumps({"step_index": 0, "inputs": {}, "results": {}}))
+    rc, data, out, err = run("args", "--manifest", str(man),
+                             "--run-state", str(st), "--step", "0")
+    assert rc == 2, out + err
+    assert "absent" in data["error"]
+
+
+def test_args_manifest_hash_present_state_hash_null_is_env_error(tmp_path):
+    man = tmp_path / "manifest.json"
+    man.write_text(json.dumps({
+        "manifest_hash": "sha256:h1",
+        "steps": [seg_step({"wf_inputs": [], "nodes": [], "carry": []})],
+        "required_inputs": [], "input_defaults": {}}))
+    st = tmp_path / "run-state.json"
+    st.write_text(json.dumps({"manifest_hash": None, "step_index": 0,
+                              "inputs": {}, "results": {}}))
+    rc, data, out, err = run("args", "--manifest", str(man),
+                             "--run-state", str(st), "--step", "0")
+    assert rc == 2, out + err
+    assert "absent" in data["error"]
+
+
+def test_args_both_hashes_absent_passes(tmp_path):
+    # Neither file carries a hash — nothing to reconcile, no integrity error.
+    man = tmp_path / "manifest.json"
+    man.write_text(json.dumps({
+        "steps": [seg_step({"wf_inputs": [], "nodes": [], "carry": []})],
+        "required_inputs": [], "input_defaults": {}}))
+    st = tmp_path / "run-state.json"
+    st.write_text(json.dumps({"step_index": 0, "inputs": {}, "results": {}}))
+    rc, data, out, err = run("args", "--manifest", str(man),
+                             "--run-state", str(st), "--step", "0")
+    assert rc == 0, out + err
+    assert data["args"] == {}
+
+
 def test_args_pre_shape_run_state_without_inputs_fails_loud(tmp_path):
     man = tmp_path / "manifest.json"
     man.write_text(json.dumps({"manifest_hash": "sha256:h1", "steps": [

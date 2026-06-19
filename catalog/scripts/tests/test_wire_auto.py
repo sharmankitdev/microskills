@@ -381,6 +381,11 @@ nodes:
   - id: a
     agent: ag
     prompt: produce
+    output_schema:
+      type: object
+      required: [x]
+      properties:
+        x: { type: string }
   - id: call
     workflow: wire-child
     wire: auto

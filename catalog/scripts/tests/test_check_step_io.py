@@ -292,6 +292,70 @@ def test_unreadable_manifest_is_env_error(tmp_path):
     assert rc == 2
 
 
+# --- integrity gate: manifest carries a hash, run-state lacks it (exit 2) --------
+# The world() helper defaults state_hash to manifest_hash, which MASKS the bug —
+# these tests write the run-state by hand to OMIT (or null) the manifest_hash key.
+
+def _pair(tmp_path, manifest, state):
+    mp = tmp_path / "manifest.json"
+    sp = tmp_path / "run-state.json"
+    mp.write_text(json.dumps(manifest, indent=2))
+    sp.write_text(json.dumps(state, indent=2))
+    return mp, sp
+
+
+_OK_STEP = [seg_step({"a": {"schema": None, "guarded": False, "fan_out": False}})]
+
+
+def test_manifest_hash_present_state_hash_absent_is_env_error(tmp_path):
+    # manifest carries manifest_hash; run-state OMITS the key. The old 3-way AND
+    # silently passed (s_hash falsy) — an incompatible/older run-state slipped
+    # through. It must now fail loud as an environment/integrity error.
+    manifest = {"name": "t-flow", "steps": _OK_STEP, "manifest_hash": "h1"}
+    state = {"step_index": 1, "results": {"a": {"any": 1}}}  # no manifest_hash
+    mp, sp = _pair(tmp_path, manifest, state)
+    rc, data, out, err = run_check(mp, sp, 0)
+    assert rc == 2, out
+    assert "absent" in data["error"]
+
+
+def test_manifest_hash_present_state_hash_null_is_env_error(tmp_path):
+    # An explicit null is the same as absent (.get returns None either way).
+    manifest = {"name": "t-flow", "steps": _OK_STEP, "manifest_hash": "h1"}
+    state = {"manifest_hash": None, "step_index": 1, "results": {"a": {"any": 1}}}
+    mp, sp = _pair(tmp_path, manifest, state)
+    rc, data, out, err = run_check(mp, sp, 0)
+    assert rc == 2, out
+    assert "absent" in data["error"]
+
+
+def test_manifest_hash_mismatch_is_env_error(tmp_path):
+    # Was already dying — confirm exit 2 under the tightened gate.
+    manifest = {"name": "t-flow", "steps": _OK_STEP, "manifest_hash": "h1"}
+    state = {"manifest_hash": "OTHER", "step_index": 1, "results": {"a": {"any": 1}}}
+    mp, sp = _pair(tmp_path, manifest, state)
+    rc, data, out, err = run_check(mp, sp, 0)
+    assert rc == 2, out
+    assert "manifest_hash" in data["error"]
+
+
+def test_both_hashes_absent_passes(tmp_path):
+    # Neither file carries a hash — nothing to reconcile, no integrity error.
+    manifest = {"name": "t-flow", "steps": _OK_STEP}        # no manifest_hash
+    state = {"step_index": 1, "results": {"a": {"any": 1}}}  # no manifest_hash
+    mp, sp = _pair(tmp_path, manifest, state)
+    rc, data, out, err = run_check(mp, sp, 0)
+    assert rc == 0, out
+
+
+def test_both_hashes_present_and_matching_passes(tmp_path):
+    manifest = {"name": "t-flow", "steps": _OK_STEP, "manifest_hash": "h1"}
+    state = {"manifest_hash": "h1", "step_index": 1, "results": {"a": {"any": 1}}}
+    mp, sp = _pair(tmp_path, manifest, state)
+    rc, data, out, err = run_check(mp, sp, 0)
+    assert rc == 0, out
+
+
 # --- integration: checker consumes EXACTLY what compile-workflow emits -----------
 
 IO_FLOW = """\

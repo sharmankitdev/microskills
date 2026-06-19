@@ -8,5 +8,8 @@
     "technical_design": "140565a189cf26f0688845658c157725f6b2590acfdacdbdc25bb427ba64d60a",
     "ux": "3f69b9d04e1d3b387327a1a7a0fabacb5807d6f52bfb9f891f6515646d588b44"
   },
-  "profile_used": "base"
+  "profile_used": "base",
+  "segment_digests": {
+    "seg-1.js": "7b8168ba858462d0e9fcba803b39c5c9b7cfa90c1f10c26537581d3250f63ca9"
+  }
 }

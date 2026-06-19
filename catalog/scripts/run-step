@@ -189,15 +189,21 @@ def get_step(manifest, index):
 
 
 def check_hash(manifest, run_state):
-    """Integrity gate (same rule as check-step-io): when both files carry a
-    manifest_hash and they differ, the run-state belongs to a different
-    compile — environment error, never a silent pass."""
+    """Integrity gate (same rule as check-step-io — kept byte-for-byte in
+    lockstep): when the manifest carries a manifest_hash, the run-state MUST
+    carry the same one. An ABSENT run-state hash (key missing/null) is an
+    incompatible/older compile, not a silent pass; a present-but-different hash
+    belongs to a different compile. Either way it is an environment error."""
     m_hash = manifest.get("manifest_hash")
     s_hash = run_state.get("manifest_hash")
-    if m_hash and s_hash and m_hash != s_hash:
-        die("run-state manifest_hash does not match the manifest — this "
-            "run-state belongs to a different compile; resume handling must "
-            "reconcile them before running steps")
+    if m_hash:
+        if not s_hash:
+            die("run-state manifest_hash is absent but the manifest carries "
+                "one — this run-state is from an incompatible/older compile; "
+                "recompile or restart")
+        if m_hash != s_hash:
+            die("run-state manifest_hash does not match the manifest — "
+                "recompile/resume must reconcile them")
 
 
 def require_state_obj(run_state, key):

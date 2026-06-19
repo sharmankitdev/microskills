@@ -785,6 +785,104 @@ def test_workflow_missing_required_child_input_blocks(tmp_path):
     assert any("requires input 'seed'" in i["message"] for i in data["issues"])
 
 
+# --- T3: profile-MERGED child read in the nested depth/cycle walk ---
+# The depth/cycle helper used to load each child RAW (load_child_doc), so a child
+# profile that ADDS a workflow: node (or import) via the parent node's
+# customize.profile was invisible — DEPTH=1/cycle was computed on the un-profiled
+# graph. The walk now reads each child through _profile_merged_child_doc, threading
+# the parent node's customize.profile at the direct parent->child boundary.
+
+def _mk_child_profile(defs_root, child_name, profile_name, text):
+    """Write <defs-root>/<child>/profiles/<profile>.yaml (and base.yaml)."""
+    pdir = defs_root / child_name / "profiles"
+    pdir.mkdir(parents=True, exist_ok=True)
+    if not (pdir / "base.yaml").exists():
+        (pdir / "base.yaml").write_text("version: 1\n")
+    (pdir / f"{profile_name}.yaml").write_text(text)
+
+
+# A parent whose workflow: node selects a child profile P on the direct boundary.
+PARENT_PROF = """\
+version: 1
+name: parent-flow
+imports: [kid-flow]
+nodes:
+  - id: a
+    agent: ag
+    prompt: do a
+  - id: build
+    workflow: kid-flow
+    depends_on: [a]
+    customize:
+      profile: %s
+    inputs:
+      seed: ${a.output.x}
+"""
+
+# A leaf child (renamed CHILD) with no nested workflow: node in its RAW form.
+KID = CHILD.replace("name: child-flow", "name: kid-flow")
+
+
+def test_nested_profile_added_grandchild_blocks_depth(tmp_path):
+    # kid-flow's profile `withgrand` ADDS a workflow: grand-flow node (nodes.add).
+    # Invisible to a RAW child read; the profile-merged read makes it depth-2.
+    make_def(tmp_path, "grand-flow", CHILD.replace("name: child-flow", "name: grand-flow"))
+    make_def(tmp_path, "kid-flow", KID)
+    _mk_child_profile(tmp_path, "kid-flow", "withgrand", """\
+version: 1
+nodes:
+  add:
+    - id: deep
+      workflow: grand-flow
+      inputs:
+        seed: hi
+""")
+    parent = make_def(tmp_path, "parent-flow", PARENT_PROF % "withgrand")
+    rc, data, _ = run_defs(tmp_path, parent)
+    assert rc == 1 and data["pass"] is False, data
+    assert any("depth" in i["message"] for i in data["issues"]), data
+
+
+def test_nested_profile_added_nonworkflow_node_passes(tmp_path):
+    # kid-flow's profile `withagent` ADDS only an agent node — no nested workflow:,
+    # so the depth/cycle walk stays clean and the parent validates.
+    make_def(tmp_path, "kid-flow", KID)
+    _mk_child_profile(tmp_path, "kid-flow", "withagent", """\
+version: 1
+nodes:
+  add:
+    - id: extra
+      agent: ag2
+      prompt: more work
+""")
+    parent = make_def(tmp_path, "parent-flow", PARENT_PROF % "withagent")
+    rc, data, _ = run_defs(tmp_path, parent)
+    assert rc == 0, data
+    assert data["pass"] is True
+
+
+def test_nested_profile_added_import_cycle_blocks(tmp_path):
+    # kid-flow's profile `cyc` ADDS parent-flow to imports AND a workflow: parent-flow
+    # node — forming parent -> kid -> parent. The cycle edge lives one level below
+    # the root, so direct-boundary profile threading surfaces it.
+    make_def(tmp_path, "kid-flow", KID)
+    _mk_child_profile(tmp_path, "kid-flow", "cyc", """\
+version: 1
+imports:
+  add: [parent-flow]
+nodes:
+  add:
+    - id: back
+      workflow: parent-flow
+      inputs:
+        seed: hi
+""")
+    parent = make_def(tmp_path, "parent-flow", PARENT_PROF % "cyc")
+    rc, data, _ = run_defs(tmp_path, parent)
+    assert rc == 1 and data["pass"] is False, data
+    assert any("cycle" in i["message"] for i in data["issues"]), data
+
+
 # --- LOOP ERGONOMICS: until / check / max_parallel validation ---
 
 LOOP_WHILE = """\

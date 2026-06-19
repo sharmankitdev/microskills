@@ -9,5 +9,8 @@
     "provision": "ee0de1cc397a7f69912e7ea8c6cb2d94bd3765ace9dff7823c50de0d18af7fca",
     "report": "7cf991c528565fcb3d1d414e0e7cec464637e412eec7e3bcc9c75a753a64b25b"
   },
-  "profile_used": "base"
+  "profile_used": "base",
+  "segment_digests": {
+    "seg-1.js": "b4b17bf39084c0b7a6061f69c9c5efe06d9ddd46766ef6699e10ad95d7df8442"
+  }
 }

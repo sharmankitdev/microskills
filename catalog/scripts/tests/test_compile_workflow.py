@@ -724,6 +724,54 @@ def test_depth_one_nesting_still_compiles(tmp_path):
     assert data["checkpoints"] == 1
 
 
+# A profile-added grandchild workflow: node is INVISIBLE to a raw child read; the
+# depth/cycle walk now resolves the child through _profile_merged_child_doc, so a
+# grandchild added by EITHER the parent node's customize.profile OR the child's
+# OWN base.profile.default surfaces at compile (not only validate --defs-root).
+
+def test_depth_two_via_customize_profile_dies_in_compile(tmp_path):
+    _nesting_def(tmp_path, "grand-flow", "",
+                 "  - id: g\n    agent: ag\n    prompt: leaf work\n")
+    _nesting_def(tmp_path, "child-flow", "grand-flow",
+                 "  - id: c\n    agent: ag\n    prompt: leaf work\n")
+    child = tmp_path / "child-flow"
+    (child / "profiles" / "withgc.yaml").write_text(
+        "version: 1\nnodes:\n  add:\n    - id: deep\n"
+        "      workflow: grand-flow\n      inputs: {}\n")
+    _nesting_def(tmp_path, "parent-flow", "child-flow",
+                 "  - id: build\n    workflow: child-flow\n"
+                 "    customize: {profile: withgc}\n    inputs: {}\n")
+    rc, data, out, err = run(tmp_path, "parent-flow")
+    assert rc == 1, out + err
+    assert "depth" in json.dumps(data), data
+    compiled = tmp_path / "parent-flow" / ".compiled"
+    assert not list(compiled.glob("seg-*.js")) if compiled.exists() else True
+
+
+def test_depth_two_via_child_default_profile_dies_in_compile(tmp_path):
+    # No customize.profile on the parent node — the child's OWN base.profile.default
+    # selects the grandchild-adding profile (mirrors compile's root resolution).
+    _nesting_def(tmp_path, "grand-flow", "",
+                 "  - id: g\n    agent: ag\n    prompt: leaf work\n")
+    child = make_flow(tmp_path, "child-flow", """\
+version: 1
+name: child-flow
+imports: [grand-flow]
+nodes:
+  - id: c
+    agent: ag
+    prompt: leaf work
+""", base="version: 1\nprofile:\n  default: withgc\n")
+    (child / "profiles" / "withgc.yaml").write_text(
+        "version: 1\nnodes:\n  add:\n    - id: deep\n"
+        "      workflow: grand-flow\n      inputs: {}\n")
+    _nesting_def(tmp_path, "parent-flow", "child-flow",
+                 "  - id: build\n    workflow: child-flow\n    inputs: {}\n")
+    rc, data, out, err = run(tmp_path, "parent-flow")
+    assert rc == 1, out + err
+    assert "depth" in json.dumps(data), data
+
+
 # --- Reserved wf_ node-id prefix (workflow-input args namespace) ---
 
 WF_PREFIX = """\
@@ -2746,6 +2794,163 @@ def test_lock_is_mutually_exclusive_with_plan_and_check(tmp_path):
     assert rc2 == 1
 
 
+# --- C2: max_parallel folded into the per-node SEMANTIC fingerprint -----------
+# max_parallel toggles parallelChunked vs the unbounded parallel() — a change
+# that lives ONLY in seg JS bytes (the manifest dict never covers it). Folding it
+# into the node fingerprint makes adopting/changing a parallelism bound
+# hash-visible and --check-caught, exactly like retry / spill_outputs.
+
+
+def test_max_parallel_folds_into_fingerprint_and_manifest_hash(tmp_path):
+    # (C2) Adopting max_parallel on a for_each node moves BOTH that node's
+    # fingerprint AND manifest_hash; --check vs the pre-adoption lock fails naming
+    # the node, and re-locking accepts the new closure.
+    d = make_flow(tmp_path, "fe-flow", FE_PLAIN)
+    rc1, d1, *_ = run(tmp_path, "fe-flow", "--lock")
+    assert rc1 == 0, d1
+    lock1 = json.loads((d / "closure.lock.json").read_text())
+    # Same partition/needs/produces; only the emitted fan-out form changes.
+    (d / "WORKFLOW.yaml").write_text(FE_MAX_PARALLEL)
+    rc2, d2, *_ = run(tmp_path, "fe-flow", "--check")
+    assert rc2 == 1
+    assert d2["drift"]["nodes"]["changed"] == ["scan"]   # fingerprint moved, node named
+    assert "manifest_hash" in d2["drift"]                # and the folded hash moved
+    rc3, d3, *_ = run(tmp_path, "fe-flow", "--lock")
+    assert rc3 == 0
+    lock2 = json.loads((d / "closure.lock.json").read_text())
+    assert lock2["node_fingerprints"]["scan"] != lock1["node_fingerprints"]["scan"]
+    assert lock2["manifest_hash"] != lock1["manifest_hash"]
+    rc4, d4, *_ = run(tmp_path, "fe-flow", "--check")
+    assert rc4 == 0, d4                                   # re-lock accepts the closure
+
+
+def test_max_parallel_fingerprint_fold_is_gated_on_for_each(tmp_path):
+    # (C2 no-op guard) The fold is gated on for_each + only-when-present: an
+    # unbounded for_each node carries NO max_parallel key in its fingerprint (so
+    # existing locks stay byte-stable), a bounded one carries the K, and a
+    # max_parallel on a NON-for_each node is rejected before fingerprinting ever
+    # runs (no-op by rejection — it can never reach the fold).
+    make_flow(tmp_path, "fe-flow", FE_PLAIN)
+    rc1, d1, *_ = run(tmp_path, "fe-flow", "--explain")
+    assert rc1 == 0, d1
+    fp_plain = {f["node"]: f["fingerprint"] for f in d1["fingerprints"]}["scan"]
+    assert "max_parallel" not in fp_plain                # unset → never folded
+    make_flow(tmp_path / "mp", "fe-flow", FE_MAX_PARALLEL)
+    rc2, d2, *_ = run(tmp_path / "mp", "fe-flow", "--explain")
+    assert rc2 == 0, d2
+    fp_mp = {f["node"]: f["fingerprint"] for f in d2["fingerprints"]}["scan"]
+    assert fp_mp["max_parallel"] == 2                    # set on a fan-out → folded
+    bad = """\
+version: 1
+name: bad-mp
+nodes:
+  - id: a
+    agent: ag
+    max_parallel: 2
+    prompt: do a
+"""
+    make_flow(tmp_path / "bad", "bad-mp", bad)
+    rc3, d3, *_ = run(tmp_path / "bad", "bad-mp")
+    assert rc3 == 1
+    assert "max_parallel is only valid on a for_each node" in d3["error"]
+
+
+# --- C3: segment_digests — a SEPARATE drift axis, never folded into the hash ---
+# Per-segment emitted-bytes digests catch a codegen-only change (same semantics,
+# different JS) that manifest_hash deliberately cannot see — so resume survives a
+# codegen tweak while --check still trips and names the segment.
+
+
+def test_lock_records_segment_digests(tmp_path):
+    # (C3) --lock records a per-segment emitted-bytes digest map; each digest is
+    # the sha256 of the actual emitted seg file (--lock writes .compiled too).
+    d = make_flow(tmp_path, "gated-flow",
+                  GATED.replace("name: linear-flow", "name: gated-flow"))
+    rc, data, *_ = run(tmp_path, "gated-flow", "--lock")
+    assert rc == 0, data
+    lock = json.loads((d / "closure.lock.json").read_text())
+    assert set(lock["segment_digests"]) == {"seg-1.js", "seg-2.js"}
+    for fname, digest in lock["segment_digests"].items():
+        on_disk = (d / ".compiled" / fname).read_bytes()
+        assert digest == hashlib.sha256(on_disk).hexdigest()
+
+
+def test_check_detects_segment_codegen_drift_and_names_segment(tmp_path):
+    # (C3) A codegen-only delta (semantics held, emitted seg bytes changed) moves
+    # a segment digest while manifest_hash and node fingerprints hold — simulated
+    # by mutating ONLY the committed lock's segment_digests entry. --check trips on
+    # the segment axis, names the drifted segment, and leaves manifest_hash and
+    # nodes OUT of the drift report.
+    d = make_flow(tmp_path, "gated-flow",
+                  GATED.replace("name: linear-flow", "name: gated-flow"))
+    rc, *_ = run(tmp_path, "gated-flow", "--lock")
+    assert rc == 0
+    lock = json.loads((d / "closure.lock.json").read_text())
+    lock["segment_digests"]["seg-1.js"] = "0" * 64       # stale codegen baseline
+    (d / "closure.lock.json").write_text(
+        json.dumps(lock, indent=2, sort_keys=True) + "\n")
+    rc2, data2, *_ = run(tmp_path, "gated-flow", "--check")
+    assert rc2 == 1
+    assert data2["drift"]["segments"]["changed"] == ["seg-1.js"]  # only the drifted one
+    assert "manifest_hash" not in data2["drift"]                  # semantics held
+    assert "nodes" not in data2["drift"]                          # fingerprints held
+
+
+def test_segment_digest_diff_does_not_move_manifest_hash(tmp_path):
+    # (C3 resume-safety) manifest_hash MUST stay byte-stable across a codegen-only
+    # (segment-digest-only) diff — it gates dispatcher resume, so a seg digest is
+    # deliberately kept OUT of it. A plain recompile recomputes the SAME hash the
+    # lock pinned regardless of the lock's segment_digests, and --check attributes
+    # a digest-only delta to the segment axis, never to manifest_hash.
+    d = make_flow(tmp_path, "gated-flow",
+                  GATED.replace("name: linear-flow", "name: gated-flow"))
+    rc, data, *_ = run(tmp_path, "gated-flow", "--lock")
+    assert rc == 0
+    pinned = data["manifest_hash"]
+    lock = json.loads((d / "closure.lock.json").read_text())
+    lock["segment_digests"]["seg-1.js"] = "f" * 64
+    (d / "closure.lock.json").write_text(
+        json.dumps(lock, indent=2, sort_keys=True) + "\n")
+    rc2, data2, *_ = run(tmp_path, "gated-flow")
+    assert rc2 == 0
+    assert data2["manifest_hash"] == pinned              # hash never feeds off the lock
+    rc3, data3, *_ = run(tmp_path, "gated-flow", "--check")
+    assert rc3 == 1
+    assert "manifest_hash" not in data3["drift"]
+    assert "segments" in data3["drift"]
+
+
+def test_segment_digests_deterministic(tmp_path):
+    # (C3 determinism) Same def compiled twice → byte-identical segment_digests
+    # (emit_segment_js is a pure function of the def + flags).
+    d = make_flow(tmp_path, "gated-flow",
+                  GATED.replace("name: linear-flow", "name: gated-flow"))
+    run(tmp_path, "gated-flow", "--lock")
+    first = json.loads((d / "closure.lock.json").read_text())["segment_digests"]
+    run(tmp_path, "gated-flow", "--lock")
+    second = json.loads((d / "closure.lock.json").read_text())["segment_digests"]
+    assert first == second
+    assert set(first) == {"seg-1.js", "seg-2.js"}
+
+
+def test_check_legacy_lock_without_segment_digests_passes(tmp_path):
+    # (C3 back-compat) A lock predating the segment_digests field (no such key)
+    # still passes --check on an unchanged def — the segment axis is skipped until
+    # the lock is regenerated, so existing committed lockfiles are not
+    # retroactively broken by the new axis.
+    d = make_flow(tmp_path, "gated-flow",
+                  GATED.replace("name: linear-flow", "name: gated-flow"))
+    rc, *_ = run(tmp_path, "gated-flow", "--lock")
+    assert rc == 0
+    lock = json.loads((d / "closure.lock.json").read_text())
+    del lock["segment_digests"]                          # simulate a pre-feature lock
+    (d / "closure.lock.json").write_text(
+        json.dumps(lock, indent=2, sort_keys=True) + "\n")
+    rc2, data2, *_ = run(tmp_path, "gated-flow", "--check")
+    assert rc2 == 0, data2
+    assert data2["check"] == "ok"
+
+
 # =============================================================================
 # 3.2 NODE-SCOPED RUN OVERRIDES — customize closed to {profile?, overrides?},
 # overrides plumbed through BOTH resolution paths, --node-override CLI twin,
@@ -4660,3 +4865,152 @@ def test_segment_node_labels_map_present(tmp_path):
     m = _manifest(tmp_path, "orch-label")
     seg = next(s for s in m["steps"] if s["kind"] == "segment")
     assert seg["node_labels"]["a"] == "A"  # humanize_id('a')
+
+
+# ===================================================== schemaless-truncation WARN
+# A when-less BACKGROUND producer that is CONSUMED DOWNSTREAM but has NO effective
+# output_schema (neither inline nor a resolved microskill _exec_schema) cannot
+# fire the native args-truncation signature — a silently-truncated null is
+# indistinguishable from a real null. compile-workflow WARNs (stderr only, never
+# the emitted bytes). Exempt: a declared output_schema, a `when` guard, a node
+# nobody consumes, and an orchestrator-classified node.
+
+TRUNC_WARN_WF = """\
+version: 1
+name: trunc-warn
+nodes:
+  - id: producer
+    agent: ag
+    prompt: produce
+  - id: consumer
+    agent: ag
+    depends_on: [producer]
+    prompt: use ${producer.output.x}
+"""
+
+
+def test_schemaless_bg_producer_consumed_downstream_warns(tmp_path):
+    d = make_flow(tmp_path, "trunc-warn", TRUNC_WARN_WF)
+    rc, data, out, err = run(tmp_path, "trunc-warn")
+    assert rc == 0, err
+    assert "truncation" in err          # the warning fired
+    assert "node 'producer'" in err     # names the offending producer
+    assert "consumer" in err            # names the downstream consumer
+    assert "output_schema" in err       # suggests the remedy
+
+
+def test_schemaless_warn_never_touches_emitted_bytes(tmp_path):
+    # stderr only: the warning text appears in neither the manifest nor the
+    # stdout summary, and a second compile is byte-identical (determinism kept).
+    d = make_flow(tmp_path, "trunc-warn", TRUNC_WARN_WF)
+    rc, data, out, err = run(tmp_path, "trunc-warn")
+    assert rc == 0 and "truncation" in err
+    man = (d / ".compiled" / "manifest.json").read_text()
+    assert "truncation" not in man      # never in the emitted bytes
+    assert "truncation" not in out      # never in the stdout summary
+    first = {p.name: p.read_text() for p in (d / ".compiled").iterdir()}
+    run(tmp_path, "trunc-warn")
+    second = {p.name: p.read_text() for p in (d / ".compiled").iterdir()}
+    assert first == second
+
+
+TRUNC_SCHEMA_WF = """\
+version: 1
+name: trunc-schema
+nodes:
+  - id: producer
+    agent: ag
+    prompt: produce
+    output_schema:
+      type: object
+      required: [x]
+      properties:
+        x: { type: string }
+  - id: consumer
+    agent: ag
+    depends_on: [producer]
+    prompt: use ${producer.output.x}
+"""
+
+
+def test_no_warn_when_producer_declares_output_schema(tmp_path):
+    make_flow(tmp_path, "trunc-schema", TRUNC_SCHEMA_WF)
+    rc, data, out, err = run(tmp_path, "trunc-schema")
+    assert rc == 0, err
+    assert "truncation" not in err      # an output_schema restores detection
+
+
+TRUNC_WHEN_WF = """\
+version: 1
+name: trunc-when
+nodes:
+  - id: src
+    agent: ag
+    prompt: src
+    output_schema:
+      type: object
+      required: [ok]
+      properties:
+        ok: { type: boolean }
+  - id: producer
+    agent: ag
+    when: ${src.output.ok}
+    depends_on: [src]
+    prompt: produce
+  - id: consumer
+    agent: ag
+    depends_on: [producer]
+    prompt: use ${producer.output.x}
+"""
+
+
+def test_no_warn_when_producer_has_when_guard(tmp_path):
+    # A `when`-guarded node already documents a may-not-fire contract -> exempt.
+    # (src carries a schema WITH required props so it is not itself an offender.)
+    make_flow(tmp_path, "trunc-when", TRUNC_WHEN_WF)
+    rc, data, out, err = run(tmp_path, "trunc-when")
+    assert rc == 0, err
+    assert "truncation" not in err
+
+
+TRUNC_NOREF_WF = """\
+version: 1
+name: trunc-noref
+nodes:
+  - id: producer
+    agent: ag
+    prompt: produce
+  - id: other
+    agent: ag
+    prompt: other
+"""
+
+
+def test_no_warn_when_producer_not_consumed_downstream(tmp_path):
+    make_flow(tmp_path, "trunc-noref", TRUNC_NOREF_WF)
+    rc, data, out, err = run(tmp_path, "trunc-noref")
+    assert rc == 0, err
+    assert "truncation" not in err      # nobody reads producer's output
+
+
+TRUNC_ORCH_WF = """\
+version: 1
+name: trunc-orch
+nodes:
+  - id: producer
+    delegation: orchestrator
+    prompt: produce
+  - id: consumer
+    agent: ag
+    depends_on: [producer]
+    prompt: use ${producer.output.x}
+"""
+
+
+def test_no_warn_for_orchestrator_checkpoint_producer(tmp_path):
+    # The signature is a BACKGROUND-segment concern; an orchestrator checkpoint
+    # threads its result through the dispatcher, not the native args boundary.
+    make_flow(tmp_path, "trunc-orch", TRUNC_ORCH_WF)
+    rc, data, out, err = run(tmp_path, "trunc-orch")
+    assert rc == 0, err
+    assert "truncation" not in err

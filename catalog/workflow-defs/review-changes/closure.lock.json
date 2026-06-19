@@ -1,5 +1,5 @@
 {
-  "manifest_hash": "8894e2faeccb14210536b4286b8164ab4e31fb0cda450e6683e2cf71f2ee5fc0",
+  "manifest_hash": "b61395b5296b4d24ebeac909b72894a606d8988344b02eca6bf5fb8c6321f220",
   "name": "review-changes",
   "node_fingerprints": {
     "collect": "f4340f64e5f733e1366d6cf65c2fc9a5d227d2b8daeaeba383f182789b373492",
@@ -8,7 +8,10 @@
     "review_security": "0d184281e93535574f3da59659157ff1159f5e0395e02fe1c972717a9fbeb045",
     "summarize": "d5d4692a9888e0842954b92ff7ec303b7948ca3420824e8d4e8c8bf525743687",
     "synthesize": "d8d945c6444451bff131b4f725112757486fa6ec3ca932a74f89caec418b3673",
-    "verify": "4e3c9eef3ad6acd92ab92e9ae7b7291bd3f6f79d5d3f8ea20682866a7ae92218"
+    "verify": "20a5c64272b282e10663d47675c605c05b471b4bf5205adbb7c0a153beb43327"
   },
-  "profile_used": "base"
+  "profile_used": "base",
+  "segment_digests": {
+    "seg-1.js": "d10c5b751aaa54c215b87d68d8369af9693007a1be4b9f7a49be47483f693cbd"
+  }
 }

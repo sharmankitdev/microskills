@@ -6,5 +6,8 @@
     "finalize": "051449eaac1a313607a1d402adfbcb87c1bd106bd18e003c37663ac2a2045686",
     "implement": "ac75a98b031bc89753954aaa15c3c0e2beb50c40efa70b103a3f0a3dd53e5c87"
   },
-  "profile_used": "base"
+  "profile_used": "base",
+  "segment_digests": {
+    "seg-1.js": "af05ac6106d192d338624ba017a00b734834b3f128821c0308dcb6b81883c3f5"
+  }
 }

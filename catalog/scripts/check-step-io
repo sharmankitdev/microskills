@@ -223,10 +223,14 @@ def main():
         die(f"--step {args.step} out of range (manifest has {len(steps)} steps)")
     m_hash = manifest.get("manifest_hash")
     s_hash = run_state.get("manifest_hash")
-    if m_hash and s_hash and m_hash != s_hash:
-        die("run-state manifest_hash does not match the manifest — this "
-            "run-state belongs to a different compile; recompile/resume "
-            "handling must reconcile them before checking")
+    if m_hash:
+        if not s_hash:
+            die("run-state manifest_hash is absent but the manifest carries "
+                "one — this run-state is from an incompatible/older compile; "
+                "recompile or restart")
+        if m_hash != s_hash:
+            die("run-state manifest_hash does not match the manifest — "
+                "recompile/resume must reconcile them")
 
     step = steps[args.step]
     io = step.get("io") or {}

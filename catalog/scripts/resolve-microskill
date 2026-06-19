@@ -191,11 +191,20 @@ def deep_merge(base, overlay, path=""):
                     f"cannot merge dict with non-verb keys onto list at '{cur_path}': "
                     f"{sorted(v.keys())} (allowed verbs: {sorted(LIST_VERBS)})"
                 )
-            if cur_path == "output_schema":
+            if k == "output_schema" and path in ("", "nodes"):
                 # output_schema is a contract, not a knob: an overlay replaces it
                 # wholesale (never a recursive properties-merge that would let base
                 # fields leak into a profile's intended shape). Absence in the
                 # overlay leaves base's output_schema untouched (the fallback).
+                # Two contract contexts: a config's TOP-LEVEL output_schema (parent
+                # path "") and a NODE's output_schema (nodes.patch[].output_schema,
+                # which recurses with parent path "nodes" — the latter was missed by
+                # the old top-level-exact `cur_path == "output_schema"` guard, so a
+                # node overlay wrongly deep-merged its schema fragment). The parent
+                # restriction is the WIDENING GUARD: a key literally named
+                # output_schema nested anywhere else (inside a vars blob, or a
+                # JSON-schema body's properties dict) is COINCIDENTAL, not a
+                # contract, and must deep-merge normally — never wholesale-replace.
                 result[k] = v
             elif isinstance(result[k], dict) and isinstance(v, dict):
                 result[k] = deep_merge(result[k], v, cur_path)
