@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""
+build-catalog-index — deterministic catalog enumeration for cross-artifact review
+grounding (§8 step 5 / spec §11 D2).
+
+Usage:
+  build-catalog-index --catalog-root <dir> [--harness <harness.yaml>] --out <path>
+
+Writes <out>: a byte-deterministic JSON array of component entries
+  {name, kind, purpose, consumers[], line}
+sorted by (kind, name, line); consumers[] sorted. The cross-artifact review
+dimensions (duplicate-capability / naming-collision / reverse-consumer) and the
+cross-artifact verify-finding seat read this SAME frozen file, so the enumeration
+is pure-script (no LLM) and reproducible.
+
+Agents are enumerated (kind=agent) for naming-collision grounding but carry NO
+consumer edges in v1: they are consumed via `runtime.agent` in microskill
+profiles, not via use:/workflow:/subgraph: DAG references, so reverse-consumer
+does not track agent consumers yet (documented v1 scope).
+
+Output (stdout): JSON {index_path, component_count, consumer_map_count}.
+Exit codes: 0 ok; 2 environment error (missing dep / catalog root not a dir /
+unreadable or malformed input file — emitted as a JSON {error} on stderr).
+"""
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+
+try:
+    import yaml
+except ImportError:
+    print(json.dumps({"error": "PyYAML not installed. pip3 install pyyaml"}), file=sys.stderr)
+    sys.exit(2)
+
+FM_RE = re.compile(r"^---\n(.*?)\n---", re.DOTALL)
+
+
+class BuildError(Exception):
+    """An unreadable or malformed input file — surfaced as a JSON {error} +
+    exit 2, never a raw traceback (matches the sibling validator scripts)."""
+
+
+def _read(path):
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        raise BuildError(f"cannot read {path}: {e}")
+
+
+def _safe_yaml(text, path):
+    try:
+        return yaml.safe_load(text) or {}
+    except yaml.YAMLError as e:
+        raise BuildError(f"invalid YAML in {path}: {e}")
+
+
+def _collapse(s):
+    return re.sub(r"\s+", " ", str(s)).strip()
+
+
+def _name_line(text, key="name:"):
+    for i, ln in enumerate(text.splitlines(), 1):
+        if ln.strip().startswith(key):
+            return i
+    return 1
+
+
+def _frontmatter(path):
+    text = _read(path)
+    m = FM_RE.match(text)
+    data = _safe_yaml(m.group(1), path) if m else {}
+    return (data if isinstance(data, dict) else {}), _name_line(text)
+
+
+def _yaml_top(path):
+    text = _read(path)
+    data = _safe_yaml(text, path)
+    return (data if isinstance(data, dict) else {}), _name_line(text)
+
+
+def _entry(name, kind, purpose, line):
+    return {"name": name, "kind": kind, "purpose": _collapse(purpose), "consumers": [], "line": line}
+
+
+def _walk_refs(node, out):
+    """Collect every use:/workflow:/subgraph: string VALUE reachable in a parsed
+    WORKFLOW/SUBGRAPH doc (the outgoing reference edges)."""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k in ("use", "workflow", "subgraph") and isinstance(v, str):
+                out.add(v)
+            else:
+                _walk_refs(v, out)
+    elif isinstance(node, list):
+        for v in node:
+            _walk_refs(v, out)
+
+
+def collect_entries(catalog_root, harness_path):
+    cr = Path(catalog_root)
+    if not cr.is_dir():
+        return None
+    entries = []       # list (NOT name-keyed: duplicate names are exactly what
+                       # naming-collision must detect — never dedupe them away)
+    ref_edges = []     # (consumed_name, consumer_name)
+
+    def add_md(path, kind):
+        data, line = _frontmatter(path)
+        entries.append(_entry(data.get("name") or path.parent.name, kind,
+                              data.get("description", ""), line))
+
+    def add_yaml(path, kind):
+        data, line = _yaml_top(path)
+        name = data.get("name") or path.parent.name
+        entries.append(_entry(name, kind, data.get("description", ""), line))
+        refs = set()
+        _walk_refs(data, refs)
+        for r in refs:
+            ref_edges.append((r, name))
+
+    for p in sorted(cr.glob("microskills/*/MICROSKILL.md")):
+        add_md(p, "microskill")
+    for p in sorted(cr.glob("workflow-defs/*/WORKFLOW.yaml")):
+        add_yaml(p, "workflow")
+    for p in sorted(cr.glob("workflow-defs/_subgraphs/*/SUBGRAPH.yaml")):
+        add_yaml(p, "subgraph")
+    for p in sorted(cr.glob("agents/*/AGENT.md")):
+        add_md(p, "agent")
+
+    # source:custom components from harness.yaml — completes the DEPLOYED namespace
+    # (custom components live under <harness.yaml dir>/<kind-dir>/<name>/).
+    if harness_path:
+        hp = Path(harness_path)
+        if hp.is_file():
+            hroot = hp.parent
+            hdata = _safe_yaml(_read(hp), hp)
+            # harness.yaml is a CLOSED grammar (harness-schema.json): the only
+            # component lists are `microskills` and `workflows` — there is no
+            # agents list. The MANIFEST key differs from the on-disk dir name for
+            # workflows (key `workflows` -> dir `workflow-defs`), so keep them
+            # decoupled: manifest_key -> (kind, on-disk dir, filename).
+            kind_dir = {"microskills": ("microskill", "microskills", "MICROSKILL.md"),
+                        "workflows": ("workflow", "workflow-defs", "WORKFLOW.yaml")}
+            for manifest_key, (kind, dir_name, fname) in kind_dir.items():
+                for item in (hdata.get(manifest_key) or []):
+                    if not (isinstance(item, dict) and item.get("source") == "custom"):
+                        continue
+                    cpath = hroot / dir_name / str(item.get("name")) / fname
+                    if cpath.is_file():
+                        (add_md if fname.endswith(".md") else add_yaml)(cpath, kind)
+
+    # attach consumers by name (a duplicate name attaches to every matching entry)
+    by_name = {}
+    for e in entries:
+        by_name.setdefault(e["name"], []).append(e)
+    for consumed, consumer in ref_edges:
+        for e in by_name.get(consumed, []):
+            if consumer not in e["consumers"]:
+                e["consumers"].append(consumer)
+    for e in entries:
+        e["consumers"].sort()
+
+    ordered = sorted(entries, key=lambda e: (e["kind"], e["name"], e["line"]))
+    consumer_map_count = sum(len(e["consumers"]) for e in ordered)
+    return ordered, consumer_map_count
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--catalog-root", required=True)
+    ap.add_argument("--harness", default=None)
+    ap.add_argument("--out", required=True)
+    args = ap.parse_args()
+
+    try:
+        result = collect_entries(args.catalog_root, args.harness)
+    except BuildError as e:
+        print(json.dumps({"error": str(e)}), file=sys.stderr)
+        sys.exit(2)
+    if result is None:
+        print(json.dumps({"error": f"catalog root not a directory: {args.catalog_root}"}),
+              file=sys.stderr)
+        sys.exit(2)
+    ordered, consumer_map_count = result
+
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    js = json.dumps(ordered, indent=2, sort_keys=True, ensure_ascii=False)
+    out.write_text(js + "\n", encoding="utf-8")
+
+    print(json.dumps({
+        "index_path": str(out),
+        "component_count": len(ordered),
+        "consumer_map_count": consumer_map_count,
+    }, indent=2))
+
+
+if __name__ == "__main__":
+    main()
