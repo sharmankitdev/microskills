@@ -2324,8 +2324,13 @@ def emit_rank_calls(seg_node_objs, seg_var_ids, declare=True, phase_line=True, i
                 node_call_js(node_by_id[nid], seg_var_ids, thunk=True)
                 for nid in layer)
             vars_js = ", ".join(jsvar(nid) for nid in layer)
-            kw = "const " if declare else ""
-            out += (f"{indent}{kw}[{vars_js}] = await parallel([\n"
+            # declare=True (non-loop): `const [` — a keyword safely begins a statement
+            # after a )-terminated line. declare=False (loop / bounded-group body): a BARE
+            # `[` reassigning pre-declared lets would be ASI-glued to the preceding
+            # )-terminated statement as a computed-member access (SyntaxError: invalid LHS).
+            # A leading `;` defeats ASI; harmless when the batch is the first body statement.
+            lead = "const " if declare else ";"
+            out += (f"{indent}{lead}[{vars_js}] = await parallel([\n"
                     f"{indent}  {thunks},\n{indent}])\n")
     return out
 

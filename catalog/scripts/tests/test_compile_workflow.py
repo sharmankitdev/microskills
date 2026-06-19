@@ -6,9 +6,13 @@ compiles the real microskill-create.
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
+
+import pytest
 
 REPO = Path(__file__).resolve().parents[3]
 SCRIPT = REPO / "catalog" / "scripts" / "compile-workflow"
@@ -34,6 +38,34 @@ def make_flow(defs_root, name, wf_yaml, base="version: 1\n"):
     (d / "WORKFLOW.yaml").write_text(wf_yaml)
     (d / "profiles" / "base.yaml").write_text(base)
     return d
+
+
+def assert_seg_parses(seg_js):
+    """REAL JS parse gate over an emitted segment (the check the substring-only
+    tests lacked — it would have caught the ASI-glued `[...] = await parallel([`
+    destructuring: `SyntaxError: Invalid left-hand side in assignment`).
+
+    A seg body has a top-level `return` AND top-level `await`, so it only parses
+    INSIDE a function: neutralize the single top-level `export` (illegal in a
+    function) and wrap the body in an async function, then `node --check`. Free
+    globals (agent/parallel/phase) are fine — `--check` validates syntax, not
+    bindings. Skips when node is unavailable. Proven to REJECT the pre-fix ASI
+    shape and ACCEPT the fixed shape (both directions verified)."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node not on PATH")
+    body = seg_js.replace("export const meta", "const meta", 1)
+    wrapped = "(async function(args){\n" + body + "\n})\n"
+    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+        f.write(wrapped)
+        path = f.name
+    try:
+        p = subprocess.run([node, "--check", path], capture_output=True, text=True)
+    finally:
+        os.unlink(path)
+    assert p.returncode == 0, (
+        "emitted segment failed `node --check` (syntax error in compiled JS):\n"
+        + p.stderr)
 
 
 LINEAR = """\
@@ -5962,9 +5994,28 @@ def test_parallel_loop_body_emits_batch(tmp_path):
     assert "n_col = await runAgent" in seg2
 
 
-def test_serial_loop_body_byte_identical(tmp_path):
-    # PLAIN_LOOP's body [impl, ev] is two single-node ranks (ev depends on impl).
-    # After the refactor its seg-2.js must be byte-for-byte what it is today.
+def test_parallel_loop_body_parses(tmp_path):
+    # THE ASI BLOCKER GATE. PARALLEL_LOOP's body emits a SINGLE-node rank (impl)
+    # immediately BEFORE a MULTI-node rank ([r1, r2]) — the exact trigger: a bare
+    # `[n_r1, n_r2] = await parallel([` reassignment glued onto the preceding
+    # `)`-terminated `n_impl = await runAgent(...)` parses as a computed-member
+    # access → `SyntaxError: Invalid left-hand side in assignment`, failing the whole
+    # segment to load. The leading `;` ASI guard defeats it. A REAL `node --check`
+    # (not a substring assert) is what catches this — proven to REJECT the pre-fix
+    # emit and ACCEPT the fixed emit (see assert_seg_parses).
+    d = make_flow(tmp_path, "pal-flow", PARALLEL_LOOP)
+    rc, data, out, err = run(tmp_path, "pal-flow")
+    assert rc == 0, err
+    seg2 = (d / ".compiled" / "seg-2.js").read_text()
+    assert_seg_parses(seg2)
+
+
+def test_serial_loop_body_shape_unchanged(tmp_path):
+    # Shape check (NOT a byte-identity proof — it asserts only the reassignment-form
+    # SHAPE: no parallel batch, no const, reassignment of pre-declared lets). The
+    # hard byte-for-byte proof is the closure-lock / catalog `--check` CI gate, which
+    # fails if any pure-serial-body loop's emitted bytes move. Both are deliberate:
+    # this localizes a regression to one fixture; `--check` proves it catalog-wide.
     d = make_flow(tmp_path, "pl-flow", PLAIN_LOOP)
     rc, data, out, err = run(tmp_path, "pl-flow")
     assert rc == 0, err
@@ -5974,6 +6025,7 @@ def test_serial_loop_body_byte_identical(tmp_path):
     assert "n_impl = await runAgent" in seg2
     assert "n_ev = await runAgent" in seg2
     assert "const n_impl" not in seg2   # loop vars are pre-declared lets, reassigned
+    assert_seg_parses(seg2)             # serial body must also be valid JS
 
 
 # A for_each node in an UNGUARDED loop body emits its fan-out as its own rank inside
@@ -6029,6 +6081,7 @@ def test_for_each_in_loop_body_emits_parallel_fanout(tmp_path):
     fan_idx = seg2.index(".map((f) => () => runAgent")
     assert do_idx < fan_idx < while_idx        # fan-out is INSIDE the do/while
     assert "n_verify = await parallel((" in seg2
+    assert_seg_parses(seg2)                     # the emitted fan-out must be valid JS
 
 
 # A BOUNDED subgraph whose group has TWO mutually-independent siblings (reva, revb
@@ -6082,3 +6135,4 @@ def test_bounded_group_parallelizes_independent_siblings(tmp_path):
     assert do_idx < batch_idx < while_idx          # the batch is INSIDE the group do/while
     assert "n_rev__synthesize = await runAgent" in seg   # exit stays a serial later rank
     assert "const n_rev__reva" not in seg          # reassignment, pre-declared lets
+    assert_seg_parses(seg)                         # the bounded-group batch must be valid JS
