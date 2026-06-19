@@ -930,6 +930,61 @@ def workflow_node_targets(doc):
     return out
 
 
+def _profile_merged_child_doc(defs_root, name, parent_profile):
+    """RESOLVED child read for the nested depth/cycle walk: load_child_doc's RAW
+    doc, then LAYER the child's own profiles/base.yaml and the parent node's
+    customize.profile overlay on top (mirrors validate-workflow's child_required
+    + runtime profile resolution). A profile that ADDS a workflow: node
+    (nodes.add) or an import is therefore visible to the depth/cycle governance —
+    the un-profiled raw graph would miss it and compute DEPTH=1/cycle wrong.
+
+    Does NOT change load_child_doc's pure RAW contract (validate-workflow, which
+    shares load_child_doc, depends on the un-merged read for its required-inputs /
+    wire:auto paths): this is a strict layer on top, used only by the walk below.
+
+    `version` is popped from each overlay (symmetric with compile's own
+    base/profile merge); missing/unparseable overlay files are tolerated and
+    leave the base read in place. The EFFECTIVE profile mirrors compile's root
+    resolution (`args.profile or base.profile.default`): the customize.profile on
+    the workflow: node that crosses INTO this child if set, ELSE the child's own
+    `base.profile.default` — so a grandchild a child's DEFAULT profile adds is
+    still visible to the depth/cycle governance. It is threaded ONLY at this
+    direct parent->child boundary and is NOT propagated to the child's own
+    grandchild lookups (a parent customizes its direct child, not its
+    descendants; each deeper boundary supplies its own customize.profile, read
+    off that level's node). Returns (doc, error) exactly like load_child_doc."""
+    doc, err = load_child_doc(defs_root, name)
+    if doc is None:
+        return None, err
+    merged_child = doc
+    base_p = Path(defs_root) / name / "profiles" / "base.yaml"
+    if base_p.exists():
+        try:
+            b = yaml.safe_load(base_p.read_text()) or {}
+            b.pop("version", None)
+            merged_child = deep_merge(merged_child, b)
+        except (yaml.YAMLError, ValueError):
+            merged_child = doc
+    # Effective profile = explicit boundary profile ELSE the child's own
+    # base.profile.default (mirrors the root resolution at the main merge).
+    effective = parent_profile if (isinstance(parent_profile, str)
+                                   and parent_profile not in ("", "base")) else None
+    if effective is None:
+        default_profile = (merged_child.get("profile") or {}).get("default")
+        if isinstance(default_profile, str) and default_profile not in ("", "base"):
+            effective = default_profile
+    if effective:
+        prof_p = Path(defs_root) / name / "profiles" / f"{effective}.yaml"
+        if prof_p.exists():
+            try:
+                o = yaml.safe_load(prof_p.read_text()) or {}
+                o.pop("version", None)  # symmetric with base + compile's merge
+                merged_child = deep_merge(merged_child, o)
+            except (yaml.YAMLError, ValueError):
+                pass
+    return merged_child, None
+
+
 def nested_workflow_depth_cycle_errors(defs_root, merged):
     """SHARED nested-workflow static governance used by BOTH compile (hard die
     pre-emit) and validate (--defs-root blocks) — the dispatcher's bounded-
@@ -955,18 +1010,36 @@ def nested_workflow_depth_cycle_errors(defs_root, merged):
         return errors
     imports_set = {imp for imp in (merged.get("imports") or [])
                    if isinstance(imp, str)}
+    # Cache the RESOLVED child doc per (name, boundary-profile): the merged graph
+    # depends on the profile threaded across the boundary (a profile may add a
+    # grandchild workflow: node or an import), so name alone is not the key.
     child_cache = {}
 
-    def child_doc(name):
-        if name not in child_cache:
-            child_cache[name] = load_child_doc(defs_root, name)
-        return child_cache[name]
+    def _node_profile(n):
+        return (n.get("customize") or {}).get("profile")
+
+    def child_doc(name, parent_profile):
+        key = (name, parent_profile)
+        if key not in child_cache:
+            child_cache[key] = _profile_merged_child_doc(
+                defs_root, name, parent_profile)
+        return child_cache[key]
+
+    def wf_node_profiles(doc):
+        """(target, boundary-profile) pairs for a doc's workflow: nodes, threading
+        each node's OWN customize.profile (the direct-boundary profile — never an
+        inherited ancestor profile)."""
+        out = []
+        for nn in (doc.get("nodes") or []):
+            if isinstance(nn, dict) and nn.get("workflow"):
+                out.append((nn["workflow"], _node_profile(nn)))
+        return out
 
     for nid, n in wf_nodes:
         target = n["workflow"]
         if target not in imports_set:
             continue
-        doc, _err = child_doc(target)
+        doc, _err = child_doc(target, _node_profile(n))
         if doc is None:
             continue
         gtargets = workflow_node_targets(doc)
@@ -987,7 +1060,7 @@ def nested_workflow_depth_cycle_errors(defs_root, merged):
     def ivisit(name, doc, stack):
         icolor[name] = IGRAY
         allow = doc_imports(doc)
-        for tgt in workflow_node_targets(doc):
+        for tgt, tgt_prof in wf_node_profiles(doc):
             if tgt not in allow:
                 continue  # un-allowlisted: validate's own block, never walked
             if icolor.get(tgt) == IGRAY:
@@ -996,7 +1069,7 @@ def nested_workflow_depth_cycle_errors(defs_root, merged):
                     f"workflow import cycle: {' -> '.join(stack + [name, tgt])}"))
                 continue
             if icolor.get(tgt, IWHITE) == IWHITE:
-                cdoc, _ = child_doc(tgt)
+                cdoc, _ = child_doc(tgt, tgt_prof)
                 if cdoc is not None:
                     ivisit(tgt, cdoc, stack + [name])
         icolor[name] = IBLACK
@@ -2381,6 +2454,50 @@ def main():
                                 f"path; make sure this consumer expects the "
                                 f"value\n")
 
+    # --- WARN: producer whose schema can't drive truncation detection ---
+    # The native Workflow args boundary can silently TRUNCATE a node's output to
+    # null; check-step-io's truncation/fabrication signature only fires for an
+    # UNGUARDED, NON-fan_out node whose effective schema declares non-empty
+    # `required` props (has_required_props at check-step-io:163-164). So an
+    # unguarded BACKGROUND producer that is CONSUMED DOWNSTREAM and whose
+    # effective schema (inline output_schema, else the microskill schema resolved
+    # onto _exec_schema by classify) lacks `required` props — no schema at all, or
+    # a schema with no required fields — cannot trip that signature: a
+    # silently-truncated null is indistinguishable from a genuine null. Warn
+    # deterministically (stderr only, never the emitted bytes); declaring an
+    # output_schema WITH required fields (or guarding the node with a `when`)
+    # restores detection. fan_out (for_each) producers are EXEMPT — a truncated
+    # null on a fan_out node is always caught as a schema_violation (it isn't an
+    # array), regardless of schema (check-step-io:174-179). Producer->consumers
+    # map reuses the SHARED scoped_ref_ids helper (unions NODE_OUTPUT_RE +
+    # NODE_ITEMS_RE), walked in topo `order` so map and warnings are
+    # deterministically ordered.
+    def _has_required_props(s):
+        # Mirror of check-step-io.has_required_props (kept in lockstep): the
+        # truncation signature's precondition is a non-empty `required` list.
+        return isinstance(s, dict) and bool(s.get("required"))
+    trunc_consumers = {}
+    for nid in order:
+        for prod in scoped_ref_ids(node_by_id[nid]):
+            if prod in node_by_id and prod != nid:
+                trunc_consumers.setdefault(prod, []).append(nid)
+    for nid in order:
+        node = node_by_id[nid]
+        if (classes.get(nid) == "background"
+                and not node.get("when")
+                and not node.get("for_each")
+                and not _has_required_props(
+                    node.get("output_schema") or node.get("_exec_schema"))
+                and trunc_consumers.get(nid)):
+            sys.stderr.write(
+                f"warning: node '{nid}': background node has no truncation-"
+                f"detectable output_schema (none, or one without `required` "
+                f"fields) but is consumed downstream (by "
+                f"{', '.join(trunc_consumers[nid])}) — native args-truncation "
+                f"detection will NOT fire, so a silently truncated null is "
+                f"indistinguishable from a real null; declare an output_schema "
+                f"with required fields or add a `when` guard\n")
+
     # --- emit segments ---
     # ALL disk-mutating operations are guarded behind `do_write` (--plan and
     # --check both write NOTHING). Under either flag we still compute the full
@@ -2406,14 +2523,26 @@ def main():
 
     seg_index = 0
     manifest_steps = []
+    # Per-segment EMITTED-BYTES digest, keyed by seg file name. Closure-lock
+    # compares these under --check ONLY (NEVER folded into manifest_hash — see the
+    # resume-preservation note at the lock-write below): a codegen-only change
+    # (same partition/semantics, different emitted JS) leaves manifest_hash stable
+    # so dispatcher resume survives, while these digests still trip --check naming
+    # the segment. emit_segment_js is byte-deterministic, so these are reproducible.
+    segment_digests = {}
     for step in steps:
         if step["kind"] == "segment":
             seg_index += 1
             seg_nodes = [node_by_id[i] for i in step["nodes"]]
             js, needs, produces = emit_segment_js(seg_nodes, wf, loop, seg_index)
             fname = f"seg-{seg_index}.js"
+            # Hash the FULL emitted body (the meta header is reproducible — name,
+            # description, phases are pure functions of the def; no timestamp/env).
+            # Pin utf-8 on BOTH the digest and the on-disk write so the locked
+            # digest matches the written bytes regardless of the host locale.
+            segment_digests[fname] = hashlib.sha256(js.encode("utf-8")).hexdigest()
             if do_write:
-                (compiled_dir / fname).write_text(js)
+                (compiled_dir / fname).write_text(js, encoding="utf-8")
             manifest_step = {
                 "kind": "segment",
                 "index": seg_index,
@@ -2555,6 +2684,16 @@ def main():
         # name the node that adopted spill.
         if node.get("spill_outputs"):
             fp["spill_outputs"] = node.get("spill_outputs")
+        # max_parallel bounds a for_each fan-out (parallelChunked vs the unbounded
+        # parallel()) — it changes emitted seg JS bytes but is a NO-OP without a
+        # fan-out (node_call_js reads it only inside `if fe:`). Fold it in ONLY
+        # when the node ACTUALLY fans out AND sets it, so non-fan-out nodes and
+        # unbounded for_each nodes keep byte-for-byte-identical fingerprints (and
+        # the lockfiles built on them); a --check drift report can then name the
+        # node that adopted/changed a parallelism bound.
+        fe = node.get("for_each")
+        if fe and node.get("max_parallel") is not None:
+            fp["max_parallel"] = node.get("max_parallel")
         digest = hashlib.sha256(
             json.dumps(fp, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
@@ -2622,7 +2761,10 @@ def main():
     # the committed closure.lock.json IS the baseline. Hash-only by design: it
     # pins manifest_hash (which folds the per-node fingerprints, including each
     # frozen resolution's sha256) plus the per-node fingerprint digests so a
-    # --check failure can name WHICH node drifted.
+    # --check failure can name WHICH node drifted, AND a SEPARATE per-segment
+    # emitted-bytes digest map (segment_digests) — compared by --check but kept
+    # OUT of manifest_hash so a codegen-only delta names the segment without
+    # invalidating resumable run-state.
     lock_path = def_dir / "closure.lock.json"
     if args.lock:
         lock_obj = {
@@ -2630,6 +2772,11 @@ def main():
             "profile_used": profile_used,
             "manifest_hash": manifest_hash,
             "node_fingerprints": node_fingerprints,
+            # SEPARATE drift axis: per-segment emitted-bytes digests, compared by
+            # --check ONLY and deliberately kept OUT of manifest_hash so a
+            # codegen-only delta (byte change with identical semantics/partition)
+            # never invalidates resumable dispatcher run-state.
+            "segment_digests": segment_digests,
         }
         lock_path.write_text(json.dumps(lock_obj, indent=2, sort_keys=True) + "\n")
     if args.check:
@@ -2654,6 +2801,20 @@ def main():
         removed = sorted(n for n in locked_fp if n not in node_fingerprints)
         if changed or added or removed:
             drift["nodes"] = {"changed": changed, "added": added, "removed": removed}
+        # Segment emitted-bytes drift — a SEPARATE axis from manifest_hash: a
+        # codegen-only change moves a seg digest while manifest_hash holds (resume
+        # stays valid), so --check must trip on it independently and name the
+        # segment. Skipped when the lock predates the field (legacy locks carry no
+        # segment_digests key) so back-compat --check stays green until re-locked.
+        if "segment_digests" in locked:
+            locked_seg = locked.get("segment_digests") or {}
+            seg_changed = sorted(s for s in segment_digests
+                                 if s in locked_seg and locked_seg[s] != segment_digests[s])
+            seg_added = sorted(s for s in segment_digests if s not in locked_seg)
+            seg_removed = sorted(s for s in locked_seg if s not in segment_digests)
+            if seg_changed or seg_added or seg_removed:
+                drift["segments"] = {"changed": seg_changed,
+                                     "added": seg_added, "removed": seg_removed}
         if drift:
             die(f"compile closure drifted from committed {rel(lock_path)} — the "
                 f"registry or workflow def changed without re-locking; review the "

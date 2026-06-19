@@ -1348,6 +1348,59 @@ def test_deep_merge_remove_verb_and_null_delete_coexist():
     assert out["keep"] == 1
 
 
+# --- output_schema wholesale-replace: contract contexts vs coincidental keys ---
+#
+# output_schema is a CONTRACT (not a knob): an overlay replaces it wholesale so a
+# base field never leaks into a profile's intended return shape. The two contract
+# contexts are a config's TOP-LEVEL output_schema and a NODE's output_schema
+# (nodes.patch[].output_schema, which recurses with parent path == "nodes"). A key
+# literally named output_schema anywhere else — inside a vars blob, or a JSON-schema
+# body's properties dict — is a COINCIDENTAL key and must deep-merge normally.
+
+
+def test_deep_merge_top_level_output_schema_replaced_wholesale():
+    mod = load_resolver()
+    base = {"output_schema": {"required": ["a"], "properties": {"a": {"type": "string"}, "b": {"type": "string"}}}}
+    overlay = {"output_schema": {"required": ["c"], "properties": {"c": {"type": "string"}}}}
+    out = mod.deep_merge(base, overlay)
+    # overlay replaces the contract verbatim — no a/b leakage, required swapped
+    assert out["output_schema"] == {"required": ["c"], "properties": {"c": {"type": "string"}}}
+
+
+def test_deep_merge_node_output_schema_replaced_wholesale():
+    mod = load_resolver()
+    # Models a WORKFLOW profile patching a node's return contract: base node carries
+    # output_schema {a,b}; the nodes.patch overlay supplies {c}. The node's schema
+    # must equal the overlay VERBATIM (recurses at parent path "nodes").
+    base = {"nodes": [{"id": "n1", "output_schema": {"required": ["a"], "properties": {"a": {"type": "string"}, "b": {"type": "string"}}}}]}
+    overlay = {"nodes": {"patch": [{"id": "n1", "output_schema": {"required": ["c"], "properties": {"c": {"type": "string"}}}}]}}
+    out = mod.deep_merge(base, overlay)
+    node = out["nodes"][0]
+    assert node["id"] == "n1"
+    assert node["output_schema"] == {"required": ["c"], "properties": {"c": {"type": "string"}}}
+
+
+def test_deep_merge_coincidental_output_schema_property_deep_merges():
+    mod = load_resolver()
+    # WIDENING GUARD: input_schema is a JSON-schema body whose properties happen to
+    # include a field literally named output_schema. That nested key is NOT a
+    # contract — it must deep-merge (base x:1 survives), never wholesale-replace.
+    base = {"input_schema": {"properties": {"output_schema": {"type": "object", "x": 1}}}}
+    overlay = {"input_schema": {"properties": {"output_schema": {"type": "string"}}}}
+    out = mod.deep_merge(base, overlay)
+    assert out["input_schema"]["properties"]["output_schema"] == {"type": "string", "x": 1}
+
+
+def test_deep_merge_coincidental_vars_output_schema_deep_merges():
+    mod = load_resolver()
+    # WIDENING GUARD: a vars entry coincidentally named output_schema is a knob, not
+    # the contract — deep-merge so base b:2 survives the partial overlay.
+    base = {"vars": {"output_schema": {"a": 1, "b": 2}}}
+    overlay = {"vars": {"output_schema": {"a": 10}}}
+    out = mod.deep_merge(base, overlay)
+    assert out["vars"]["output_schema"] == {"a": 10, "b": 2}
+
+
 # --- Integration: verbs through the real resolver via gates.add (schema-legal) ---
 
 
