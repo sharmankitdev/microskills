@@ -6084,6 +6084,71 @@ def test_for_each_in_loop_body_emits_parallel_fanout(tmp_path):
     assert_seg_parses(seg2)                     # the emitted fan-out must be valid JS
 
 
+# A for_each node (verify) and an INDEPENDENT plain-agent node (sib) SHARE a rank in
+# an UNGUARDED loop body — both depend only on col, neither on the other. The headline
+# new shape: the destructured batch must hold BOTH a plain `() => runAgent` thunk AND a
+# nested `() => parallel((…||[]).map(...))` fan-out thunk, inside the do/while — and it
+# must PARSE (this also exercises the ASI `;` guard on the nested-fanout-in-batch form).
+FOREACH_CORESIDENT_LOOP = """\
+version: 1
+name: fcl-flow
+nodes:
+  - id: p
+    agent: ag
+    prompt: plan
+  - id: impl
+    agent: ag
+    depends_on: [p]
+    prompt: impl
+  - id: col
+    agent: ag
+    depends_on: [impl]
+    prompt: collect ${impl.output.x}
+    output_schema:
+      type: object
+      required: [findings, pass]
+      properties: { findings: { type: array }, pass: { type: boolean } }
+  - id: sib
+    agent: ag
+    depends_on: [col]
+    prompt: sibling work ${col.output.pass}
+  - id: verify
+    agent: ag
+    depends_on: [col]
+    for_each: ${col.output.findings}
+    as: f
+    prompt: verify ${f}
+gates:
+  - id: g
+    after: p
+    type: human_approval
+    prompt: ok?
+loop:
+  while: ${!col.output.pass}
+  max_iters: 2
+  body: [impl, col, sib, verify]
+  carry:
+    last: ${col.output}
+"""
+
+
+def test_foreach_coresident_with_sibling_parallelizes_and_parses(tmp_path):
+    d = make_flow(tmp_path, "fcl-flow", FOREACH_CORESIDENT_LOOP)
+    rc, data, out, err = run(tmp_path, "fcl-flow")
+    assert rc == 0, err
+    seg2 = (d / ".compiled" / "seg-2.js").read_text()
+    do_idx = seg2.index("do {"); while_idx = seg2.index("} while (")
+    batch_idx = seg2.index("= await parallel([")
+    assert do_idx < batch_idx < while_idx       # the shared-rank batch is INSIDE the do/while
+    # sib + verify share one rank → ONE batch holding BOTH a plain thunk AND a
+    # nested for_each fan-out thunk (order = declaration order).
+    assert ("[n_sib, n_verify] = await parallel([" in seg2
+            or "[n_verify, n_sib] = await parallel([" in seg2)
+    assert "() => runAgent" in seg2                              # plain sibling thunk
+    assert "() => parallel((" in seg2 and ".map((f) =>" in seg2  # nested fan-out thunk
+    assert_seg_parses(seg2)                                      # ASI fix on the nested form
+
+
 # A BOUNDED subgraph whose group has TWO mutually-independent siblings (reva, revb
 # both read ${inputs.artifact_path}; synthesize depends on both). After unifying the
 # bounded-group emit with the rank emitter, reva+revb fan out as ONE parallel([...])
@@ -6136,3 +6201,67 @@ def test_bounded_group_parallelizes_independent_siblings(tmp_path):
     assert "n_rev__synthesize = await runAgent" in seg   # exit stays a serial later rank
     assert "const n_rev__reva" not in seg          # reassignment, pre-declared lets
     assert_seg_parses(seg)                         # the bounded-group batch must be valid JS
+
+
+# A GUARDED loop body whose two members (ga, gb) are mutually independent (both depend
+# only on p) — i.e. the same dependency rank. Guarded bodies stay SERIAL (the __ran
+# bookkeeping can't ride a concurrent batch), so NO parallel batch may appear in the
+# loop body AND each guarded member must still emit `__ran = true`. Pins BOTH halves of
+# the `if has_guarded_body:` branch — mutating the guard to `if False:` would break (a)
+# (the siblings would batch) and re-routing past the serial emit would drop (b).
+GUARDED_PARALLEL_LOOP = """\
+version: 1
+name: gpl-flow
+nodes:
+  - id: p
+    agent: ag
+    prompt: plan
+    output_schema:
+      type: object
+      properties:
+        adv: { type: ["object", "null"] }
+  - id: ga
+    agent: ag
+    when: ${p.output.adv == null}
+    depends_on: [p]
+    prompt: guarded a ${loop.carry.last}
+  - id: gb
+    agent: ag
+    when: ${p.output.adv == null}
+    depends_on: [p]
+    prompt: guarded b
+  - id: col
+    agent: ag
+    depends_on: [ga, gb]
+    prompt: collect
+    output_schema:
+      type: object
+      required: [pass]
+      properties: { pass: { type: boolean } }
+gates:
+  - id: g
+    after: p
+    type: human_approval
+    prompt: ok?
+loop:
+  while: ${!col.output.pass}
+  max_iters: 2
+  body: [ga, gb, col]
+  carry:
+    last: ${col.output}
+"""
+
+
+def test_guarded_loop_body_independent_siblings_stay_serial(tmp_path):
+    d = make_flow(tmp_path, "gpl-flow", GUARDED_PARALLEL_LOOP)
+    rc, data, out, err = run(tmp_path, "gpl-flow")
+    assert rc == 0, err
+    seg2 = (d / ".compiled" / "seg-2.js").read_text()
+    # (a) guarded siblings stay SERIAL — no parallel batch despite being one rank.
+    assert "await parallel([" not in seg2
+    # (b) __ran tracking survives on each member (guarded → if/else; col → trailing).
+    assert "{ n_ga = await runAgent" in seg2 and "__ran = true" in seg2
+    assert "{ n_gb = await runAgent" in seg2
+    assert seg2.count("__ran = true") >= 3          # ga, gb, col each set it
+    assert "let __ran = false" in seg2 and "if (!__ran) break" in seg2
+    assert_seg_parses(seg2)
