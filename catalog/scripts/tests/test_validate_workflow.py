@@ -168,7 +168,10 @@ nodes:
     assert any("safe identifier" in i["message"] for i in data["issues"])
 
 
-def test_for_each_in_loop_body_blocks(tmp_path):
+def test_for_each_in_unguarded_loop_body_passes(tmp_path):
+    # An UNGUARDED loop body may now carry a for_each node: it routes through the
+    # rank emitter and compiles to `await parallel(map(...))` as its own rank inside
+    # the do/while (the conservative guard is lifted for unguarded bodies).
     body = """\
 version: 1
 name: fe
@@ -178,6 +181,51 @@ nodes:
   - id: a
     agent: ag
     prompt: plan
+  - id: col
+    agent: ag
+    depends_on: [a]
+    prompt: collect
+    output_schema:
+      type: object
+      required: [findings, done]
+      properties: { findings: { type: array }, done: { type: boolean } }
+  - id: b
+    agent: ag
+    for_each: ${col.output.findings}
+    as: item
+    prompt: scan ${item}
+loop:
+  while: ${!col.output.done}
+  max_iters: 2
+  body: [col, b]
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 0, data
+    assert not any("fan-out inside a loop body" in i["message"]
+                   for i in (data or {}).get("issues", []))
+
+
+def test_for_each_in_guarded_loop_body_blocks(tmp_path):
+    # A GUARDED loop body (a `when`-guarded member) stays serial — its __ran
+    # bookkeeping can't ride a concurrent batch — so a for_each fan-out there is
+    # still rejected.
+    body = """\
+version: 1
+name: fe
+inputs:
+  items: { type: array, required: true }
+nodes:
+  - id: a
+    agent: ag
+    prompt: plan
+    output_schema:
+      type: object
+      properties: { skip: { type: boolean }, done: { type: boolean } }
+  - id: g
+    agent: ag
+    when: ${!a.output.skip}
+    depends_on: [a]
+    prompt: gated
   - id: b
     agent: ag
     for_each: ${workflow.inputs.items}
@@ -185,13 +233,14 @@ nodes:
     depends_on: [a]
     prompt: scan ${item}
 loop:
-  while: ${!b.output.done}
+  while: ${!a.output.done}
   max_iters: 2
-  body: [b]
+  body: [g, b]
 """
     rc, data, _ = run(write_wf(tmp_path, body))
     assert rc == 1
-    assert any("fan-out inside a loop body" in i["message"] for i in data["issues"])
+    assert any("for_each in a GUARDED loop body" in i["message"]
+               for i in data["issues"])
 
 
 def test_when_ref_infers_edge_passes(tmp_path):

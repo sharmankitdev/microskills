@@ -1360,14 +1360,23 @@ def main():
         if wu_err:
             add(issues, "block", "loop", wu_err)
         desugar_loop_until(loop)
+        # A GUARDED body (any `when`-guarded member) stays serial — its __ran
+        # bookkeeping can't ride a concurrent batch — so compile keeps the serial
+        # emit and a for_each fan-out there is still rejected. An UNGUARDED body
+        # routes through the rank emitter, where a for_each node composes as its own
+        # `await parallel(map(...))` rank inside the do/while, so it is now legal.
+        body_guarded = any(node_by_id.get(b, {}).get("when")
+                           for b in (loop.get("body") or []))
         for b in loop.get("body") or []:
             if b not in id_set:
                 add(issues, "block", "loop/body", f"references unknown node '{b}'")
                 continue
             bn = node_by_id.get(b, {})
-            if bn.get("for_each"):
+            if bn.get("for_each") and body_guarded:
                 add(issues, "block", "loop/body",
-                    f"node '{b}' uses for_each; fan-out inside a loop body is unsupported")
+                    f"node '{b}' uses for_each in a GUARDED loop body (a `when`-guarded "
+                    f"member forces the serial emit); fan-out is supported only in an "
+                    f"unguarded loop body")
             # FAIL-LOUD (statically-detectable subset; mirrors compile's hard die):
             # an orchestrator-classified body member splits the body across steps
             # and silently drops the do/while scaffold. Block the cases visible

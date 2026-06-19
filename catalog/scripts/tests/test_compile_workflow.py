@@ -1773,17 +1773,20 @@ loop:
 """
 
 
-def test_loop_body_siblings_stay_serial(tmp_path):
-    # SCOPE BOUNDARY: independent siblings inside a loop body are NOT parallelized —
-    # the do/while scaffold stays a sequential body (v1 only fans out non-loop segments).
+def test_loop_body_siblings_parallelize(tmp_path):
+    # KEYSTONE: independent siblings inside an UNGUARDED loop body now fan out — x and
+    # y both depend only on p (outside the body) so they share rank 0 and compile into
+    # ONE parallel([...]) batch (reassignment form) INSIDE the do/while. The do/while
+    # scaffold is unchanged.
     d = make_flow(tmp_path, "loopsib-flow", LOOP_SIBLINGS)
     rc, data, out, err = run(tmp_path, "loopsib-flow")
     assert rc == 0, err
     seg2 = (d / ".compiled" / "seg-2.js").read_text()   # loop segment, after the gate
     assert "do {" in seg2 and "} while (" in seg2
-    assert "n_x = await runAgent" in seg2               # sequential body assignment
-    assert "n_y = await runAgent" in seg2
-    assert "await parallel([" not in seg2               # no sibling batch in the loop
+    do_idx = seg2.index("do {"); while_idx = seg2.index("} while (")
+    batch_idx = seg2.index("[n_x, n_y] = await parallel([")
+    assert do_idx < batch_idx < while_idx               # sibling batch INSIDE the loop
+    assert "const n_x" not in seg2                       # reassignment, pre-declared lets
 
 
 def test_review_changes_dimension_reviews_parallelize(tmp_path):
@@ -5971,3 +5974,58 @@ def test_serial_loop_body_byte_identical(tmp_path):
     assert "n_impl = await runAgent" in seg2
     assert "n_ev = await runAgent" in seg2
     assert "const n_impl" not in seg2   # loop vars are pre-declared lets, reassigned
+
+
+# A for_each node in an UNGUARDED loop body emits its fan-out as its own rank inside
+# the do/while — `await parallel((coll||[]).map(...))`. (The validate guard that
+# forbade this is lifted for unguarded bodies in this PR.)
+FOREACH_LOOP = """\
+version: 1
+name: fel-flow
+inputs:
+  seed: { type: string, required: true }
+nodes:
+  - id: p
+    agent: ag
+    prompt: plan
+  - id: impl
+    agent: ag
+    depends_on: [p]
+    prompt: impl
+  - id: col
+    agent: ag
+    depends_on: [impl]
+    prompt: collect ${impl.output.x}
+    output_schema:
+      type: object
+      required: [findings, pass]
+      properties: { findings: { type: array }, pass: { type: boolean } }
+  - id: verify
+    agent: ag
+    depends_on: [col]
+    for_each: ${col.output.findings}
+    as: f
+    prompt: verify ${f}
+gates:
+  - id: g
+    after: p
+    type: human_approval
+    prompt: ok?
+loop:
+  while: ${!col.output.pass}
+  max_iters: 2
+  body: [impl, col, verify]
+  carry:
+    last: ${col.output}
+"""
+
+
+def test_for_each_in_loop_body_emits_parallel_fanout(tmp_path):
+    d = make_flow(tmp_path, "fel-flow", FOREACH_LOOP)
+    rc, data, out, err = run(tmp_path, "fel-flow")
+    assert rc == 0, err
+    seg2 = (d / ".compiled" / "seg-2.js").read_text()
+    do_idx = seg2.index("do {"); while_idx = seg2.index("} while (")
+    fan_idx = seg2.index(".map((f) => () => runAgent")
+    assert do_idx < fan_idx < while_idx        # fan-out is INSIDE the do/while
+    assert "n_verify = await parallel((" in seg2
