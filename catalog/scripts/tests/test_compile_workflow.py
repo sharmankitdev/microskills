@@ -6029,3 +6029,56 @@ def test_for_each_in_loop_body_emits_parallel_fanout(tmp_path):
     fan_idx = seg2.index(".map((f) => () => runAgent")
     assert do_idx < fan_idx < while_idx        # fan-out is INSIDE the do/while
     assert "n_verify = await parallel((" in seg2
+
+
+# A BOUNDED subgraph whose group has TWO mutually-independent siblings (reva, revb
+# both read ${inputs.artifact_path}; synthesize depends on both). After unifying the
+# bounded-group emit with the rank emitter, reva+revb fan out as ONE parallel([...])
+# batch INSIDE the local do/while.
+SG_BOUNDED_PAR = """\
+version: 1
+params:
+  artifact_kind: { required: true }
+inputs:
+  artifact_path: { required: true }
+output: synthesize
+convergence:
+  mode: bounded
+  max_iters: 3
+  until: ${synthesize.output.converged}
+nodes:
+  - id: reva
+    agent: reviewer
+    prompt: review A this {{artifact_kind}}
+    inputs:
+      artifact_path: ${inputs.artifact_path}
+  - id: revb
+    agent: reviewer
+    prompt: review B this {{artifact_kind}}
+    inputs:
+      artifact_path: ${inputs.artifact_path}
+  - id: synthesize
+    agent: synthesizer
+    depends_on: [reva, revb]
+    prompt: synthesize
+    inputs:
+      a: ${reva.output}
+      b: ${revb.output}
+    output_schema:
+      type: object
+      required: [converged]
+      properties:
+        converged: { type: boolean }
+"""
+
+
+def test_bounded_group_parallelizes_independent_siblings(tmp_path):
+    _setup_subgraph_world(tmp_path, sg=SG_BOUNDED_PAR)
+    rc, data, out, err = run(tmp_path, "host-flow")
+    assert rc == 0, out + err
+    seg = (tmp_path / "host-flow" / ".compiled" / "seg-1.js").read_text()
+    do_idx = seg.index("do {"); while_idx = seg.index("} while (")
+    batch_idx = seg.index("[n_rev__reva, n_rev__revb] = await parallel([")
+    assert do_idx < batch_idx < while_idx          # the batch is INSIDE the group do/while
+    assert "n_rev__synthesize = await runAgent" in seg   # exit stays a serial later rank
+    assert "const n_rev__reva" not in seg          # reassignment, pre-declared lets

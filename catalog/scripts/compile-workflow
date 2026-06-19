@@ -2543,10 +2543,13 @@ def emit_segment_js(seg_nodes, wf, loop, seg_index, converge_groups=None):
                     gids = [g for g in seg_ids if g in set(grp["nodes"])]
                     iter_var, max_var = f"__cv{cv_idx}_iter", f"__cv{cv_idx}_max"
                     while_js = translate_ref(grp["while"], seg_var_ids)
-                    group_calls = "".join(
-                        node_call_js(node_by_id[gid], seg_var_ids, indent="    ",
-                                     declare=False)
-                        for gid in gids)
+                    # Route the bounded group's do/while body through the SAME rank
+                    # emitter as the top-level loop body (D2 — one emit path): independent
+                    # group siblings fan out as a parallel([...]) batch, dependency chains
+                    # and single-node ranks stay byte-identical to the prior serial emit.
+                    group_calls = emit_rank_calls(
+                        [node_by_id[g] for g in gids], seg_var_ids,
+                        declare=False, phase_line=False, indent="    ")
                     group_body = f"{group_calls}  {iter_var}++\n"
                     calls += (f"let {', '.join(jsvar(g) for g in gids)}\n"
                               f"let {iter_var} = 0\nconst {max_var} = {grp['max_iters']}\n")
