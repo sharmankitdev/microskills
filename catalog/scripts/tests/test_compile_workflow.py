@@ -5899,3 +5899,75 @@ def test_subgraph_schema_file_present():
     assert os.path.isfile(p), p
     import json as _json
     _json.loads(open(p).read())  # valid JSON
+
+
+# --- rank-parallel do/while loop bodies (engine keystone) ---
+# A loop body with TWO mutually-independent siblings (r1, r2 both depend only on
+# impl) -> same dependency rank -> must compile to ONE parallel([...]) batch INSIDE
+# the do/while. col depends on both, so it is a later (serial) rank.
+PARALLEL_LOOP = """\
+version: 1
+name: pal-flow
+nodes:
+  - id: p
+    agent: ag
+    prompt: plan
+  - id: impl
+    agent: ag
+    depends_on: [p]
+    prompt: impl ${loop.carry.last}
+  - id: r1
+    agent: ag
+    depends_on: [impl]
+    prompt: review one ${impl.output.x}
+  - id: r2
+    agent: ag
+    depends_on: [impl]
+    prompt: review two ${impl.output.x}
+  - id: col
+    agent: ag
+    depends_on: [r1, r2]
+    prompt: collect ${r1.output} ${r2.output}
+gates:
+  - id: g
+    after: p
+    type: human_approval
+    prompt: ok?
+loop:
+  while: ${!col.output.pass}
+  max_iters: 2
+  body: [impl, r1, r2, col]
+  carry:
+    last: ${col.output}
+"""
+
+
+def test_parallel_loop_body_emits_batch(tmp_path):
+    d = make_flow(tmp_path, "pal-flow", PARALLEL_LOOP)
+    rc, data, out, err = run(tmp_path, "pal-flow")
+    assert rc == 0, err
+    seg2 = (d / ".compiled" / "seg-2.js").read_text()   # seg-1 = pre-gate (p); seg-2 = loop body
+    # r1 + r2 are an independent rank -> one parallel batch, reassigning pre-declared lets.
+    assert "[n_r1, n_r2] = await parallel([" in seg2
+    # The batch is INSIDE the do/while (the loop scaffold), not before it.
+    do_idx = seg2.index("do {")
+    while_idx = seg2.index("} while (")
+    batch_idx = seg2.index("await parallel([")
+    assert do_idx < batch_idx < while_idx
+    # impl and col stay serial (single-node ranks).
+    assert "n_impl = await runAgent" in seg2
+    assert "n_col = await runAgent" in seg2
+
+
+def test_serial_loop_body_byte_identical(tmp_path):
+    # PLAIN_LOOP's body [impl, ev] is two single-node ranks (ev depends on impl).
+    # After the refactor its seg-2.js must be byte-for-byte what it is today.
+    d = make_flow(tmp_path, "pl-flow", PLAIN_LOOP)
+    rc, data, out, err = run(tmp_path, "pl-flow")
+    assert rc == 0, err
+    seg2 = (d / ".compiled" / "seg-2.js").read_text()
+    # Serial body keeps reassignment form, no parallel batch, no const, no leading phase().
+    assert "await parallel([" not in seg2
+    assert "n_impl = await runAgent" in seg2
+    assert "n_ev = await runAgent" in seg2
+    assert "const n_impl" not in seg2   # loop vars are pre-declared lets, reassigned
