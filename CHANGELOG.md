@@ -1,3 +1,9 @@
+## [0.21.0](https://github.com/sharmankitdev/microskills/compare/v0.20.0...v0.21.0) (2026-06-19)
+
+### Features
+
+* **scripts:** harden determinism floor (resolve/compile/integrity, 6 checks) ([#25](https://github.com/sharmankitdev/microskills/issues/25)) ([823455d](https://github.com/sharmankitdev/microskills/commit/823455d2fc9c637317ac6729f0033e4dc8f3626c))
+
 ## [0.20.0](https://github.com/sharmankitdev/microskills/compare/v0.19.0...v0.20.0) (2026-06-19)
 
 ### Features
