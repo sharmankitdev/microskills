@@ -337,6 +337,17 @@ def engine_outputs(catalog, deploy_root):
     if sdir.is_dir():
         for f in sorted(p for p in sdir.rglob("*") if p.is_file()):
             out.append((f, deploy_root / "workflow-defs" / "_snippets" / f.relative_to(sdir)))
+    # Reusable subgraph registry (`subgraph: NAME` node-groups spliced into a host DAG
+    # by compile-workflow / validate-workflow) is plugin/ENGINE-owned in V1, exactly
+    # like _snippets: catalog/workflow-defs/_subgraphs/<name>/SUBGRAPH.yaml is vendored
+    # to .claude/workflow-defs/_subgraphs/ HERE (tracked/pruned in the engine ledger)
+    # and only here — _subgraphs is not a component, never appears in harness.yaml, and
+    # harness-sync never touches it. rglob enumerates the dir-of-dirs (the nested
+    # SUBGRAPH.yaml, and any sibling files), sorted for a stable engine_hash.
+    sdir = catalog / "workflow-defs" / "_subgraphs"
+    if sdir.is_dir():
+        for f in sorted(p for p in sdir.rglob("*") if p.is_file()):
+            out.append((f, deploy_root / "workflow-defs" / "_subgraphs" / f.relative_to(sdir)))
     return out
 
 

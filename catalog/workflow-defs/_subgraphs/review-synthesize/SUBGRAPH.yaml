@@ -1,0 +1,73 @@
+version: 1
+# review-synthesize — the FIRST real catalog subgraph, and the minimal demonstrator of
+# the `subgraph:` primitive (the spliceable reusable node-group). A host node
+# `subgraph: review-synthesize` is DESUGARED (spliced) into the host DAG by
+# compile-workflow / validate-workflow BEFORE partitioning, so its two plain agent: nodes
+# land in the host's BACKGROUND segment (in-segment, autonomous, no checkpoint break).
+#
+# It is intentionally minimal: two self-contained agent: nodes (no microskill dependency →
+# splices anywhere with no missing components), parameterized by {{artifact_kind}} and
+# bound to a host ${inputs.artifact_path}. The flagship review→collect→verify→synthesize
+# content (the real adversarial-review subgraph, built from review-dimension / verify-finding /
+# synthesize-review) is a LATER step; this proves the splice end-to-end over the real registry.
+#
+# This file is plugin/ENGINE-owned: initialize-harness vendors it to
+# .claude/workflow-defs/_subgraphs/review-synthesize/SUBGRAPH.yaml; it is never a component,
+# never appears in harness.yaml, and harness-sync never touches it.
+
+# Textual {{param}} tokens, substituted from the host node's `with:` map.
+params:
+  artifact_kind:
+    required: true
+
+# ${inputs.<name>} binding points; the host node's `inputs:` supplies a ${ref} each.
+inputs:
+  artifact_path:
+    required: true
+
+# The exit: downstream host refs ${<splice-id>.output...} re-point at <splice-id>__synthesize.
+output: synthesize
+
+# single_pass = spliced once inline (the only PR-supported mode; bounded is a later step).
+convergence:
+  mode: single_pass
+
+nodes:
+  # Review the bound artifact along the host-supplied kind. {{artifact_kind}} is
+  # substituted textually from the host `with:`; ${inputs.artifact_path} is rewritten to
+  # the host `inputs:` binding on splice.
+  - id: review
+    agent: reviewer
+    # The prompt REFERENCES the bound input (${inputs.artifact_path}, rewritten to the host
+    # binding on splice) so the data flow lands in the emitted segment bytes — a host
+    # inputs: edit then moves segment_digests too, not just manifest_hash.
+    prompt: >-
+      Review this {{artifact_kind}}, read at ${inputs.artifact_path}, and report concrete
+      findings as structured notes, each with a severity and a suggested fix.
+    inputs:
+      artifact_path: ${inputs.artifact_path}
+    # A required field so native args-truncation detection fires for this consumed node.
+    output_schema:
+      type: object
+      required: [findings]
+      properties:
+        findings: { type: array }
+
+  # Synthesize the review into one prioritized report. The sibling ${review.output} ref is
+  # re-pointed at the namespaced sibling (<splice-id>__review) on splice; this node is the
+  # subgraph's `output:` exit, so downstream host refs to the splice land here.
+  - id: synthesize
+    agent: synthesizer
+    depends_on: [review]
+    # The prompt references the sibling output (${review.output}, re-pointed at
+    # <splice-id>__review on splice) so the splice's data flow is exercised end to end.
+    prompt: >-
+      Synthesize the review findings ${review.output} into a single prioritized report.
+    inputs:
+      findings: ${review.output}
+    # `report` is the exit field downstream host nodes read as ${<splice-id>.output.report}.
+    output_schema:
+      type: object
+      required: [report]
+      properties:
+        report: { type: string }

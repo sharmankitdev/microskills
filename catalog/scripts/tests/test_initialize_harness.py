@@ -12,6 +12,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -201,6 +202,52 @@ def test_init_compiles_snippet_consuming_def_in_fresh_project(tmp_path):
     fin = [s for s in data["manifest"]["steps"] if s.get("node") == "finalize"][0]
     assert "vendoring the approved microskill" in fin["prompt"]
     assert "{{snippet:" not in fin["prompt"]
+
+
+def test_init_vendors_subgraphs_as_engine(tmp_path):
+    # The `subgraph:` registry (catalog/workflow-defs/_subgraphs/<name>/SUBGRAPH.yaml)
+    # is plugin/ENGINE-owned, exactly like _snippets: initialize-harness materializes it
+    # to .claude/workflow-defs/_subgraphs/ and tracks it in the ENGINE ledger (not a
+    # component, so harness-sync never touches it).
+    init_project(tmp_path)
+    sg = (tmp_path / ".claude" / "workflow-defs" / "_subgraphs"
+          / "review-synthesize" / "SUBGRAPH.yaml")
+    assert sg.exists(), "_subgraphs not materialized into .claude/workflow-defs/"
+    src = (REPO / "catalog" / "workflow-defs" / "_subgraphs"
+           / "review-synthesize" / "SUBGRAPH.yaml")
+    assert sg.read_bytes() == src.read_bytes()
+    state = json.loads((tmp_path / ".claude" / ".harness-state.json").read_text())
+    assert (".claude/workflow-defs/_subgraphs/review-synthesize/SUBGRAPH.yaml"
+            in state["engine"]["installed_paths"])
+    assert "review-synthesize" not in state.get("components", {})
+
+
+def test_init_compiles_subgraph_splicing_def_from_runtime(tmp_path):
+    # End-to-end: a fresh project's materialized runtime can compile + validate a def
+    # whose `subgraph:` node resolves from the vendored _subgraphs/ — with NO
+    # CLAUDE_PLUGIN_ROOT (the segment-agent env). The splice replaces `rev` in place with
+    # its namespaced inner nodes, collapsing into ONE background segment.
+    init_project(tmp_path)
+    src = REPO / "catalog" / "workflow-defs" / "subgraph-smoke"
+    dst = tmp_path / ".claude" / "workflow-defs" / "subgraph-smoke"
+    shutil.copytree(src, dst, ignore=shutil.ignore_patterns(".compiled"))
+
+    rc, out, err = run_materialized(tmp_path, "compile-workflow", "subgraph-smoke", "--plan")
+    assert rc == 0, out + err
+    data = json.loads(out)
+    assert data["segments"] == 1 and data["checkpoints"] == 0
+    seg = data["manifest"]["steps"][0]
+    # The subgraph node `rev` was spliced in place into its namespaced inner nodes — its
+    # survival would have hard-blocked the compile (the desugar fail-loud sweep).
+    assert seg["nodes"] == ["author", "rev__review", "rev__synthesize", "publish"]
+    assert "rev" not in seg["nodes"]
+
+    rc, out, err = run_materialized(
+        tmp_path, "validate-workflow",
+        str(dst / "WORKFLOW.yaml"), str(dst / "profiles" / "base.yaml"),
+        "--defs-root", str(tmp_path / ".claude" / "workflow-defs"))
+    assert rc == 0, out + err
+    assert json.loads(out)["pass"] is True
 
 
 def test_reinit_preserves_compiled_runs_ledger(tmp_path):
@@ -559,3 +606,79 @@ def test_flip_entry_source_misses_are_loud():
     assert not flipped                                   # already custom: nothing to flip
     out, flipped = mod.flip_entry_source(GNARLY_MANIFEST, "workflows", "alpha")
     assert not flipped                                   # wrong list
+
+
+# --- _subgraphs engine vendoring (dir-of-dirs, parallel to _snippets) -----------------------
+
+def _mk_subgraph_catalog(tmp, name="demo", inner_agent="reviewer"):
+    """A throwaway catalog carrying ONLY a _subgraphs/<name>/SUBGRAPH.yaml — exercises
+    engine_outputs/engine_hash on the new dir-of-dirs block in isolation (the other
+    ENGINE_SUBDIRS + templates/ are absent → their is_dir() guards skip them)."""
+    catalog = tmp / "catalog"
+    d = catalog / "workflow-defs" / "_subgraphs" / name
+    d.mkdir(parents=True)
+    f = d / "SUBGRAPH.yaml"
+    f.write_text(
+        "version: 1\noutput: x\nnodes:\n"
+        f"  - id: x\n    agent: {inner_agent}\n    prompt: do the thing\n")
+    return catalog, f
+
+
+def test_subgraphs_are_engine_outputs_dir_of_dirs(tmp_path):
+    # The _subgraphs registry is plugin/ENGINE-owned: engine_outputs() enumerates the
+    # nested SUBGRAPH.yaml (rglob, dir-of-dirs) and maps it under
+    # .claude/workflow-defs/_subgraphs/<name>/SUBGRAPH.yaml — exactly like _snippets.
+    mod = load_init_module()
+    catalog, _ = _mk_subgraph_catalog(tmp_path)
+    deploy = tmp_path / ".claude"
+    dests = {str(d) for _, d in mod.engine_outputs(catalog, deploy)}
+    assert str(deploy / "workflow-defs" / "_subgraphs" / "demo" / "SUBGRAPH.yaml") in dests
+
+
+def test_subgraph_byte_edit_flips_engine_hash(tmp_path):
+    # A byte edit to a _subgraphs file must move the engine hash so the refresh path
+    # re-materializes it (engine_hash is the drift signal; engine_hash already folds
+    # every output's bytes hierarchically).
+    mod = load_init_module()
+    catalog, f = _mk_subgraph_catalog(tmp_path)
+    deploy = tmp_path / ".claude"
+    h1 = mod.engine_hash(mod.engine_outputs(catalog, deploy))
+    f.write_text(f.read_text().replace("agent: reviewer", "agent: critic"))
+    h2 = mod.engine_hash(mod.engine_outputs(catalog, deploy))
+    assert h1 != h2
+
+
+def test_removed_subgraph_file_drops_from_engine_outputs(tmp_path):
+    # A removed _subgraphs file drops from engine_outputs → it is no longer a materialize
+    # target. The on-disk prune that follows from this is asserted in
+    # test_materialize_engine_prunes_removed_subgraph_dir.
+    mod = load_init_module()
+    catalog, f = _mk_subgraph_catalog(tmp_path)
+    deploy = tmp_path / ".claude"
+    target = deploy / "workflow-defs" / "_subgraphs" / "demo" / "SUBGRAPH.yaml"
+    assert any(d == target for _, d in mod.engine_outputs(catalog, deploy))
+    f.unlink()
+    assert not any(d == target for _, d in mod.engine_outputs(catalog, deploy))
+
+
+def test_materialize_engine_prunes_removed_subgraph_dir(tmp_path):
+    # The genuinely-new dir-of-dirs behavior (vs the flat _snippets block): removing a
+    # vendored subgraph must prune the deployed SUBGRAPH.yaml AND its now-empty
+    # _subgraphs/<name>/ (and _subgraphs/) dirs on the next reconcile — the on-disk prune,
+    # asserted against disk per the assert-on-state convention.
+    mod = load_init_module()
+    catalog, f = _mk_subgraph_catalog(tmp_path)
+    anchor, deploy = tmp_path, tmp_path / ".claude"
+    # pass 1: materialize the subgraph into the runtime (fresh install, no prior ledger)
+    outs1 = mod.engine_outputs(catalog, deploy)
+    mod.materialize_engine(outs1, None, anchor, deploy)
+    dep = deploy / "workflow-defs" / "_subgraphs" / "demo" / "SUBGRAPH.yaml"
+    assert dep.read_text().startswith("version: 1")
+    installed = [str(d.relative_to(anchor)) for _, d in outs1]
+    # pass 2: the file is gone from the catalog → reconcile prunes it + its empty dirs
+    f.unlink()
+    mod.materialize_engine(mod.engine_outputs(catalog, deploy),
+                           {"installed_paths": installed}, anchor, deploy)
+    assert not dep.exists(), "deployed SUBGRAPH.yaml not pruned"
+    assert not dep.parent.exists(), "empty _subgraphs/demo/ not pruned"
+    assert not (deploy / "workflow-defs" / "_subgraphs").exists(), "empty _subgraphs/ not pruned"
