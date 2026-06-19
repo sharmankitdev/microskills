@@ -1,3 +1,9 @@
+## [0.24.0](https://github.com/sharmankitdev/microskills/compare/v0.23.0...v0.24.0) (2026-06-19)
+
+### Features
+
+* **scripts:** subgraph vendoring + first catalog subgraph (PR2) ([#28](https://github.com/sharmankitdev/microskills/issues/28)) ([8452d6d](https://github.com/sharmankitdev/microskills/commit/8452d6df1cb87b7a671a87ba57ec590f247b1a6c))
+
 ## [0.23.0](https://github.com/sharmankitdev/microskills/compare/v0.22.0...v0.23.0) (2026-06-19)
 
 ### Features
