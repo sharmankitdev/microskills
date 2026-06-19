@@ -49,6 +49,7 @@ except ImportError:
 
 REQUIRED_SECTIONS = ["## Purpose", "## Inputs", "## Steps", "## Output", "## Failure modes"]
 NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
+PLACEHOLDER_RE = re.compile(r"\{\{\s*([a-zA-Z0-9_]+)\s*\}\}")
 
 SCRIPT = Path(__file__).resolve()
 
@@ -436,6 +437,37 @@ def cross_check(skill_meta, config_path, issues):
                     f"gather it at runtime. Add inputs.{name}.required: true (or an inject_from source).")
 
 
+def check_vars(skill_path, config_paths, issues):
+    p = Path(skill_path)
+    if not p.exists():
+        return
+    _, body = parse_frontmatter(p.read_text())
+    if not isinstance(body, str):
+        return
+    tokens = set(PLACEHOLDER_RE.findall(body))
+    if not tokens:
+        return
+    declared = set()
+    have_config = False
+    for cfg in config_paths:
+        cp = Path(cfg)
+        if not cp.exists():
+            continue
+        try:
+            doc = yaml.safe_load(cp.read_text())
+        except yaml.YAMLError:
+            continue
+        have_config = True
+        if isinstance(doc, dict) and isinstance(doc.get("vars"), dict):
+            declared.update(doc["vars"].keys())
+    if not have_config:
+        return
+    for tok in sorted(tokens - declared):
+        add(issues, "warn", "structure",
+            f"body references {{{{{tok}}}}} which resolves from no config `vars` key "
+            f"(runtime-gathered, or a typo).")
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Validate a microskill MICROSKILL.md (and optional config files)."
@@ -450,6 +482,7 @@ def main():
     for cfg in args.configs:
         check_config(cfg, issues)
         cross_check(skill_meta, cfg, issues)
+    check_vars(args.skill, args.configs, issues)
 
     blocks = [i for i in issues if i["severity"] == "block"]
     passed = len(blocks) == 0

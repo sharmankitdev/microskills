@@ -541,3 +541,28 @@ def test_inject_from_with_default_warns(tmp_path):
     code, data, _, err = run(str(skill), str(cfg))
     assert any(i["severity"] == "warn" and "inject_from with a default" in i["message"]
                for i in data["issues"]), data
+
+
+# ---------------------------------------------------------------------------
+# vars token undeclared checks
+# ---------------------------------------------------------------------------
+
+
+def test_undeclared_var_token_warns(tmp_path):
+    body = MINIMAL_BODY.format(name="vary").replace(
+        "Test fixture.", "Test fixture using {{contract_doc}}.")
+    skill = write_skill(tmp_path, "vary", body)
+    cfg = write_cfg(tmp_path, "base.yaml", "version: 1\n")
+    code, data, _, err = run(str(skill), str(cfg))
+    assert any(i["severity"] == "warn" and "contract_doc" in i["message"]
+               and "resolves from no config" in i["message"] for i in data["issues"]), data
+
+
+def test_declared_var_token_no_warn(tmp_path):
+    body = MINIMAL_BODY.format(name="vary2").replace(
+        "Test fixture.", "Test fixture using {{contract_doc}}.")
+    skill = write_skill(tmp_path, "vary2", body)
+    cfg = write_cfg(tmp_path, "base.yaml", "version: 1\nvars:\n  contract_doc: ./x.md\n")
+    code, data, _, err = run(str(skill), str(cfg))
+    assert not any("contract_doc" in i["message"] and "resolves from no config" in i["message"]
+                   for i in data["issues"]), data
