@@ -1,3 +1,9 @@
+## [0.26.0](https://github.com/sharmankitdev/microskills/compare/v0.25.0...v0.26.0) (2026-06-19)
+
+### Features
+
+* **microskill:** create-domain review profiles for the create pipelines (§8 step 4) ([#30](https://github.com/sharmankitdev/microskills/issues/30)) ([64cb53a](https://github.com/sharmankitdev/microskills/commit/64cb53a5e8825eb3a8c85ab3565f2fe67b7a425b))
+
 ## [0.25.0](https://github.com/sharmankitdev/microskills/compare/v0.24.0...v0.25.0) (2026-06-19)
 
 ### Features
