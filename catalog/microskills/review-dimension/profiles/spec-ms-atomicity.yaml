@@ -1,0 +1,40 @@
+version: 1
+
+# spec-ms-atomicity lens overlay for review-dimension (create pipeline, §8 step 6 / D3).
+# Reviews a microskill specification document for the atomic-unit contract a microskill
+# must satisfy (single purpose, single linear path, no control flow, ≤10 steps). Sibling
+# of the req-* lenses — no floor runs at this stage. A plain list REPLACES base's snippet
+# wholesale. output_schema, inputs, runtime, and the body inherit from base.
+vars:
+  dimension: spec-ms-atomicity
+  artifact_kind: microskill specification document
+
+context:
+  snippets:
+    - name: spec-ms-atomicity-rubric
+      text: >-
+        Atomicity rubric for a microskill specification document — answer "does this spec
+        describe exactly one atomic capability on a single linear path, with no control
+        flow?" against Capability & Single Responsibility, Linear Steps ≤10, and Atomicity
+        Boundary & Non-Goals. A microskill is the atomic unit of the composition layer:
+        it must do ONE concern, run a single straight-line sequence, and contain NO
+        branching, looping, conditional, retry, or when-then control flow (that lives in
+        the workflow layer). Flag only atomicity defects: a Capability that names two or
+        more separable concerns ("and also" / "then also") belonging in different skills;
+        Linear Steps that branch, loop, retry, or condition (any "if / else / for each /
+        when … then / otherwise" shape); Steps that perform a distinct second capability
+        after the primary one completes; more than ten numbered steps; an Atomicity
+        Boundary that admits a second job rather than fencing it out. Severity mapping:
+        two genuinely separate capabilities fused into one spec, or control flow embedded
+        in the steps = blocker (the unit is not atomic / not linear and cannot be a
+        microskill); a secondary concern needing a human split decision = major; an
+        over-broad capability phrasing around a genuinely single action = minor; a step
+        count just over ten that is otherwise linear = minor. Open-question parity rule
+        (binding): an explicit open-question, TBD, or unresolved-decision line inside
+        Capability & Single Responsibility, Linear Steps, or Atomicity Boundary & Non-Goals
+        that gates whether the unit is atomic = blocker, any other such line in those
+        sections = major; lines inside the structural Open Questions / Gaps section are
+        the spec's own gap ledger, never findings. Set each finding's file to the reviewed
+        document's path and line to the line number of the cited section heading. Do not
+        raise spec-ms-completeness (section presence / contract thinness) concerns under
+        this rubric — that sibling lens owns them.
