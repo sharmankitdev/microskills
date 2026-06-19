@@ -3166,10 +3166,39 @@ nodes:
     assert not any("resolves to no" in i["message"] for i in data["issues"]), data
 
 
-def test_bare_ref_carry_key_clean(tmp_path):
+def test_bare_ref_carry_dotted_clean(tmp_path):
+    # the CORRECT carry-ref form is dotted ${loop.carry.<v>} (DAG-RULES §loop) — it
+    # has a dot, so the bare-ref check skips it and never false-blocks.
     wf = write_wf(tmp_path, """
 version: 1
 name: br3
+description: d
+nodes:
+  - id: seed
+    agent: ag
+    prompt: seed
+  - id: work
+    agent: ag
+    depends_on: [seed]
+    prompt: continue from ${loop.carry.prev}
+loop:
+  body: [work]
+  max_iters: 3
+  while: ${work.output.go}
+  carry:
+    prev: ${work.output}
+""")
+    rc, data, err = run(wf)
+    assert rc == 0, err
+    assert not any("resolves to no" in i["message"] for i in data["issues"]), data
+
+
+def test_bare_ref_carry_bare_blocks(tmp_path):
+    # a BARE ${prev} is undefined at runtime even when `prev` is a carry key — carry
+    # resolves only via ${loop.carry.prev}, so the bare form must block.
+    wf = write_wf(tmp_path, """
+version: 1
+name: br4
 description: d
 nodes:
   - id: seed
@@ -3187,8 +3216,9 @@ loop:
     prev: ${work.output}
 """)
     rc, data, err = run(wf)
-    assert rc == 0, err
-    assert not any("resolves to no" in i["message"] for i in data["issues"]), data
+    assert rc == 1, err
+    assert any(i["severity"] == "block" and i["location"] == "nodes/work"
+               and "prev" in i["message"] for i in data["issues"]), data
 
 
 def test_use_node_missing_profile_blocks(tmp_path):
@@ -3324,6 +3354,37 @@ nodes:
     assert rc == 0, err
     assert any(i["severity"] == "warn" and i["location"] == "nodes/fan/max_parallel"
                and "orchestrator" in i["message"] for i in data["issues"]), data
+
+
+def _mk_ms_hardgate(tmp_path, name):
+    # a microskill carrying a hard gate -> _use_resolves_orchestrator's gates branch
+    # (classify case 5b) -> orchestrator. Covers the non-AskUserQuestion path.
+    base = ("version: 1\ngates:\n  add:\n    - id: checkit\n      after: \"1\"\n"
+            "      type: verification\n      severity: hard\n")
+    _mk_ms(tmp_path, name, base_yaml=base)
+
+
+def test_loop_body_hardgate_orchestrator_blocks(tmp_path):
+    _mk_ms_hardgate(tmp_path, "gated")
+    defs_root = tmp_path / "workflow-defs"
+    wf = make_def(defs_root, "f", """
+version: 1
+name: f
+description: d
+nodes:
+  - id: g
+    use: gated
+    prompt: x
+loop:
+  body: [g]
+  max_iters: 2
+  while: ${g.output.go}
+""")
+    rc, data, err = run_defs(defs_root, wf)
+    assert rc == 1, err
+    assert any(i["severity"] == "block" and i["location"] == "loop/body"
+               and "g" in i["message"] and "orchestrator" in i["message"]
+               for i in data["issues"]), data
 
 
 def _child_with_profile(defs_root, name="child-flow"):

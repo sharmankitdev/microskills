@@ -722,18 +722,17 @@ def main():
 
     # --- bare-identifier ref existence (block) ---
     # A ${ident} with no dot (e.g. ${finding}) is a runtime lookup that resolves only
-    # to: the CONTAINING node's own for_each `as` var, OR a loop.carry var. Anything
-    # else (workflow inputs ride ${workflow.inputs.x}; node outputs ride
-    # ${id.output...}; both have dots) is undefined at run time. We scope the scan to
-    # node ref-bearing fields (inputs/prompt/when/for_each), matching the S-INFER
-    # node-ref scan, and only flag a lowercase identifier (as/carry naming) so a
-    # capitalized template token is left alone.
+    # to the CONTAINING node's own for_each `as` var. Everything else is dotted —
+    # workflow inputs ride ${workflow.inputs.x}, node outputs ride ${id.output...},
+    # and a loop carry var rides ${loop.carry.<v>} (DAG-RULES §loop; a BARE ${v} is
+    # NOT a carry binding) — so all of those are skipped by the dot guard below. We
+    # scope the scan to node ref-bearing fields (inputs/prompt/when/for_each),
+    # matching the S-INFER node-ref scan, and only flag a lowercase identifier (the
+    # `as`-var naming) so a capitalized template token is left alone.
     _BARE_RE = re.compile(r"^[a-z][a-z0-9_]*$")
-    _loop_carry_keys = set(((merged.get("loop") or {}).get("carry") or {}).keys()) \
-        if isinstance(merged.get("loop"), dict) else set()
     for nid, n in node_by_id.items():
         own_as = n.get("as") if n.get("for_each") else None
-        legal_bare = _loop_carry_keys | ({own_as} if own_as else set())
+        legal_bare = {own_as} if own_as else set()
         scoped = {k: n.get(k) for k in ("inputs", "prompt", "when", "for_each") if k in n}
         reported = set()
         for s in collect_strings(scoped):
@@ -746,9 +745,9 @@ def main():
                 reported.add(tok)
                 add(issues, "block", f"nodes/{nid}",
                     f"bare reference ${{{tok}}} resolves to no for_each binding "
-                    f"(this node's `as`) or loop carry var; node outputs ride "
-                    f"${{<id>.output...}} and workflow inputs ride "
-                    f"${{workflow.inputs.<name>}} — both require a dotted path")
+                    f"(this node's `as`); node outputs ride ${{<id>.output...}}, "
+                    f"workflow inputs ride ${{workflow.inputs.<name>}}, and a loop "
+                    f"carry var rides ${{loop.carry.{tok}}} — all require a dotted path")
 
     # --- spill_outputs: declared node-output-by-reference (shared checks) ---
     # Mirrors compile EXACTLY (same shared helpers — the two tools can never
@@ -1379,9 +1378,14 @@ def main():
         touches_local = any(
             rid in body_id_set
             for inner in while_refs for rid in NODE_OUTPUT_RE.findall(inner))
+        # A carry var is referenced via the dotted ${loop.carry.<v>} form ONLY
+        # (DAG-RULES §loop; compile uses the same \bloop\.carry\.(\w+) regex), so
+        # match that exact shape — a coarse identifier scan would collide with node
+        # ids / the literal 'output' and wrongly suppress the warn.
         touches_carry = any(
             ck in carry_keys
-            for inner in while_refs for ck in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", inner))
+            for inner in while_refs
+            for ck in re.findall(r"\bloop\.carry\.([A-Za-z0-9_]+)", inner))
         if loop.get("while") and while_refs and not touches_local and not touches_carry:
             add(issues, "warn", "loop",
                 "loop.while references nothing iteration-local (no loop-body node "
@@ -1489,6 +1493,7 @@ def main():
                 if prof_p.exists():
                     try:
                         o = yaml.safe_load(prof_p.read_text()) or {}
+                        o.pop("version", None)  # symmetric with base + compile's merge
                         merged_child = deep_merge(merged_child, o)
                     except (yaml.YAMLError, ValueError):
                         pass
