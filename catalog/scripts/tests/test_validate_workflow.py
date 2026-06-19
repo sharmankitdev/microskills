@@ -650,6 +650,17 @@ def make_def(defs_root, name, body):
     return p
 
 
+def _mk_ms(tmp_path, name, base_yaml="version: 1\n", md=None):
+    d = tmp_path / "microskills" / name
+    (d / "profiles").mkdir(parents=True, exist_ok=True)
+    (d / "MICROSKILL.md").write_text(md or (
+        "---\nname: %s\ndescription: minimal\n---\n\n# %s\n\n"
+        "## Purpose\n\nGiven X do Y produce Z.\n\n## Steps\n\n1. Return the result.\n"
+        % (name, name)))
+    (d / "profiles" / "base.yaml").write_text(base_yaml)
+    return d
+
+
 # A simple leaf child with one required input and no nested workflow: node.
 CHILD = """\
 version: 1
@@ -2860,3 +2871,620 @@ def test_unknown_node_key_still_blocks(tmp_path):
     rc, data, _ = run(write_wf(tmp_path, body))
     assert any(i["severity"] == "block" and i["location"].startswith("schema:nodes/")
                for i in data["issues"])
+
+
+def test_grant_tools_warns_inert(tmp_path):
+    wf = write_wf(tmp_path, """
+version: 1
+name: gt
+description: d
+nodes:
+  - id: a
+    agent: ag
+    grant_tools: [Bash]
+    prompt: do a
+""")
+    rc, data, err = run(wf)
+    assert rc == 0, err
+    assert any(i["severity"] == "warn" and i["location"] == "nodes/a"
+               and "grant_tools" in i["message"] for i in data["issues"]), data
+
+
+def test_materialize_name_not_path_warns(tmp_path):
+    wf = write_wf(tmp_path, """
+version: 1
+name: mz
+description: d
+inputs:
+  blob:
+    type: string
+    materialize: file
+nodes:
+  - id: a
+    agent: ag
+    prompt: do ${workflow.inputs.blob}
+""")
+    rc, data, err = run(wf)
+    assert rc == 0, err
+    assert any(i["severity"] == "warn" and i["location"] == "inputs"
+               and "blob" in i["message"] and "_path" in i["message"]
+               for i in data["issues"]), data
+
+
+def test_materialize_name_ending_path_clean(tmp_path):
+    wf = write_wf(tmp_path, """
+version: 1
+name: mz2
+description: d
+inputs:
+  blob_path:
+    type: string
+    materialize: file
+nodes:
+  - id: a
+    agent: ag
+    prompt: do ${workflow.inputs.blob_path}
+""")
+    rc, data, err = run(wf)
+    assert rc == 0, err
+    assert not any("materialize" in i["message"] and "_path" in i["message"]
+                   for i in data["issues"]), data
+
+
+def test_warn_nonapproval_gate_dropped_warns(tmp_path):
+    # severity:warn + type != human_approval, NOT branched on -> warn (dead checkpoint)
+    wf = write_wf(tmp_path, """
+version: 1
+name: wg
+description: d
+nodes:
+  - id: a
+    agent: ag
+    prompt: do a
+gates:
+  - id: g1
+    after: a
+    type: verification
+    severity: warn
+    prompt: check it
+""")
+    rc, data, err = run(wf)
+    assert rc == 0, err
+    assert any(i["severity"] == "warn" and i["location"] == "gates/g1"
+               and "no checkpoint" in i["message"] for i in data["issues"]), data
+
+
+LOOP_TYPED = """
+version: 1
+name: loopt
+description: d
+nodes:
+  - id: seed
+    agent: ag
+    prompt: seed
+  - id: work
+    agent: ag
+    depends_on: [seed]
+    output_schema:
+      type: object
+      properties:
+        pass: {type: boolean}
+      required: [pass]
+    prompt: work
+loop:
+  body: [work]
+  max_iters: 3
+  while: {WHILE}
+"""
+
+def test_loop_while_bad_field_blocks(tmp_path):
+    wf = write_wf(tmp_path, LOOP_TYPED.replace("{WHILE}", "${work.output.nope}"))
+    rc, data, err = run(wf)
+    assert rc == 1, err
+    assert any(i["severity"] == "block" and i["location"] == "loop"
+               and "nope" in i["message"] and "work" in i["message"]
+               for i in data["issues"]), data
+
+
+def test_loop_while_good_field_clean(tmp_path):
+    wf = write_wf(tmp_path, LOOP_TYPED.replace("{WHILE}", "${work.output.pass}"))
+    rc, data, err = run(wf)
+    assert rc == 0, err
+    assert not any(i["severity"] == "block" and i["location"] == "loop"
+                   for i in data["issues"]), data
+
+
+def test_loop_carry_bad_field_blocks(tmp_path):
+    body = LOOP_TYPED.replace("{WHILE}", "${work.output.pass}").rstrip() + \
+        "\n  carry:\n    keep: ${work.output.ghost}\n"
+    wf = write_wf(tmp_path, body)
+    rc, data, err = run(wf)
+    assert rc == 1, err
+    assert any("ghost" in i["message"] for i in data["issues"]), data
+
+
+def test_loop_while_non_converging_warns(tmp_path):
+    # while references a NON-body node's output and no carry -> can't converge early
+    body = """
+version: 1
+name: nc
+description: d
+nodes:
+  - id: cfg
+    agent: ag
+    output_schema: {type: object, properties: {go: {type: boolean}}}
+    prompt: cfg
+  - id: work
+    agent: ag
+    depends_on: [cfg]
+    prompt: work
+loop:
+  body: [work]
+  max_iters: 3
+  while: ${cfg.output.go}
+"""
+    wf = write_wf(tmp_path, body)
+    rc, data, err = run(wf)
+    assert rc == 0, err
+    assert any(i["severity"] == "warn" and i["location"] == "loop"
+               and "iteration-local" in i["message"] for i in data["issues"]), data
+
+
+FE = """
+version: 1
+name: fe
+description: d
+nodes:
+  - id: src
+    agent: ag
+    output_schema:
+      type: object
+      properties:
+        items: {type: array}
+        name: {type: string}
+    prompt: src
+  - id: fan
+    agent: ag
+    depends_on: [src]
+    for_each: {SRC}
+    as: it
+    prompt: handle ${it}
+"""
+
+def test_for_each_non_array_field_warns(tmp_path):
+    wf = write_wf(tmp_path, FE.replace("{SRC}", "${src.output.name}"))
+    rc, data, err = run(wf)
+    assert rc == 0, err
+    assert any(i["severity"] == "warn" and i["location"] == "nodes/fan/for_each"
+               and "name" in i["message"] and "array" in i["message"]
+               for i in data["issues"]), data
+
+
+def test_for_each_array_field_clean(tmp_path):
+    wf = write_wf(tmp_path, FE.replace("{SRC}", "${src.output.items}"))
+    rc, data, err = run(wf)
+    assert rc == 0, err
+    assert not any("for_each" in i["location"] and "array" in i["message"]
+                   for i in data["issues"]), data
+
+
+def test_for_each_method_chain_no_warn(tmp_path):
+    # a .filter(...) expression is not statically typeable -> NO warn (catalog pattern)
+    wf = write_wf(tmp_path, FE.replace("{SRC}", "${src.output.items.filter(x => x)}"))
+    rc, data, err = run(wf)
+    assert rc == 0, err
+    assert not any(i["location"] == "nodes/fan/for_each" and "array" in i["message"]
+                   for i in data["issues"]), data
+
+
+ENUMG = """
+version: 1
+name: eg
+description: d
+nodes:
+  - id: judge
+    agent: ag
+    output_schema:
+      type: object
+      properties:
+        verdict: {type: string, enum: [approve, reject]}
+    prompt: judge
+  - id: act
+    agent: ag
+    depends_on: [judge]
+    when: {WHEN}
+    prompt: act
+"""
+
+def test_dead_enum_literal_blocks(tmp_path):
+    wf = write_wf(tmp_path, ENUMG.replace("{WHEN}", "${judge.output.verdict == 'reqect'}"))
+    rc, data, err = run(wf)
+    assert rc == 1, err
+    assert any(i["severity"] == "block" and i["location"] == "nodes/act"
+               and "reqect" in i["message"] and "enum" in i["message"]
+               for i in data["issues"]), data
+
+
+def test_valid_enum_literal_clean(tmp_path):
+    wf = write_wf(tmp_path, ENUMG.replace("{WHEN}", "${judge.output.verdict == 'approve'}"))
+    rc, data, err = run(wf)
+    assert rc == 0, err
+    assert not any("enum" in i["message"] for i in data["issues"]), data
+
+
+def test_non_enum_field_literal_clean(tmp_path):
+    # field has no enum -> any literal is fine
+    body = ENUMG.replace(
+        "verdict: {type: string, enum: [approve, reject]}",
+        "verdict: {type: string}").replace("{WHEN}", "${judge.output.verdict == 'whatever'}")
+    wf = write_wf(tmp_path, body)
+    rc, data, err = run(wf)
+    assert rc == 0, err
+    assert not any("enum" in i["message"] for i in data["issues"]), data
+
+
+def test_bare_ref_unknown_blocks(tmp_path):
+    wf = write_wf(tmp_path, """
+version: 1
+name: br
+description: d
+nodes:
+  - id: a
+    agent: ag
+    prompt: do a
+  - id: b
+    agent: ag
+    depends_on: [a]
+    prompt: use ${mystery}
+""")
+    rc, data, err = run(wf)
+    assert rc == 1, err
+    assert any(i["severity"] == "block" and i["location"] == "nodes/b"
+               and "mystery" in i["message"] for i in data["issues"]), data
+
+
+def test_bare_ref_own_as_var_clean(tmp_path):
+    # LOUD #2 regression guard: ${finding} == this node's own `as: finding`
+    wf = write_wf(tmp_path, """
+version: 1
+name: br2
+description: d
+nodes:
+  - id: src
+    agent: ag
+    output_schema: {type: object, properties: {findings: {type: array}}}
+    prompt: src
+  - id: fan
+    agent: ag
+    depends_on: [src]
+    for_each: ${src.output.findings}
+    as: finding
+    prompt: verify ${finding}
+""")
+    rc, data, err = run(wf)
+    assert rc == 0, err
+    assert not any("resolves to no" in i["message"] for i in data["issues"]), data
+
+
+def test_bare_ref_carry_dotted_clean(tmp_path):
+    # the CORRECT carry-ref form is dotted ${loop.carry.<v>} (DAG-RULES §loop) — it
+    # has a dot, so the bare-ref check skips it and never false-blocks.
+    wf = write_wf(tmp_path, """
+version: 1
+name: br3
+description: d
+nodes:
+  - id: seed
+    agent: ag
+    prompt: seed
+  - id: work
+    agent: ag
+    depends_on: [seed]
+    prompt: continue from ${loop.carry.prev}
+loop:
+  body: [work]
+  max_iters: 3
+  while: ${work.output.go}
+  carry:
+    prev: ${work.output}
+""")
+    rc, data, err = run(wf)
+    assert rc == 0, err
+    assert not any("resolves to no" in i["message"] for i in data["issues"]), data
+
+
+def test_bare_ref_carry_bare_blocks(tmp_path):
+    # a BARE ${prev} is undefined at runtime even when `prev` is a carry key — carry
+    # resolves only via ${loop.carry.prev}, so the bare form must block.
+    wf = write_wf(tmp_path, """
+version: 1
+name: br4
+description: d
+nodes:
+  - id: seed
+    agent: ag
+    prompt: seed
+  - id: work
+    agent: ag
+    depends_on: [seed]
+    prompt: continue from ${prev}
+loop:
+  body: [work]
+  max_iters: 3
+  while: ${work.output.go}
+  carry:
+    prev: ${work.output}
+""")
+    rc, data, err = run(wf)
+    assert rc == 1, err
+    assert any(i["severity"] == "block" and i["location"] == "nodes/work"
+               and "prev" in i["message"] for i in data["issues"]), data
+
+
+def test_use_node_missing_profile_blocks(tmp_path):
+    _mk_ms(tmp_path, "real-ms")  # has profiles/base.yaml only
+    defs_root = tmp_path / "workflow-defs"
+    wf = make_def(defs_root, "f", """
+version: 1
+name: f
+description: d
+nodes:
+  - id: a
+    use: real-ms
+    customize:
+      profile: ghost
+    prompt: x
+""")
+    rc, data, err = run_defs(defs_root, wf)
+    assert rc == 1, err
+    assert any(i["severity"] == "block" and i["location"] == "nodes/a"
+               and "ghost" in i["message"] for i in data["issues"]), data
+
+
+def test_use_node_missing_required_input_blocks(tmp_path):
+    _mk_ms(tmp_path, "needy", base_yaml=(
+        "version: 1\ninputs:\n  seed:\n    required: true\n"))
+    # MICROSKILL.md must list `seed` in its Inputs table for required_inputs to include it
+    md = ("---\nname: needy\ndescription: d\n---\n\n# needy\n\n## Purpose\n\n"
+          "Given seed do work produce out.\n\n## Inputs\n\n"
+          "| name | required | type | description | default |\n"
+          "| --- | --- | --- | --- | --- |\n"
+          "| seed | yes | string | the seed | — |\n\n## Steps\n\n1. Use ${seed}.\n")
+    (tmp_path / "microskills" / "needy" / "MICROSKILL.md").write_text(md)
+    defs_root = tmp_path / "workflow-defs"
+    wf = make_def(defs_root, "f", """
+version: 1
+name: f
+description: d
+nodes:
+  - id: a
+    use: needy
+    prompt: x
+""")
+    rc, data, err = run_defs(defs_root, wf)
+    assert rc == 1, err
+    assert any(i["severity"] == "block" and i["location"] == "nodes/a"
+               and "seed" in i["message"] and "required" in i["message"]
+               for i in data["issues"]), data
+
+
+def test_use_node_required_input_supplied_clean(tmp_path):
+    _mk_ms(tmp_path, "needy", base_yaml=(
+        "version: 1\ninputs:\n  seed:\n    required: true\n"))
+    md = ("---\nname: needy\ndescription: d\n---\n\n# needy\n\n## Purpose\n\n"
+          "Given seed do work produce out.\n\n## Inputs\n\n"
+          "| name | required | type | description | default |\n"
+          "| --- | --- | --- | --- | --- |\n"
+          "| seed | yes | string | the seed | — |\n\n## Steps\n\n1. Use ${seed}.\n")
+    (tmp_path / "microskills" / "needy" / "MICROSKILL.md").write_text(md)
+    defs_root = tmp_path / "workflow-defs"
+    wf = make_def(defs_root, "f", """
+version: 1
+name: f
+description: d
+nodes:
+  - id: src
+    agent: ag
+    prompt: src
+  - id: a
+    use: needy
+    depends_on: [src]
+    inputs:
+      seed: ${src.output.x}
+    prompt: x
+""")
+    rc, data, err = run_defs(defs_root, wf)
+    assert rc == 0, err
+    assert not any("required" in i["message"] and "seed" in i["message"]
+                   for i in data["issues"]), data
+
+
+def _mk_ms_orch(tmp_path, name):
+    # a microskill whose runtime exposes AskUserQuestion -> classifies orchestrator
+    base = ("version: 1\nruntime:\n  allowed_tools: [AskUserQuestion]\n")
+    _mk_ms(tmp_path, name, base_yaml=base)
+
+
+def test_loop_body_use_orchestrator_blocks(tmp_path):
+    _mk_ms_orch(tmp_path, "asker")
+    defs_root = tmp_path / "workflow-defs"
+    wf = make_def(defs_root, "f", """
+version: 1
+name: f
+description: d
+nodes:
+  - id: ask
+    use: asker
+    prompt: x
+loop:
+  body: [ask]
+  max_iters: 2
+  while: ${ask.output.go}
+""")
+    rc, data, err = run_defs(defs_root, wf)
+    assert rc == 1, err
+    assert any(i["severity"] == "block" and i["location"] == "loop/body"
+               and "ask" in i["message"] and "orchestrator" in i["message"]
+               for i in data["issues"]), data
+
+
+def test_max_parallel_orchestrator_foreach_warns(tmp_path):
+    _mk_ms_orch(tmp_path, "asker")
+    defs_root = tmp_path / "workflow-defs"
+    wf = make_def(defs_root, "f", """
+version: 1
+name: f
+description: d
+nodes:
+  - id: src
+    agent: ag
+    output_schema: {type: object, properties: {items: {type: array}}}
+    prompt: src
+  - id: fan
+    use: asker
+    depends_on: [src]
+    for_each: ${src.output.items}
+    as: it
+    max_parallel: 4
+    inputs:
+      it: ${it}
+    prompt: x
+""")
+    rc, data, err = run_defs(defs_root, wf)
+    assert rc == 0, err
+    assert any(i["severity"] == "warn" and i["location"] == "nodes/fan/max_parallel"
+               and "orchestrator" in i["message"] for i in data["issues"]), data
+
+
+def _mk_ms_hardgate(tmp_path, name):
+    # a microskill carrying a hard gate -> _use_resolves_orchestrator's gates branch
+    # (classify case 5b) -> orchestrator. Covers the non-AskUserQuestion path.
+    base = ("version: 1\ngates:\n  add:\n    - id: checkit\n      after: \"1\"\n"
+            "      type: verification\n      severity: hard\n")
+    _mk_ms(tmp_path, name, base_yaml=base)
+
+
+def test_loop_body_hardgate_orchestrator_blocks(tmp_path):
+    _mk_ms_hardgate(tmp_path, "gated")
+    defs_root = tmp_path / "workflow-defs"
+    wf = make_def(defs_root, "f", """
+version: 1
+name: f
+description: d
+nodes:
+  - id: g
+    use: gated
+    prompt: x
+loop:
+  body: [g]
+  max_iters: 2
+  while: ${g.output.go}
+""")
+    rc, data, err = run_defs(defs_root, wf)
+    assert rc == 1, err
+    assert any(i["severity"] == "block" and i["location"] == "loop/body"
+               and "g" in i["message"] and "orchestrator" in i["message"]
+               for i in data["issues"]), data
+
+
+def _child_with_profile(defs_root, name="child-flow"):
+    make_def(defs_root, name, """
+version: 1
+name: child-flow
+imports: []
+inputs:
+  seed:
+    type: string
+    required: false
+nodes:
+  - id: work
+    agent: ag
+    prompt: work ${workflow.inputs.seed}
+output:
+  from: work
+""")
+    pdir = defs_root / name / "profiles"
+    pdir.mkdir(parents=True, exist_ok=True)
+    (pdir / "strict.yaml").write_text(
+        "inputs:\n  seed:\n    required: true\n")
+
+
+def test_child_required_input_via_profile_blocks(tmp_path):
+    defs_root = tmp_path / "workflow-defs"
+    _child_with_profile(defs_root)
+    parent = make_def(defs_root, "parent", """
+version: 1
+name: parent
+imports: [child-flow]
+nodes:
+  - id: a
+    agent: ag
+    prompt: a
+  - id: build
+    workflow: child-flow
+    depends_on: [a]
+    customize:
+      profile: strict
+""")
+    rc, data, err = run_defs(defs_root, parent)
+    assert rc == 1, err
+    assert any(i["severity"] == "block" and i["location"] == "nodes/build"
+               and "seed" in i["message"] for i in data["issues"]), data
+
+
+def test_child_required_input_base_not_required_clean(tmp_path):
+    # same child WITHOUT the strict profile -> seed is required:false -> no block
+    defs_root = tmp_path / "workflow-defs"
+    _child_with_profile(defs_root)
+    parent = make_def(defs_root, "parent", """
+version: 1
+name: parent
+imports: [child-flow]
+nodes:
+  - id: a
+    agent: ag
+    prompt: a
+  - id: build
+    workflow: child-flow
+    depends_on: [a]
+""")
+    rc, data, err = run_defs(defs_root, parent)
+    assert rc == 0, err
+    assert not any("seed" in i["message"] and "requires input" in i["message"]
+                   for i in data["issues"]), data
+
+
+def test_child_output_field_via_resolved_schema_warns(tmp_path):
+    # child output.from is a use: node with NO inline schema; its resolved schema
+    # declares {result}; a parent ref to ${build.output.ghost} should warn.
+    defs_root = tmp_path / "workflow-defs"
+    _mk_ms(tmp_path, "producer", base_yaml=(
+        "version: 1\noutput_schema:\n  type: object\n  properties:\n    result: {type: string}\n"))
+    make_def(defs_root, "child-flow", """
+version: 1
+name: child-flow
+imports: []
+nodes:
+  - id: make
+    use: producer
+    prompt: make
+output:
+  from: make
+""")
+    parent = make_def(defs_root, "parent", """
+version: 1
+name: parent
+imports: [child-flow]
+nodes:
+  - id: build
+    workflow: child-flow
+    inputs: {}
+  - id: read
+    agent: ag
+    depends_on: [build]
+    prompt: got ${build.output.ghost}
+""")
+    rc, data, err = run_defs(defs_root, parent)
+    assert rc == 0, err
+    assert any(i["severity"] == "warn" and "ghost" in i["message"]
+               and "child workflow" in i["message"] for i in data["issues"]), data

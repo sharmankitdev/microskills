@@ -423,6 +423,13 @@ def main():
                 f"delegation: orchestrator if a checkpoint is intended)")
             continue
         cust = n.get("customize") if isinstance(n.get("customize"), dict) else None
+        prof = (cust or {}).get("profile")
+        if isinstance(prof, str) and prof != "base" and \
+                not (skill_root / str(use_name) / "profiles" / f"{prof}.yaml").exists():
+            add(issues, node_unres_sev, f"nodes/{nid}",
+                f"use: '{use_name}' customize.profile '{prof}' has no "
+                f"profiles/{prof}.yaml (resolution silently falls back to base, "
+                f"masking the typo)")
         key = (str(use_name), (cust or {}).get("profile"),
                json.dumps((cust or {}).get("overrides") or {}, sort_keys=True))
         if key not in _res_cache:
@@ -449,6 +456,20 @@ def main():
                     f"inline output_schema diverges from use: '{use_name}' "
                     f"resolved output_schema — reconcile them, or keep the "
                     f"override and document the narrowing")
+
+    def _use_resolves_orchestrator(nid):
+        """True when a resolved use: node carries an orchestrator-forcing directive
+        (AskUserQuestion or a hard gate) — mirrors compile's classify() cases 5a/5b
+        without re-shelling the resolver. False for an unresolved node (compile stays
+        authoritative there)."""
+        pl = resolved_payloads.get(nid)
+        if not isinstance(pl, dict):
+            return False
+        d = pl.get("directives") or {}
+        if "AskUserQuestion" in (d.get("allowed_tools") or []):
+            return True
+        return any((g or {}).get("severity", "hard") == "hard"
+                   for g in (d.get("gates") or []))
 
     # --- wire: auto — materialize declared pass-through forwards (shared helper) ---
     # Mirrors compile EXACTLY (same auto_wire_node_inputs / wire_auto_placement_error
@@ -493,6 +514,27 @@ def main():
                 f"wire: auto satisfied REQUIRED target input '{rname}' from "
                 f"${{workflow.inputs.{rname}}} — verify the same-named workflow "
                 f"input is really the intended source")
+
+    # --- use: node required-input satisfaction (block) ---
+    # A use: node must supply every input its RESOLVED microskill marks required.
+    # Source of truth = resolver's own required_inputs ledger (resolved_payloads[nid]
+    # ["required_inputs"]): it already honors the customize.profile overlay AND
+    # excludes inject_from inputs (env-supplied) — recomputing from the base config
+    # over-blocks (the synthesize-review `design` profile flips fields optional).
+    # wire:auto already mutated n['inputs'] in place above, so wired forwards count.
+    for nid, n in node_by_id.items():
+        if not n.get("use") or n.get("delegation") == "orchestrator" \
+                or n.get("side_effect") is True:
+            continue
+        payload = resolved_payloads.get(nid)
+        if not isinstance(payload, dict):
+            continue  # unresolved (standalone/no-registry) — already warned/blocked above
+        required = payload.get("required_inputs") or []
+        supplied = set((n.get("inputs") or {}).keys())
+        for req in sorted(set(required) - supplied):
+            add(issues, "block", f"nodes/{nid}",
+                f"use: '{n['use']}' requires input '{req}' (required) but the node's "
+                f"inputs omit it (supply inputs.{req}: ${{...}}, or wire it)")
 
     # phase_group is a cosmetic /workflows progress-group label (emit-only). A
     # phase_group equal to a DIFFERENT node's id would merge that group's box with
@@ -651,6 +693,61 @@ def main():
                 f"'as' must match ^[a-z][a-z0-9_]*$ (safe identifier), got '{as_var}'")
         if as_var and not has_for_each:
             add(issues, "warn", f"nodes/{nid}", "'as' declared without 'for_each'; it has no effect")
+
+    # --- for_each source array-type lint (warn) ---
+    # A for_each whose source is a CLEAN whole-value ref ${prod.output.field} should
+    # iterate an array; warn if the producer's schema declares that field non-array.
+    # Method-chained sources (${...items.filter(...)}) are not statically typeable —
+    # skip them (they would false-warn). ${x.items} is always an array — skip.
+    _CLEAN_FE_RE = re.compile(r"^\$\{\s*([a-z][a-z0-9_-]*)\.output\.([A-Za-z_][A-Za-z0-9_]*)\s*\}$")
+    for nid, n in node_by_id.items():
+        fe = n.get("for_each")
+        if not isinstance(fe, str):
+            continue
+        m = _CLEAN_FE_RE.match(fe.strip())
+        if not m:
+            continue  # ${x.items}, method chains, multi-token exprs — un-typeable here
+        prod_id, field = m.group(1), m.group(2)
+        if prod_id not in node_by_id:
+            continue  # unknown producer already blocked by the ref checks above
+        osch = node_by_id[prod_id].get("output_schema") or resolved_schemas.get(prod_id)
+        if not (isinstance(osch, dict) and isinstance(osch.get("properties"), dict)):
+            continue
+        fld = osch["properties"].get(field)
+        if isinstance(fld, dict) and fld.get("type") and fld.get("type") != "array":
+            add(issues, "warn", f"nodes/{nid}/for_each",
+                f"for_each iterates ${{{prod_id}.output.{field}}} but node "
+                f"'{prod_id}' declares '{field}' as type '{fld.get('type')}', not array "
+                f"— fan-out needs an array source")
+
+    # --- bare-identifier ref existence (block) ---
+    # A ${ident} with no dot (e.g. ${finding}) is a runtime lookup that resolves only
+    # to the CONTAINING node's own for_each `as` var. Everything else is dotted —
+    # workflow inputs ride ${workflow.inputs.x}, node outputs ride ${id.output...},
+    # and a loop carry var rides ${loop.carry.<v>} (DAG-RULES §loop; a BARE ${v} is
+    # NOT a carry binding) — so all of those are skipped by the dot guard below. We
+    # scope the scan to node ref-bearing fields (inputs/prompt/when/for_each),
+    # matching the S-INFER node-ref scan, and only flag a lowercase identifier (the
+    # `as`-var naming) so a capitalized template token is left alone.
+    _BARE_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+    for nid, n in node_by_id.items():
+        own_as = n.get("as") if n.get("for_each") else None
+        legal_bare = {own_as} if own_as else set()
+        scoped = {k: n.get(k) for k in ("inputs", "prompt", "when", "for_each") if k in n}
+        reported = set()
+        for s in collect_strings(scoped):
+            for inner in REF_RE.findall(s):
+                tok = inner.strip()
+                if "." in tok or not _BARE_RE.match(tok):
+                    continue  # dotted refs + non-identifier tokens handled elsewhere
+                if tok in legal_bare or tok in reported:
+                    continue
+                reported.add(tok)
+                add(issues, "block", f"nodes/{nid}",
+                    f"bare reference ${{{tok}}} resolves to no for_each binding "
+                    f"(this node's `as`); node outputs ride ${{<id>.output...}}, "
+                    f"workflow inputs ride ${{workflow.inputs.<name>}}, and a loop "
+                    f"carry var rides ${{loop.carry.{tok}}} — all require a dotted path")
 
     # --- spill_outputs: declared node-output-by-reference (shared checks) ---
     # Mirrors compile EXACTLY (same shared helpers — the two tools can never
@@ -948,6 +1045,22 @@ def main():
             merged.get("loop")):
         add(issues, "block", r_loc, r_msg)
 
+    # --- INERT/DROPPED declarations (warn-only — no runtime effect) ---
+    # grant_tools is schema-declared on a node but never consumed by the engine.
+    for nid, n in node_by_id.items():
+        if n.get("grant_tools"):
+            add(issues, "warn", f"nodes/{nid}",
+                "grant_tools is schema-declared but the engine never consumes it "
+                "(no-op); remove it or grant the tool via the microskill's runtime")
+    # A workflow input declared materialize:file is passed BY REFERENCE as a short
+    # file PATH; by convention its name ends _path so downstream reads read-a-path.
+    for in_name, spec in (wf_inputs_map or {}).items():
+        if isinstance(spec, dict) and spec.get("materialize") == "file" \
+                and not str(in_name).endswith("_path"):
+            add(issues, "warn", "inputs",
+                f"input '{in_name}' is materialize:file (threaded by reference as a "
+                f"file path) but its name does not end in '_path'; rename for clarity")
+
     # --- present: declared gate presentation — checked, then rendered MECHANICALLY ---
     # A gate's `present` is an ordered list of field paths the dispatcher renders
     # verbatim (the model output-rubric is only the fallback), so the approver
@@ -1084,6 +1197,42 @@ def main():
                     f"recorded choice is always one of the gate's offered labels, so "
                     f"this comparison is constant and the branch is dead")
 
+    # --- dead-guard enum-literal lint (block) ---
+    # A when/for_each guard comparing a node-output field that declares an `enum`
+    # against a literal OUTSIDE that enum is constant (== always false, != always
+    # true) — the branch is dead. Generalizes the gate-choice literal cross-check to
+    # typed node outputs. Bounded via _parse_guard (one field, one comparison, one
+    # literal); anything outside the grammar parses to None and is skipped.
+    _GUARD_FIELD_RE = re.compile(r"^([a-z][a-z0-9_-]*)\.output\.([A-Za-z_][A-Za-z0-9_]*)$")
+    for nid, n in node_by_id.items():
+        for key in ("when", "for_each"):
+            parsed = _parse_guard(n.get(key))
+            if parsed is None:
+                continue
+            field_expr, op, value = parsed
+            if op not in ("==", "!=") or value is None or value[0] not in ("str", "num", "bool"):
+                continue
+            fm = _GUARD_FIELD_RE.match(field_expr)
+            if not fm:
+                continue
+            prod_id, fld = fm.group(1), fm.group(2)
+            if prod_id not in node_by_id:
+                continue
+            osch = node_by_id[prod_id].get("output_schema") or resolved_schemas.get(prod_id)
+            if not (isinstance(osch, dict) and isinstance(osch.get("properties"), dict)):
+                continue
+            spec = osch["properties"].get(fld)
+            enum = spec.get("enum") if isinstance(spec, dict) else None
+            if not isinstance(enum, list) or not enum:
+                continue
+            # compare the literal against enum members (members are scalars)
+            lit = value[1]
+            if lit not in enum:
+                add(issues, "block", f"nodes/{nid}",
+                    f"guard '{key}' compares ${{{prod_id}.output.{fld}}} against "
+                    f"{lit!r}, not a member of its declared enum {enum} — the "
+                    f"comparison is constant and the branch is dead")
+
     # --- FORCE a default on a warn gate whose choice is branched on ---
     # The dispatcher no longer fabricates a pick at a non-pausing gate: a warn
     # human_approval gate records its DECLARED default verbatim, or {choice: null}
@@ -1112,9 +1261,40 @@ def main():
                 f"the DECLARED default verbatim (or {{choice: null}} when none; never a "
                 f"fabricated pick), so the branch could never fire; declare default:")
 
+    # A severity:warn gate of a non-human_approval type emits NO checkpoint at all
+    # (dropped at compile), so its present/prompt are dead. The branched-on case is
+    # already a BLOCK above; here we warn the NOT-branched-on case so the dead
+    # declaration is still surfaced.
+    for g in gates_list:
+        gid = g.get("id")
+        if not gid or gid in referenced_gids:
+            continue  # branched-on warn gates already handled by the block above
+        if g.get("severity", "hard") == "warn" and g.get("type") != "human_approval":
+            add(issues, "warn", f"gates/{gid}",
+                f"gate '{gid}' is severity:warn and type '{g.get('type')}' — it emits "
+                f"no checkpoint at all (dropped at compile), so its present/prompt are "
+                f"dead; make it human_approval, or severity:hard, or drop it")
+
     # --- max_parallel placement: only valid on a for_each node (shared with compile) ---
     for mp_id, mp_msg in loop_max_parallel_errors(well_formed_nodes):
         add(issues, "block", f"nodes/{mp_id}/max_parallel", mp_msg)
+
+    # max_parallel on a for_each node that classifies orchestrator is silently
+    # dropped (an orchestrator checkpoint fans out serially in the main loop), so
+    # the cap is inert. Structural orchestrators (delegation/side_effect/workflow:/
+    # neither-use-nor-agent) and resolution-driven ones (AskUserQuestion / hard gate).
+    for nid, n in node_by_id.items():
+        if not n.get("max_parallel") or not n.get("for_each"):
+            continue
+        structural_orch = (n.get("delegation") == "orchestrator"
+                           or n.get("side_effect") is True
+                           or n.get("workflow")
+                           or not (n.get("use") or n.get("agent") or n.get("workflow")))
+        if structural_orch or (n.get("use") and _use_resolves_orchestrator(nid)):
+            add(issues, "warn", f"nodes/{nid}/max_parallel",
+                "max_parallel is set on a for_each node that classifies as an "
+                "orchestrator checkpoint; it fans out serially in the main loop, so "
+                "max_parallel is inert here and silently dropped")
 
     # --- Loop anchoring ---
     loop = merged.get("loop")
@@ -1148,6 +1328,11 @@ def main():
                     f"delegation/side_effect, a workflow: node, or no use/agent); a "
                     f"loop body must be entirely background — an orchestrator member "
                     f"breaks the do/while scaffold")
+            elif bn.get("use") and _use_resolves_orchestrator(b):
+                add(issues, "block", "loop/body",
+                    f"node '{b}' resolves to an orchestrator checkpoint (its "
+                    f"microskill exposes AskUserQuestion or carries a hard gate); a "
+                    f"loop body must be entirely background")
         if "max_iters" not in loop:
             add(issues, "block", "loop", "missing required 'max_iters' cap")
         # on_exhaust coherence (shared helper; the synthetic gate's policy/
@@ -1160,8 +1345,52 @@ def main():
             add(issues, "block", "loop/on_exhaust", oe_msg)
         for inner in refs_in({"while": loop.get("while"), "carry": loop.get("carry")}):
             for ref_id in NODE_OUTPUT_RE.findall(inner):
-                if ref_id not in id_set:
+                if ref_id not in id_set and ref_id not in gate_id_set:
                     add(issues, "block", "loop", f"references output of unknown node '{ref_id}'")
+            for prod_id, field in NODE_OUTPUT_FIELD_RE.findall(inner):
+                if _oe_escalate and prod_id == LOOP_RESULT_ID:
+                    if field not in ("converged", "rounds", "carry"):
+                        add(issues, "block", "loop",
+                            f"references ${{loop.output.{field}}} but the loop "
+                            f"pseudo-result declares only converged/rounds/carry")
+                    continue
+                if prod_id in gate_id_set or prod_id not in id_set:
+                    continue
+                osch = node_by_id[prod_id].get("output_schema")
+                if osch is None:
+                    osch = resolved_schemas.get(prod_id)
+                if not (isinstance(osch, dict) and osch.get("type") == "object"
+                        and isinstance(osch.get("properties"), dict)):
+                    continue
+                if field not in osch["properties"]:
+                    add(issues, "block", "loop",
+                        f"references ${{{prod_id}.output.{field}}} but node "
+                        f"'{prod_id}' output_schema does not declare property '{field}'")
+
+        # CONVERGENCE: a loop.while that references nothing iteration-local — no
+        # body-node output and no carry var — re-evaluates to the same value every
+        # round, so the loop can never converge early (only the max_iters cap stops
+        # it). Warn (a constant-true while + max_iters is a legitimate fixed-count
+        # loop, just rarely intended).
+        body_id_set = set(loop.get("body") or [])
+        carry_keys = set((loop.get("carry") or {}).keys())
+        while_refs = refs_in({"while": loop.get("while")})
+        touches_local = any(
+            rid in body_id_set
+            for inner in while_refs for rid in NODE_OUTPUT_RE.findall(inner))
+        # A carry var is referenced via the dotted ${loop.carry.<v>} form ONLY
+        # (DAG-RULES §loop; compile uses the same \bloop\.carry\.(\w+) regex), so
+        # match that exact shape — a coarse identifier scan would collide with node
+        # ids / the literal 'output' and wrongly suppress the warn.
+        touches_carry = any(
+            ck in carry_keys
+            for inner in while_refs
+            for ck in re.findall(r"\bloop\.carry\.([A-Za-z0-9_]+)", inner))
+        if loop.get("while") and while_refs and not touches_local and not touches_carry:
+            add(issues, "warn", "loop",
+                "loop.while references nothing iteration-local (no loop-body node "
+                "output and no carry var); it re-evaluates identically each round so "
+                "the loop can only stop at max_iters — verify the continue-condition")
 
         # S-LOOP: loop.body must occupy a CONTIGUOUS window in topological order
         # with no interleaved orchestrator/out-of-body node and no hard/human_approval
@@ -1245,6 +1474,31 @@ def main():
                 child_cache[name] = load_child_doc(defs_root, name)
             return child_cache[name]
 
+        def child_required(target, doc, profile):
+            """Required child inputs computed on the child's base.yaml + the parent
+            node's customize.profile overlay (mirrors runtime profile resolution),
+            not the raw child WORKFLOW.yaml. Falls back to the raw doc when no
+            overlay files are present."""
+            merged_child = doc
+            base_p = defs_root / target / "profiles" / "base.yaml"
+            if base_p.exists():
+                try:
+                    b = yaml.safe_load(base_p.read_text()) or {}
+                    b.pop("version", None)
+                    merged_child = deep_merge(merged_child, b)
+                except (yaml.YAMLError, ValueError):
+                    merged_child = doc
+            if isinstance(profile, str) and profile not in (None, "", "base"):
+                prof_p = defs_root / target / "profiles" / f"{profile}.yaml"
+                if prof_p.exists():
+                    try:
+                        o = yaml.safe_load(prof_p.read_text()) or {}
+                        o.pop("version", None)  # symmetric with base + compile's merge
+                        merged_child = deep_merge(merged_child, o)
+                    except (yaml.YAMLError, ValueError):
+                        pass
+            return required_inputs_of(merged_child)
+
         for nid, n in wf_nodes:
             target = n["workflow"]
             # (a) target must be declared in the imports allowlist.
@@ -1264,7 +1518,8 @@ def main():
             # (d) N4 child contract (PURE, from child WORKFLOW.yaml): every
             # required child input must be supplied by this node's inputs.
             supplied = set((n.get("inputs") or {}).keys())
-            for req in sorted(required_inputs_of(doc)):
+            _child_prof = (n.get("customize") or {}).get("profile")
+            for req in sorted(child_required(target, doc, _child_prof)):
                 if req not in supplied:
                     add(issues, "block", f"nodes/{nid}",
                         f"workflow: '{target}' requires input '{req}' but the node's inputs omit it")
@@ -1287,6 +1542,13 @@ def main():
                 producer = cby.get(child_out["from"])
                 if isinstance(producer, dict):
                     osch = producer.get("output_schema")
+                    if osch is None and producer.get("use"):
+                        # resolve the child producer's microskill schema (inheritance)
+                        rc_ = resolve_microskill_directives(
+                            producer["use"],
+                            producer.get("customize") if isinstance(producer.get("customize"), dict) else None,
+                            defs_root)
+                        osch = rc_.get("output_schema")
                     if isinstance(osch, dict) and isinstance(osch.get("properties"), dict):
                         child_fields = set(osch["properties"].keys())
             if child_fields is not None:
