@@ -948,6 +948,22 @@ def main():
             merged.get("loop")):
         add(issues, "block", r_loc, r_msg)
 
+    # --- INERT/DROPPED declarations (warn-only — no runtime effect) ---
+    # grant_tools is schema-declared on a node but never consumed by the engine.
+    for nid, n in node_by_id.items():
+        if n.get("grant_tools"):
+            add(issues, "warn", f"nodes/{nid}",
+                "grant_tools is schema-declared but the engine never consumes it "
+                "(no-op); remove it or grant the tool via the microskill's runtime")
+    # A workflow input declared materialize:file is passed BY REFERENCE as a short
+    # file PATH; by convention its name ends _path so downstream reads read-a-path.
+    for in_name, spec in (wf_inputs_map or {}).items():
+        if isinstance(spec, dict) and spec.get("materialize") == "file" \
+                and not str(in_name).endswith("_path"):
+            add(issues, "warn", "inputs",
+                f"input '{in_name}' is materialize:file (threaded by reference as a "
+                f"file path) but its name does not end in '_path'; rename for clarity")
+
     # --- present: declared gate presentation — checked, then rendered MECHANICALLY ---
     # A gate's `present` is an ordered list of field paths the dispatcher renders
     # verbatim (the model output-rubric is only the fallback), so the approver
@@ -1111,6 +1127,20 @@ def main():
                 f"no 'default' — a warn gate never pauses, and the dispatcher records "
                 f"the DECLARED default verbatim (or {{choice: null}} when none; never a "
                 f"fabricated pick), so the branch could never fire; declare default:")
+
+    # A severity:warn gate of a non-human_approval type emits NO checkpoint at all
+    # (dropped at compile), so its present/prompt are dead. The branched-on case is
+    # already a BLOCK above; here we warn the NOT-branched-on case so the dead
+    # declaration is still surfaced.
+    for g in gates_list:
+        gid = g.get("id")
+        if not gid or gid in referenced_gids:
+            continue  # branched-on warn gates already handled by the block above
+        if g.get("severity", "hard") == "warn" and g.get("type") != "human_approval":
+            add(issues, "warn", f"gates/{gid}",
+                f"gate '{gid}' is severity:warn and type '{g.get('type')}' — it emits "
+                f"no checkpoint at all (dropped at compile), so its present/prompt are "
+                f"dead; make it human_approval, or severity:hard, or drop it")
 
     # --- max_parallel placement: only valid on a for_each node (shared with compile) ---
     for mp_id, mp_msg in loop_max_parallel_errors(well_formed_nodes):

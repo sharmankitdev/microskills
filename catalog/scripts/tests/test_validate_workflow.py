@@ -2860,3 +2860,84 @@ def test_unknown_node_key_still_blocks(tmp_path):
     rc, data, _ = run(write_wf(tmp_path, body))
     assert any(i["severity"] == "block" and i["location"].startswith("schema:nodes/")
                for i in data["issues"])
+
+
+def test_grant_tools_warns_inert(tmp_path):
+    wf = write_wf(tmp_path, """
+version: 1
+name: gt
+description: d
+nodes:
+  - id: a
+    agent: ag
+    grant_tools: [Bash]
+    prompt: do a
+""")
+    rc, data, err = run(wf)
+    assert rc == 0, err
+    assert any(i["severity"] == "warn" and i["location"] == "nodes/a"
+               and "grant_tools" in i["message"] for i in data["issues"]), data
+
+
+def test_materialize_name_not_path_warns(tmp_path):
+    wf = write_wf(tmp_path, """
+version: 1
+name: mz
+description: d
+inputs:
+  blob:
+    type: string
+    materialize: file
+nodes:
+  - id: a
+    agent: ag
+    prompt: do ${workflow.inputs.blob}
+""")
+    rc, data, err = run(wf)
+    assert rc == 0, err
+    assert any(i["severity"] == "warn" and i["location"] == "inputs"
+               and "blob" in i["message"] and "_path" in i["message"]
+               for i in data["issues"]), data
+
+
+def test_materialize_name_ending_path_clean(tmp_path):
+    wf = write_wf(tmp_path, """
+version: 1
+name: mz2
+description: d
+inputs:
+  blob_path:
+    type: string
+    materialize: file
+nodes:
+  - id: a
+    agent: ag
+    prompt: do ${workflow.inputs.blob_path}
+""")
+    rc, data, err = run(wf)
+    assert rc == 0, err
+    assert not any("materialize" in i["message"] and "_path" in i["message"]
+                   for i in data["issues"]), data
+
+
+def test_warn_nonapproval_gate_dropped_warns(tmp_path):
+    # severity:warn + type != human_approval, NOT branched on -> warn (dead checkpoint)
+    wf = write_wf(tmp_path, """
+version: 1
+name: wg
+description: d
+nodes:
+  - id: a
+    agent: ag
+    prompt: do a
+gates:
+  - id: g1
+    after: a
+    type: verification
+    severity: warn
+    prompt: check it
+""")
+    rc, data, err = run(wf)
+    assert rc == 0, err
+    assert any(i["severity"] == "warn" and i["location"] == "gates/g1"
+               and "no checkpoint" in i["message"] for i in data["issues"]), data
