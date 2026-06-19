@@ -1,0 +1,34 @@
+version: 1
+
+# duplicate-capability cross-artifact lens (§8 step 5 / D2). The catalog index
+# (catalog-index.json from build-catalog-index) is threaded as context_path — the
+# catalog-wide grounding this dimension compares the draft against. A plain snippet
+# list REPLACES base's correctness rubric. output_schema, inputs, runtime, body
+# inherit from base.
+vars:
+  dimension: duplicate-capability
+  artifact_kind: component draft bundle under catalog review (a microskill or workflow draft)
+
+context:
+  snippets:
+    - name: duplicate-capability-rubric
+      text: >-
+        Duplicate-capability rubric — compare the component draft (read from
+        artifact_path) against the catalog index Read from context_path
+        (catalog-index.json: one {name, kind, purpose, consumers, line} entry per
+        existing component). An absent context_path = a missing grounding basis:
+        raise exactly one blocker naming the missing index and review nothing blind.
+        Flag ONLY where the draft's capability substantially duplicates or overlaps an
+        EXISTING entry's purpose — the draft does a job an existing component already
+        does, such that a profile or parameterization of the existing one would be the
+        right move instead of a new component. The deterministic floor
+        (validate-microskill / validate-workflow) checks structure, the name regex,
+        and schema only; it never reads the catalog, so duplication is invisible to it
+        — do not re-raise structural issues. For each overlap cite the colliding entry
+        by name and its index line. Severity: a near-exact capability duplicate of an
+        existing component = blocker; a substantial partial overlap a human should
+        adjudicate (extend-vs-new) = major; an adjacent-but-distinct capability worth a
+        note = minor. Set each finding's file to the real source file per the bundle's
+        provenance markers and line to that file's real line. Do not raise
+        naming-collision (identical NAME, not capability) or reverse-consumer (breaking
+        existing consumers) concerns — sibling lenses own them.

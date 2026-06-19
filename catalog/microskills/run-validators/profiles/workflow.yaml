@@ -1,0 +1,26 @@
+version: 1
+
+# Workflow-creation domain. Replaces the floor-contract snippet (list-REPLACE) with
+# the two-validator procedure: validate-workflow + compile-workflow. inputs name and
+# staging_base (optional in base) are consumed by this contract. runtime, inputs, and
+# output_schema deep-merge in from base unchanged.
+context:
+  snippets:
+    - name: deterministic-floor-contract
+      text: >-
+        Deterministic-floor contract — WORKFLOW domain. staging_paths is exactly two
+        files: <name>/WORKFLOW.yaml and <name>/profiles/base.yaml; the inputs `name`
+        and `staging_base` are also supplied. Run BOTH validators:
+        (1) `.claude/scripts/validate-workflow <name>/WORKFLOW.yaml <name>/profiles/base.yaml --defs-root <staging_base>`
+        and (2) `.claude/scripts/compile-workflow <name> --defs-root <staging_base>`.
+        For validate-workflow: parse stdout JSON {pass, issues}; map each issue to a
+        floor finding (severity block→blocker and warn→warn; location and message
+        verbatim; source validate-workflow). For compile-workflow: a non-zero exit is
+        ALWAYS a blocker — emit one floor finding per schema_errors / error entry in
+        its JSON (severity blocker, location compilation, source compile-workflow), or
+        if it printed no JSON, one blocker quoting the exit code and stderr. If either
+        validator fails to start (non-zero exit, empty or non-JSON stdout where JSON
+        was expected), emit one blocker floor finding at location environment naming
+        the failing validator. Never skip compile-workflow even when validate-workflow
+        passes. Assign ids floor-1, floor-2, … in command-output order
+        (validate-workflow issues first, then compile-workflow errors).

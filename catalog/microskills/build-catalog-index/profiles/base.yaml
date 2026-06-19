@@ -1,0 +1,24 @@
+version: 1
+
+# Thin script-runner: the body invokes the deterministic build-catalog-index
+# helper and returns its stdout summary. catalog_root + output_dir are
+# Required=yes in the table, so the resolver needs them required:true to gather
+# them; harness_path is optional with a null default (no entry). The body runs a
+# Bash command, so Bash must be allowlisted; no Read (the helper does all I/O).
+inputs:
+  catalog_root:
+    required: true
+  output_dir:
+    required: true
+
+runtime:
+  allowed_tools: [Bash]
+  model: haiku
+
+output_schema:
+  type: object
+  required: [index_path, component_count, consumer_map_count]
+  properties:
+    index_path: { type: string }
+    component_count: { type: integer }
+    consumer_map_count: { type: integer }
