@@ -1,3 +1,9 @@
+## [0.27.0](https://github.com/sharmankitdev/microskills/compare/v0.26.0...v0.27.0) (2026-06-19)
+
+### Features
+
+* **microskill:** run-validators + build-catalog-index + cross-artifact dimensions (§8 step 5) ([#31](https://github.com/sharmankitdev/microskills/issues/31)) ([2bb7551](https://github.com/sharmankitdev/microskills/commit/2bb7551870954e9186de9772f89db927b909aa41))
+
 ## [0.26.0](https://github.com/sharmankitdev/microskills/compare/v0.25.0...v0.26.0) (2026-06-19)
 
 ### Features
