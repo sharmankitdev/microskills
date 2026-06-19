@@ -1,3 +1,9 @@
+## [0.29.0](https://github.com/sharmankitdev/microskills/compare/v0.28.0...v0.29.0) (2026-06-19)
+
+### Features
+
+* **scripts:** rank-parallel do/while bodies + for_each-in-loop unblock ([#33](https://github.com/sharmankitdev/microskills/issues/33)) ([4a18ee2](https://github.com/sharmankitdev/microskills/commit/4a18ee2a2bc9832e543552760bb71650a0a72f6a))
+
 ## [0.28.0](https://github.com/sharmankitdev/microskills/compare/v0.27.0...v0.28.0) (2026-06-19)
 
 ### Features
