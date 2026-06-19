@@ -652,6 +652,32 @@ def main():
         if as_var and not has_for_each:
             add(issues, "warn", f"nodes/{nid}", "'as' declared without 'for_each'; it has no effect")
 
+    # --- for_each source array-type lint (warn) ---
+    # A for_each whose source is a CLEAN whole-value ref ${prod.output.field} should
+    # iterate an array; warn if the producer's schema declares that field non-array.
+    # Method-chained sources (${...items.filter(...)}) are not statically typeable —
+    # skip them (they would false-warn). ${x.items} is always an array — skip.
+    _CLEAN_FE_RE = re.compile(r"^\$\{\s*([a-z][a-z0-9_-]*)\.output\.([A-Za-z_][A-Za-z0-9_]*)\s*\}$")
+    for nid, n in node_by_id.items():
+        fe = n.get("for_each")
+        if not isinstance(fe, str):
+            continue
+        m = _CLEAN_FE_RE.match(fe.strip())
+        if not m:
+            continue  # ${x.items}, method chains, multi-token exprs — un-typeable here
+        prod_id, field = m.group(1), m.group(2)
+        if prod_id not in node_by_id:
+            continue  # unknown producer already blocked by the ref checks above
+        osch = node_by_id[prod_id].get("output_schema") or resolved_schemas.get(prod_id)
+        if not (isinstance(osch, dict) and isinstance(osch.get("properties"), dict)):
+            continue
+        fld = osch["properties"].get(field)
+        if isinstance(fld, dict) and fld.get("type") and fld.get("type") != "array":
+            add(issues, "warn", f"nodes/{nid}/for_each",
+                f"for_each iterates ${{{prod_id}.output.{field}}} but node "
+                f"'{prod_id}' declares '{field}' as type '{fld.get('type')}', not array "
+                f"— fan-out needs an array source")
+
     # --- spill_outputs: declared node-output-by-reference (shared checks) ---
     # Mirrors compile EXACTLY (same shared helpers — the two tools can never
     # disagree): (a) placement — spill_outputs on a for_each fan-out node is a

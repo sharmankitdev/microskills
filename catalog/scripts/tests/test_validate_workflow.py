@@ -3017,3 +3017,50 @@ loop:
     assert rc == 0, err
     assert any(i["severity"] == "warn" and i["location"] == "loop"
                and "iteration-local" in i["message"] for i in data["issues"]), data
+
+
+FE = """
+version: 1
+name: fe
+description: d
+nodes:
+  - id: src
+    agent: ag
+    output_schema:
+      type: object
+      properties:
+        items: {type: array}
+        name: {type: string}
+    prompt: src
+  - id: fan
+    agent: ag
+    depends_on: [src]
+    for_each: {SRC}
+    as: it
+    prompt: handle ${it}
+"""
+
+def test_for_each_non_array_field_warns(tmp_path):
+    wf = write_wf(tmp_path, FE.replace("{SRC}", "${src.output.name}"))
+    rc, data, err = run(wf)
+    assert rc == 0, err
+    assert any(i["severity"] == "warn" and i["location"] == "nodes/fan/for_each"
+               and "name" in i["message"] and "array" in i["message"]
+               for i in data["issues"]), data
+
+
+def test_for_each_array_field_clean(tmp_path):
+    wf = write_wf(tmp_path, FE.replace("{SRC}", "${src.output.items}"))
+    rc, data, err = run(wf)
+    assert rc == 0, err
+    assert not any("for_each" in i["location"] and "array" in i["message"]
+                   for i in data["issues"]), data
+
+
+def test_for_each_method_chain_no_warn(tmp_path):
+    # a .filter(...) expression is not statically typeable -> NO warn (catalog pattern)
+    wf = write_wf(tmp_path, FE.replace("{SRC}", "${src.output.items.filter(x => x)}"))
+    rc, data, err = run(wf)
+    assert rc == 0, err
+    assert not any(i["location"] == "nodes/fan/for_each" and "array" in i["message"]
+                   for i in data["issues"]), data
