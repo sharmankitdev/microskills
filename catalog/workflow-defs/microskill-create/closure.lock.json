@@ -8,5 +8,9 @@
     "implement": "7250ad6fbb9f0ee299565601accca5da0ce046c5b373eea6450a0fee5d4d25aa",
     "plan": "0be81585bcb6233af1413ef01ea50e427bba12b6ea01108d6c508f336c7878fa"
   },
-  "profile_used": "base"
+  "profile_used": "base",
+  "segment_digests": {
+    "seg-1.js": "2f9fcfd3ec40f187bfb3d276eccd0b712d5c62fb824f09b325cf8450fd9c9d38",
+    "seg-2.js": "02077d50f6e52314f9bf5bcb9a0e2ac3f5bd9f8ba7a8262f5f3233aa127a6301"
+  }
 }
