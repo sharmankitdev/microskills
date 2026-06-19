@@ -30,6 +30,10 @@ def test_create_profile_resolves_with_floor_and_carry():
     body = r["rendered_skill_body"]
     assert "floor_findings" in body
     assert "pre-confirmed" in body.lower()
+    # the fold PRESERVES the floor finding's id (load-bearing: the loop carry + the
+    # body's missing-id failure mode both key on it) and nulls line
+    assert "keep each floor finding's id" in body.lower()
+    assert "set line to null" in body.lower()
 
 
 def test_create_profile_validates_clean():
@@ -45,19 +49,27 @@ def test_create_profile_validates_clean():
 def test_verdict_mapping_covers_floor_and_review_tiers():
     r = _resolve("create")
     body = r["rendered_skill_body"].lower()
-    # request_changes tier names floor blocker + review blocker + review major
-    assert "request_changes" in body and "major" in body
-    # comment tier names review minor/nit AND the floor warn tier
-    assert "warn" in body and "comment" in body
+    # Pin the EXACT verdict-mapping clauses, not bare tokens (a bare "warn"/"comment"
+    # exists independently in the fold step + output schema, so dropping the floor-warn
+    # tier from verdict_mapping would slip a token-only check). These substrings fail if
+    # the create mapping is swapped for the design mapping (which has no floor tiers).
+    assert "deterministic-floor blocker" in body          # floor blocker → request_changes side
+    assert "request_changes" in body and "major-severity finding gives request_changes" in body
+    assert "deterministic-floor warn survivors give comment" in body   # floor warn → comment (NOT dropped)
     # the fold normalizes floor shape into the common finding fields
     assert "location to the file" in body and "message to the title" in body
 
 
 def test_base_and_design_unchanged_by_create_profile():
-    # The create profile is a NEW file; base/design must resolve exactly as on main.
+    # The create profile is a NEW file; base/design must resolve exactly as on main —
+    # the shared MICROSKILL.md/base.yaml body must carry NONE of the create-only markers.
+    # (Token-set guard, not a brittle golden hash: catches any shared-body create-leak —
+    # a steps.add fold, a floor input, a floor-tier verdict clause — without breaking on a
+    # legitimate future base/design edit. Full byte-identity is proven catalog-wide by the
+    # consumer --check / golden CI gates.)
+    create_only = ["floor_findings", "deterministic-floor", "pre-confirmed",
+                   "keep each floor finding's id"]
     for prof in ("base", "design"):
-        cur = _resolve(prof)
-        # The create profile did not touch the shared body — base/design's rendered
-        # body must NOT contain the create-only floor fold.
-        assert "floor_findings" not in cur["rendered_skill_body"], \
-            f"{prof} body leaked the create-only floor fold — base body was modified"
+        body = _resolve(prof)["rendered_skill_body"].lower()
+        leaked = [m for m in create_only if m in body]
+        assert not leaked, f"{prof} body leaked create-only marker(s) {leaked} — shared body was modified"

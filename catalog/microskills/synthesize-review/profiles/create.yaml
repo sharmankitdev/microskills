@@ -43,7 +43,7 @@ runtime:
 
 # ADD ONE step (the resolver appends + renumbers): fold the floor findings in as pre-confirmed
 # survivors BEFORE the base merge/re-rank/verdict steps. Phrased with NO branching vocabulary
-# (validate-microskill BRANCH_RE). `after: "1"` places it right after "Join verdicts" so the
+# (validate-microskill BRANCH_RE). `after: 1` places it right after "Join verdicts" so the
 # folded survivors flow through merge-duplicates / re-rank / tally / verdict / render unchanged.
 steps:
   add:
@@ -51,9 +51,10 @@ steps:
       text: >-
         Fold the supplied floor_findings into the survivor set as pre-confirmed
         deterministic findings — never joined to a verification and never dropped:
-        map each floor finding's location to the file field, its message to the title and
-        the explanation, preserve its severity (blocker or warn), set confidence to high,
-        and keep its source. A null or empty floor_findings folds nothing.
+        keep each floor finding's id and source, map its location to the file field, its
+        message to the title and the explanation, preserve its severity (blocker or warn),
+        set confidence to high, and set line to null. A null or empty floor_findings folds
+        nothing.
 
 # REPLACES base wholesale — RETAINS findings (the load-bearing loop carry) and adds the
 # count fields the gate/evidence present.
