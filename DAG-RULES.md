@@ -387,7 +387,10 @@ checkpoint. It requires `max_iters` (int ≥ 1) and **exactly one** of `while:` 
 carry, or no node at all (a bare token / a missing `.output`) are each a block. A `for_each` **or**
 `when` inner node inside a bounded group is blocked (mirrors a loop body — a guarded skip could null
 the exit var the continue-condition dereferences). The host `with.convergence` overrides the registry
-default. The bounded structure (group membership,
+default. The group's `do/while` body is emitted through the **same dependency-rank machinery as a
+top-level loop body** (§9) — independent same-rank inner siblings fan out as one
+`await parallel([...])` batch, dependency chains and single-node-rank groups stay byte-identical. The
+bounded structure (group membership,
 `max_iters`, the rewritten signal) is stamped onto the owning segment step (`converge`) **inside
 `manifest_hash`** — a `max_iters` / signal edit is hash-visible. A subgraph referenced by the
 **top-level `loop:`** (body / while / until / carry) is blocked in **all** modes (the splice id is
@@ -591,8 +594,10 @@ Run one instance per item in a collection. `as` names the per-item loop variable
   `notify-owners` example above) the compiler forwards only `when`/`for_each`/`as` to the checkpoint and
   silently drops `max_parallel`, and the dispatcher applies no batch cap — validation does not block it.
 - The whole fan-out result array is consumable downstream via **`${<id>.items}`** (§4).
-- **`for_each` is not allowed inside a `loop.body`** — fan-out inside a loop is a **block**
-  (`fan-out inside a loop body is unsupported`).
+- **`for_each` is legal inside an *unguarded* `loop.body`** — it composes as its own
+  `await parallel(map(...))` rank inside the `do/while` (e.g. an adversarial verify fan-out run every
+  iteration). It is **blocked only in a *guarded* body** (`for_each in a GUARDED loop body`), since a
+  guarded body stays serial (§9).
 
 > `for_each` fans out **one node over a collection**. To run **distinct nodes** concurrently you don't
 > need it — just make them independent siblings (same segment, no edge between them, e.g. all depending
@@ -862,10 +867,20 @@ loop:
   `while: ${!(EXPR)}`** (the inner expression is negated and re-wrapped) — the compiled output is
   byte-identical to writing that negated `while` by hand. The desugar runs before every ref /
   contiguity check, so both forms are validated identically.
-- `body` lists the node ids that repeat. Each must be a known node; a `for_each` node in the body is
-  a **block**.
+- `body` lists the node ids that repeat. Each must be a known node. A `for_each` node is **legal in an
+  unguarded body** (it fans out as just another rank — see below) but **blocked in a guarded body**
+  (a `when`-guarded member forces the serial emit, which can't host a concurrent fan-out).
 - The body compiles to a JS `do { ... } while ((<while>) && __iter < __max)` inside **one segment**
   (the compiler emits `let __iter = 0` / `const __max = <max_iters>`).
+- **Rank-parallel body (unguarded):** an unguarded body is emitted through the **same dependency-rank
+  machinery as a plain segment** (§12, *Intra-segment parallelism*) — independent same-rank siblings fan out as one
+  `await parallel([...])` batch, dependency chains stay serial. So a body like
+  `[implement, review_a, review_b, collect]` (where `review_a`/`review_b` both depend only on
+  `implement`) runs the two reviews concurrently each iteration. Single-node ranks (a pure
+  `[implement, evaluate]` chain) and dependency chains compile **byte-identically** to the prior serial
+  emit — only a body with genuinely independent siblings re-baselines. The principle: declare the
+  independence in the DAG (no edge between siblings) and the engine extracts the parallelism, in or out
+  of a loop. (The subgraph bounded-convergence group, §11, shares this one emit path.)
 - `carry` threads state across iterations: each var inits from `_args.carry_<v>` (`null` on the first
   round) and is reassigned at the end of each iteration. Body nodes read it via `${loop.carry.<v>}`.
 - The loop returns a `__rounds` count (the iteration count) so the dispatcher can recap "loop done in
@@ -875,7 +890,9 @@ loop:
 **Guarded-loop break:** if any body node has a `when`, the loop tracks a `__ran` flag and emits
 `if (!__ran) break` — an iteration where *every* node skipped exits the loop immediately (instead of
 spinning to `max_iters` and reading a skipped node's `null` in the `while`). You don't write this; the
-compiler emits it when it sees a `when` in the body.
+compiler emits it when it sees a `when` in the body. **A guarded body stays serial** — the `__ran`
+bookkeeping can't ride a concurrent batch, so rank-parallelism (above) applies to **unguarded bodies
+only**, and a `for_each` node is blocked in a guarded body.
 
 ### `on_exhaust` — declared cap-exhaustion policy
 
@@ -1146,7 +1163,8 @@ workflow-create:          segment[plan]  gate  nested_workflow(provision)  orche
 
 ### Intra-segment parallelism — independent-sibling ranks
 
-**Within a (non-loop) segment the compiler runs independent siblings concurrently, not serially.**
+**The compiler runs independent siblings concurrently, not serially — in plain segments AND in
+`do/while` bodies (unguarded loop bodies + subgraph bounded groups; see below).**
 After segmentation it partitions the segment's nodes into **dependency ranks**: `rank(n) = 0` if `n`
 has no in-segment dependency, else `1 + max(rank of its in-segment deps)`. Nodes that share a rank
 have **no edge between them** (§7) — they are mutually independent — so the compiler emits the whole
@@ -1177,10 +1195,17 @@ why they're siblings and not a fan-out). Rules and guarantees:
   parallel(...)` / `() => parallelChunked(...)` nested inside the rank's outer `parallel([...])`. A
   `when`-guarded sibling becomes a ternary thunk `() => (cond) ? <call> : null` (the rank's
   `parallel()` tolerates the `null`).
-- **Loop-body segments are NOT rank-parallelized** — the `do/while` body stays sequential (the loop
-  scaffold owns its ordering). Independent siblings only fan out inside ordinary (non-loop) segments.
+- **`do/while` bodies share this emit path.** An **unguarded** top-level `loop:` body (§9) and a
+  subgraph **bounded-convergence group** (§11) route through the same rank machinery, wrapped in the
+  `do/while` — independent same-rank siblings fan out as one `parallel([...])` batch each iteration,
+  in **reassignment** form (the vars are pre-declared `let`s, no `const`, no inline `phase()` line).
+  Single-node ranks and dependency chains compile byte-identically to the prior serial loop emit, so
+  only a body with genuinely independent siblings re-baselines. A **guarded** body (any `when`-guarded
+  member) stays sequential — its `__ran` break bookkeeping can't ride a concurrent batch.
 - This is purely an *emit* optimization: it never moves a node across a segment boundary, never
-  changes the `sequence` / partition, and so leaves `manifest.json` (and `manifest_hash`) untouched.
+  changes the `sequence` / partition, and so leaves `manifest.json` (and `manifest_hash`) untouched —
+  even for a re-baselined loop body, **only the closure-lock `segment_digests` move, not
+  `manifest_hash`**.
 
 ### Progress grouping — `phase_group`
 
