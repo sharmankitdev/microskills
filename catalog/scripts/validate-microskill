@@ -181,6 +181,7 @@ def check_skill(path, issues):
     if m_inputs:
         inputs_body = m_inputs.group(1)
         data_row_count = 0
+        seen_input_names = set()
         for line in inputs_body.splitlines():
             stripped = line.strip()
             if not stripped.startswith("|"):
@@ -202,6 +203,16 @@ def check_skill(path, issues):
             data_row_count += 1
             name_cell = parts[1].strip()
             default_cell = parts[5].strip()
+            required_cell = parts[2].strip().lower()
+            if required_cell not in ("yes", "no"):
+                add(issues, "block", "inputs",
+                    f"Inputs row '{name_cell}' Required column is {parts[2].strip()!r}; "
+                    f"must be literally `yes` or `no` (any other token is silently treated as not-required).")
+            if name_cell and name_cell in seen_input_names:
+                add(issues, "block", "inputs",
+                    f"Inputs table has a duplicate input name '{name_cell}'; input names must be unique.")
+            if name_cell:
+                seen_input_names.add(name_cell)
             if default_cell not in ("—", ""):
                 add(issues, "block", "inputs",
                     f"Inputs row '{name_cell}' Default column is {default_cell!r}; must be literally `—`. "

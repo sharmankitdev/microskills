@@ -259,6 +259,30 @@ def test_inputs_table_pipe_in_description_blocks(tmp_path):
     assert pipe, data
 
 
+def test_required_cell_non_vocabulary_blocks(tmp_path):
+    body = MINIMAL_BODY.format(name="bad-required").replace(
+        "| dummy | no | string | placeholder | — |",
+        "| dummy | maybe | string | placeholder | — |",
+    )
+    skill = write_skill(tmp_path, "bad-required", body)
+    code, data, _, err = run(str(skill))
+    assert code == 1, err
+    assert any(i["severity"] == "block" and "Required column" in i["message"]
+               and "yes` or `no" in i["message"] for i in data["issues"]), data
+
+
+def test_duplicate_input_names_block(tmp_path):
+    body = MINIMAL_BODY.format(name="dup-input").replace(
+        "| dummy | no | string | placeholder | — |",
+        "| dummy | no | string | placeholder | — |\n| dummy | no | string | again | — |",
+    )
+    skill = write_skill(tmp_path, "dup-input", body)
+    code, data, _, err = run(str(skill))
+    assert code == 1, err
+    assert any(i["severity"] == "block" and "duplicate input name" in i["message"]
+               for i in data["issues"]), data
+
+
 def test_word_count_cap_blocks(tmp_path):
     long_desc = " ".join(["word"] * 110)
     body = MINIMAL_BODY.format(name="too-many-words").replace(
