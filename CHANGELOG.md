@@ -1,3 +1,9 @@
+## [0.28.0](https://github.com/sharmankitdev/microskills/compare/v0.27.0...v0.28.0) (2026-06-19)
+
+### Features
+
+* **workflow:** refine-requirements create-spec profile family (§8 step 6) ([#32](https://github.com/sharmankitdev/microskills/issues/32)) ([0dbdbdd](https://github.com/sharmankitdev/microskills/commit/0dbdbdd40d605d5ce1e611fec5e54aae456c972c))
+
 ## [0.27.0](https://github.com/sharmankitdev/microskills/compare/v0.26.0...v0.27.0) (2026-06-19)
 
 ### Features
