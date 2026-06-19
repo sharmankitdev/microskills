@@ -1,0 +1,72 @@
+version: 1
+
+# The create-pipeline RVS synthesis profile. Fuses the deterministic-floor findings
+# (run-validators: severity blocker|warn, shape {location, message, source}) with the
+# adversarially-verified review findings (review-dimension: blocker|major|minor|nit) into
+# ONE whole-branch verdict + ranked must-fix. PURE OVERLAY: it ADDS the floor-fold via
+# steps.add and an optional floor_findings input — the shared body is untouched, so every
+# other synthesize-review consumer stays byte-identical (zero re-baseline).
+#
+# Floor findings are PRE-CONFIRMED deterministic facts: they bypass verify entirely and enter
+# here via floor_findings (NOT findings/verifications), folded as survivors before merge/rank.
+# A null/empty floor_findings folds nothing, so this same profile serves the plan-stage RVS
+# (which has no floor).
+vars:
+  # Major-strict, floor-aware. Identical re-loop semantics to the design profile, with the
+  # floor's warn tier mapped to comment (non-blocking, recorded).
+  verdict_mapping: >-
+    a surviving blocker-severity finding (whether a deterministic-floor blocker or a review
+    blocker) or a review major-severity finding gives request_changes; only review
+    minor/nit survivors or deterministic-floor warn survivors give comment; no survivors
+    gives approve.
+  report_target: >-
+    write the severity-grouped markdown report to the exact file named by the report_path
+    input (creating parent directories), AND write a .json sidecar next to it (same path +
+    ".json") carrying the verdict, every count field, and the merged surviving findings;
+    return that report_path in the structured result.
+
+inputs:
+  findings:
+    required: true             # the collected, dimension-tagged REVIEW findings
+  verifications:
+    required: false            # the per-review-finding verdicts; null = keep all, join nothing
+  change_summary:
+    required: false            # the create draft has no diff summary
+  floor_findings:
+    required: false            # run-validators output's findings[]; null/absent = no floor (plan stage)
+  report_path:
+    required: true             # exact evidence file to write (+ .json sidecar)
+
+# The body writes the report file, so Write joins Read.
+runtime:
+  allowed_tools: [Read, Write]
+
+# ADD ONE step (the resolver appends + renumbers): fold the floor findings in as pre-confirmed
+# survivors BEFORE the base merge/re-rank/verdict steps. Phrased with NO branching vocabulary
+# (validate-microskill BRANCH_RE). `after: 1` places it right after "Join verdicts" so the
+# folded survivors flow through merge-duplicates / re-rank / tally / verdict / render unchanged.
+steps:
+  add:
+    - after: 1
+      text: >-
+        Fold the supplied floor_findings into the survivor set as pre-confirmed
+        deterministic findings — never joined to a verification and never dropped:
+        keep each floor finding's id and source, map its location to the file field, its
+        message to the title and the explanation, preserve its severity (blocker or warn),
+        set confidence to high, and set line to null. A null or empty floor_findings folds
+        nothing.
+
+# REPLACES base wholesale — RETAINS findings (the load-bearing loop carry) and adds the
+# count fields the gate/evidence present.
+output_schema:
+  type: object
+  required: [verdict, blocker_count, comment_count, summary, findings, report_path]
+  properties:
+    verdict: { type: string, enum: [approve, comment, request_changes] }
+    blocker_count: { type: integer }      # floor blockers + review blockers
+    comment_count: { type: integer }      # surviving comment-tier (review minor/nit + floor warn)
+    summary: { type: string }
+    findings:                              # RETAINED — the loop carry (surviving, re-ranked)
+      type: array
+      items: { type: object }
+    report_path: { type: string }
