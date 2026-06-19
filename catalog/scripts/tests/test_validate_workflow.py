@@ -2941,3 +2941,79 @@ gates:
     assert rc == 0, err
     assert any(i["severity"] == "warn" and i["location"] == "gates/g1"
                and "no checkpoint" in i["message"] for i in data["issues"]), data
+
+
+LOOP_TYPED = """
+version: 1
+name: loopt
+description: d
+nodes:
+  - id: seed
+    agent: ag
+    prompt: seed
+  - id: work
+    agent: ag
+    depends_on: [seed]
+    output_schema:
+      type: object
+      properties:
+        pass: {type: boolean}
+      required: [pass]
+    prompt: work
+loop:
+  body: [work]
+  max_iters: 3
+  while: {WHILE}
+"""
+
+def test_loop_while_bad_field_blocks(tmp_path):
+    wf = write_wf(tmp_path, LOOP_TYPED.replace("{WHILE}", "${work.output.nope}"))
+    rc, data, err = run(wf)
+    assert rc == 1, err
+    assert any(i["severity"] == "block" and i["location"] == "loop"
+               and "nope" in i["message"] and "work" in i["message"]
+               for i in data["issues"]), data
+
+
+def test_loop_while_good_field_clean(tmp_path):
+    wf = write_wf(tmp_path, LOOP_TYPED.replace("{WHILE}", "${work.output.pass}"))
+    rc, data, err = run(wf)
+    assert rc == 0, err
+    assert not any(i["severity"] == "block" and i["location"] == "loop"
+                   for i in data["issues"]), data
+
+
+def test_loop_carry_bad_field_blocks(tmp_path):
+    body = LOOP_TYPED.replace("{WHILE}", "${work.output.pass}").rstrip() + \
+        "\n  carry:\n    keep: ${work.output.ghost}\n"
+    wf = write_wf(tmp_path, body)
+    rc, data, err = run(wf)
+    assert rc == 1, err
+    assert any("ghost" in i["message"] for i in data["issues"]), data
+
+
+def test_loop_while_non_converging_warns(tmp_path):
+    # while references a NON-body node's output and no carry -> can't converge early
+    body = """
+version: 1
+name: nc
+description: d
+nodes:
+  - id: cfg
+    agent: ag
+    output_schema: {type: object, properties: {go: {type: boolean}}}
+    prompt: cfg
+  - id: work
+    agent: ag
+    depends_on: [cfg]
+    prompt: work
+loop:
+  body: [work]
+  max_iters: 3
+  while: ${cfg.output.go}
+"""
+    wf = write_wf(tmp_path, body)
+    rc, data, err = run(wf)
+    assert rc == 0, err
+    assert any(i["severity"] == "warn" and i["location"] == "loop"
+               and "iteration-local" in i["message"] for i in data["issues"]), data

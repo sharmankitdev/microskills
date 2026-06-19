@@ -1190,8 +1190,47 @@ def main():
             add(issues, "block", "loop/on_exhaust", oe_msg)
         for inner in refs_in({"while": loop.get("while"), "carry": loop.get("carry")}):
             for ref_id in NODE_OUTPUT_RE.findall(inner):
-                if ref_id not in id_set:
+                if ref_id not in id_set and ref_id not in gate_id_set:
                     add(issues, "block", "loop", f"references output of unknown node '{ref_id}'")
+            for prod_id, field in NODE_OUTPUT_FIELD_RE.findall(inner):
+                if _oe_escalate and prod_id == LOOP_RESULT_ID:
+                    if field not in ("converged", "rounds", "carry"):
+                        add(issues, "block", "loop",
+                            f"references ${{loop.output.{field}}} but the loop "
+                            f"pseudo-result declares only converged/rounds/carry")
+                    continue
+                if prod_id in gate_id_set or prod_id not in id_set:
+                    continue
+                osch = node_by_id[prod_id].get("output_schema")
+                if osch is None:
+                    osch = resolved_schemas.get(prod_id)
+                if not (isinstance(osch, dict) and osch.get("type") == "object"
+                        and isinstance(osch.get("properties"), dict)):
+                    continue
+                if field not in osch["properties"]:
+                    add(issues, "block", "loop",
+                        f"references ${{{prod_id}.output.{field}}} but node "
+                        f"'{prod_id}' output_schema does not declare property '{field}'")
+
+        # CONVERGENCE: a loop.while that references nothing iteration-local — no
+        # body-node output and no carry var — re-evaluates to the same value every
+        # round, so the loop can never converge early (only the max_iters cap stops
+        # it). Warn (a constant-true while + max_iters is a legitimate fixed-count
+        # loop, just rarely intended).
+        body_id_set = set(loop.get("body") or [])
+        carry_keys = set((loop.get("carry") or {}).keys())
+        while_refs = refs_in({"while": loop.get("while")})
+        touches_local = any(
+            rid in body_id_set
+            for inner in while_refs for rid in NODE_OUTPUT_RE.findall(inner))
+        touches_carry = any(
+            ck in carry_keys
+            for inner in while_refs for ck in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", inner))
+        if loop.get("while") and while_refs and not touches_local and not touches_carry:
+            add(issues, "warn", "loop",
+                "loop.while references nothing iteration-local (no loop-body node "
+                "output and no carry var); it re-evaluates identically each round so "
+                "the loop can only stop at max_iters — verify the continue-condition")
 
         # S-LOOP: loop.body must occupy a CONTIGUOUS window in topological order
         # with no interleaved orchestrator/out-of-body node and no hard/human_approval
