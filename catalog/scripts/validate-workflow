@@ -1126,6 +1126,42 @@ def main():
                     f"recorded choice is always one of the gate's offered labels, so "
                     f"this comparison is constant and the branch is dead")
 
+    # --- dead-guard enum-literal lint (block) ---
+    # A when/for_each guard comparing a node-output field that declares an `enum`
+    # against a literal OUTSIDE that enum is constant (== always false, != always
+    # true) — the branch is dead. Generalizes the gate-choice literal cross-check to
+    # typed node outputs. Bounded via _parse_guard (one field, one comparison, one
+    # literal); anything outside the grammar parses to None and is skipped.
+    _GUARD_FIELD_RE = re.compile(r"^([a-z][a-z0-9_-]*)\.output\.([A-Za-z_][A-Za-z0-9_]*)$")
+    for nid, n in node_by_id.items():
+        for key in ("when", "for_each"):
+            parsed = _parse_guard(n.get(key))
+            if parsed is None:
+                continue
+            field_expr, op, value = parsed
+            if op not in ("==", "!=") or value is None or value[0] not in ("str", "num", "bool"):
+                continue
+            fm = _GUARD_FIELD_RE.match(field_expr)
+            if not fm:
+                continue
+            prod_id, fld = fm.group(1), fm.group(2)
+            if prod_id not in node_by_id:
+                continue
+            osch = node_by_id[prod_id].get("output_schema") or resolved_schemas.get(prod_id)
+            if not (isinstance(osch, dict) and isinstance(osch.get("properties"), dict)):
+                continue
+            spec = osch["properties"].get(fld)
+            enum = spec.get("enum") if isinstance(spec, dict) else None
+            if not isinstance(enum, list) or not enum:
+                continue
+            # compare the literal against enum members (members are scalars)
+            lit = value[1]
+            if lit not in enum:
+                add(issues, "block", f"nodes/{nid}",
+                    f"guard '{key}' compares ${{{prod_id}.output.{fld}}} against "
+                    f"{lit!r}, not a member of its declared enum {enum} — the "
+                    f"comparison is constant and the branch is dead")
+
     # --- FORCE a default on a warn gate whose choice is branched on ---
     # The dispatcher no longer fabricates a pick at a non-pausing gate: a warn
     # human_approval gate records its DECLARED default verbatim, or {choice: null}

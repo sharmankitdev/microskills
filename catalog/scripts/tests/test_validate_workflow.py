@@ -3064,3 +3064,49 @@ def test_for_each_method_chain_no_warn(tmp_path):
     assert rc == 0, err
     assert not any(i["location"] == "nodes/fan/for_each" and "array" in i["message"]
                    for i in data["issues"]), data
+
+
+ENUMG = """
+version: 1
+name: eg
+description: d
+nodes:
+  - id: judge
+    agent: ag
+    output_schema:
+      type: object
+      properties:
+        verdict: {type: string, enum: [approve, reject]}
+    prompt: judge
+  - id: act
+    agent: ag
+    depends_on: [judge]
+    when: {WHEN}
+    prompt: act
+"""
+
+def test_dead_enum_literal_blocks(tmp_path):
+    wf = write_wf(tmp_path, ENUMG.replace("{WHEN}", "${judge.output.verdict == 'reqect'}"))
+    rc, data, err = run(wf)
+    assert rc == 1, err
+    assert any(i["severity"] == "block" and i["location"] == "nodes/act"
+               and "reqect" in i["message"] and "enum" in i["message"]
+               for i in data["issues"]), data
+
+
+def test_valid_enum_literal_clean(tmp_path):
+    wf = write_wf(tmp_path, ENUMG.replace("{WHEN}", "${judge.output.verdict == 'approve'}"))
+    rc, data, err = run(wf)
+    assert rc == 0, err
+    assert not any("enum" in i["message"] for i in data["issues"]), data
+
+
+def test_non_enum_field_literal_clean(tmp_path):
+    # field has no enum -> any literal is fine
+    body = ENUMG.replace(
+        "verdict: {type: string, enum: [approve, reject]}",
+        "verdict: {type: string}").replace("{WHEN}", "${judge.output.verdict == 'whatever'}")
+    wf = write_wf(tmp_path, body)
+    rc, data, err = run(wf)
+    assert rc == 0, err
+    assert not any("enum" in i["message"] for i in data["issues"]), data
