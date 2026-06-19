@@ -457,6 +457,20 @@ def main():
                     f"resolved output_schema — reconcile them, or keep the "
                     f"override and document the narrowing")
 
+    def _use_resolves_orchestrator(nid):
+        """True when a resolved use: node carries an orchestrator-forcing directive
+        (AskUserQuestion or a hard gate) — mirrors compile's classify() cases 5a/5b
+        without re-shelling the resolver. False for an unresolved node (compile stays
+        authoritative there)."""
+        pl = resolved_payloads.get(nid)
+        if not isinstance(pl, dict):
+            return False
+        d = pl.get("directives") or {}
+        if "AskUserQuestion" in (d.get("allowed_tools") or []):
+            return True
+        return any((g or {}).get("severity", "hard") == "hard"
+                   for g in (d.get("gates") or []))
+
     # --- wire: auto — materialize declared pass-through forwards (shared helper) ---
     # Mirrors compile EXACTLY (same auto_wire_node_inputs / wire_auto_placement_error
     # helpers, so the two tools can never disagree on the wired set): for an
@@ -1266,6 +1280,23 @@ def main():
     for mp_id, mp_msg in loop_max_parallel_errors(well_formed_nodes):
         add(issues, "block", f"nodes/{mp_id}/max_parallel", mp_msg)
 
+    # max_parallel on a for_each node that classifies orchestrator is silently
+    # dropped (an orchestrator checkpoint fans out serially in the main loop), so
+    # the cap is inert. Structural orchestrators (delegation/side_effect/workflow:/
+    # neither-use-nor-agent) and resolution-driven ones (AskUserQuestion / hard gate).
+    for nid, n in node_by_id.items():
+        if not n.get("max_parallel") or not n.get("for_each"):
+            continue
+        structural_orch = (n.get("delegation") == "orchestrator"
+                           or n.get("side_effect") is True
+                           or n.get("workflow")
+                           or not (n.get("use") or n.get("agent") or n.get("workflow")))
+        if structural_orch or (n.get("use") and _use_resolves_orchestrator(nid)):
+            add(issues, "warn", f"nodes/{nid}/max_parallel",
+                "max_parallel is set on a for_each node that classifies as an "
+                "orchestrator checkpoint; it fans out serially in the main loop, so "
+                "max_parallel is inert here and silently dropped")
+
     # --- Loop anchoring ---
     loop = merged.get("loop")
     if isinstance(loop, dict):
@@ -1298,6 +1329,11 @@ def main():
                     f"delegation/side_effect, a workflow: node, or no use/agent); a "
                     f"loop body must be entirely background — an orchestrator member "
                     f"breaks the do/while scaffold")
+            elif bn.get("use") and _use_resolves_orchestrator(b):
+                add(issues, "block", "loop/body",
+                    f"node '{b}' resolves to an orchestrator checkpoint (its "
+                    f"microskill exposes AskUserQuestion or carries a hard gate); a "
+                    f"loop body must be entirely background")
         if "max_iters" not in loop:
             add(issues, "block", "loop", "missing required 'max_iters' cap")
         # on_exhaust coherence (shared helper; the synthetic gate's policy/

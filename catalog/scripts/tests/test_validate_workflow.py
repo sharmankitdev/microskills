@@ -3267,3 +3267,60 @@ nodes:
     assert rc == 0, err
     assert not any("required" in i["message"] and "seed" in i["message"]
                    for i in data["issues"]), data
+
+
+def _mk_ms_orch(tmp_path, name):
+    # a microskill whose runtime exposes AskUserQuestion -> classifies orchestrator
+    base = ("version: 1\nruntime:\n  allowed_tools: [AskUserQuestion]\n")
+    _mk_ms(tmp_path, name, base_yaml=base)
+
+
+def test_loop_body_use_orchestrator_blocks(tmp_path):
+    _mk_ms_orch(tmp_path, "asker")
+    defs_root = tmp_path / "workflow-defs"
+    wf = make_def(defs_root, "f", """
+version: 1
+name: f
+description: d
+nodes:
+  - id: ask
+    use: asker
+    prompt: x
+loop:
+  body: [ask]
+  max_iters: 2
+  while: ${ask.output.go}
+""")
+    rc, data, err = run_defs(defs_root, wf)
+    assert rc == 1, err
+    assert any(i["severity"] == "block" and i["location"] == "loop/body"
+               and "ask" in i["message"] and "orchestrator" in i["message"]
+               for i in data["issues"]), data
+
+
+def test_max_parallel_orchestrator_foreach_warns(tmp_path):
+    _mk_ms_orch(tmp_path, "asker")
+    defs_root = tmp_path / "workflow-defs"
+    wf = make_def(defs_root, "f", """
+version: 1
+name: f
+description: d
+nodes:
+  - id: src
+    agent: ag
+    output_schema: {type: object, properties: {items: {type: array}}}
+    prompt: src
+  - id: fan
+    use: asker
+    depends_on: [src]
+    for_each: ${src.output.items}
+    as: it
+    max_parallel: 4
+    inputs:
+      it: ${it}
+    prompt: x
+""")
+    rc, data, err = run_defs(defs_root, wf)
+    assert rc == 0, err
+    assert any(i["severity"] == "warn" and i["location"] == "nodes/fan/max_parallel"
+               and "orchestrator" in i["message"] for i in data["issues"]), data
