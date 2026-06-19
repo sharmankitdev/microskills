@@ -2434,9 +2434,20 @@ def emit_segment_js(seg_nodes, wf, loop, seg_index, converge_groups=None):
         # this iteration; an all-skipped iteration breaks out (avoids spinning to
         # the cap and reading a skipped node's null output in the while condition).
         has_guarded_body = any(n.get("when") for n in seg_nodes)
-        loop_calls = "".join(
-            node_call_js(n, seg_var_ids, indent="    ", declare=False, track_ran=has_guarded_body)
-            for n in seg_nodes)
+        if has_guarded_body:
+            # A guarded body tracks __ran to break on an all-skipped iteration; that
+            # bookkeeping can't ride a concurrent batch, so it stays the serial emit.
+            loop_calls = "".join(
+                node_call_js(n, seg_var_ids, indent="    ", declare=False, track_ran=True)
+                for n in seg_nodes)
+        else:
+            # Unguarded body → route through the shared rank emitter: independent
+            # same-rank siblings fan out as ONE parallel([...]) batch, dependency
+            # chains stay serial. Single-node ranks emit byte-identically to the old
+            # serial loop body (the byte-identity floor); a for_each node composes as
+            # its own already-parallel rank inside the do/while.
+            loop_calls = emit_rank_calls(seg_nodes, seg_var_ids, declare=False,
+                                         phase_line=False, indent="    ")
         ran_init = "    let __ran = false\n" if has_guarded_body else ""
         break_line = "    if (!__ran) break\n" if has_guarded_body else ""
         carry_assign = "".join(
