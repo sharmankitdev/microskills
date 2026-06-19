@@ -129,6 +129,13 @@ _TPL_ROOT, SCHEMA_SOURCE = next(
     ((p, label) for p, label in _templates_candidates(SCRIPT) if p.is_dir()),
     _templates_candidates(SCRIPT)[0])
 SCHEMA_PATH = _TPL_ROOT / "references" / "workflow-schema.json"
+# Closed grammar for a reusable node-group registry file (<defs-root>/_subgraphs/
+# <name>/SUBGRAPH.yaml). Read ONLY by desugar_subgraphs, and ONLY when a
+# `subgraph:` node is present, so a subgraph-free compile never touches it (and
+# its bytes stay out of manifest_hash — like workflow-schema.json, it is the
+# validator, not content; the SPLICED nodes fingerprint normally, so a registry
+# edit is closure-visible through them).
+SUBGRAPH_SCHEMA_PATH = _TPL_ROOT / "references" / "subgraph-schema.json"
 RESOLVE_SCRIPT = SCRIPT.parent / "resolve-microskill"
 
 # Reuse resolver helpers (extension-less file → SourceFileLoader).
@@ -169,6 +176,17 @@ EACH_ANY_RE = re.compile(r"\{\{each\.[^}]*\}\}")
 # Legal expand.over item name: lowercase identifier; '-' is normalized to '_' when the
 # item is used as a generated-node-id suffix / fan-in input key.
 EXPAND_ITEM_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
+# {{param}} token inside a SUBGRAPH.yaml inner node — substituted from the host
+# `with:` map by desugar_subgraphs (whole-value aware). Same shape as
+# resolve-microskill's PLACEHOLDER_RE; a DISTINCT namespace from {{snippet:...}}
+# (colon) and {{each.*}} (dot), so the three token kinds never collide.
+SUBGRAPH_PARAM_RE = re.compile(r"\{\{([\w-]+)\}\}")
+# Post-splice fail-loud sweep: ANY surviving {{...}} token in a SPLICED node — an
+# unknown param, or a {{snippet:}}/{{each.}} token a subgraph may not carry (V1).
+SUBGRAPH_TOKEN_RE = re.compile(r"\{\{[^}]*\}\}")
+# A SUBGRAPH.yaml ${inputs.<name>} binding ref — the WHOLE inner expression
+# (inputs are opaque whole-value bindings, no field tail in V1).
+SUBGRAPH_INPUT_RE = re.compile(r"^inputs\.([a-z][a-z0-9_-]*)$")
 
 
 def substitute_vars_deep(obj, vars_map, unresolved):
@@ -407,6 +425,459 @@ def expand_static_fanout(wf):
                               f"unresolved {m.group(0)} token (only {{{{each.item}}}} is "
                               f"substituted, and only inside an expand template)")
                 break
+
+    wf["nodes"] = new_nodes
+    return wf, errors
+
+
+def _subgraph_static_orchestrator(node):
+    """The STATIC orchestrator signals (a subset of classify() that needs no
+    resolver shell): delegation:orchestrator, a workflow: key, side_effect, or
+    neither use: nor agent:. A subgraph runs inside ONE background segment, so an
+    inner node tripping any of these is a hard block (the no-human-gate rule)."""
+    if not isinstance(node, dict):
+        return True
+    if node.get("delegation") == "orchestrator":
+        return True
+    if node.get("workflow"):
+        return True
+    if node.get("side_effect") is True:
+        return True
+    if not node.get("use") and not node.get("agent"):
+        return True
+    return False
+
+
+def _subgraph_map_strings(obj, fn):
+    """Apply fn to every string in a nested structure, returning a NEW structure
+    (dict keys walked too, mirroring substitute_vars_deep). Pure transform."""
+    if isinstance(obj, str):
+        return fn(obj)
+    if isinstance(obj, dict):
+        return {(_subgraph_map_strings(k, fn) if isinstance(k, str) else k):
+                _subgraph_map_strings(v, fn) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_subgraph_map_strings(v, fn) for v in obj]
+    return obj
+
+
+def _subgraph_subst_params(obj, params):
+    """Whole-value-aware {{param}} substitution into a subgraph inner structure.
+    A string that is EXACTLY {{key}} (key a supplied param) yields params[key]
+    VERBATIM — preserving its list/dict/scalar type, so a list param can drive an
+    inner for_each. (expand: is desugared BEFORE the subgraph splice, so an inner
+    node's expand never survives into a spliced node.) An embedded {{key}} is
+    textual (str-coerced). An unknown
+    {{...}} token is left intact for the post-splice fail-loud sweep. Dict keys
+    are substituted textually only (a whole-value list/dict can't be a key)."""
+    if isinstance(obj, str):
+        m = SUBGRAPH_PARAM_RE.fullmatch(obj)
+        if m and m.group(1) in params:
+            return copy.deepcopy(params[m.group(1)])
+        def repl(mm):
+            k = mm.group(1)
+            return str(params[k]) if k in params else mm.group(0)
+        return SUBGRAPH_PARAM_RE.sub(repl, obj)
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if isinstance(k, str):
+                k = SUBGRAPH_PARAM_RE.sub(
+                    lambda mm: str(params[mm.group(1)]) if mm.group(1) in params
+                    else mm.group(0), k)
+            out[k] = _subgraph_subst_params(v, params)
+        return out
+    if isinstance(obj, list):
+        return [_subgraph_subst_params(v, params) for v in obj]
+    return obj
+
+
+def _subgraph_self_containment(node, name, declared_inputs, inner_ids, self_as):
+    """A subgraph couples to the host ONLY through its declared inputs:/with:. So
+    every ${...} ref in an inner node's scoped fields must be a declared
+    ${inputs.<name>}, a sibling ${<inner>.output|items}, or the node's own
+    for_each loop-var (${<as>}). Anything else (${workflow.inputs.x}, a host node
+    id, an undeclared input) is a hard block. Returns an error string, or None."""
+    scoped = {k: node.get(k) for k in SCOPED_REF_FIELDS if k in node}
+    for s in collect_strings(scoped):
+        for inner in REF_RE.findall(s):
+            e = inner.strip()
+            im = SUBGRAPH_INPUT_RE.match(e)
+            if im:
+                if im.group(1) in declared_inputs:
+                    continue
+                return (f"subgraph '{name}' must be self-contained: ref "
+                        f"'${{{inner}}}' is not a declared input or an inner node")
+            if self_as and (e == self_as or e.startswith(self_as + ".")):
+                continue
+            ids = set(NODE_OUTPUT_RE.findall(e)) | set(NODE_ITEMS_RE.findall(e))
+            if ids and ids <= inner_ids:
+                continue
+            return (f"subgraph '{name}' must be self-contained: ref "
+                    f"'${{{inner}}}' is not a declared input or an inner node")
+    return None
+
+
+def _subgraph_rewrite_ref(s, bindings, inner_ids, splice_id):
+    """Rewrite the ${...} refs in a SPLICED inner node's scoped-field string:
+    sibling ${<inner>.output|items} -> ${<splice>__<inner>.output|items} (only
+    ids in the inner set), then ${inputs.<name>} -> the host binding string
+    (whole-token). Confined to ref inners via REF_RE so prose like 'the
+    review.output file' is never rewritten. Inner-id namespacing runs BEFORE the
+    inputs substitution so a host binding that itself names a node (e.g.
+    ${author_hld.output...}) is inserted verbatim, never re-namespaced."""
+    def repl(m):
+        inner = m.group(1)
+        im = SUBGRAPH_INPUT_RE.match(inner.strip())
+        if im and im.group(1) in bindings:
+            # The binding is a full ${ref} / literal value string — emit verbatim.
+            return bindings[im.group(1)]
+        # items BEFORE output (mirrors translate_ref): the (?<!\.) lookbehind keeps
+        # ${prod.output.items} from mis-firing on the field tail.
+        def items_repl(mm):
+            nid = mm.group(1)
+            return f"{splice_id}__{nid}.items" if nid in inner_ids else mm.group(0)
+        def out_repl(mm):
+            nid = mm.group(1)
+            return f"{splice_id}__{nid}.output" if nid in inner_ids else mm.group(0)
+        inner = NODE_ITEMS_RE.sub(items_repl, inner)
+        inner = NODE_OUTPUT_RE.sub(out_repl, inner)
+        return "${" + inner + "}"
+    return REF_RE.sub(repl, s)
+
+
+def _subgraph_rewrite_exit(s, splice_id, exit_id):
+    """Downstream host rewrite: a ref to the splice node's output —
+    ${<splice>.output...} / ${<splice>.items} — re-points at the subgraph's exit
+    (the `output:` inner node, namespaced <splice>__<output>). Matches the EXACT
+    splice id only, so ${<splice>__<inner>.output} (a namespaced sibling) is left
+    alone. Confined to ref inners via REF_RE."""
+    def repl(m):
+        inner = m.group(1)
+        def items_repl(mm):
+            return f"{exit_id}.items" if mm.group(1) == splice_id else mm.group(0)
+        def out_repl(mm):
+            return f"{exit_id}.output" if mm.group(1) == splice_id else mm.group(0)
+        inner = NODE_ITEMS_RE.sub(items_repl, inner)
+        inner = NODE_OUTPUT_RE.sub(out_repl, inner)
+        return "${" + inner + "}"
+    return REF_RE.sub(repl, s)
+
+
+def desugar_subgraphs(wf, subgraphs_dir):
+    """SHARED `subgraph:` desugar used by BOTH compile and validate. Runs
+    immediately AFTER expand_static_fanout and BEFORE the wf_-prefix check + schema
+    validation — placement is load-bearing: the FIFTH node kind (`subgraph:
+    <name>`) is consumed here and SPLICED into the host DAG as ordinary namespaced
+    nodes, so the CLOSED node schema never sees it (mirrors the expand: sugar). The
+    spliced nodes land in the host segment (in-segment, autonomous, no checkpoint
+    break) and fingerprint normally → a SUBGRAPH.yaml / with: / inputs: edit moves
+    manifest_hash (closure-visible).
+
+    A node carrying a `subgraph` key references <subgraphs-dir>/<name>/SUBGRAPH.yaml
+    (a closed grammar). It is replaced IN PLACE (preserving position / topo order)
+    by the subgraph's inner nodes, each:
+      - id namespaced <splice-id>__<inner-id> (double-underscore reserved),
+      - {{param}} tokens substituted from the host `with:` (whole-value aware),
+      - ${inputs.<name>} refs rewritten to the host `inputs:` binding,
+      - sibling ${<inner>.output|items} refs re-pointed at the namespaced sibling,
+      - depends_on inner ids namespaced.
+    Downstream host refs to the splice id (${<splice>.output|items} / a depends_on
+    entry == <splice>) re-point at the subgraph's `output:` inner node (its exit).
+
+    PR1 supports convergence single_pass ONLY (pure inline splice); bounded is a
+    hard 'not yet supported (PR3)' block. Static-orchestrator inner nodes, V1
+    nesting, non-self-contained refs, the reserved '__' author id, and the
+    param/input contract are all HARD errors.
+
+    Pure function of the static doc + the registry bytes — deterministic; a doc
+    with no `subgraph:` node is returned UNCHANGED (the registry is not read).
+    Returns (wf, errors); non-empty errors are a HARD block in both tools."""
+    errors = []
+    if not isinstance(wf, dict) or not isinstance(wf.get("nodes"), list):
+        return wf, errors
+    nodes = wf["nodes"]
+
+    # Reserved-id guard (defense in depth, always): the splice namespace is
+    # <splice>__<inner>, so a hand-authored node id carrying '__' could collide
+    # with a spliced id. Block it regardless of whether a subgraph is present.
+    for n in nodes:
+        if isinstance(n, dict) and isinstance(n.get("id"), str) and "__" in n["id"]:
+            errors.append(
+                f"node id '{n['id']}' may not contain '__' — the double-underscore "
+                f"is reserved for the subgraph splice namespace "
+                f"(<splice-id>__<inner-id>)")
+    if errors:
+        return wf, errors
+
+    if not any(isinstance(n, dict) and "subgraph" in n for n in nodes):
+        # Byte-identical no-op when no subgraph node exists — the registry and its
+        # schema are never read.
+        return wf, errors
+
+    if not SUBGRAPH_SCHEMA_PATH.exists():
+        return wf, [f"subgraph schema not found: {SUBGRAPH_SCHEMA_PATH}"]
+    try:
+        sg_schema = json.loads(SUBGRAPH_SCHEMA_PATH.read_bytes())
+    except (OSError, json.JSONDecodeError) as e:
+        return wf, [f"subgraph schema unreadable: {e}"]
+
+    # Pass 1: validate each subgraph node + build its namespaced inner-node list.
+    spliced = {}        # splice-id -> [namespaced inner node dicts] (definition order)
+    splice_exits = {}   # splice-id -> namespaced exit (output) node id
+    for n in nodes:
+        if not (isinstance(n, dict) and "subgraph" in n):
+            continue
+        sid = n.get("id")
+        if not isinstance(sid, str) or not sid:
+            errors.append("a subgraph node is missing its id")
+            continue
+        # Host node shape: CLOSED to {id, subgraph, with, inputs} — desugared
+        # before the schema, so nothing else would validate it.
+        extra = set(n) - {"id", "subgraph", "with", "inputs"}
+        if extra:
+            errors.append(f"subgraph node '{sid}': unexpected key(s) "
+                          f"{sorted(extra)} (a subgraph node carries only "
+                          f"id/subgraph/with/inputs)")
+            continue
+        name = n.get("subgraph")
+        if not isinstance(name, str) or not name:
+            errors.append(f"subgraph node '{sid}': subgraph must be a string name")
+            continue
+        sg_path = Path(subgraphs_dir) / name / "SUBGRAPH.yaml"
+        if not sg_path.is_file():
+            errors.append(f"subgraph '{name}': not found at {sg_path}")
+            continue
+        try:
+            sg = yaml.safe_load(sg_path.read_text()) or {}
+        except yaml.YAMLError as e:
+            errors.append(f"subgraph '{name}': SUBGRAPH.yaml parse error: {e}")
+            continue
+        sv_errs = sorted(Draft202012Validator(sg_schema).iter_errors(sg),
+                         key=lambda e: list(e.path))
+        if sv_errs:
+            for e in sv_errs:
+                loc = "/".join(str(x) for x in e.path) or "<root>"
+                errors.append(f"subgraph '{name}': schema {loc}: {e.message}")
+            continue
+
+        inner_nodes = sg["nodes"]
+        inner_ids = set()
+        bad = False
+        for inn in inner_nodes:
+            iid = inn.get("id") if isinstance(inn, dict) else None
+            if iid in inner_ids:
+                errors.append(f"subgraph '{name}': duplicate inner node id '{iid}'")
+                bad = True
+                break
+            if isinstance(iid, str) and "__" in iid:
+                errors.append(f"subgraph '{name}': inner node id '{iid}' may not contain "
+                              f"'__' (reserved for the <splice>__<inner> namespace)")
+                bad = True
+                break
+            inner_ids.add(iid)
+        if bad:
+            continue
+        output_id = sg["output"]
+        if output_id not in inner_ids:
+            errors.append(f"subgraph '{name}': output '{output_id}' names no inner node")
+            continue
+
+        # CONVERGENCE: host with.convergence overrides SUBGRAPH.convergence; default
+        # single_pass. bounded is the PR3 feature — a hard block here.
+        host_with = n.get("with") or {}
+        if not isinstance(host_with, dict):
+            errors.append(f"subgraph node '{sid}': with must be a mapping")
+            continue
+        if "convergence" in host_with and not isinstance(host_with["convergence"], dict):
+            # A non-dict shorthand (e.g. `convergence: bounded`) must NOT silently
+            # downgrade to single_pass — that would let bounded escape the PR3 block.
+            errors.append(f"subgraph node '{sid}': with.convergence must be a mapping "
+                          f"{{mode: single_pass|bounded}}, not a scalar")
+            continue
+        if isinstance(host_with.get("convergence"), dict):
+            conv = host_with["convergence"]
+        elif isinstance(sg.get("convergence"), dict):
+            conv = sg["convergence"]
+        else:
+            conv = {}
+        mode = conv.get("mode", "single_pass")
+        if mode == "bounded":
+            errors.append(f"subgraph '{name}': convergence.mode 'bounded' is not yet "
+                          f"supported (PR3)")
+            continue
+        if mode != "single_pass":
+            errors.append(f"subgraph '{name}': convergence.mode '{mode}' is invalid "
+                          f"(single_pass only)")
+            continue
+
+        # PARAMS: declared params + defaults; the host `with:` supplies/overrides.
+        declared_params = sg.get("params") or {}
+        unknown_with = set(host_with) - {"convergence"} - set(declared_params)
+        if unknown_with:
+            errors.append(f"subgraph node '{sid}': unknown with key(s) "
+                          f"{sorted(unknown_with)} (not a declared param of '{name}')")
+            bad = True
+        params = {}
+        for pname, pspec in declared_params.items():
+            pspec = pspec or {}
+            if pname in host_with:
+                params[pname] = host_with[pname]
+            elif "default" in pspec:
+                params[pname] = pspec["default"]
+            elif pspec.get("required"):
+                errors.append(f"subgraph node '{sid}': required param '{pname}' of "
+                              f"'{name}' is not supplied in with:")
+                bad = True
+
+        # INPUTS: declared inputs; the host `inputs:` binds a ${ref}/value each.
+        declared_inputs = sg.get("inputs") or {}
+        host_inputs = n.get("inputs") or {}
+        if not isinstance(host_inputs, dict):
+            errors.append(f"subgraph node '{sid}': inputs must be a mapping")
+            continue
+        unknown_inputs = set(host_inputs) - set(declared_inputs)
+        if unknown_inputs:
+            errors.append(f"subgraph node '{sid}': unknown inputs key(s) "
+                          f"{sorted(unknown_inputs)} (not a declared input of '{name}')")
+            bad = True
+        bindings = {}
+        for iname, ispec in declared_inputs.items():
+            ispec = ispec or {}
+            if iname in host_inputs:
+                bval = host_inputs[iname]
+                if not isinstance(bval, str):
+                    # The binding is substituted verbatim into a ${inputs.X} ref
+                    # string, so it must be a string (a ${ref} or a literal); a
+                    # non-string would crash the rewrite. Block, never traceback.
+                    errors.append(f"subgraph node '{sid}': input '{iname}' binding must "
+                                  f"be a string (a ${{ref}} or literal), got "
+                                  f"{type(bval).__name__}")
+                    bad = True
+                else:
+                    bindings[iname] = bval
+            elif ispec.get("required"):
+                errors.append(f"subgraph node '{sid}': required input '{iname}' of "
+                              f"'{name}' is not bound in inputs:")
+                bad = True
+        if bad:
+            continue
+
+        # Per-inner-node: static-orchestrator / nesting / self-containment guards,
+        # then namespace + rewrite. Build the spliced list in definition order.
+        gen_nodes = []
+        for inn in inner_nodes:
+            iid = inn["id"]
+            if "subgraph" in inn:
+                errors.append(f"subgraph '{name}': inner node '{iid}' carries a "
+                              f"subgraph key — nested subgraphs are not supported (V1)")
+                bad = True
+                break
+            if _subgraph_static_orchestrator(inn):
+                errors.append(f"subgraph '{name}': inner node '{iid}' classifies as an "
+                              f"orchestrator (delegation:orchestrator / workflow: / "
+                              f"side_effect / neither use: nor agent:) — a subgraph runs "
+                              f"inside one background segment and cannot hold a human gate")
+                bad = True
+                break
+            self_as = inn.get("as") if isinstance(inn.get("as"), str) else None
+            sc_err = _subgraph_self_containment(
+                inn, name, declared_inputs, inner_ids, self_as)
+            if sc_err:
+                errors.append(sc_err)
+                bad = True
+                break
+            dep_bad = next((d for d in (inn.get("depends_on") or [])
+                            if d not in inner_ids), None)
+            if dep_bad is not None:
+                errors.append(f"subgraph '{name}' must be self-contained: inner node "
+                              f"'{iid}' depends_on '{dep_bad}', which is not an inner node")
+                bad = True
+                break
+
+            gen = copy.deepcopy(inn)
+            gen = _subgraph_subst_params(gen, params)
+            for f in SCOPED_REF_FIELDS:
+                if f in gen:
+                    gen[f] = _subgraph_map_strings(
+                        gen[f],
+                        lambda s: _subgraph_rewrite_ref(s, bindings, inner_ids, sid))
+            if gen.get("depends_on"):
+                gen["depends_on"] = [f"{sid}__{d}" for d in gen["depends_on"]]
+            gen["id"] = f"{sid}__{iid}"
+            gen_nodes.append(gen)
+        if bad:
+            continue
+
+        spliced[sid] = gen_nodes
+        splice_exits[sid] = f"{sid}__{output_id}"
+
+    # A subgraph that the top-level `loop:` references (its splice id in loop.body,
+    # or its output ${<splice>.output|items} in loop.while/until/carry) is NOT
+    # supported in PR1: the splice id is rewritten away, so the loop block would
+    # dangle. PR3 owns subgraph<->loop interaction; block here rather than miscompile.
+    loop = wf.get("loop")
+    if isinstance(loop, dict) and splice_exits:
+        body_ids = set(loop.get("body") or [])
+        loop_ref_ids = set()
+        non_body = {k: v for k, v in loop.items() if k != "body"}
+        for s in collect_strings(non_body):
+            for inner in REF_RE.findall(s):
+                loop_ref_ids.update(NODE_OUTPUT_RE.findall(inner))
+                loop_ref_ids.update(NODE_ITEMS_RE.findall(inner))
+        for sid in splice_exits:
+            if sid in body_ids or sid in loop_ref_ids:
+                errors.append(f"subgraph node '{sid}': a subgraph referenced by the "
+                              f"top-level loop (body/while/until/carry) is not supported "
+                              f"in PR1 (PR3 owns subgraph<->loop interaction)")
+
+    if errors:
+        return wf, errors
+
+    # Pass 2: splice — replace each subgraph node in place with its inner nodes.
+    new_nodes = []
+    for n in nodes:
+        if isinstance(n, dict) and "subgraph" in n and n.get("id") in spliced:
+            new_nodes.extend(spliced[n["id"]])
+        else:
+            new_nodes.append(n)
+
+    # Pass 3: downstream host rewrite — every node's ${<splice>.output|items} and a
+    # depends_on entry == <splice> re-point at the subgraph's namespaced exit. Runs
+    # over ALL nodes (spliced inner nodes too, so a cross-subgraph ${B.output}
+    # binding inside A's spliced nodes also re-points).
+    for n in new_nodes:
+        if not isinstance(n, dict):
+            continue
+        for sid, exit_id in splice_exits.items():
+            for f in SCOPED_REF_FIELDS:
+                if f in n:
+                    n[f] = _subgraph_map_strings(
+                        n[f],
+                        lambda s, _sid=sid, _ex=exit_id: _subgraph_rewrite_exit(
+                            s, _sid, _ex))
+            if isinstance(n.get("depends_on"), list):
+                n["depends_on"] = [exit_id if d == sid else d
+                                   for d in n["depends_on"]]
+
+    # Fail-loud sweep: a surviving `subgraph` key anywhere, or an unresolved {{...}}
+    # token in a SPLICED node — either is a half-desugared splice and must block.
+    spliced_ids = {gen["id"] for gens in spliced.values() for gen in gens}
+    for n in new_nodes:
+        if not isinstance(n, dict):
+            continue
+        if "subgraph" in n:
+            errors.append(f"node '{n.get('id', '?')}': a `subgraph` key survived "
+                          f"desugaring")
+            continue
+        if n.get("id") in spliced_ids:
+            for s in collect_strings(n):
+                m = SUBGRAPH_TOKEN_RE.search(s)
+                if m:
+                    errors.append(f"node '{n['id']}': unresolved {m.group(0)} token "
+                                  f"after subgraph desugar (only declared {{{{param}}}} "
+                                  f"tokens are substituted)")
+                    break
 
     wf["nodes"] = new_nodes
     return wf, errors
@@ -1980,6 +2451,17 @@ def main():
     wf, expand_errors = expand_static_fanout(wf)
     if expand_errors:
         die("expand: desugar failed", 1, expand_errors=expand_errors)
+
+    # --- COMPILE-TIME SUBGRAPH: splice reusable node-groups (shared desugar) ---
+    # Immediately AFTER expand and BEFORE the wf_-prefix check + schema validation
+    # (placement is load-bearing, mirroring expand:: the FIFTH node kind `subgraph:
+    # <name>` is consumed here and spliced into the host DAG as ordinary namespaced
+    # <splice>__<inner> nodes, so the closed node schema never sees it). The
+    # spliced nodes fingerprint normally → a registry/with/inputs edit is
+    # closure-visible. Errors are a HARD block (the splice must never half-resolve).
+    wf, sg_errors = desugar_subgraphs(wf, defs_root / "_subgraphs")
+    if sg_errors:
+        die("subgraph: desugar failed", 1, subgraph_errors=sg_errors)
 
     # --- FAIL-LOUD: reserved wf_ node-id prefix (defense in depth with the
     # schema pattern + validate's block — the 1.1 fail-loud pattern). A

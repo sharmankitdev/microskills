@@ -5125,3 +5125,352 @@ def test_no_warn_for_orchestrator_checkpoint_producer(tmp_path):
     rc, data, out, err = run(tmp_path, "trunc-orch")
     assert rc == 0, err
     assert "truncation" not in err
+
+
+# --- subgraph: — reusable node-group spliced into the host DAG (PR1) ---
+# Desugared PRE-VALIDATION (immediately after expand:), so the closed node schema
+# never sees the FIFTH node kind; spliced <splice>__<inner> nodes are ordinary
+# nodes classified after the splice. Hermetic: a throwaway _subgraphs/<name>/ dir
+# under the defs-root (NO vendoring) supplies the registry the desugar reads.
+
+def make_subgraph(defs_root, name, body):
+    d = defs_root / "_subgraphs" / name
+    d.mkdir(parents=True)
+    (d / "SUBGRAPH.yaml").write_text(body)
+    return d
+
+
+# A minimal single_pass subgraph: a sibling-chained review -> synthesize, with one
+# {{param}} (artifact_kind), one ${inputs.X} binding (artifact_path), a sibling
+# ${review.output} ref, and output: synthesize (its exit).
+SG_REVIEW = """\
+version: 1
+params:
+  artifact_kind: { required: true }
+inputs:
+  artifact_path: { required: true }
+output: synthesize
+convergence: { mode: single_pass }
+nodes:
+  - id: review
+    agent: reviewer
+    prompt: review this {{artifact_kind}}
+    inputs:
+      artifact_path: ${inputs.artifact_path}
+  - id: synthesize
+    agent: synthesizer
+    prompt: synthesize the review
+    inputs:
+      findings: ${review.output}
+"""
+
+# Host: author -> [subgraph rev] -> post. The subgraph node carries only
+# id/subgraph/with/inputs; downstream ${rev.output.report} re-points at the exit.
+SG_HOST = """\
+version: 1
+name: host-flow
+nodes:
+  - id: author
+    agent: writer
+    prompt: write the doc
+  - id: rev
+    subgraph: adversarial-review
+    with:
+      artifact_kind: high-level design document
+    inputs:
+      artifact_path: ${author.output.document_path}
+  - id: post
+    agent: poster
+    depends_on: [rev]
+    prompt: publish ${rev.output.report}
+"""
+
+
+def _setup_subgraph_world(defs_root, host=SG_HOST, sg=SG_REVIEW,
+                          sg_name="adversarial-review"):
+    make_flow(defs_root, "host-flow", host)
+    make_subgraph(defs_root, sg_name, sg)
+
+
+def _sg_errs(data):
+    return (data or {}).get("subgraph_errors", [])
+
+
+def test_subgraph_splices_in_one_segment(tmp_path):
+    # The subgraph node is replaced IN PLACE by its namespaced inner nodes; with
+    # plain agent nodes the whole thing collapses into ONE background segment (no
+    # checkpoint break) — that is the in-segment promise of the primitive.
+    _setup_subgraph_world(tmp_path)
+    rc, data, out, err = run(tmp_path, "host-flow")
+    assert rc == 0, err
+    assert data["segments"] == 1 and data["checkpoints"] == 0
+    assert data["sequence"] == ["segment[author,rev__review,rev__synthesize,post]"]
+
+
+def test_subgraph_rewrites_params_inputs_siblings_and_exit(tmp_path):
+    # The four desugar rewrites, read off the --explain per-node fingerprints:
+    #   1. {{param}} substituted from with:
+    #   2. ${inputs.X} -> the host inputs: binding
+    #   3. sibling ${<inner>.output} -> ${<splice>__<inner>.output}
+    #   4. downstream ${<splice>.output...} -> ${<splice>__<exit>.output...}
+    _setup_subgraph_world(tmp_path)
+    rc, data, out, err = run(tmp_path, "host-flow", "--explain")
+    assert rc == 0, err
+    fp = {f["node"]: f["fingerprint"] for f in data["fingerprints"]}
+    assert fp["rev__review"]["prompt"] == "review this high-level design document"
+    assert fp["rev__review"]["inputs"] == {
+        "artifact_path": "${author.output.document_path}"}
+    assert fp["rev__synthesize"]["inputs"] == {"findings": "${rev__review.output}"}
+    assert fp["post"]["prompt"] == "publish ${rev__synthesize.output.report}"
+
+
+def test_subgraph_deterministic(tmp_path):
+    # Same inputs -> byte-identical .compiled/ (manifest + segment): the spliced
+    # nodes fingerprint normally, no nondeterministic registry hashing.
+    _setup_subgraph_world(tmp_path)
+    d = tmp_path / "host-flow"
+    rc, d1, out, err = run(tmp_path, "host-flow")
+    assert rc == 0, err
+    first = {p.name: p.read_text() for p in (d / ".compiled").iterdir() if p.is_file()}
+    rc, d2, out, err = run(tmp_path, "host-flow")
+    assert rc == 0, err
+    second = {p.name: p.read_text() for p in (d / ".compiled").iterdir() if p.is_file()}
+    assert first == second
+    assert d1["manifest_hash"] == d2["manifest_hash"]
+
+
+# --- subgraph rejections (each a HARD block, rc 1, with a named message) ---
+
+def test_subgraph_unresolved_name_blocks(tmp_path):
+    make_flow(tmp_path, "host-flow", SG_HOST)  # no _subgraphs dir at all
+    rc, data, out, err = run(tmp_path, "host-flow")
+    assert rc == 1, out
+    assert any("not found" in e for e in _sg_errs(data)), data
+
+
+def test_subgraph_bounded_convergence_blocks(tmp_path):
+    sg = SG_REVIEW.replace("convergence: { mode: single_pass }",
+                           "convergence: { mode: bounded, max_iters: 3 }")
+    _setup_subgraph_world(tmp_path, sg=sg)
+    rc, data, out, err = run(tmp_path, "host-flow")
+    assert rc == 1, out
+    assert any("bounded" in e and "PR3" in e for e in _sg_errs(data)), data
+
+
+def test_subgraph_missing_required_param_blocks(tmp_path):
+    host = SG_HOST.replace(
+        "    with:\n      artifact_kind: high-level design document\n", "")
+    _setup_subgraph_world(tmp_path, host=host)
+    rc, data, out, err = run(tmp_path, "host-flow")
+    assert rc == 1, out
+    assert any("required param" in e and "artifact_kind" in e
+               for e in _sg_errs(data)), data
+
+
+def test_subgraph_unknown_with_key_blocks(tmp_path):
+    host = SG_HOST.replace(
+        "      artifact_kind: high-level design document\n",
+        "      artifact_kind: high-level design document\n      bogus: x\n")
+    _setup_subgraph_world(tmp_path, host=host)
+    rc, data, out, err = run(tmp_path, "host-flow")
+    assert rc == 1, out
+    assert any("unknown with key" in e and "bogus" in e for e in _sg_errs(data)), data
+
+
+def test_subgraph_missing_required_input_blocks(tmp_path):
+    host = SG_HOST.replace(
+        "    inputs:\n      artifact_path: ${author.output.document_path}\n", "")
+    _setup_subgraph_world(tmp_path, host=host)
+    rc, data, out, err = run(tmp_path, "host-flow")
+    assert rc == 1, out
+    assert any("required input" in e and "artifact_path" in e
+               for e in _sg_errs(data)), data
+
+
+def test_subgraph_unknown_inputs_key_blocks(tmp_path):
+    host = SG_HOST.replace(
+        "      artifact_path: ${author.output.document_path}\n",
+        "      artifact_path: ${author.output.document_path}\n"
+        "      bogus: ${author.output.x}\n")
+    _setup_subgraph_world(tmp_path, host=host)
+    rc, data, out, err = run(tmp_path, "host-flow")
+    assert rc == 1, out
+    assert any("unknown inputs key" in e and "bogus" in e
+               for e in _sg_errs(data)), data
+
+
+def test_subgraph_inner_orchestrator_blocks(tmp_path):
+    # An inner node that classifies as a static orchestrator (here
+    # delegation:orchestrator) breaks the in-segment, no-human-gate rule.
+    sg = SG_REVIEW.replace("  - id: synthesize\n    agent: synthesizer\n",
+                           "  - id: synthesize\n    delegation: orchestrator\n")
+    _setup_subgraph_world(tmp_path, sg=sg)
+    rc, data, out, err = run(tmp_path, "host-flow")
+    assert rc == 1, out
+    assert any("orchestrator" in e for e in _sg_errs(data)), data
+
+
+def test_subgraph_nested_subgraph_blocks(tmp_path):
+    # An inner node carrying its own subgraph key — no V1 nesting.
+    sg = SG_REVIEW.replace(
+        "  - id: synthesize\n    agent: synthesizer\n    prompt: synthesize the review\n",
+        "  - id: synthesize\n    subgraph: other\n")
+    _setup_subgraph_world(tmp_path, sg=sg)
+    rc, data, out, err = run(tmp_path, "host-flow")
+    assert rc == 1, out
+    assert any("nested" in e for e in _sg_errs(data)), data
+
+
+def test_subgraph_author_id_with_double_underscore_blocks(tmp_path):
+    # Defense in depth: a hand-authored host node id carrying '__' collides with
+    # the splice namespace.
+    host = SG_HOST.replace("author", "au__thor")
+    _setup_subgraph_world(tmp_path, host=host)
+    rc, data, out, err = run(tmp_path, "host-flow")
+    assert rc == 1, out
+    assert any("__" in e and "reserved" in e for e in _sg_errs(data)), data
+
+
+def test_subgraph_non_self_contained_ref_blocks(tmp_path):
+    # A ref that is neither a declared input nor a sibling inner node — here a
+    # ${workflow.inputs.x} host coupling — breaks self-containment.
+    sg = SG_REVIEW.replace("      artifact_path: ${inputs.artifact_path}\n",
+                           "      artifact_path: ${workflow.inputs.secret}\n")
+    _setup_subgraph_world(tmp_path, sg=sg)
+    rc, data, out, err = run(tmp_path, "host-flow")
+    assert rc == 1, out
+    assert any("self-contained" in e and "workflow.inputs.secret" in e
+               for e in _sg_errs(data)), data
+
+
+def test_subgraph_no_nodes_blocks(tmp_path):
+    # A SUBGRAPH.yaml missing its required `nodes` fails the closed schema.
+    sg = "version: 1\noutput: synthesize\n"
+    _setup_subgraph_world(tmp_path, sg=sg)
+    rc, data, out, err = run(tmp_path, "host-flow")
+    assert rc == 1, out
+    assert any("schema" in e and "nodes" in e for e in _sg_errs(data)), data
+
+
+def test_subgraph_output_names_no_inner_node_blocks(tmp_path):
+    sg = SG_REVIEW.replace("output: synthesize", "output: ghost")
+    _setup_subgraph_world(tmp_path, sg=sg)
+    rc, data, out, err = run(tmp_path, "host-flow")
+    assert rc == 1, out
+    assert any("output 'ghost' names no inner node" in e for e in _sg_errs(data)), data
+
+
+def test_subgraph_surviving_undeclared_token_blocks(tmp_path):
+    # A {{token}} that is neither a declared param nor a supplied with: value
+    # survives substitution -> the post-splice fail-loud sweep blocks it (a
+    # literal token must never ship into a compiled prompt).
+    sg = SG_REVIEW.replace("prompt: review this {{artifact_kind}}",
+                           "prompt: review this {{artifact_kind}} with {{undeclared_tok}}")
+    _setup_subgraph_world(tmp_path, sg=sg)
+    rc, data, out, err = run(tmp_path, "host-flow")
+    assert rc == 1, out
+    assert any("undeclared_tok" in e and "unresolved" in e for e in _sg_errs(data)), data
+
+
+# --- PR1 remediation: loop interaction, non-string binding, convergence shape ---
+
+SG_LOOP_HOST = """\
+version: 1
+name: host-flow
+loop:
+  body: [rev]
+  while: ${rev.output.again}
+  max_iters: 3
+nodes:
+  - id: author
+    agent: writer
+    prompt: write the doc
+  - id: rev
+    subgraph: adversarial-review
+    with:
+      artifact_kind: high-level design document
+    inputs:
+      artifact_path: ${author.output.document_path}
+"""
+
+
+def test_subgraph_in_top_level_loop_blocks(tmp_path):
+    # PR1 does not support a subgraph the top-level loop references — the splice id
+    # is rewritten away and the loop block would dangle; block, never miscompile.
+    _setup_subgraph_world(tmp_path, host=SG_LOOP_HOST)
+    rc, data, out, err = run(tmp_path, "host-flow")
+    assert rc == 1, out
+    assert any("top-level loop" in e for e in _sg_errs(data)), data
+
+
+SG_LOOP_WHILE_HOST = """\
+version: 1
+name: host-flow
+loop:
+  body: [author]
+  while: ${rev.output.again}
+  max_iters: 3
+nodes:
+  - id: author
+    agent: writer
+    prompt: write the doc
+  - id: rev
+    subgraph: adversarial-review
+    with:
+      artifact_kind: high-level design document
+    inputs:
+      artifact_path: ${author.output.document_path}
+"""
+
+
+def test_subgraph_referenced_only_in_loop_while_blocks(tmp_path):
+    # Independently exercises the loop while/until/carry REF-detection branch (the
+    # splice id is NOT in loop.body, only referenced by loop.while).
+    _setup_subgraph_world(tmp_path, host=SG_LOOP_WHILE_HOST)
+    rc, data, out, err = run(tmp_path, "host-flow")
+    assert rc == 1, out
+    assert any("top-level loop" in e for e in _sg_errs(data)), data
+
+
+def test_subgraph_non_string_input_binding_blocks(tmp_path):
+    # A non-string ${inputs.X} binding (e.g. an int) must block, not raise an
+    # uncaught TypeError in the ref rewrite.
+    host = SG_HOST.replace("      artifact_path: ${author.output.document_path}\n",
+                           "      artifact_path: 42\n")
+    _setup_subgraph_world(tmp_path, host=host)
+    rc, data, out, err = run(tmp_path, "host-flow")
+    assert rc == 1, out
+    assert any("binding must" in e and "string" in e for e in _sg_errs(data)), data
+
+
+def test_subgraph_convergence_scalar_shorthand_blocks(tmp_path):
+    # `with.convergence: bounded` (a scalar, not a {mode: ...} dict) must NOT
+    # silently downgrade to single_pass and let bounded escape — block it.
+    host = SG_HOST.replace(
+        "    with:\n      artifact_kind: high-level design document\n",
+        "    with:\n      artifact_kind: high-level design document\n"
+        "      convergence: bounded\n")
+    _setup_subgraph_world(tmp_path, host=host)
+    rc, data, out, err = run(tmp_path, "host-flow")
+    assert rc == 1, out
+    assert any("convergence must be a mapping" in e for e in _sg_errs(data)), data
+
+
+def test_subgraph_inner_id_double_underscore_blocks(tmp_path):
+    # An inner node id containing '__' collides with the splice namespace.
+    sg = SG_REVIEW.replace("  - id: review\n", "  - id: re__view\n").replace(
+        "${review.output}", "${re__view.output}")
+    _setup_subgraph_world(tmp_path, sg=sg)
+    rc, data, out, err = run(tmp_path, "host-flow")
+    assert rc == 1, out
+    assert any("__" in e and "reserved" in e for e in _sg_errs(data)), data
+
+
+def test_subgraph_schema_file_present():
+    # The desugar hard-requires the registry schema; it must be a tracked,
+    # readable file (not just generated into .claude/).
+    import os
+    p = os.path.join(REPO, "templates", "references", "subgraph-schema.json")
+    assert os.path.isfile(p), p
+    import json as _json
+    _json.loads(open(p).read())  # valid JSON

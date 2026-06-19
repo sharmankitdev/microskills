@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://anthropic.com/microskills/subgraph-schema.json",
+  "title": "Subgraph",
+  "description": "Closed grammar for a reusable, parameterized node-group: <subgraphs-dir>/<name>/SUBGRAPH.yaml. A host workflow node `subgraph: <name>` is DESUGARED (spliced) into the host DAG by compile-workflow / validate-workflow BEFORE the workflow schema runs (mirrors the expand: sugar): every inner node is id-namespaced <splice-id>__<inner-id>, its {{param}} tokens are substituted from the host `with:`, its ${inputs.<name>} refs are rewritten to the host `inputs:` bindings, and its sibling ${<inner>.output|items} refs are re-pointed at the namespaced sibling. The spliced inner nodes are then validated by the workflow node schema, so this grammar intentionally does NOT re-declare the full node shape — it only requires each inner node carry an id. Closed: unknown fields at the subgraph level are rejected.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "output", "nodes"],
+  "properties": {
+    "version": {
+      "const": 1,
+      "description": "Subgraph grammar version. Only 1 is recognized."
+    },
+    "output": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]*$",
+      "description": "Names the inner node whose output is the subgraph's exit: downstream host refs ${<splice-id>.output...} / ${<splice-id>.items} (and a depends_on entry == <splice-id>) re-point at <splice-id>__<output> after the splice. MUST name a node in `nodes`."
+    },
+    "params": {
+      "type": "object",
+      "propertyNames": { "pattern": "^[a-z][a-z0-9_-]*$" },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "required": { "type": "boolean", "description": "When true, the host `with:` MUST supply this param (unless a default is declared)." },
+          "default": { "description": "Value used when the host `with:` omits this param. Any JSON type." }
+        }
+      },
+      "description": "Declared {{param}} tokens substituted textually from the host `with:` map (whole-value aware: an inner string that is EXACTLY {{key}} yields the param value verbatim, so a list param can drive an inner for_each; an embedded {{key}} is scalar text). Param names must match ^[a-z][a-z0-9_-]*$ (the {{token}} grammar). Every required param must be supplied by the host `with:`; an unknown `with:` key (not a declared param, and not the reserved `convergence`) is a hard block."
+    },
+    "inputs": {
+      "type": "object",
+      "propertyNames": { "pattern": "^[a-z][a-z0-9_-]*$" },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "required": { "type": "boolean", "description": "When true, the host `inputs:` MUST bind a ${ref}/value for this input." }
+        }
+      },
+      "description": "Declared ${inputs.<name>} binding points. The host node's `inputs:` supplies a ${ref} (or literal value) per name; ${inputs.<name>} refs inside the inner nodes are rewritten to that binding on splice. Every required input must be bound; an unknown host `inputs:` key is a hard block."
+    },
+    "convergence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode"],
+      "properties": {
+        "mode": {
+          "enum": ["single_pass", "bounded"],
+          "description": "single_pass = the inner node-group is spliced once inline (PR1). bounded = a local do/while around the spliced group (PR3 — currently a hard 'not yet supported' block). The host `with.convergence` overrides this."
+        },
+        "max_iters": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "bounded mode only: the iteration cap (consumed in PR3)."
+        }
+      },
+      "description": "Default convergence mode for the splice. Absent → single_pass. The host node's `with.convergence` (a reserved `with:` key, never treated as a param) overrides it."
+    },
+    "nodes": {
+      "type": "array",
+      "minItems": 1,
+      "description": "The inner node-group template (definition order preserved on splice). Each inner node is an ordinary workflow node (use:/agent: with inputs/prompt/when/for_each/etc.) — its full grammar is validated by the WORKFLOW schema AFTER the splice, so this schema only requires an id. Desugar additionally blocks: an inner node that classifies as a static orchestrator (delegation:orchestrator / workflow: / side_effect / neither use: nor agent:), an inner node carrying its own `subgraph` key (no V1 nesting), and any ref that is not a declared input or a sibling inner node (self-containment).",
+      "items": {
+        "type": "object",
+        "required": ["id"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_-]*$",
+            "description": "Inner node id, unique within the subgraph. Namespaced to <splice-id>__<id> on splice."
+          }
+        }
+      }
+    }
+  }
+}
