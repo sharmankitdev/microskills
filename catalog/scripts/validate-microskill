@@ -245,6 +245,25 @@ def check_config(path, issues):
         path_str = "/".join(str(part) for part in err.path) or "<root>"
         add(issues, "block", "config", f"{p.name}@{path_str}: {err.message}")
 
+    os_frag = doc.get("output_schema") if isinstance(doc, dict) else None
+    if isinstance(os_frag, dict) and os_frag:
+        try:
+            Draft202012Validator.check_schema(os_frag)
+        except Exception as e:
+            add(issues, "block", "config",
+                f"{p.name}: output_schema is not a valid JSON Schema — {e}")
+        else:
+            if os_frag.get("type") != "object":
+                add(issues, "warn", "config",
+                    f"{p.name}: output_schema type is {os_frag.get('type')!r}, not 'object'; "
+                    f"the resolver appends a 'return ONLY a JSON object' directive, so a non-object contract is incoherent.")
+            props = os_frag.get("properties") or {}
+            for req in (os_frag.get("required") or []):
+                if req not in props:
+                    add(issues, "warn", "config",
+                        f"{p.name}: output_schema.required lists '{req}' which is not in properties — "
+                        f"a dead field that dead-ends downstream .output.{req} refs.")
+
     if p.name != "base.yaml" and isinstance(doc, dict) and "profile" in doc:
         add(issues, "block", "config",
             f"{p.name}: top-level 'profile' block is only allowed in base.yaml")

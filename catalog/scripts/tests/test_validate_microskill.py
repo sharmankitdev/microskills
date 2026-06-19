@@ -93,6 +93,34 @@ def test_empty_output_schema_blocks(tmp_path):
     assert rc == 1 and data["pass"] is False
 
 
+def test_malformed_output_schema_blocks(tmp_path):
+    skill = write_skill(tmp_path, "os-bad")
+    cfg = write_cfg(tmp_path, "base.yaml",
+                    "version: 1\noutput_schema:\n  type: not-a-real-type\n")
+    code, data, _, err = run(str(skill), str(cfg))
+    assert code == 1, err
+    assert any(i["severity"] == "block" and "not a valid JSON Schema" in i["message"]
+               for i in data["issues"]), data
+
+
+def test_output_schema_non_object_warns(tmp_path):
+    skill = write_skill(tmp_path, "os-arr")
+    cfg = write_cfg(tmp_path, "base.yaml",
+                    "version: 1\noutput_schema:\n  type: array\n  items: { type: string }\n")
+    code, data, _, err = run(str(skill), str(cfg))
+    assert any(i["severity"] == "warn" and "not 'object'" in i["message"]
+               for i in data["issues"]), data
+
+
+def test_output_schema_required_not_in_properties_warns(tmp_path):
+    skill = write_skill(tmp_path, "os-req")
+    cfg = write_cfg(tmp_path, "base.yaml",
+                    "version: 1\noutput_schema:\n  type: object\n  properties:\n    a: { type: string }\n  required: [b]\n")
+    code, data, _, err = run(str(skill), str(cfg))
+    assert any(i["severity"] == "warn" and "not in properties" in i["message"]
+               for i in data["issues"]), data
+
+
 REQUIRED_BODY = """\
 ---
 name: needs-input
