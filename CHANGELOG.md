@@ -1,3 +1,9 @@
+## [0.22.0](https://github.com/sharmankitdev/microskills/compare/v0.21.0...v0.22.0) (2026-06-19)
+
+### Features
+
+* **scripts:** human-readable segment names in the manifest label ([#26](https://github.com/sharmankitdev/microskills/issues/26)) ([c0b9141](https://github.com/sharmankitdev/microskills/commit/c0b914117bfbcf9cad410eaceaa9f35b2445746d))
+
 ## [0.21.0](https://github.com/sharmankitdev/microskills/compare/v0.20.0...v0.21.0) (2026-06-19)
 
 ### Features
