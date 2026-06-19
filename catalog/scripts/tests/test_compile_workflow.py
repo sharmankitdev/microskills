@@ -5186,6 +5186,40 @@ nodes:
 """
 
 
+# A BOUNDED subgraph: same review -> synthesize group, but convergence.mode bounded
+# with a max_iters cap and an `until` signal referencing ONLY the exit (synthesize).
+# Desugars to a local do/while around the spliced group inside the host segment.
+SG_BOUNDED = """\
+version: 1
+params:
+  artifact_kind: { required: true }
+inputs:
+  artifact_path: { required: true }
+output: synthesize
+convergence:
+  mode: bounded
+  max_iters: 4
+  until: ${synthesize.output.converged}
+nodes:
+  - id: review
+    agent: reviewer
+    prompt: review this {{artifact_kind}}
+    inputs:
+      artifact_path: ${inputs.artifact_path}
+  - id: synthesize
+    agent: synthesizer
+    prompt: synthesize the review
+    inputs:
+      findings: ${review.output}
+    output_schema:
+      type: object
+      required: [converged]
+      properties:
+        converged: { type: boolean }
+        report: { type: string }
+"""
+
+
 def _setup_subgraph_world(defs_root, host=SG_HOST, sg=SG_REVIEW,
                           sg_name="adversarial-review"):
     make_flow(defs_root, "host-flow", host)
@@ -5248,13 +5282,404 @@ def test_subgraph_unresolved_name_blocks(tmp_path):
     assert any("not found" in e for e in _sg_errs(data)), data
 
 
-def test_subgraph_bounded_convergence_blocks(tmp_path):
-    sg = SG_REVIEW.replace("convergence: { mode: single_pass }",
-                           "convergence: { mode: bounded, max_iters: 3 }")
+# --- subgraph BOUNDED convergence (PR3): a local do/while around the spliced group ---
+
+def _seg1(tmp_path):
+    return (tmp_path / "host-flow" / ".compiled" / "seg-1.js").read_text()
+
+
+def test_subgraph_bounded_splices_in_one_segment(tmp_path):
+    # The bounded group is a LOCAL do/while INSIDE the host background segment — the
+    # whole def is still ONE segment, no checkpoint (the in-segment promise holds).
+    _setup_subgraph_world(tmp_path, sg=SG_BOUNDED)
+    rc, data, out, err = run(tmp_path, "host-flow")
+    assert rc == 0, out + err
+    assert data["segments"] == 1 and data["checkpoints"] == 0
+    assert data["sequence"] == ["segment[author,rev__review,rev__synthesize,post]"]
+
+
+def test_subgraph_bounded_emits_local_do_while(tmp_path):
+    # The emitted segment carries the local do/while: a `let` group-var decl, the
+    # __cv0_iter/__cv0_max scaffold with N from max_iters, the until->while NEGATED
+    # signal rewritten to the namespaced in-segment exit var, and pre/group/post order.
+    _setup_subgraph_world(tmp_path, sg=SG_BOUNDED)
+    rc, data, out, err = run(tmp_path, "host-flow")
+    assert rc == 0, out + err
+    js = _seg1(tmp_path)
+    assert "let n_rev__review, n_rev__synthesize\n" in js
+    assert "let __cv0_iter = 0\nconst __cv0_max = 4\n" in js
+    assert "do {\n" in js
+    # until: ${synthesize.output.converged} -> while !(...) -> namespaced in-seg var
+    # (translate_ref maps a node's `.output.<field>` onto its var: n_<id>.<field>).
+    assert "while ((!(n_rev__synthesize.converged)) && __cv0_iter < __cv0_max)" in js
+    assert "  __cv0_iter++\n" in js
+    # pre (author) before the group; post (publish) after it.
+    assert js.index("n_author") < js.index("__cv0_iter")
+    assert js.index("__cv0_iter") < js.index("n_post")
+
+
+def test_subgraph_bounded_stamps_converge_in_manifest(tmp_path):
+    # The convergence STRUCTURE rides the manifest (hash-visible) — the spliced nodes
+    # fingerprint normally, but max_iters / the rewritten signal live only in seg JS,
+    # so the stamp is what makes them closure-visible.
+    _setup_subgraph_world(tmp_path, sg=SG_BOUNDED)
+    rc, data, out, err = run(tmp_path, "host-flow", "--plan")
+    assert rc == 0, out + err
+    seg = next(s for s in data["manifest"]["steps"] if s["kind"] == "segment")
+    assert seg["converge"] == [{
+        "splice": "rev",
+        "nodes": ["rev__review", "rev__synthesize"],
+        "max_iters": 4,
+        "while": "!(rev__synthesize.output.converged)",
+        "exit": "rev__synthesize",
+    }]
+
+
+def test_subgraph_bounded_max_iters_is_hash_visible(tmp_path):
+    # A max_iters edit moves manifest_hash even though every spliced node's
+    # fingerprint is unchanged (the convergence stamp is the hash-visible fact).
+    _setup_subgraph_world(tmp_path, sg=SG_BOUNDED)
+    rc, d1, out, err = run(tmp_path, "host-flow")
+    assert rc == 0, out + err
+    (tmp_path / "_subgraphs" / "adversarial-review" / "SUBGRAPH.yaml").write_text(
+        SG_BOUNDED.replace("max_iters: 4", "max_iters: 7"))
+    rc, d2, out, err = run(tmp_path, "host-flow")
+    assert rc == 0, out + err
+    assert d1["manifest_hash"] != d2["manifest_hash"]
+
+
+def test_subgraph_bounded_deterministic(tmp_path):
+    _setup_subgraph_world(tmp_path, sg=SG_BOUNDED)
+    d = tmp_path / "host-flow"
+    rc, d1, out, err = run(tmp_path, "host-flow")
+    assert rc == 0, out + err
+    first = {p.name: p.read_text() for p in (d / ".compiled").iterdir() if p.is_file()}
+    rc, d2, out, err = run(tmp_path, "host-flow")
+    assert rc == 0, out + err
+    second = {p.name: p.read_text() for p in (d / ".compiled").iterdir() if p.is_file()}
+    assert first == second and d1["manifest_hash"] == d2["manifest_hash"]
+
+
+def test_subgraph_bounded_with_override_signal(tmp_path):
+    # The host `with.convergence` overrides the SUBGRAPH default — a single_pass
+    # subgraph driven bounded by the host, with a `while` form (no negation).
+    host = SG_HOST.replace(
+        "    with:\n      artifact_kind: high-level design document\n",
+        "    with:\n      artifact_kind: high-level design document\n"
+        "      convergence:\n        mode: bounded\n        max_iters: 2\n"
+        "        while: ${synthesize.output.again}\n")
+    sg = SG_REVIEW.replace(
+        "    inputs:\n      findings: ${review.output}\n",
+        "    inputs:\n      findings: ${review.output}\n"
+        "    output_schema:\n      type: object\n      required: [again]\n"
+        "      properties:\n        again: { type: boolean }\n")
+    _setup_subgraph_world(tmp_path, host=host, sg=sg)
+    rc, data, out, err = run(tmp_path, "host-flow")
+    assert rc == 0, out + err
+    js = _seg1(tmp_path)
+    assert "const __cv0_max = 2\n" in js
+    assert "while ((n_rev__synthesize.again) && __cv0_iter < __cv0_max)" in js
+
+
+# --- bounded rejections (each a HARD block, rc 1, named) ---
+
+def test_subgraph_bounded_missing_max_iters_blocks(tmp_path):
+    sg = SG_BOUNDED.replace("  max_iters: 4\n", "")
     _setup_subgraph_world(tmp_path, sg=sg)
     rc, data, out, err = run(tmp_path, "host-flow")
     assert rc == 1, out
-    assert any("bounded" in e and "PR3" in e for e in _sg_errs(data)), data
+    assert any("max_iters" in e for e in _sg_errs(data)), data
+
+
+def test_subgraph_bounded_neither_while_until_blocks(tmp_path):
+    sg = SG_BOUNDED.replace("  until: ${synthesize.output.converged}\n", "")
+    _setup_subgraph_world(tmp_path, sg=sg)
+    rc, data, out, err = run(tmp_path, "host-flow")
+    assert rc == 1, out
+    assert any("exactly one of 'while' / 'until'" in e for e in _sg_errs(data)), data
+
+
+def test_subgraph_bounded_both_while_until_blocks(tmp_path):
+    sg = SG_BOUNDED.replace(
+        "  until: ${synthesize.output.converged}\n",
+        "  until: ${synthesize.output.converged}\n"
+        "  while: ${synthesize.output.again}\n")
+    _setup_subgraph_world(tmp_path, sg=sg)
+    rc, data, out, err = run(tmp_path, "host-flow")
+    assert rc == 1, out
+    assert any("only one of 'while' / 'until'" in e for e in _sg_errs(data)), data
+
+
+def test_subgraph_bounded_signal_references_non_exit_blocks(tmp_path):
+    # The signal references `review` (an inner node, but NOT the exit `synthesize`).
+    sg = SG_BOUNDED.replace("  until: ${synthesize.output.converged}\n",
+                            "  until: ${review.output.converged}\n")
+    _setup_subgraph_world(tmp_path, sg=sg)
+    rc, data, out, err = run(tmp_path, "host-flow")
+    assert rc == 1, out
+    assert any("reference only the subgraph's output node 'synthesize'" in e
+               for e in _sg_errs(data)), data
+
+
+def test_subgraph_bounded_for_each_inner_blocks(tmp_path):
+    # A for_each inner node inside a bounded group is unsupported (mirrors loop.body).
+    sg = SG_BOUNDED.replace(
+        "  - id: review\n    agent: reviewer\n    prompt: review this {{artifact_kind}}\n",
+        "  - id: review\n    agent: reviewer\n    prompt: review this {{artifact_kind}}\n"
+        "    for_each: ${inputs.artifact_path}\n    as: item\n")
+    _setup_subgraph_world(tmp_path, sg=sg)
+    rc, data, out, err = run(tmp_path, "host-flow")
+    assert rc == 1, out
+    assert any("for_each" in e and "bounded" in e for e in _sg_errs(data)), data
+
+
+def test_subgraph_bounded_gate_between_group_nodes_blocks(tmp_path):
+    # A hard gate anchored after the first spliced node splits the group's do/while
+    # window — the shared contiguity check blocks it (parity with the loop check).
+    host = SG_HOST + (
+        "gates:\n"
+        "  - id: mid\n    after: rev__review\n    type: verification\n"
+        "    severity: hard\n    prompt: inspect\n")
+    _setup_subgraph_world(tmp_path, host=host, sg=SG_BOUNDED)
+    rc, data, out, err = run(tmp_path, "host-flow")
+    assert rc == 1, out
+    assert "bounded group must be contiguous" in (out + err), (out, err)
+
+
+def test_subgraph_bounded_in_top_level_loop_still_blocks(tmp_path):
+    # A BOUNDED subgraph referenced by the top-level loop is still blocked (the
+    # PR1 subgraph<->loop block holds for ALL modes; bounded ⊂ all).
+    _setup_subgraph_world(tmp_path, host=SG_LOOP_HOST, sg=SG_BOUNDED)
+    rc, data, out, err = run(tmp_path, "host-flow")
+    assert rc == 1, out
+    assert any("top-level loop" in e for e in _sg_errs(data)), data
+
+
+SG_TWO_HOST = """\
+version: 1
+name: host-flow
+nodes:
+  - id: author
+    agent: writer
+    prompt: write the doc
+  - id: rev1
+    subgraph: adversarial-review
+    with:
+      artifact_kind: design A
+    inputs:
+      artifact_path: ${author.output.document_path}
+  - id: rev2
+    subgraph: adversarial-review
+    with:
+      artifact_kind: design B
+    inputs:
+      artifact_path: ${rev1.output.report}
+"""
+
+
+def test_subgraph_two_bounded_groups_emit_distinct_scaffolds(tmp_path):
+    # Two bounded splices of the same subgraph in sequence → two LOCAL do/whiles in
+    # ONE segment, prefixed __cv0_ / __cv1_ in topo order (never colliding).
+    _setup_subgraph_world(tmp_path, host=SG_TWO_HOST, sg=SG_BOUNDED)
+    rc, data, out, err = run(tmp_path, "host-flow")
+    assert rc == 0, out + err
+    assert data["segments"] == 1 and data["checkpoints"] == 0
+    js = _seg1(tmp_path)
+    assert "const __cv0_max = 4\n" in js and "const __cv1_max = 4\n" in js
+    assert "let n_rev1__review, n_rev1__synthesize\n" in js
+    assert "let n_rev2__review, n_rev2__synthesize\n" in js
+    # Group 0 (rev1) emitted before group 1 (rev2).
+    assert js.index("__cv0_iter") < js.index("__cv1_iter")
+    # Two stamped descriptors, sorted by splice id.
+    rc, data, out, err = run(tmp_path, "host-flow", "--plan")
+    seg = next(s for s in data["manifest"]["steps"] if s["kind"] == "segment")
+    assert [g["splice"] for g in seg["converge"]] == ["rev1", "rev2"]
+
+
+def test_subgraph_bounded_contiguity_helper_interleave():
+    # Direct unit coverage of the interleave branch (un-authorable end-to-end because
+    # the host cannot reference a spliced inner id): a non-group node sits between the
+    # group's spliced nodes in topo order.
+    import importlib.machinery
+    import importlib.util
+    loader = importlib.machinery.SourceFileLoader("compile_workflow_ut", str(SCRIPT))
+    spec = importlib.util.spec_from_loader("compile_workflow_ut", loader)
+    cw = importlib.util.module_from_spec(spec)
+    loader.exec_module(cw)
+    converge = {"rev": {"node_ids": ["rev__review", "rev__synthesize"],
+                        "max_iters": 3, "while": "x", "exit": "rev__synthesize"}}
+    node_by_id = {"rev__review": {}, "x": {}, "rev__synthesize": {}}
+    order = ["rev__review", "x", "rev__synthesize"]
+    err = cw.subgraph_convergence_contiguity_error(order, node_by_id, {}, converge)
+    assert err and "interleaved" in err and "'x'" in err
+
+
+# A bounded subgraph whose inner nodes are authored OUT of dependency order:
+# `synthesize` (the exit) is DEFINED before `review` but DEPENDS on it.
+SG_BOUNDED_OOO = """\
+version: 1
+params:
+  artifact_kind: { required: true }
+inputs:
+  artifact_path: { required: true }
+output: synthesize
+convergence:
+  mode: bounded
+  max_iters: 3
+  until: ${synthesize.output.converged}
+nodes:
+  - id: synthesize
+    agent: synthesizer
+    depends_on: [review]
+    prompt: synthesize ${review.output}
+    inputs:
+      findings: ${review.output}
+    output_schema:
+      type: object
+      required: [converged]
+      properties:
+        converged: { type: boolean }
+  - id: review
+    agent: reviewer
+    prompt: review this {{artifact_kind}}
+    inputs:
+      artifact_path: ${inputs.artifact_path}
+"""
+
+
+def test_subgraph_bounded_emits_topo_not_definition_order(tmp_path):
+    # Inner nodes authored out of dependency order: the local do/while body must call
+    # the dependency (review) BEFORE its dependent (synthesize) every iteration —
+    # subgraph DEFINITION order would reference an undefined var on iteration 1.
+    _setup_subgraph_world(tmp_path, sg=SG_BOUNDED_OOO)
+    rc, data, out, err = run(tmp_path, "host-flow")
+    assert rc == 0, out + err
+    js = _seg1(tmp_path)
+    assert js.index("n_rev__review =") < js.index("n_rev__synthesize ="), js
+    assert "let n_rev__review, n_rev__synthesize\n" in js
+    # The manifest converge `nodes` is topo too (review before synthesize).
+    rc, data, out, err = run(tmp_path, "host-flow", "--plan")
+    seg = next(s for s in data["manifest"]["steps"] if s["kind"] == "segment")
+    assert seg["converge"][0]["nodes"] == ["rev__review", "rev__synthesize"]
+
+
+def test_subgraph_bounded_when_inner_blocks(tmp_path):
+    # A when-guarded inner node in a bounded group is rejected — a guarded skip can
+    # null the convergence-signal exit var the do/while condition derefs (mirrors
+    # the for_each block; single_pass inner `when` stays legal).
+    sg = SG_BOUNDED.replace(
+        "    prompt: synthesize the review\n",
+        "    prompt: synthesize the review\n    when: ${review.output.findings}\n")
+    _setup_subgraph_world(tmp_path, sg=sg)
+    rc, data, out, err = run(tmp_path, "host-flow")
+    assert rc == 1, out
+    assert any("when" in e and "bounded" in e for e in _sg_errs(data)), data
+
+
+def test_subgraph_bounded_signal_bare_token_blocks(tmp_path):
+    # A signal that references no exit-node output (a bare token) → block.
+    sg = SG_BOUNDED.replace("  until: ${synthesize.output.converged}\n",
+                            "  until: ${converged}\n")
+    _setup_subgraph_world(tmp_path, sg=sg)
+    rc, data, out, err = run(tmp_path, "host-flow")
+    assert rc == 1, out
+    assert any("found no such reference" in e for e in _sg_errs(data)), data
+
+
+def test_subgraph_bounded_signal_missing_output_blocks(tmp_path):
+    # A missing '.output' (${synthesize.converged}) resolves to no node output → block.
+    sg = SG_BOUNDED.replace("  until: ${synthesize.output.converged}\n",
+                            "  until: ${synthesize.converged}\n")
+    _setup_subgraph_world(tmp_path, sg=sg)
+    rc, data, out, err = run(tmp_path, "host-flow")
+    assert rc == 1, out
+    assert any("found no such reference" in e
+               and "output node 'synthesize'" in e for e in _sg_errs(data)), data
+
+
+def test_subgraph_bounded_signal_host_coupling_blocks(tmp_path):
+    # A signal coupling to a host workflow input violates self-containment → block.
+    sg = SG_BOUNDED.replace("  until: ${synthesize.output.converged}\n",
+                            "  while: ${workflow.inputs.flag}\n")
+    _setup_subgraph_world(tmp_path, sg=sg)
+    rc, data, out, err = run(tmp_path, "host-flow")
+    assert rc == 1, out
+    assert any("may not couple to a host workflow input" in e
+               for e in _sg_errs(data)), data
+
+
+def test_subgraph_bounded_override_to_single_pass(tmp_path):
+    # The reverse override direction: a bounded-DEFAULT subgraph driven single_pass by
+    # the host with.convergence → no local do/while, no converge stamp.
+    host = SG_HOST.replace(
+        "    with:\n      artifact_kind: high-level design document\n",
+        "    with:\n      artifact_kind: high-level design document\n"
+        "      convergence:\n        mode: single_pass\n")
+    _setup_subgraph_world(tmp_path, host=host, sg=SG_BOUNDED)
+    rc, data, out, err = run(tmp_path, "host-flow")
+    assert rc == 0, out + err
+    js = _seg1(tmp_path)
+    assert "do {" not in js and "__cv0" not in js
+    man = json.loads(
+        (tmp_path / "host-flow" / ".compiled" / "manifest.json").read_text())
+    seg = next(s for s in man["steps"] if s["kind"] == "segment")
+    assert "converge" not in seg
+
+
+# A bounded subgraph whose EXIT inner node is a use: that resolves to an
+# orchestrator (AskUserQuestion) — splits the group across segments at compile.
+SG_BOUNDED_USE = """\
+version: 1
+params:
+  artifact_kind: { required: true }
+inputs:
+  artifact_path: { required: true }
+output: decide
+convergence:
+  mode: bounded
+  max_iters: 2
+  until: ${decide.output.converged}
+nodes:
+  - id: review
+    agent: reviewer
+    prompt: review this {{artifact_kind}}
+    inputs:
+      artifact_path: ${inputs.artifact_path}
+  - id: decide
+    use: asker
+    depends_on: [review]
+    prompt: decide on ${review.output}
+"""
+
+SG_USE_HOST = """\
+version: 1
+name: cls-flow
+nodes:
+  - id: author
+    agent: writer
+    prompt: write the doc
+  - id: rev
+    subgraph: adversarial-review
+    with:
+      artifact_kind: design
+    inputs:
+      artifact_path: ${author.output.document_path}
+"""
+
+
+def test_subgraph_bounded_use_orchestrator_inner_dies_compile(tmp_path):
+    # A bounded group's use: inner node that RESOLVES to an orchestrator
+    # (AskUserQuestion) forces a checkpoint flush mid-group → the group splits across
+    # segments → compile dies (validate blocks the same world — parity, see the twin
+    # in test_validate_workflow.py). The STATIC desugar orchestrator guard misses
+    # this resolution-driven case.
+    defs_root, d = make_cls_world(tmp_path, SG_USE_HOST, ms={"asker": ASK_MS_BASE})
+    sgd = defs_root / "_subgraphs" / "adversarial-review"
+    sgd.mkdir(parents=True)
+    (sgd / "SUBGRAPH.yaml").write_text(SG_BOUNDED_USE)
+    rc, data, out, err = run(defs_root, "cls-flow")
+    assert rc == 1, out
+    assert "split across background segments" in data.get("error", ""), data
 
 
 def test_subgraph_missing_required_param_blocks(tmp_path):

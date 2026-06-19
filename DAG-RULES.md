@@ -233,11 +233,12 @@ dependency on a node named `workflow` — and **`x` must be declared in the top-
 
 ---
 
-## 5. Nodes — the four kinds
+## 5. Nodes — the four kinds (+ the `subgraph:` splice)
 
-Every node has a unique `id` (`^[a-z][a-z0-9_-]*$`). A node is **exactly one of four kinds** (`use`,
-`agent`, `workflow` are mutually exclusive — declaring more than one is a block; the fourth kind
-declares none of them):
+Every node has a unique `id` (`^[a-z][a-z0-9_-]*$`). A compiled node is **exactly one of four kinds**
+(`use`, `agent`, `workflow` are mutually exclusive — declaring more than one is a block; the fourth
+kind declares none of them). A fifth authoring construct, `subgraph:` (e), is **splice-time sugar**
+that desugars into the four kinds before the schema runs:
 
 ### (a) `use:` — invoke a registered microskill
 
@@ -347,6 +348,51 @@ these are **also a hard `compile-workflow` die** (one shared helper, so the two 
 disagree): the dispatcher's bounded-recursion contract does not depend on the optional validate
 pass. Without `--defs-root` the validate-side checks are skipped (backward-compatible single-file
 validation); the compile-side die always runs.
+
+### (e) `subgraph:` — splice a reusable node-group
+
+```yaml
+nodes:
+  - id: rev                                  # the splice id (downstream refs read its exit)
+    subgraph: review-converge                # resolves <defs-root>/_subgraphs/review-converge/SUBGRAPH.yaml
+    with: { artifact_kind: "high-level design document" }   # {{param}} tokens (textual)
+    inputs: { artifact_path: ${author.output.document_path} }  # ${inputs.X} bindings
+  - id: publish
+    agent: publisher
+    prompt: Publish ${rev.output.report}     # ${rev.output...} re-points at the subgraph's exit
+```
+
+A `subgraph:` node is **splice-time sugar**, not a runtime kind: `compile-workflow` /
+`validate-workflow` **desugar** it into ordinary nodes *before* the schema runs (mirrors
+`expand:`), so the compiled graph still only ever holds the four kinds above. The registry file
+`_subgraphs/<name>/SUBGRAPH.yaml` (plugin/engine-owned — vendored by `initialize-harness`, never in
+`harness.yaml`, never touched by `harness-sync`) is a closed grammar: `params`, `inputs`, `output`
+(the exit inner node), `convergence`, and `nodes` (the inner node-group). On splice every inner
+node id is namespaced `<splice-id>__<inner-id>`, its `{{param}}` tokens are substituted from the
+host `with:`, its `${inputs.X}` refs are rewritten to the host `inputs:` bindings, sibling
+`${<inner>.output|items}` refs re-point at the namespaced sibling, and downstream host refs to the
+splice id (`${<splice>.output...}` / a `depends_on` entry) re-point at the exit. The spliced nodes
+fingerprint normally → a `SUBGRAPH.yaml` / `with:` / `inputs:` edit moves `manifest_hash` (closure-
+visible). **Hard blocks:** an unresolved name, a malformed registry file, an inner node that
+classifies as an orchestrator (so the group stays in **one background segment** — no human gate), V1
+nesting (an inner `subgraph:`), a non-self-contained ref (anything but a declared input or a sibling
+inner), a host node id containing `__`, or a missing/unknown `with:`/`inputs:` key.
+
+**Convergence.** `convergence.mode` is `single_pass` (default — the group is spliced once inline) or
+`bounded`. A **bounded** group is wrapped in a **self-contained local `do { … } while ((cond) &&
+iter < max_iters)` INSIDE the host background segment** — never the top-level `loop:`, never a
+checkpoint. It requires `max_iters` (int ≥ 1) and **exactly one** of `while:` / `until:`
+(`until: ${E}` desugars to `while: ${!(E)}`); the continue-signal may reference **only the exit
+(`output:`) inner node** (`${<output>.output…}`) — another inner node, a host workflow input, a loop
+carry, or no node at all (a bare token / a missing `.output`) are each a block. A `for_each` **or**
+`when` inner node inside a bounded group is blocked (mirrors a loop body — a guarded skip could null
+the exit var the continue-condition dereferences). The host `with.convergence` overrides the registry
+default. The bounded structure (group membership,
+`max_iters`, the rewritten signal) is stamped onto the owning segment step (`converge`) **inside
+`manifest_hash`** — a `max_iters` / signal edit is hash-visible. A subgraph referenced by the
+**top-level `loop:`** (body / while / until / carry) is blocked in **all** modes (the splice id is
+rewritten away — use the subgraph's own bounded convergence instead). Multiple bounded groups in one
+segment emit in topo order with the `__cv<idx>_` var prefix.
 
 ### `wire: auto` — declared pass-through forwarding
 

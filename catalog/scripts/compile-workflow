@@ -564,6 +564,110 @@ def _subgraph_rewrite_exit(s, splice_id, exit_id):
     return REF_RE.sub(repl, s)
 
 
+def subgraph_convergence_grammar_error(conv, output_id):
+    """SHARED bounded-convergence grammar check used by BOTH compile and validate
+    (called for a subgraph whose EFFECTIVE convergence.mode is 'bounded'). Enforces
+    what the closed schema cannot:
+      - max_iters present + an int >= 1 (schema allows but does NOT require it, so a
+        bounded block missing it blocks here — mirrors loop's mandatory cap);
+      - EXACTLY ONE of while/until (mirror loop_while_until_error; neither/both block);
+      - the convergence SIGNAL references ONLY the exit (output:) inner node —
+        ${<output>.output|items}. Any OTHER inner id, or a non-exit node ref, is a
+        block (the signal becomes an in-segment var on splice, so it must resolve to
+        the group's own exit, never another node).
+    Runs on the RAW signal (pre until->while desugar, pre ref-rewrite), so it reads
+    the inner ids the author wrote. Returns an error message string, or None."""
+    if not isinstance(conv, dict) or conv.get("mode") != "bounded":
+        return None
+    mi = conv.get("max_iters")
+    if mi is None:
+        return "bounded convergence requires a max_iters cap (an int >= 1)"
+    if isinstance(mi, bool) or not isinstance(mi, int) or mi < 1:
+        return f"bounded convergence max_iters must be an integer >= 1, got {mi!r}"
+    has_while = "while" in conv and conv.get("while") is not None
+    has_until = "until" in conv and conv.get("until") is not None
+    if has_while and has_until:
+        return "bounded convergence may carry only one of 'while' / 'until', not both"
+    if not has_while and not has_until:
+        return "bounded convergence requires exactly one of 'while' / 'until'"
+    cond = conv.get("while") if has_while else conv.get("until")
+    if not isinstance(cond, str):
+        return ("bounded convergence while/until must be a ${...} string expression "
+                f"referencing the output node '{output_id}'")
+    # Self-containment: the signal couples ONLY to the group's own exit — never a
+    # host workflow input or a loop carry. (Caught explicitly so an exit ref MIXED
+    # with host coupling — which would pass the exit-only set check below — still
+    # blocks.)
+    if re.search(r"\b(workflow\.inputs|loop\.carry)\.", cond):
+        return (f"the convergence signal must reference only the subgraph's output "
+                f"node '{output_id}' — it may not couple to a host workflow input or "
+                f"a loop carry")
+    referenced = set()
+    for inner in REF_RE.findall(cond):
+        referenced |= set(NODE_OUTPUT_RE.findall(inner))
+        referenced |= set(NODE_ITEMS_RE.findall(inner))
+    bad = referenced - {output_id}
+    if bad:
+        return (f"the convergence signal must reference only the subgraph's output "
+                f"node '{output_id}' (found {sorted(bad)})")
+    # An EMPTY reference set means the signal resolves to no exit-node output: a bare
+    # token (${converged}), a missing-'.output' typo (${synthesize.converged}), or
+    # pure host coupling — each compiles to a broken / off-contract continue-condition.
+    if not referenced:
+        return (f"the convergence signal must reference the subgraph's output node "
+                f"'{output_id}' via ${{{output_id}.output|items}} — found no such "
+                f"reference (a bare token or a missing '.output' does not resolve)")
+    return None
+
+
+def desugar_subgraph_convergence_until(conv):
+    """SHARED until->while desugar for a bounded convergence block (mirror
+    desugar_loop_until). `until: ${EXPR}` is sugar for `while: ${!(EXPR)}` — negate
+    the inner-of-${...} expression and re-wrap, byte-identical to a hand-written
+    negated while. Mutates `conv` in place: replaces `until` with the derived
+    `while`. No-op when `until` is absent."""
+    if not isinstance(conv, dict) or conv.get("until") is None:
+        return
+    inner = strip_ref_wrapper(conv.pop("until"))
+    conv["while"] = "${!(" + inner + ")}"
+
+
+def subgraph_convergence_contiguity_error(order, node_by_id, gates_after, converge):
+    """SHARED bounded-group contiguity check used by BOTH compile and validate
+    (mirror loop_contiguity_error). Each bounded subgraph group's spliced nodes must
+    occupy a CONTIGUOUS window in topological order with NO interleaved out-of-group
+    node and NO hard/human_approval gate anchored between them — either silently
+    splits the group across segments and drops the local do/while. `converge` is the
+    metadata channel desugar_subgraphs returns ({splice_id: {node_ids, ...}}).
+    Returns an error message string (first offending group, deterministic), or None."""
+    if not converge:
+        return None
+    for sid in sorted(converge):
+        group = [g for g in converge[sid]["node_ids"] if g in node_by_id]
+        if len(group) < 2:
+            continue
+        gset = set(group)
+        positions = [i for i, nid in enumerate(order) if nid in gset]
+        if not positions:
+            continue
+        lo, hi = min(positions), max(positions)
+        window = order[lo:hi + 1]
+        for nid in window:
+            if nid not in gset:
+                return (f"subgraph '{sid}' bounded group must be contiguous in "
+                        f"topological order, but node '{nid}' is interleaved between "
+                        f"its spliced nodes; an out-of-group node inside the "
+                        f"convergence window silently breaks the local do/while")
+        for nid in window[:-1]:
+            for g in gates_after.get(nid, []):
+                if g.get("type") == "human_approval" or g.get("severity", "hard") == "hard":
+                    return (f"subgraph '{sid}' bounded group must be contiguous, but a "
+                            f"{g.get('type') or 'hard'} gate is anchored after node "
+                            f"'{nid}'; a checkpoint between its spliced nodes silently "
+                            f"breaks the local do/while")
+    return None
+
+
 def desugar_subgraphs(wf, subgraphs_dir):
     """SHARED `subgraph:` desugar used by BOTH compile and validate. Runs
     immediately AFTER expand_static_fanout and BEFORE the wf_-prefix check + schema
@@ -585,17 +689,24 @@ def desugar_subgraphs(wf, subgraphs_dir):
     Downstream host refs to the splice id (${<splice>.output|items} / a depends_on
     entry == <splice>) re-point at the subgraph's `output:` inner node (its exit).
 
-    PR1 supports convergence single_pass ONLY (pure inline splice); bounded is a
-    hard 'not yet supported (PR3)' block. Static-orchestrator inner nodes, V1
-    nesting, non-self-contained refs, the reserved '__' author id, and the
+    Convergence single_pass (pure inline splice) AND bounded (a SELF-CONTAINED local
+    do/while around the spliced group, emitted INSIDE the host segment — never the
+    top-level loop, never a checkpoint) are both supported. Static-orchestrator inner
+    nodes, V1 nesting, non-self-contained refs, the reserved '__' author id, and the
     param/input contract are all HARD errors.
 
     Pure function of the static doc + the registry bytes — deterministic; a doc
     with no `subgraph:` node is returned UNCHANGED (the registry is not read).
-    Returns (wf, errors); non-empty errors are a HARD block in both tools."""
+    Returns (wf, errors, converge); non-empty errors are a HARD block in both tools.
+    `converge` is the metadata channel for bounded groups —
+    {splice_id: {node_ids:[<splice>__<inner>...], max_iters:N, while:'<continue-expr,
+    ${}-stripped, ref rewritten>', exit:'<splice>__<output>'}} — empty when no bounded
+    subgraph is present. Compile stamps it onto the owning segment step (hash-visible);
+    validate uses it for the shared contiguity check then discards it."""
     errors = []
+    converge = {}
     if not isinstance(wf, dict) or not isinstance(wf.get("nodes"), list):
-        return wf, errors
+        return wf, errors, converge
     nodes = wf["nodes"]
 
     # Reserved-id guard (defense in depth, always): the splice namespace is
@@ -608,19 +719,19 @@ def desugar_subgraphs(wf, subgraphs_dir):
                 f"is reserved for the subgraph splice namespace "
                 f"(<splice-id>__<inner-id>)")
     if errors:
-        return wf, errors
+        return wf, errors, converge
 
     if not any(isinstance(n, dict) and "subgraph" in n for n in nodes):
         # Byte-identical no-op when no subgraph node exists — the registry and its
         # schema are never read.
-        return wf, errors
+        return wf, errors, converge
 
     if not SUBGRAPH_SCHEMA_PATH.exists():
-        return wf, [f"subgraph schema not found: {SUBGRAPH_SCHEMA_PATH}"]
+        return wf, [f"subgraph schema not found: {SUBGRAPH_SCHEMA_PATH}"], converge
     try:
         sg_schema = json.loads(SUBGRAPH_SCHEMA_PATH.read_bytes())
     except (OSError, json.JSONDecodeError) as e:
-        return wf, [f"subgraph schema unreadable: {e}"]
+        return wf, [f"subgraph schema unreadable: {e}"], converge
 
     # Pass 1: validate each subgraph node + build its namespaced inner-node list.
     spliced = {}        # splice-id -> [namespaced inner node dicts] (definition order)
@@ -684,14 +795,15 @@ def desugar_subgraphs(wf, subgraphs_dir):
             continue
 
         # CONVERGENCE: host with.convergence overrides SUBGRAPH.convergence; default
-        # single_pass. bounded is the PR3 feature — a hard block here.
+        # single_pass. bounded desugars the spliced group into a local do/while
+        # (built below + emitted by emit_segment_js); its grammar is checked here.
         host_with = n.get("with") or {}
         if not isinstance(host_with, dict):
             errors.append(f"subgraph node '{sid}': with must be a mapping")
             continue
         if "convergence" in host_with and not isinstance(host_with["convergence"], dict):
             # A non-dict shorthand (e.g. `convergence: bounded`) must NOT silently
-            # downgrade to single_pass — that would let bounded escape the PR3 block.
+            # downgrade to single_pass — that would let bounded escape its grammar check.
             errors.append(f"subgraph node '{sid}': with.convergence must be a mapping "
                           f"{{mode: single_pass|bounded}}, not a scalar")
             continue
@@ -702,14 +814,21 @@ def desugar_subgraphs(wf, subgraphs_dir):
         else:
             conv = {}
         mode = conv.get("mode", "single_pass")
-        if mode == "bounded":
-            errors.append(f"subgraph '{name}': convergence.mode 'bounded' is not yet "
-                          f"supported (PR3)")
-            continue
-        if mode != "single_pass":
+        if mode not in ("single_pass", "bounded"):
             errors.append(f"subgraph '{name}': convergence.mode '{mode}' is invalid "
-                          f"(single_pass only)")
+                          f"(single_pass or bounded)")
             continue
+        if mode == "bounded":
+            # Validate the bounded grammar (max_iters / while-until exclusivity /
+            # signal-references-exit-only) on the RAW signal, then desugar until->while
+            # so the rewrite below reads a normalized `while`. The signal rewrite +
+            # the converge entry are built AFTER the inner-node loop (the namespaced
+            # exit id + the host bindings are known there).
+            cv_err = subgraph_convergence_grammar_error(conv, output_id)
+            if cv_err:
+                errors.append(f"subgraph '{name}': {cv_err}")
+                continue
+            desugar_subgraph_convergence_until(conv)
 
         # PARAMS: declared params + defaults; the host `with:` supplies/overrides.
         declared_params = sg.get("params") or {}
@@ -780,6 +899,27 @@ def desugar_subgraphs(wf, subgraphs_dir):
                               f"inside one background segment and cannot hold a human gate")
                 bad = True
                 break
+            if mode == "bounded" and inn.get("for_each"):
+                # A for_each inner node fans out into a parallel() batch; wrapping that
+                # in the local do/while is unsupported (mirrors loop.body's fan-out
+                # block). single_pass inner for_each stays legal (no loop wrapper).
+                errors.append(f"subgraph '{name}': inner node '{iid}' uses for_each; "
+                              f"fan-out inside a bounded convergence group is "
+                              f"unsupported (mirrors a loop body)")
+                bad = True
+                break
+            if mode == "bounded" and inn.get("when"):
+                # A guarded inner node skips to null; the local do/while's
+                # continue-condition dereferences the exit node's output (and the
+                # group has no __ran/break), so a skipped exit — or a skipped
+                # producer the exit reads — null-derefs at runtime. Block the whole
+                # group from carrying `when` (mirrors the for_each restriction);
+                # single_pass inner `when` stays legal (no loop wrapper).
+                errors.append(f"subgraph '{name}': inner node '{iid}' uses when; a "
+                              f"guarded skip inside a bounded convergence group can "
+                              f"null the convergence-signal exit var (mirrors for_each)")
+                bad = True
+                break
             self_as = inn.get("as") if isinstance(inn.get("as"), str) else None
             sc_err = _subgraph_self_containment(
                 inn, name, declared_inputs, inner_ids, self_as)
@@ -812,10 +952,28 @@ def desugar_subgraphs(wf, subgraphs_dir):
         spliced[sid] = gen_nodes
         splice_exits[sid] = f"{sid}__{output_id}"
 
+        # BOUNDED: build the convergence metadata entry. The signal references the
+        # exit inner id (grammar-enforced) — substitute {{param}} tokens and rewrite
+        # the sibling exit ref to its namespaced <splice>__<output> form (reusing the
+        # SHARED splice machinery, never a bespoke regex), then store it ${}-stripped
+        # as the emit-time continue-expression. node_ids = the spliced group (the
+        # do/while window); exit = the namespaced output node.
+        if mode == "bounded":
+            sig = _subgraph_subst_params(conv["while"], params)
+            sig = _subgraph_rewrite_ref(sig, bindings, inner_ids, sid)
+            converge[sid] = {
+                "node_ids": [g["id"] for g in gen_nodes],
+                "max_iters": int(conv["max_iters"]),
+                "while": strip_ref_wrapper(sig),
+                "exit": f"{sid}__{output_id}",
+            }
+
     # A subgraph that the top-level `loop:` references (its splice id in loop.body,
     # or its output ${<splice>.output|items} in loop.while/until/carry) is NOT
-    # supported in PR1: the splice id is rewritten away, so the loop block would
-    # dangle. PR3 owns subgraph<->loop interaction; block here rather than miscompile.
+    # supported in ANY mode: the splice id is rewritten away, so the loop block would
+    # dangle. Block here rather than miscompile — a subgraph iterates via its OWN
+    # bounded convergence (a local do/while), not the top-level loop; enabling a
+    # subgraph inside the top-level loop is deferred and orthogonal to that.
     loop = wf.get("loop")
     if isinstance(loop, dict) and splice_exits:
         body_ids = set(loop.get("body") or [])
@@ -829,10 +987,12 @@ def desugar_subgraphs(wf, subgraphs_dir):
             if sid in body_ids or sid in loop_ref_ids:
                 errors.append(f"subgraph node '{sid}': a subgraph referenced by the "
                               f"top-level loop (body/while/until/carry) is not supported "
-                              f"in PR1 (PR3 owns subgraph<->loop interaction)")
+                              f"(the splice id is rewritten away, so the loop block "
+                              f"would dangle); use the subgraph's own bounded "
+                              f"convergence instead of the top-level loop")
 
     if errors:
-        return wf, errors
+        return wf, errors, converge
 
     # Pass 2: splice — replace each subgraph node in place with its inner nodes.
     new_nodes = []
@@ -880,7 +1040,7 @@ def desugar_subgraphs(wf, subgraphs_dir):
                     break
 
     wf["nodes"] = new_nodes
-    return wf, errors
+    return wf, errors, converge
 
 
 def collect_strings(obj):
@@ -2119,8 +2279,30 @@ async function withRetry(thunk, maxAttempts) {
 """.strip("\n")
 
 
-def emit_segment_js(seg_nodes, wf, loop, seg_index):
-    """Emit a Workflow-JS file for one background segment. Returns (js, needs, produces)."""
+def emit_local_do_while(body_js, while_js, iter_var, max_var, carry=None):
+    """The `do { <body> } while ((<cond>) && <iter> < <max>)` wrapper, FACTORED so
+    the top-level loop segment and a subgraph bounded group share ONE emit shape.
+    Parameterized by the iteration/cap var names (top-level: __iter/__max; a bounded
+    group: __cv<idx>_iter/__cv<idx>_max). The `&&  <iter> < <max>` operand comes
+    SECOND so a caller may short-circuit the cond deref on the FIRST operand. `carry`
+    is reserved for future in-loop carry threading — the subgraph path passes none,
+    keeping the helper ready without exposing carry grammar yet. The trailing blank
+    line is part of the golden top-level shape (kept byte-identical)."""
+    return (f"do {{\n{body_js}"
+            f"}} while (({while_js}) && {iter_var} < {max_var})\n\n")
+
+
+def emit_segment_js(seg_nodes, wf, loop, seg_index, converge_groups=None):
+    """Emit a Workflow-JS file for one background segment. Returns (js, needs, produces).
+
+    converge_groups: ordered bounded-convergence descriptors that land in THIS segment
+    (each {splice, nodes, max_iters, while, exit}); None/empty for an ordinary segment.
+    A group's spliced nodes are emitted as a SELF-CONTAINED local do/while (a `let`
+    declaration + `do { <group calls> __cv<idx>_iter++ } while ((cond) && iter < max)`),
+    the surrounding non-group nodes by ordinary dependency rank. Mutually exclusive with
+    is_loop_seg (the top-level loop never references a subgraph splice, so its body
+    segment never carries a group)."""
+    converge_groups = converge_groups or []
     seg_ids = [n["id"] for n in seg_nodes]
     seg_var_ids = set(seg_ids)
     needs = Needs()
@@ -2138,6 +2320,11 @@ def emit_segment_js(seg_nodes, wf, loop, seg_index):
         needs.scan((loop or {}).get("while"), seg_var_ids)
         for expr in ((loop or {}).get("carry") or {}).values():
             needs.scan(expr, seg_var_ids)
+    # A bounded group's continue-signal references only its own in-segment exit var
+    # (grammar-enforced), but scan it defensively (re-wrapped in ${...} since the
+    # descriptor stores it ${}-stripped) so emit and needs can never disagree.
+    for grp in converge_groups:
+        needs.scan("${" + grp["while"] + "}", seg_var_ids)
 
     # meta.phases: one entry per distinct progress group, in byte-stable topo order.
     # A node's group is its phase_group (if set) else its id; nodes sharing a
@@ -2249,8 +2436,7 @@ def emit_segment_js(seg_nodes, wf, loop, seg_index):
             produces = produces + [LOOP_RESULT_ID]
         loop_body_js = (f"{ran_init}{loop_calls}{break_line}{carry_assign}"
                         f"  __iter++\n")
-        scaffold = (f"do {{\n{loop_body_js}"
-                    f"}} while (({while_js}) && __iter < __max)\n\n")
+        scaffold = emit_local_do_while(loop_body_js, while_js, "__iter", "__max")
         body = (carry_init +
                 f"let __iter = 0\nconst __max = {max_iters}\n"
                 f"let {', '.join(jsvar(i) for i in seg_ids)}\n"
@@ -2266,17 +2452,72 @@ def emit_segment_js(seg_nodes, wf, loop, seg_index):
         # carried by each call's `phase` arg (and meta.phases), so the inline phase()
         # marker is only needed for the serial single-node form.
         node_by_id = {n["id"]: n for n in seg_nodes}
-        calls = ""
-        for layer in rank_partition(seg_nodes):
-            if len(layer) == 1:
-                n = node_by_id[layer[0]]
-                calls += f"phase({json.dumps(n.get('phase_group') or n['id'])})\n"
-                calls += node_call_js(n, seg_var_ids, indent="").lstrip()
-            else:
-                thunks = ",\n  ".join(
-                    node_call_js(node_by_id[nid], seg_var_ids, thunk=True) for nid in layer)
-                vars_js = ", ".join(jsvar(nid) for nid in layer)
-                calls += f"const [{vars_js}] = await parallel([\n  {thunks},\n])\n"
+
+        def emit_plain(node_ids):
+            """Rank-partition + emit a run of NON-group node ids (byte-identical to the
+            no-group path when called with the whole segment). Edges restrict to the
+            run's own ids, so a post-group node's edge to the group exit is dropped —
+            correct, since the exit var is already declared before the post run."""
+            out = ""
+            for layer in rank_partition([node_by_id[i] for i in node_ids]):
+                if len(layer) == 1:
+                    n = node_by_id[layer[0]]
+                    out += f"phase({json.dumps(n.get('phase_group') or n['id'])})\n"
+                    out += node_call_js(n, seg_var_ids, indent="").lstrip()
+                else:
+                    thunks = ",\n  ".join(
+                        node_call_js(node_by_id[nid], seg_var_ids, thunk=True)
+                        for nid in layer)
+                    vars_js = ", ".join(jsvar(nid) for nid in layer)
+                    out += f"const [{vars_js}] = await parallel([\n  {thunks},\n])\n"
+            return out
+
+        if not converge_groups:
+            # No bounded group → the original whole-segment rank emit (byte-identical).
+            calls = emit_plain(seg_ids)
+        else:
+            # Walk seg_ids in topo order: accumulate non-group runs (emit_plain) and, at
+            # each group's first node (its anchor), flush the run then emit the group's
+            # local do/while. Contiguity guarantees a group's nodes are adjacent, so the
+            # whole group is consumed at its anchor. Multiple groups iterate in topo
+            # order with the __cv<idx>_ prefix (never collides with __iter/__max/carry_*).
+            anchors = {}
+            for grp in converge_groups:
+                first = next(i for i in seg_ids if i in set(grp["nodes"]))
+                anchors[first] = grp
+            calls = ""
+            plain_run = []
+            cv_idx = 0
+            i = 0
+            while i < len(seg_ids):
+                nid = seg_ids[i]
+                if nid in anchors:
+                    if plain_run:
+                        calls += emit_plain(plain_run)
+                        plain_run = []
+                    grp = anchors[nid]
+                    # TOPOLOGICAL order (from seg_ids, not the descriptor): a
+                    # dependency is declared/assigned before its dependent on every
+                    # iteration. Contiguity makes this slice adjacent, so i += len(gids)
+                    # still consumes exactly the group.
+                    gids = [g for g in seg_ids if g in set(grp["nodes"])]
+                    iter_var, max_var = f"__cv{cv_idx}_iter", f"__cv{cv_idx}_max"
+                    while_js = translate_ref(grp["while"], seg_var_ids)
+                    group_calls = "".join(
+                        node_call_js(node_by_id[gid], seg_var_ids, indent="    ",
+                                     declare=False)
+                        for gid in gids)
+                    group_body = f"{group_calls}  {iter_var}++\n"
+                    calls += (f"let {', '.join(jsvar(g) for g in gids)}\n"
+                              f"let {iter_var} = 0\nconst {max_var} = {grp['max_iters']}\n")
+                    calls += emit_local_do_while(group_body, while_js, iter_var, max_var)
+                    cv_idx += 1
+                    i += len(gids)
+                else:
+                    plain_run.append(nid)
+                    i += 1
+            if plain_run:
+                calls += emit_plain(plain_run)
         ret = "{ " + ", ".join(f"{json.dumps(i)}: {jsvar(i)}" for i in seg_ids) + " }"
         body = calls + f"\nreturn {ret}\n"
 
@@ -2459,7 +2700,7 @@ def main():
     # <splice>__<inner> nodes, so the closed node schema never sees it). The
     # spliced nodes fingerprint normally → a registry/with/inputs edit is
     # closure-visible. Errors are a HARD block (the splice must never half-resolve).
-    wf, sg_errors = desugar_subgraphs(wf, defs_root / "_subgraphs")
+    wf, sg_errors, converge = desugar_subgraphs(wf, defs_root / "_subgraphs")
     if sg_errors:
         die("subgraph: desugar failed", 1, subgraph_errors=sg_errors)
 
@@ -2648,6 +2889,15 @@ def main():
     contig_err = loop_contiguity_error(order, node_by_id, gates_after, loop)
     if contig_err:
         die(contig_err, 1)
+
+    # --- SUBGRAPH bounded convergence: each group occupies a contiguous topo window
+    # (no interleaved out-of-group node, no hard/human_approval gate between its
+    # spliced nodes) — an interleave silently splits the group across segments and
+    # drops the local do/while. Shared helper with validate (parity by construction).
+    sg_contig_err = subgraph_convergence_contiguity_error(
+        order, node_by_id, gates_after, converge)
+    if sg_contig_err:
+        die(sg_contig_err, 1)
 
     # --- classify every node ONCE, in topological order ---
     # classify() stashes _exec_* on use: nodes (consumed by the emit) and DIES on
@@ -3016,7 +3266,40 @@ def main():
         if step["kind"] == "segment":
             seg_index += 1
             seg_nodes = [node_by_id[i] for i in step["nodes"]]
-            js, needs, produces = emit_segment_js(seg_nodes, wf, loop, seg_index)
+            # Which bounded convergence groups land in THIS segment. Contiguity above
+            # guarantees a group is never split across a checkpoint, so a group is
+            # wholly in or wholly out of a segment; a partial overlap is a hard die
+            # (defense in depth — a resolution-driven orchestrator inner node could
+            # in principle split it). The ordered descriptor list (sorted by splice
+            # id) is BOTH emitted (the local do/while) and stamped into the manifest.
+            seg_node_set = set(step["nodes"])
+            seg_converge = []
+            for sid in sorted(converge):
+                info = converge[sid]
+                grp_set = set(info["node_ids"])
+                # TOPOLOGICAL order, not subgraph DEFINITION order: step["nodes"] is
+                # already topo, so a dependency is always emitted/declared before its
+                # dependent in the do/while body (an out-of-dependency-order SUBGRAPH
+                # would otherwise reference an undefined var on iteration 1). The split
+                # check counts membership; the descriptor + emit both consume this
+                # topo order.
+                ordered = [i for i in step["nodes"] if i in grp_set]
+                if not ordered:
+                    continue
+                if len(ordered) != len(info["node_ids"]):
+                    die(f"subgraph '{sid}' bounded group is split across background "
+                        f"segments — its spliced nodes must compile into ONE segment "
+                        f"for the local do/while to wrap them; remove the checkpoint/"
+                        f"orchestrator boundary between them", 1)
+                seg_converge.append({
+                    "splice": sid,
+                    "nodes": ordered,
+                    "max_iters": info["max_iters"],
+                    "while": info["while"],
+                    "exit": info["exit"],
+                })
+            js, needs, produces = emit_segment_js(
+                seg_nodes, wf, loop, seg_index, seg_converge)
             fname = f"seg-{seg_index}.js"
             # Hash the FULL emitted body (the meta header is reproducible — name,
             # description, phases are pure functions of the def; no timestamp/env).
@@ -3052,6 +3335,16 @@ def main():
                          if node_by_id[nid].get("spill_outputs")}
             if seg_spill:
                 manifest_step["spill"] = seg_spill
+            # SUBGRAPH bounded convergence: the segment's group descriptors (sorted by
+            # splice id), stamped ONLY when present (bounded-free defs stay
+            # byte-identical) and INSIDE the hashed manifest — the spliced nodes
+            # fingerprint normally, but the convergence STRUCTURE (max_iters, the
+            # rewritten signal, the group membership) lives only in seg JS bytes
+            # (which node fingerprints never cover), so this stamp is what makes a
+            # max_iters / signal edit hash-visible (a superset of the loop's is_loop
+            # bool). Each descriptor is the same object emit_segment_js consumed.
+            if seg_converge:
+                manifest_step["converge"] = seg_converge
             # loop.on_exhaust: stamped on the LOOP step ONLY when declared
             # (absent defs stay byte-identical), and INSIDE the hashed manifest
             # — `fail` changes only seg JS bytes (the post-loop throw), which

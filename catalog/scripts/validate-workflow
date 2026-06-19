@@ -106,6 +106,10 @@ loop_max_parallel_errors = _cw.loop_max_parallel_errors
 apply_workflow_vars = _cw.apply_workflow_vars
 expand_static_fanout = _cw.expand_static_fanout
 desugar_subgraphs = _cw.desugar_subgraphs
+# Bounded-convergence grammar + until->while desugar run INSIDE the shared
+# desugar_subgraphs (which validate calls), so they are not imported separately;
+# only the contiguity check is re-run here against validate's own topo order.
+subgraph_convergence_contiguity_error = _cw.subgraph_convergence_contiguity_error
 scoped_ref_ids = _cw.scoped_ref_ids
 resolve_microskill_directives = _cw.resolve_microskill_directives
 wire_auto_placement_error = _cw.wire_auto_placement_error
@@ -286,10 +290,12 @@ def main():
     # --defs-root when given, else derived from the standard
     # <defs-root>/<name>/WORKFLOW.yaml layout (same as the snippets root). A desugar
     # error is a HARD block (the half-spliced doc is structurally unusable).
+    converge = {}
     if isinstance(merged, dict):
         sg_root = (Path(args.defs_root) if args.defs_root
                    else wf_path.resolve().parent.parent)
-        merged, subgraph_errors = desugar_subgraphs(merged, sg_root / "_subgraphs")
+        merged, subgraph_errors, converge = desugar_subgraphs(
+            merged, sg_root / "_subgraphs")
         for se in subgraph_errors:
             add(issues, "block", "subgraph", se)
         if subgraph_errors:
@@ -1010,6 +1016,36 @@ def main():
             add(issues, "block", f"gates/{g.get('id','?')}", f"'after' references unknown node '{after}'")
         if after:
             gates_after.setdefault(after, []).append(g)
+
+    # --- SUBGRAPH bounded convergence: each group occupies a contiguous topo window
+    # (no interleaved out-of-group node, no hard/human_approval gate between its
+    # spliced nodes). Mirror compile via the SAME shared helper (parity by
+    # construction); only safe to topo-sort when the union graph is acyclic (a cycle
+    # is already reported above). Grammar + until->while were enforced inside the
+    # shared desugar_subgraphs, so a bounded subgraph reaches here already validated.
+    if converge and not cycle_found[0]:
+        sg_contig = subgraph_convergence_contiguity_error(
+            topo_sort(well_formed_nodes), node_by_id, gates_after, converge)
+        if sg_contig:
+            add(issues, "block", "subgraph", sg_contig)
+    # PARITY with compile's per-segment split die (compile-workflow:~3277): an
+    # in-group use: node that RESOLVES to an orchestrator (AskUserQuestion / a hard
+    # gate) forces a checkpoint flush mid-group, splitting the bounded group across
+    # segments so the local do/while can't wrap it. The static
+    # _subgraph_static_orchestrator guard (inside the shared desugar) catches only
+    # STATIC signals; this resolution-driven case is caught here exactly as the
+    # loop-body path at :1367 — needs no topo (independent of cycle_found).
+    if converge:
+        for sid in sorted(converge):
+            for nid in converge[sid]["node_ids"]:
+                bn = node_by_id.get(nid)
+                if isinstance(bn, dict) and bn.get("use") and _use_resolves_orchestrator(nid):
+                    add(issues, "block", "subgraph",
+                        f"subgraph '{sid}': inner node '{nid}' resolves to an "
+                        f"orchestrator checkpoint (its microskill exposes "
+                        f"AskUserQuestion or carries a hard gate) — a bounded "
+                        f"convergence group must be entirely background, or it splits "
+                        f"across segments and the local do/while can't wrap it")
 
     # --- Declared gate policy: defaults + headless coherence (shared helpers) ---
     # Same gate_policy_errors / gate_headless_errors compile-workflow dies on, so

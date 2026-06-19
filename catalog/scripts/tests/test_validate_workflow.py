@@ -3593,7 +3593,8 @@ nodes:
 # accept/reject identically. The fixtures are imported from the compile test
 # module so there is ONE definition (no parity drift between the two suites).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from test_compile_workflow import SG_HOST, SG_REVIEW, SG_LOOP_HOST  # noqa: E402
+from test_compile_workflow import (  # noqa: E402
+    SG_HOST, SG_REVIEW, SG_LOOP_HOST, SG_BOUNDED, SG_BOUNDED_USE, SG_USE_HOST)
 
 
 def _setup_sg(tmp_path, host=SG_HOST, sg=SG_REVIEW, sg_name="adversarial-review"):
@@ -3628,13 +3629,139 @@ def test_subgraph_unresolved_name_blocks(tmp_path):
     assert any("not found" in m for m in _sg_blocks(data)), data
 
 
-def test_subgraph_bounded_convergence_blocks(tmp_path):
-    sg = SG_REVIEW.replace("convergence: { mode: single_pass }",
-                           "convergence: { mode: bounded, max_iters: 3 }")
+def test_subgraph_bounded_convergence_passes(tmp_path):
+    # Parity: validate ACCEPTS a well-formed bounded subgraph (the shared desugar
+    # validates the grammar + contiguity; nothing left to block).
+    wf = _setup_sg(tmp_path, sg=SG_BOUNDED)
+    rc, data, _ = run(wf, "--defs-root", tmp_path)
+    assert rc == 0, data
+    assert data["pass"] is True
+    assert not any(i["severity"] == "block" for i in data["issues"]), data
+
+
+def test_subgraph_bounded_missing_max_iters_blocks(tmp_path):
+    sg = SG_BOUNDED.replace("  max_iters: 4\n", "")
     wf = _setup_sg(tmp_path, sg=sg)
     rc, data, _ = run(wf, "--defs-root", tmp_path)
     assert rc == 1, data
-    assert any("bounded" in m and "PR3" in m for m in _sg_blocks(data)), data
+    assert any("max_iters" in m for m in _sg_blocks(data)), data
+
+
+def test_subgraph_bounded_neither_while_until_blocks(tmp_path):
+    sg = SG_BOUNDED.replace("  until: ${synthesize.output.converged}\n", "")
+    wf = _setup_sg(tmp_path, sg=sg)
+    rc, data, _ = run(wf, "--defs-root", tmp_path)
+    assert rc == 1, data
+    assert any("exactly one of 'while' / 'until'" in m for m in _sg_blocks(data)), data
+
+
+def test_subgraph_bounded_both_while_until_blocks(tmp_path):
+    sg = SG_BOUNDED.replace(
+        "  until: ${synthesize.output.converged}\n",
+        "  until: ${synthesize.output.converged}\n"
+        "  while: ${synthesize.output.again}\n")
+    wf = _setup_sg(tmp_path, sg=sg)
+    rc, data, _ = run(wf, "--defs-root", tmp_path)
+    assert rc == 1, data
+    assert any("only one of 'while' / 'until'" in m for m in _sg_blocks(data)), data
+
+
+def test_subgraph_bounded_signal_references_non_exit_blocks(tmp_path):
+    sg = SG_BOUNDED.replace("  until: ${synthesize.output.converged}\n",
+                            "  until: ${review.output.converged}\n")
+    wf = _setup_sg(tmp_path, sg=sg)
+    rc, data, _ = run(wf, "--defs-root", tmp_path)
+    assert rc == 1, data
+    assert any("reference only the subgraph's output node 'synthesize'" in m
+               for m in _sg_blocks(data)), data
+
+
+def test_subgraph_bounded_for_each_inner_blocks(tmp_path):
+    sg = SG_BOUNDED.replace(
+        "  - id: review\n    agent: reviewer\n    prompt: review this {{artifact_kind}}\n",
+        "  - id: review\n    agent: reviewer\n    prompt: review this {{artifact_kind}}\n"
+        "    for_each: ${inputs.artifact_path}\n    as: item\n")
+    wf = _setup_sg(tmp_path, sg=sg)
+    rc, data, _ = run(wf, "--defs-root", tmp_path)
+    assert rc == 1, data
+    assert any("for_each" in m and "bounded" in m for m in _sg_blocks(data)), data
+
+
+def test_subgraph_bounded_gate_between_group_nodes_blocks(tmp_path):
+    # Parity with compile: a hard gate anchored between the group's spliced nodes
+    # trips the SHARED contiguity helper (called by validate after cycle detection).
+    host = SG_HOST + (
+        "gates:\n"
+        "  - id: mid\n    after: rev__review\n    type: verification\n"
+        "    severity: hard\n    prompt: inspect\n")
+    wf = _setup_sg(tmp_path, host=host, sg=SG_BOUNDED)
+    rc, data, _ = run(wf, "--defs-root", tmp_path)
+    assert rc == 1, data
+    assert any("bounded group must be contiguous" in m for m in _sg_blocks(data)), data
+
+
+def test_subgraph_bounded_in_top_level_loop_still_blocks(tmp_path):
+    wf = _setup_sg(tmp_path, host=SG_LOOP_HOST, sg=SG_BOUNDED)
+    rc, data, _ = run(wf, "--defs-root", tmp_path)
+    assert rc == 1, data
+    assert any("top-level loop" in m for m in _sg_blocks(data)), data
+
+
+def test_subgraph_bounded_when_inner_blocks(tmp_path):
+    # Parity: a when-guarded inner node in a bounded group is rejected by the shared
+    # desugar (mirrors the for_each block).
+    sg = SG_BOUNDED.replace(
+        "    prompt: synthesize the review\n",
+        "    prompt: synthesize the review\n    when: ${review.output.findings}\n")
+    wf = _setup_sg(tmp_path, sg=sg)
+    rc, data, _ = run(wf, "--defs-root", tmp_path)
+    assert rc == 1, data
+    assert any("when" in m and "bounded" in m for m in _sg_blocks(data)), data
+
+
+def test_subgraph_bounded_signal_bare_token_blocks(tmp_path):
+    sg = SG_BOUNDED.replace("  until: ${synthesize.output.converged}\n",
+                            "  until: ${converged}\n")
+    wf = _setup_sg(tmp_path, sg=sg)
+    rc, data, _ = run(wf, "--defs-root", tmp_path)
+    assert rc == 1, data
+    assert any("found no such reference" in m for m in _sg_blocks(data)), data
+
+
+def test_subgraph_bounded_signal_missing_output_blocks(tmp_path):
+    sg = SG_BOUNDED.replace("  until: ${synthesize.output.converged}\n",
+                            "  until: ${synthesize.converged}\n")
+    wf = _setup_sg(tmp_path, sg=sg)
+    rc, data, _ = run(wf, "--defs-root", tmp_path)
+    assert rc == 1, data
+    assert any("found no such reference" in m for m in _sg_blocks(data)), data
+
+
+def test_subgraph_bounded_signal_host_coupling_blocks(tmp_path):
+    sg = SG_BOUNDED.replace("  until: ${synthesize.output.converged}\n",
+                            "  while: ${workflow.inputs.flag}\n")
+    wf = _setup_sg(tmp_path, sg=sg)
+    rc, data, _ = run(wf, "--defs-root", tmp_path)
+    assert rc == 1, data
+    assert any("may not couple to a host workflow input" in m
+               for m in _sg_blocks(data)), data
+
+
+def test_subgraph_bounded_use_orchestrator_inner_blocks(tmp_path):
+    # PARITY with compile's split die: a bounded group's use: inner node that RESOLVES
+    # to an orchestrator (AskUserQuestion) is caught by validate (the static desugar
+    # guard misses resolution-driven orchestrators). Mirrors the loop-body path.
+    _mk_ms_orch(tmp_path, "asker")
+    defs_root = tmp_path / "workflow-defs"
+    make_def(defs_root, "host-flow", SG_USE_HOST.replace("name: cls-flow",
+                                                         "name: host-flow"))
+    d = defs_root / "_subgraphs" / "adversarial-review"
+    d.mkdir(parents=True)
+    (d / "SUBGRAPH.yaml").write_text(SG_BOUNDED_USE)
+    wf = defs_root / "host-flow" / "WORKFLOW.yaml"
+    rc, data, err = run_defs(defs_root, wf)
+    assert rc == 1, (data, err)
+    assert any("resolves to an orchestrator" in m for m in _sg_blocks(data)), data
 
 
 def test_subgraph_missing_required_param_blocks(tmp_path):

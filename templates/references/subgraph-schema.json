@@ -48,15 +48,23 @@
       "properties": {
         "mode": {
           "enum": ["single_pass", "bounded"],
-          "description": "single_pass = the inner node-group is spliced once inline (PR1). bounded = a local do/while around the spliced group (PR3 — currently a hard 'not yet supported' block). The host `with.convergence` overrides this."
+          "description": "single_pass = the inner node-group is spliced once inline. bounded = a SELF-CONTAINED local do/while around the spliced group, emitted INSIDE the host background segment (never the top-level loop, never a checkpoint). The host `with.convergence` overrides this."
         },
         "max_iters": {
           "type": "integer",
           "minimum": 1,
-          "description": "bounded mode only: the iteration cap (consumed in PR3)."
+          "description": "bounded mode only: the mandatory iteration cap (the desugar blocks a bounded block missing it)."
+        },
+        "while": {
+          "type": "string",
+          "description": "bounded mode only: a ${...} continue-condition. The local do/while iterates WHILE this is truthy AND iter < max_iters. May reference ONLY the subgraph's `output:` (exit) inner node — ${<output>.output|items} — which becomes an in-segment var on splice. Exactly one of while/until (the desugar blocks neither/both)."
+        },
+        "until": {
+          "type": "string",
+          "description": "bounded mode only: a ${...} stop-condition, the sugar inverse of `while` — `until: ${E}` desugars to `while: ${!(E)}` byte-identically. Same exit-only reference rule as `while`. Exactly one of while/until."
         }
       },
-      "description": "Default convergence mode for the splice. Absent → single_pass. The host node's `with.convergence` (a reserved `with:` key, never treated as a param) overrides it."
+      "description": "Default convergence mode for the splice. Absent → single_pass. The host node's `with.convergence` (a reserved `with:` key, never treated as a param) overrides it. bounded requires max_iters + exactly one of while/until, enforced by the desugar (a closed schema cannot express the cross-field rule)."
     },
     "nodes": {
       "type": "array",

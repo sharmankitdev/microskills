@@ -1,0 +1,14 @@
+{
+  "manifest_hash": "b855c3aee4072f45c715346885097c4eb7f628c469be7ae697fd898d26c7a3b1",
+  "name": "subgraph-bounded-smoke",
+  "node_fingerprints": {
+    "author": "25402932c624104ebc2d913f30afbfc62999b82934675e24b1f5a72da35236c0",
+    "publish": "548f707ed6f517386f5656d11f0457ad6955b443f047d44cbf361f253e67cf7a",
+    "rev__review": "c2c7213aad2d00ea92d45a9603fbbf38fc71a1a8466863758b91d467e3e0c15a",
+    "rev__synthesize": "ae707b620c42e3a8d85f6956f557536d8c88ebdc3ece9e71d751cc8de9bb1d55"
+  },
+  "profile_used": "base",
+  "segment_digests": {
+    "seg-1.js": "729b6e28043ba85e1652e183def093f7a68e89ad1b341714c00186aac42cc96a"
+  }
+}
