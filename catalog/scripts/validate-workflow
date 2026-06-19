@@ -1420,6 +1420,20 @@ def main():
                     continue
                 if prod_id in gate_id_set or prod_id not in id_set:
                     continue
+                # INVERSE of the ${id.items}-on-a-NON-for_each block (~705-708): a
+                # for_each producer's runtime result is the per-item ARRAY, not an
+                # object. A scalar ${fe.output.<field>} ref in while/until/carry
+                # compiles to `n_fe = await parallel(map(...))` (an array) and then
+                # `(!n_fe.<field>)` → undefined → the loop can never converge (spins to
+                # max_iters / throws under on_exhaust:fail). A fan-out result is
+                # consumable only as the whole array via ${fe.items}.
+                if node_by_id[prod_id].get("for_each"):
+                    add(issues, "block", "loop",
+                        f"references ${{{prod_id}.output.{field}}} but node '{prod_id}' "
+                        f"is a for_each fan-out; its result is the per-item results "
+                        f"array, not an object — consume the whole array via "
+                        f"${{{prod_id}.items}}, never a scalar .output field")
+                    continue
                 osch = node_by_id[prod_id].get("output_schema")
                 if osch is None:
                     osch = resolved_schemas.get(prod_id)

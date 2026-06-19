@@ -243,6 +243,56 @@ loop:
                for i in data["issues"])
 
 
+# A for_each node's runtime result is the per-item ARRAY, not an object. A loop
+# while/until/carry that dereferences a SCALAR field on it (${fe.output.field})
+# compiles to `n_fe = await parallel(map(...))` (an array) then `(!n_fe.field)` →
+# undefined → the loop can never converge (spins to max_iters / throws under
+# on_exhaust:fail). Block the scalar ref; the whole-array form ${fe.items} (or a
+# plain non-fan-out scalar) is clean.
+_FE_WHILE_BLOCK = """\
+version: 1
+name: fe-while
+nodes:
+  - id: a
+    agent: ag
+    prompt: plan
+  - id: col
+    agent: ag
+    depends_on: [a]
+    prompt: collect
+    output_schema:
+      type: object
+      required: [findings, done]
+      properties: { findings: { type: array }, done: { type: boolean } }
+  - id: b
+    agent: ag
+    for_each: ${col.output.findings}
+    as: item
+    prompt: scan ${item}
+loop:
+  while: ${!b.output.done}
+  max_iters: 2
+  body: [col, b]
+"""
+
+
+def test_loop_while_scalar_ref_on_for_each_producer_blocks(tmp_path):
+    rc, data, _ = run(write_wf(tmp_path, _FE_WHILE_BLOCK))
+    assert rc == 1, data
+    assert any(i["severity"] == "block" and "is a for_each fan-out" in i["message"]
+               and "b.output.done" in i["message"] for i in data["issues"]), data
+
+
+def test_loop_while_plain_scalar_ref_clean_twin(tmp_path):
+    # Same graph, but the while reads a PLAIN node's scalar (${col.output.done}) —
+    # the for_each fan-out result is never scalar-dereferenced → no block.
+    body = _FE_WHILE_BLOCK.replace("while: ${!b.output.done}", "while: ${!col.output.done}")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 0, data
+    assert not any("is a for_each fan-out" in i["message"]
+                   for i in (data or {}).get("issues", []))
+
+
 def test_when_ref_infers_edge_passes(tmp_path):
     # S-INFER: a ${a.output.ok} ref in `when` implies the edge a->b, so no explicit
     # depends_on is required — this now passes.
