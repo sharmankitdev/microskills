@@ -2292,6 +2292,44 @@ def emit_local_do_while(body_js, while_js, iter_var, max_var, carry=None):
             f"}} while (({while_js}) && {iter_var} < {max_var})\n\n")
 
 
+def emit_rank_calls(seg_node_objs, seg_var_ids, declare=True, phase_line=True, indent=""):
+    """Rank-partition a run of node objects and emit each dependency layer. A
+    single-node layer emits the serial form (an awaited assignment, optionally
+    preceded by an inline phase() marker); a layer of >=2 mutually-independent
+    siblings emits ONE parallel([...]) batch with destructuring — concurrent
+    instead of serial. ONE emitter feeds three call sites:
+
+      - the non-loop segment (declare=True, phase_line=True, indent="") — emits
+        `const` decls + the inline phase() marker, byte-identical to the old
+        emit_plain;
+      - the top-level do/while loop body (declare=False, phase_line=False,
+        indent="    ") — bare reassignment into pre-declared lets, no phase line;
+      - a subgraph bounded group's do/while body (same flags as the loop body).
+
+    A single-node layer routes through node_call_js so a for_each / when node keeps
+    its EXACT existing emission — which is why a for_each node composes as just
+    another (already-parallel `await parallel(map(...))`) rank inside a do/while
+    body. Single-node ranks therefore stay byte-for-byte identical to the prior
+    serial emit; only layers with genuinely independent siblings change."""
+    out = ""
+    node_by_id = {n["id"]: n for n in seg_node_objs}
+    for layer in rank_partition(seg_node_objs):
+        if len(layer) == 1:
+            n = node_by_id[layer[0]]
+            if phase_line:
+                out += f"{indent}phase({json.dumps(n.get('phase_group') or n['id'])})\n"
+            out += node_call_js(n, seg_var_ids, indent=indent, declare=declare)
+        else:
+            thunks = ",\n  ".join(
+                node_call_js(node_by_id[nid], seg_var_ids, thunk=True)
+                for nid in layer)
+            vars_js = ", ".join(jsvar(nid) for nid in layer)
+            kw = "const " if declare else ""
+            out += (f"{indent}{kw}[{vars_js}] = await parallel([\n"
+                    f"{indent}  {thunks},\n{indent}])\n")
+    return out
+
+
 def emit_segment_js(seg_nodes, wf, loop, seg_index, converge_groups=None):
     """Emit a Workflow-JS file for one background segment. Returns (js, needs, produces).
 
@@ -2457,20 +2495,11 @@ def emit_segment_js(seg_nodes, wf, loop, seg_index, converge_groups=None):
             """Rank-partition + emit a run of NON-group node ids (byte-identical to the
             no-group path when called with the whole segment). Edges restrict to the
             run's own ids, so a post-group node's edge to the group exit is dropped —
-            correct, since the exit var is already declared before the post run."""
-            out = ""
-            for layer in rank_partition([node_by_id[i] for i in node_ids]):
-                if len(layer) == 1:
-                    n = node_by_id[layer[0]]
-                    out += f"phase({json.dumps(n.get('phase_group') or n['id'])})\n"
-                    out += node_call_js(n, seg_var_ids, indent="").lstrip()
-                else:
-                    thunks = ",\n  ".join(
-                        node_call_js(node_by_id[nid], seg_var_ids, thunk=True)
-                        for nid in layer)
-                    vars_js = ", ".join(jsvar(nid) for nid in layer)
-                    out += f"const [{vars_js}] = await parallel([\n  {thunks},\n])\n"
-            return out
+            correct, since the exit var is already declared before the post run.
+            Delegates to the shared emit_rank_calls with the non-loop flag set
+            (const decls + the inline phase() marker)."""
+            return emit_rank_calls([node_by_id[i] for i in node_ids], seg_var_ids,
+                                   declare=True, phase_line=True, indent="")
 
         if not converge_groups:
             # No bounded group → the original whole-segment rank emit (byte-identical).
