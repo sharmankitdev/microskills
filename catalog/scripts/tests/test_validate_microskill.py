@@ -480,3 +480,23 @@ def test_steps_add_after_unknown_warns(tmp_path):
     code, data, _, err = run(str(skill), str(cfg))
     assert any(i["severity"] == "warn" and "steps.add" in i["message"] and "does not exist" in i["message"]
                for i in data["issues"]), data
+
+
+def test_profile_step_add_branching_blocks(tmp_path):
+    skill = write_skill(tmp_path, "psb", MINIMAL_BODY.format(name="psb"))
+    cfg = write_cfg(tmp_path, "strict.yaml",
+                    "version: 1\nsteps:\n  add:\n    - after: 1\n      text: if the file exists then read it\n")
+    code, data, _, err = run(str(skill), str(cfg))
+    assert code == 1, err
+    assert any(i["severity"] == "block" and "branching language" in i["message"] and ".text" in i["message"]
+               for i in data["issues"]), data
+
+
+def test_profile_step_patch_branching_blocks(tmp_path):
+    skill = write_skill(tmp_path, "psp", MINIMAL_BODY.format(name="psp"))
+    cfg = write_cfg(tmp_path, "strict.yaml",
+                    "version: 1\nsteps:\n  patch:\n    \"1\":\n      text: for each commit, process it\n")
+    code, data, _, err = run(str(skill), str(cfg))
+    assert code == 1, err
+    assert any(i["severity"] == "block" and "branching language" in i["message"]
+               for i in data["issues"]), data

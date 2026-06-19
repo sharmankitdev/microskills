@@ -264,6 +264,23 @@ def check_config(path, issues):
                         f"{p.name}: output_schema.required lists '{req}' which is not in properties — "
                         f"a dead field that dead-ends downstream .output.{req} refs.")
 
+    steps_block = doc.get("steps") if isinstance(doc, dict) else None
+    if isinstance(steps_block, dict):
+        frags = []
+        patch = steps_block.get("patch")
+        if isinstance(patch, dict):
+            for k, v in patch.items():
+                if isinstance(v, dict) and isinstance(v.get("text"), str):
+                    frags.append((f"steps.patch.{k}", v["text"]))
+        for i, entry in enumerate(steps_block.get("add") or []):
+            if isinstance(entry, dict) and isinstance(entry.get("text"), str):
+                frags.append((f"steps.add[{i}]", entry["text"]))
+        for loc, text in frags:
+            for snippet, _span in _steps_mod.find_branch_language(text):
+                add(issues, "block", "config",
+                    f"{p.name}: {loc}.text contains branching language: \"…{snippet}…\" — "
+                    f"profile-supplied steps must form a single linear path (same rule as the body Steps).")
+
     if p.name != "base.yaml" and isinstance(doc, dict) and "profile" in doc:
         add(issues, "block", "config",
             f"{p.name}: top-level 'profile' block is only allowed in base.yaml")
