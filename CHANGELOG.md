@@ -1,3 +1,9 @@
+## [0.23.0](https://github.com/sharmankitdev/microskills/compare/v0.22.0...v0.23.0) (2026-06-19)
+
+### Features
+
+* **scripts:** subgraph primitive — single_pass splice (compile + validate) ([#27](https://github.com/sharmankitdev/microskills/issues/27)) ([d58a76f](https://github.com/sharmankitdev/microskills/commit/d58a76f56d3f9f2b41ba681940fcab5f19d8e7b2))
+
 ## [0.22.0](https://github.com/sharmankitdev/microskills/compare/v0.21.0...v0.22.0) (2026-06-19)
 
 ### Features
