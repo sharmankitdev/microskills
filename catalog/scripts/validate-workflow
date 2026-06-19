@@ -423,6 +423,13 @@ def main():
                 f"delegation: orchestrator if a checkpoint is intended)")
             continue
         cust = n.get("customize") if isinstance(n.get("customize"), dict) else None
+        prof = (cust or {}).get("profile")
+        if isinstance(prof, str) and prof != "base" and \
+                not (skill_root / str(use_name) / "profiles" / f"{prof}.yaml").exists():
+            add(issues, node_unres_sev, f"nodes/{nid}",
+                f"use: '{use_name}' customize.profile '{prof}' has no "
+                f"profiles/{prof}.yaml (resolution silently falls back to base, "
+                f"masking the typo)")
         key = (str(use_name), (cust or {}).get("profile"),
                json.dumps((cust or {}).get("overrides") or {}, sort_keys=True))
         if key not in _res_cache:
@@ -493,6 +500,27 @@ def main():
                 f"wire: auto satisfied REQUIRED target input '{rname}' from "
                 f"${{workflow.inputs.{rname}}} — verify the same-named workflow "
                 f"input is really the intended source")
+
+    # --- use: node required-input satisfaction (block) ---
+    # A use: node must supply every input its RESOLVED microskill marks required.
+    # Source of truth = resolver's own required_inputs ledger (resolved_payloads[nid]
+    # ["required_inputs"]): it already honors the customize.profile overlay AND
+    # excludes inject_from inputs (env-supplied) — recomputing from the base config
+    # over-blocks (the synthesize-review `design` profile flips fields optional).
+    # wire:auto already mutated n['inputs'] in place above, so wired forwards count.
+    for nid, n in node_by_id.items():
+        if not n.get("use") or n.get("delegation") == "orchestrator" \
+                or n.get("side_effect") is True:
+            continue
+        payload = resolved_payloads.get(nid)
+        if not isinstance(payload, dict):
+            continue  # unresolved (standalone/no-registry) — already warned/blocked above
+        required = payload.get("required_inputs") or []
+        supplied = set((n.get("inputs") or {}).keys())
+        for req in sorted(set(required) - supplied):
+            add(issues, "block", f"nodes/{nid}",
+                f"use: '{n['use']}' requires input '{req}' (required) but the node's "
+                f"inputs omit it (supply inputs.{req}: ${{...}}, or wire it)")
 
     # phase_group is a cosmetic /workflows progress-group label (emit-only). A
     # phase_group equal to a DIFFERENT node's id would merge that group's box with

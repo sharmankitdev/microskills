@@ -650,6 +650,17 @@ def make_def(defs_root, name, body):
     return p
 
 
+def _mk_ms(tmp_path, name, base_yaml="version: 1\n", md=None):
+    d = tmp_path / "microskills" / name
+    (d / "profiles").mkdir(parents=True, exist_ok=True)
+    (d / "MICROSKILL.md").write_text(md or (
+        "---\nname: %s\ndescription: minimal\n---\n\n# %s\n\n"
+        "## Purpose\n\nGiven X do Y produce Z.\n\n## Steps\n\n1. Return the result.\n"
+        % (name, name)))
+    (d / "profiles" / "base.yaml").write_text(base_yaml)
+    return d
+
+
 # A simple leaf child with one required input and no nested workflow: node.
 CHILD = """\
 version: 1
@@ -3178,3 +3189,81 @@ loop:
     rc, data, err = run(wf)
     assert rc == 0, err
     assert not any("resolves to no" in i["message"] for i in data["issues"]), data
+
+
+def test_use_node_missing_profile_blocks(tmp_path):
+    _mk_ms(tmp_path, "real-ms")  # has profiles/base.yaml only
+    defs_root = tmp_path / "workflow-defs"
+    wf = make_def(defs_root, "f", """
+version: 1
+name: f
+description: d
+nodes:
+  - id: a
+    use: real-ms
+    customize:
+      profile: ghost
+    prompt: x
+""")
+    rc, data, err = run_defs(defs_root, wf)
+    assert rc == 1, err
+    assert any(i["severity"] == "block" and i["location"] == "nodes/a"
+               and "ghost" in i["message"] for i in data["issues"]), data
+
+
+def test_use_node_missing_required_input_blocks(tmp_path):
+    _mk_ms(tmp_path, "needy", base_yaml=(
+        "version: 1\ninputs:\n  seed:\n    required: true\n"))
+    # MICROSKILL.md must list `seed` in its Inputs table for required_inputs to include it
+    md = ("---\nname: needy\ndescription: d\n---\n\n# needy\n\n## Purpose\n\n"
+          "Given seed do work produce out.\n\n## Inputs\n\n"
+          "| name | required | type | description | default |\n"
+          "| --- | --- | --- | --- | --- |\n"
+          "| seed | yes | string | the seed | — |\n\n## Steps\n\n1. Use ${seed}.\n")
+    (tmp_path / "microskills" / "needy" / "MICROSKILL.md").write_text(md)
+    defs_root = tmp_path / "workflow-defs"
+    wf = make_def(defs_root, "f", """
+version: 1
+name: f
+description: d
+nodes:
+  - id: a
+    use: needy
+    prompt: x
+""")
+    rc, data, err = run_defs(defs_root, wf)
+    assert rc == 1, err
+    assert any(i["severity"] == "block" and i["location"] == "nodes/a"
+               and "seed" in i["message"] and "required" in i["message"]
+               for i in data["issues"]), data
+
+
+def test_use_node_required_input_supplied_clean(tmp_path):
+    _mk_ms(tmp_path, "needy", base_yaml=(
+        "version: 1\ninputs:\n  seed:\n    required: true\n"))
+    md = ("---\nname: needy\ndescription: d\n---\n\n# needy\n\n## Purpose\n\n"
+          "Given seed do work produce out.\n\n## Inputs\n\n"
+          "| name | required | type | description | default |\n"
+          "| --- | --- | --- | --- | --- |\n"
+          "| seed | yes | string | the seed | — |\n\n## Steps\n\n1. Use ${seed}.\n")
+    (tmp_path / "microskills" / "needy" / "MICROSKILL.md").write_text(md)
+    defs_root = tmp_path / "workflow-defs"
+    wf = make_def(defs_root, "f", """
+version: 1
+name: f
+description: d
+nodes:
+  - id: src
+    agent: ag
+    prompt: src
+  - id: a
+    use: needy
+    depends_on: [src]
+    inputs:
+      seed: ${src.output.x}
+    prompt: x
+""")
+    rc, data, err = run_defs(defs_root, wf)
+    assert rc == 0, err
+    assert not any("required" in i["message"] and "seed" in i["message"]
+                   for i in data["issues"]), data
