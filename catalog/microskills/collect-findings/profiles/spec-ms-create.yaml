@@ -1,0 +1,10 @@
+version: 1
+
+# Microskill-spec critique fan-in overlay for collect-findings (§8 step 6 / D3). Registers
+# the 2 spec review-dimension input names the create-spec-microskill critique panel fans
+# over (review-dimension profiles spec-ms-*). Base's six code-review inputs deep-merge in
+# unused. Each entry is an empty map (declaring the name is the whole point). Names = the
+# critique expand item names with hyphen→underscore (the inputs_each desugar contract).
+inputs:
+  spec_ms_completeness: {}
+  spec_ms_atomicity: {}

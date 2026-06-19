@@ -1,0 +1,45 @@
+version: 1
+
+# create-spec-microskill — the interactive intent front-end for microskill-create
+# (§8 step 6 / D3). Retargets refine-requirements' completeness critique panel from the
+# generic SE-requirements lenses (req-*) to the 2 microskill-spec lenses, threads the
+# 7-section microskill spec template, tightens the loop/clarify/refute budgets to the
+# tighter microskill scope, and COLLAPSES the approval gate (severity:warn, keep
+# default:approve) so the parent create pipeline's approve_plan is the only human gate.
+# clarify + present_refined stay INTERACTIVE here (intent capture is the whole point of
+# the front-end). NO output_schema / parent-input changes → develop-product-backlog's
+# external contract is untouched.
+inputs:
+  template_path:
+    default: .claude/workflow-defs/refine-requirements/references/microskill-spec-template.md
+  max_iterations:
+    default: 2          # clarify-loop cap (tight microskill scope)
+  refute_seats:
+    default: 1          # odd; single-judge closure refute for the small ms spec
+
+nodes:
+  patch:
+    # Replace the 4 req-* critique lenses with the 2 microskill-spec lenses. The
+    # expand.over list REPLACES wholesale (resolver list-replace), so compile generates
+    # exactly critique_spec_ms_completeness + critique_spec_ms_atomicity.
+    - id: critique
+      expand:
+        over:
+          - { item: spec-ms-completeness, name: "Microskill spec completeness" }
+          - { item: spec-ms-atomicity, name: "Atomicity & single-linear-path" }
+    # Re-point the fan-in to the collect profile that registers the 2 new lens keys.
+    - id: collect_req
+      customize: { profile: spec-ms-create }
+
+# Co-patch loop.body to the NEW generated critique ids (WORKFLOW.yaml lines 369-373
+# mandate this whenever critique.over changes) + tighten the convergence cap.
+loop:
+  max_iters: 2
+  body: [revise_req, critique_spec_ms_completeness, critique_spec_ms_atomicity,
+         collect_req, synth_req]
+
+# Gate collapse: the final approval no longer pauses — the parent owns the one human gate.
+gates:
+  patch:
+    - id: approve_requirements
+      severity: warn

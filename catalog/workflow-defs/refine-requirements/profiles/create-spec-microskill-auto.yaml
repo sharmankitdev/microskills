@@ -1,0 +1,59 @@
+version: 1
+
+# create-spec-microskill-auto — unattended variant of create-spec-microskill for the
+# headless provision fan-out (§8 step 6 / D3). The engine deep-merges a SINGLE overlay
+# onto base (profiles do not inherit each other), so this is the full create-spec-microskill
+# body PLUS gate_mode:auto and the unattended clarify/present_refined prompts (cloned from
+# autonomous.yaml, adapted to "specification"). triage_reopened is deliberately NOT patched
+# — a red closure tally PARKS the run honestly (on_headless: fail), never silently degrades.
+gate_mode: auto
+
+inputs:
+  template_path:
+    default: .claude/workflow-defs/refine-requirements/references/microskill-spec-template.md
+  max_iterations:
+    default: 2
+  refute_seats:
+    default: 1
+
+nodes:
+  patch:
+    - id: critique
+      expand:
+        over:
+          - { item: spec-ms-completeness, name: "Microskill spec completeness" }
+          - { item: spec-ms-atomicity, name: "Atomicity & single-linear-path" }
+    - id: collect_req
+      customize: { profile: spec-ms-create }
+    - id: clarify
+      prompt: >
+        Refine the assembled microskill specification at ${assemble.output.document_path}
+        UNATTENDED — there is NO human, so you MUST NOT call AskUserQuestion. It has
+        ${assemble.output.gaps_count} open gap(s): ${assemble.output.gaps}. Fill a gap ONLY
+        when its answer is unambiguously inferable from the sources at
+        ${workflow.inputs.sources_path} or a safe documented default; record what you
+        inferred and why. For every gap you cannot fill confidently, leave that section's
+        content as an explicit "Open question for human review:" line quoting the gap's
+        question. Write the confidently-inferred answers to a ledger at
+        ${workflow.inputs.staging_dir}/answers.json and re-invoke /assimilate-requirements
+        ONCE with prior_answers_path set to that ledger to rewrite the document and re-emit
+        gaps. Do exactly ONE pass (no rounds — there is no one to ask). Do NOT present the
+        document — an adversarial critique loop, a closure refute-vote, and an approval gate
+        run downstream. RETURN {choice: "auto-accepted", final_document_path, rounds: 1,
+        converged: <true only when the re-emitted gaps_count is 0>, remaining_gaps}.
+    - id: present_refined
+      prompt: >
+        UNATTENDED — do NOT call AskUserQuestion. Verify the refined specification exists at
+        ${assemble.output.document_path} and the critique report at
+        ${synth_req.output.report_path}. RETURN {action: "auto-accepted",
+        document_path: ${assemble.output.document_path}, remediation_rounds: 0}.
+
+loop:
+  max_iters: 2
+  body: [revise_req, critique_spec_ms_completeness, critique_spec_ms_atomicity,
+         collect_req, synth_req]
+
+gates:
+  patch:
+    - id: approve_requirements
+      severity: warn
