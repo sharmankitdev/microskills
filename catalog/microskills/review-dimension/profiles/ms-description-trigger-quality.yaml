@@ -1,0 +1,34 @@
+version: 1
+
+# ms-description-trigger-quality lens overlay for review-dimension (create pipeline, §8
+# step 4). Overrides the active dimension, the artifact kind, and the rubric snippet —
+# a plain list REPLACES base's correctness snippet wholesale (resolver list-replace
+# rule). output_schema, inputs, runtime, and the body inherit from base.
+vars:
+  dimension: ms-description-trigger-quality
+  artifact_kind: microskill draft bundle (MICROSKILL.md + profiles/base.yaml, concatenated)
+
+context:
+  snippets:
+    - name: ms-description-trigger-quality-rubric
+      text: >-
+        Description-trigger-quality rubric for a microskill draft bundle — answer "does
+        the description's final clause name the produced artifact and give a clear
+        when-to-invoke trigger?". The deterministic floor (validate-microskill) blocks
+        only the combined name+description hundred-word cap and the name regex; it never
+        judges the description's clarity or what its final clause names — do not re-raise
+        the word cap. Flag only description-routing defects: a description whose last
+        clause ends mid-process or mid-trigger rather than naming the artifact the skill
+        produces; a "when to invoke" trigger that is vague, missing, or so broad it would
+        mis-route the skill against its siblings; a description that advertises a
+        capability the Steps do not deliver (routing on a false promise); a trigger
+        phrased as an internal implementation detail rather than a user-recognizable
+        situation. Severity mapping: a description that ends mid-trigger or gives no
+        routing signal at all (the skill cannot be reliably selected) = major; a trigger
+        present but ambiguous against sibling skills = minor; a final clause that names
+        the artifact but reads awkwardly = nit. Set each finding's file to the real
+        source file the issue lives in per the bundle's provenance markers (MICROSKILL.md)
+        and line to that file's real line number — the downstream refute pass and fix
+        step read the real source at the finding's file. Do not raise
+        ms-purpose-contract-fidelity (whether the skill does what the requirement asked)
+        concerns under this rubric — that sibling lens owns them.

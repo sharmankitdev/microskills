@@ -1,0 +1,44 @@
+version: 1
+
+# wf-output-schema-downstream-fit lens overlay for review-dimension (create pipeline, §8
+# step 4). Overrides the active dimension, the artifact kind, and the rubric snippet — a
+# plain list REPLACES base's correctness snippet wholesale (resolver list-replace rule).
+# output_schema, inputs, runtime, and the body inherit from base. The caller threads the
+# approved plan/requirement as context_path (grounding, Read by path).
+vars:
+  dimension: wf-output-schema-downstream-fit
+  artifact_kind: workflow draft bundle (WORKFLOW.yaml + profiles/*.yaml, concatenated)
+
+context:
+  snippets:
+    - name: wf-output-schema-downstream-fit-rubric
+      text: >-
+        Output-schema-downstream-fit rubric for a workflow draft bundle — answer "are a
+        node's declared output_schema fields the semantically right ones for what its
+        downstream consumers need, with a correct inherit-vs-override choice?". Read the
+        approved plan/requirement from context_path as ground truth; an absent
+        context_path = a missing grounding basis: raise exactly one blocker finding naming
+        the missing grounding and review nothing blind. The deterministic floor
+        (validate-workflow + compile-workflow --defs-root) already blocks
+        ${id.output.field} references to fields absent from the producer's effective
+        schema (S-FIELD inheritance) and an unknown output.from, and warns when an inline
+        schema is identical or divergent to the resolved one — do not re-raise those; it
+        never judges whether the declared field set is the right one. Flag only output-fit
+        defects above that floor: a node output_schema missing a field a downstream node
+        or the workflow's output.from must dereference for the plan's task; a schema
+        carrying fields no consumer reads (dead output surface) where a leaner contract
+        was intended; a wrong inherit-vs-override choice — a node that redeclares
+        output_schema and replaces a base contract the chain joins on, or one that should
+        override but inherits a base shape that does not fit; a field typed too loosely
+        for the consumer that branches on it (a free string where the enum a guard
+        compares against was meant); a terminal output.from selecting a node whose schema
+        omits a field the requirement promises the caller. Severity mapping: a schema
+        missing a field a downstream node must dereference (the consumer reads an absent
+        field) = blocker; a wrong inherit-vs-override choice or a field set that needs a
+        decision = major; a superfluous or loosely-typed field = minor. Set each finding's
+        file to the real source file the issue lives in per the bundle's provenance
+        markers (WORKFLOW.yaml or profiles/<p>.yaml) and line to that file's real line
+        number — the downstream refute pass and fix step read the real source at the
+        finding's file. Do not raise wf-prompt-task-fidelity (whether a prompt produces
+        its declared schema) or wf-dag-decomposition-correctness (node granularity and
+        dispatch form) concerns under this rubric — sibling lenses own them.

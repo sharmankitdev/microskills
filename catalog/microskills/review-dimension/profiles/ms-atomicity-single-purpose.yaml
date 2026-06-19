@@ -1,0 +1,34 @@
+version: 1
+
+# ms-atomicity-single-purpose lens overlay for review-dimension (create pipeline, §8
+# step 4). Overrides the active dimension, the artifact kind, and the rubric snippet —
+# a plain list REPLACES base's correctness snippet wholesale (resolver list-replace
+# rule). output_schema, inputs, runtime, and the body inherit from base.
+vars:
+  dimension: ms-atomicity-single-purpose
+  artifact_kind: microskill draft bundle (MICROSKILL.md + profiles/base.yaml, concatenated)
+
+context:
+  snippets:
+    - name: ms-atomicity-single-purpose-rubric
+      text: >-
+        Single-purpose rubric for a microskill draft bundle — answer "does this skill do
+        exactly one concern, with no second capability bundled in?". The deterministic
+        floor (validate-microskill) already warns past ten numbered steps as an
+        atomicity advisory but never judges whether the skill serves a single purpose —
+        do not re-raise the step-count warning. Flag only single-purpose defects: a
+        Purpose that names two or more separable concerns (an "and also" / "then also"
+        clause) that belong in different skills; Steps that perform a distinct second
+        capability after the primary one completes (compute a result and then publish
+        it); an Output that bundles two unrelated deliverables a consumer would want
+        from separate skills; a name or description that advertises one job while the
+        Steps quietly do a second. Severity mapping: two genuinely separate capabilities
+        fused into one skill that should be split = blocker (the unit is no longer
+        atomic); a secondary concern that needs a human decision on whether to split =
+        major; an over-broad Purpose phrasing around a genuinely single action = minor.
+        Set each finding's file to the real source file the issue lives in per the
+        bundle's provenance markers (MICROSKILL.md) and line to that file's real line
+        number — the downstream refute pass and fix step read the real source at the
+        finding's file. Do not raise ms-step-atomicity-linearity (per-step action
+        bundling) or ms-single-linear-path-semantic (overall flow shape) concerns under
+        this rubric — sibling lenses own them.

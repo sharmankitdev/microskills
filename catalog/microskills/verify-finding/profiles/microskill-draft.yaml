@@ -1,0 +1,11 @@
+version: 1
+
+# Microskill-draft adversarial-verify overlay for verify-finding (§8 step 4). Swaps ONLY
+# the artifact-kind var so the adversarial seat reasons about microskill code-as-contract
+# semantics (atomicity, the 5-section contract, the input/output schema, YAML keys) rather
+# than prose claims — do NOT reuse the `document` profile, which primes for paragraph
+# claims. inputs (finding + artifact_path materialize:file + seat), runtime, and
+# output_schema deep-merge in from base untouched. The caller threads the SAME draft
+# bundle as artifact_path that the review panel saw, so cross-file counter-cases hold.
+vars:
+  artifact_kind: microskill draft bundle (MICROSKILL.md + profiles/base.yaml, concatenated)

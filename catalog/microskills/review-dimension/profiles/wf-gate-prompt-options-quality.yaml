@@ -1,0 +1,37 @@
+version: 1
+
+# wf-gate-prompt-options-quality lens overlay for review-dimension (create pipeline, §8
+# step 4). Overrides the active dimension, the artifact kind, and the rubric snippet — a
+# plain list REPLACES base's correctness snippet wholesale (resolver list-replace rule).
+# output_schema, inputs, runtime, and the body inherit from base.
+vars:
+  dimension: wf-gate-prompt-options-quality
+  artifact_kind: workflow draft bundle (WORKFLOW.yaml + profiles/*.yaml, concatenated)
+
+context:
+  snippets:
+    - name: wf-gate-prompt-options-quality-rubric
+      text: >-
+        Gate-prompt-options-quality rubric for a workflow draft bundle — answer "is each
+        human gate's prompt clear, and are its options the right consequence set?". The
+        deterministic floor (validate-workflow + compile-workflow --defs-root) already
+        blocks gate id rules, an after target that is not an upstream node, a default that
+        is not a member of options, dead constant-false gate-choice literals, and invalid
+        present: path checks — do not re-raise those; it never judges prompt clarity or
+        whether the consequence set is complete. Flag only gate-quality defects: a gate
+        prompt that does not state the decision the human is being asked to make, or
+        states it ambiguously; an options set that omits a needed consequence (an approve
+        path with no reject or abandon, a destructive action with no decline); options
+        whose consequences overlap or contradict so the choices are not meaningfully
+        distinct; an option label that misdescribes the branch it actually triggers; a
+        gate that surfaces evidence the human cannot act on, or withholds the evidence a
+        sound decision needs. Severity mapping: a gate whose option set leaves no choice
+        that lets the workflow proceed correctly, so the run is stranded at the gate =
+        blocker; an options set that omits a needed consequence, or a prompt too unclear
+        for the human to choose, needing a decision = major; gate-prompt wording or
+        option-label polish = minor. Set each finding's file to the real source file the
+        issue lives in per the bundle's provenance markers (WORKFLOW.yaml or
+        profiles/<p>.yaml) and line to that file's real line number — the downstream
+        refute pass and fix step read the real source at the finding's file. Do not raise
+        wf-prompt-task-fidelity (an agent/orchestrator node's prompt-to-output-schema
+        fidelity) concerns under this rubric — sibling lenses own them.

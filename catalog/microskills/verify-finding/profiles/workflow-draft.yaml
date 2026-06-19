@@ -1,0 +1,8 @@
+version: 1
+
+# Workflow-draft adversarial-verify overlay for verify-finding (§8 step 4). Swaps ONLY
+# the artifact-kind var so the seat reasons about WORKFLOW.yaml/DAG/profile semantics
+# rather than prose. Do NOT reuse `document`. inputs/runtime/output_schema inherit from
+# base. The caller threads the same workflow draft bundle as artifact_path.
+vars:
+  artifact_kind: workflow draft bundle (WORKFLOW.yaml + profiles/*.yaml, concatenated)

@@ -1,0 +1,43 @@
+version: 1
+
+# additionalprops-and-empty-content-permissive lens overlay for review-dimension (create
+# pipeline, §8 step 4). Overrides the active dimension, the artifact kind, and the rubric
+# snippet — a plain list REPLACES base's correctness snippet wholesale (resolver
+# list-replace rule). output_schema, inputs, runtime, and the body inherit from base.
+# Guard/meta lens: vacuity is a judgment the closed grammar deliberately leaves open, so
+# it leans confidence medium/low and frames findings as uncertainty for a human rather
+# than asserted defects.
+vars:
+  dimension: additionalprops-and-empty-content-permissive
+  artifact_kind: microskill draft bundle (MICROSKILL.md + profiles/base.yaml, concatenated)
+
+context:
+  snippets:
+    - name: additionalprops-and-empty-content-permissive-rubric
+      text: >-
+        Permissive-empty-content rubric for a microskill draft bundle — answer "is any
+        section or field structurally present but semantically vacuous in a way the closed
+        grammar lets pass?". The deterministic floor (config-schema.json's
+        additionalProperties:false) blocks UNKNOWN configuration fields and warns — but
+        does not block — on a zero-data-row Inputs table; it never judges whether
+        present-but-vacuous content carries meaning — do not re-raise unknown-field
+        rejection or the empty-table warning. Flag only present-but-empty-content signals,
+        leaning toward flagging uncertainty rather than asserting a defect: a required
+        section whose body is empty or a single placeholder line; an Inputs table whose
+        rows are present but carry placeholder or meaningless descriptions that convey
+        nothing; an output_schema that is technically valid JSON Schema yet vacuous (an empty
+        properties map, or all-optional with no required field, where the output is
+        genuinely structured); a Steps or Failure-modes section present in form but
+        carrying no actionable content. Severity mapping: a structurally-present section
+        or schema vacuous enough to mislead a reader into thinking content exists = major
+        (flagged for human confirmation, confidence medium or low); a thin-but-nonempty
+        section = minor; a terse-yet-adequate body = nit. Lean confidence medium or low
+        across this lens — vacuity is a judgment call the closed grammar deliberately
+        leaves open. Set each finding's file to the real source file the issue lives in
+        per the bundle's provenance markers (MICROSKILL.md or profiles/base.yaml) and line
+        to that file's real line number — the downstream refute pass and fix step read the
+        real source at the finding's file. Do not raise
+        shape-not-faithfulness-fabrication-passes (steps that name but do not perform the
+        task), ms-inputs-contract-adequacy (whether the input SET is complete for the
+        requirement), or ms-step-input-reference-undeclared (a step needing an undeclared
+        input) concerns under this rubric — sibling lenses own them.

@@ -1,0 +1,37 @@
+version: 1
+
+# ms-output-contract-appropriate lens overlay for review-dimension (create pipeline, §8
+# step 4). Overrides the active dimension, the artifact kind, and the rubric snippet —
+# a plain list REPLACES base's correctness snippet wholesale (resolver list-replace
+# rule). output_schema, inputs, runtime, and the body inherit from base.
+vars:
+  dimension: ms-output-contract-appropriate
+  artifact_kind: microskill draft bundle (MICROSKILL.md + profiles/base.yaml, concatenated)
+
+context:
+  snippets:
+    - name: ms-output-contract-appropriate-rubric
+      text: >-
+        Output-contract-appropriateness rubric for a microskill draft bundle — answer
+        "is an output_schema present exactly when the output is composable structured
+        data, and absent for pure human-facing prose?". The deterministic floor
+        (validate-microskill) already rejects an output_schema that is not valid JSON
+        Schema and warns when its type is not object or its required names a
+        non-property, but it never judges whether a schema SHOULD be present at all — do
+        not re-raise those structural checks. Flag only schema-appropriateness defects:
+        an output that downstream nodes consume as structured data but ships no
+        output_schema (uncomposable — the consumer has nothing to dereference); a pure
+        human-facing prose output that nonetheless ships a fabricated output_schema
+        implying structure it does not produce; an output_schema present but typed as a
+        bare string or blob where the output is genuinely structured; the wrong
+        composability call for how the skill is meant to be consumed. Severity mapping: a
+        downstream-consumed output with no schema, or a prose-only skill with a
+        fabricated schema (the contract misleads the consumer) = blocker; a borderline
+        composability call needing a human decision = major; a schema that is present and
+        correct but slightly over- or under-specified = minor. Set each finding's file to
+        the real source file the issue lives in per the bundle's provenance markers
+        (MICROSKILL.md or profiles/base.yaml) and line to that file's real line number —
+        the downstream refute pass and fix step read the real source at the finding's
+        file. Do not raise ms-output-section-vs-schema-fields (whether the Output prose
+        and the schema fields agree) or ms-purpose-contract-fidelity (whether the output
+        matches the requirement) concerns under this rubric — sibling lenses own them.

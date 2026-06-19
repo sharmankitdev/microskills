@@ -1,0 +1,24 @@
+version: 1
+
+# Microskill-create review fan-in overlay for collect-findings (§8 step 4). Registers
+# the 14 artifact-stage dimension input names the create-pipeline review panel wires
+# (review-dimension profiles ms-* + the guard/meta trio). Base's six code-review inputs
+# are NOT renamed — they deep-merge in, stay optional, and go unsupplied. Each entry is
+# an empty map: an optional input with a null default needs no required/materialize/
+# default keys; declaring the name is the whole point. Names = the review-dimension
+# fan-out item names with hyphen→underscore (the inputs_each desugar contract).
+inputs:
+  ms_atomicity_single_purpose: {}
+  ms_single_linear_path_semantic: {}
+  ms_step_atomicity_linearity: {}
+  ms_inputs_contract_adequacy: {}
+  ms_output_contract_appropriate: {}
+  ms_failure_modes_coverage: {}
+  ms_output_section_vs_schema_fields: {}
+  ms_step_input_reference_undeclared: {}
+  ms_declared_input_unused: {}
+  ms_purpose_contract_fidelity: {}
+  ms_description_trigger_quality: {}
+  shape_not_faithfulness_fabrication_passes: {}
+  additionalprops_and_empty_content_permissive: {}
+  unanalyzable_fork_guard_no_signal: {}
