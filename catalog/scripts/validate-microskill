@@ -335,6 +335,28 @@ def cross_check(skill_meta, config_path, issues):
         if n not in skill_meta["steps"]:
             add(issues, "warn", "config",
                 f"{p.name}: steps.\"{key}\" references step {n} which does not exist in MICROSKILL.md")
+    steps_doc = doc.get("steps") or {}
+    if isinstance(steps_doc, dict):
+        for n in (steps_doc.get("remove") or []):
+            if isinstance(n, int) and n not in skill_meta["steps"]:
+                add(issues, "warn", "config",
+                    f"{p.name}: steps.remove references step {n} which does not exist in MICROSKILL.md.")
+        patch = steps_doc.get("patch")
+        if isinstance(patch, dict):
+            for k in patch.keys():
+                try:
+                    n = int(k)
+                except (TypeError, ValueError):
+                    continue
+                if n not in skill_meta["steps"]:
+                    add(issues, "warn", "config",
+                        f"{p.name}: steps.patch.\"{k}\" references step {n} which does not exist in MICROSKILL.md.")
+        for entry in (steps_doc.get("add") or []):
+            if isinstance(entry, dict):
+                after = entry.get("after")
+                if isinstance(after, int) and after != 0 and after not in skill_meta["steps"]:
+                    add(issues, "warn", "config",
+                        f"{p.name}: steps.add[].after references step {after} which does not exist in MICROSKILL.md.")
     for key in (doc.get("gates") or {}).keys():
         if key == "add":
             seen_add_ids = set()
