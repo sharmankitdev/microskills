@@ -63,6 +63,12 @@ microskills:
     source: plugin
   - name: expand-assignments
     source: plugin
+  # domain: create-pipeline floor + grounding (§8 step 5) — the deterministic-floor
+  # node and the cross-artifact catalog index source.
+  - name: run-validators
+    source: plugin
+  - name: build-catalog-index
+    source: plugin
 workflows:
   - name: microskill-create
     source: plugin
