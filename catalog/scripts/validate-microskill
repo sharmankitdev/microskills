@@ -293,6 +293,30 @@ def check_config(path, issues):
             add(issues, "block", "config",
                 f"{p.name}: inputs.<name>.default is base-only; found in: {overlay_defaults}")
 
+    cfg_inputs = doc.get("inputs") if isinstance(doc, dict) else None
+    if isinstance(cfg_inputs, dict):
+        for iname, spec in cfg_inputs.items():
+            if not isinstance(spec, dict):
+                continue
+            av = spec.get("allowed_values")
+            if isinstance(av, list) and "default" in spec and spec["default"] not in av:
+                add(issues, "warn", "config",
+                    f"{p.name}: input '{iname}' default {spec['default']!r} is not in allowed_values {av}; "
+                    f"the declared default guarantees a runtime allowed-values block.")
+            if "inject_from" in spec:
+                if spec.get("required") is True:
+                    add(issues, "warn", "config",
+                        f"{p.name}: input '{iname}' declares inject_from with required: true — a declared-inject "
+                        f"input is never added to required_inputs, so required is inert.")
+                if "default" in spec:
+                    add(issues, "warn", "config",
+                        f"{p.name}: input '{iname}' declares inject_from with a default — the default is dead "
+                        f"(the value comes from the inject source).")
+                if spec.get("materialize") == "file":
+                    add(issues, "warn", "config",
+                        f"{p.name}: input '{iname}' declares both inject_from and materialize: file — "
+                        f"contradictory (environment-injected vs caller-by-reference).")
+
 
 def extract_skill_identifiers(skill_path):
     p = Path(skill_path)

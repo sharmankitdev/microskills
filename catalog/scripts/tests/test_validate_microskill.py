@@ -500,3 +500,44 @@ def test_profile_step_patch_branching_blocks(tmp_path):
     assert code == 1, err
     assert any(i["severity"] == "block" and "branching language" in i["message"]
                for i in data["issues"]), data
+
+
+# ---------------------------------------------------------------------------
+# allowed_values + inject_from coherence checks
+# ---------------------------------------------------------------------------
+
+
+def test_default_not_in_allowed_values_warns(tmp_path):
+    skill = write_skill(tmp_path, "av")
+    cfg = write_cfg(tmp_path, "base.yaml",
+                    "version: 1\ninputs:\n  dummy:\n    allowed_values: [a, b]\n    default: c\n")
+    code, data, _, err = run(str(skill), str(cfg))
+    assert any(i["severity"] == "warn" and "not in allowed_values" in i["message"]
+               for i in data["issues"]), data
+
+
+def test_inject_from_with_required_warns(tmp_path):
+    skill = write_skill(tmp_path, "if1")
+    cfg = write_cfg(tmp_path, "base.yaml",
+                    "version: 1\ninputs:\n  dummy:\n    required: true\n    inject_from:\n      env: X\n")
+    code, data, _, err = run(str(skill), str(cfg))
+    assert any(i["severity"] == "warn" and "inject_from with required" in i["message"]
+               for i in data["issues"]), data
+
+
+def test_inject_from_with_materialize_warns(tmp_path):
+    skill = write_skill(tmp_path, "if2")
+    cfg = write_cfg(tmp_path, "base.yaml",
+                    "version: 1\ninputs:\n  dummy:\n    materialize: file\n    inject_from:\n      env: X\n")
+    code, data, _, err = run(str(skill), str(cfg))
+    assert any(i["severity"] == "warn" and "inject_from and materialize" in i["message"]
+               for i in data["issues"]), data
+
+
+def test_inject_from_with_default_warns(tmp_path):
+    skill = write_skill(tmp_path, "if3")
+    cfg = write_cfg(tmp_path, "base.yaml",
+                    "version: 1\ninputs:\n  dummy:\n    default: somevalue\n    inject_from:\n      env: X\n")
+    code, data, _, err = run(str(skill), str(cfg))
+    assert any(i["severity"] == "warn" and "inject_from with a default" in i["message"]
+               for i in data["issues"]), data
