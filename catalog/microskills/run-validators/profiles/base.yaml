@@ -1,0 +1,49 @@
+version: 1
+
+# Default domain = microskill. The floor contract is supplied as a context
+# snippet (the catalog convention for replaceable per-profile instruction — the
+# `workflow` overlay list-REPLACES it). staging_paths is Required=yes in the
+# table → required:true; name/staging_base are optional (no entry). The body runs
+# Bash validators; Read is allowed for any validator output the body inspects.
+inputs:
+  staging_paths:
+    required: true
+
+runtime:
+  allowed_tools: [Bash, Read]
+  model: haiku
+
+context:
+  snippets:
+    - name: deterministic-floor-contract
+      text: >-
+        Deterministic-floor contract — MICROSKILL domain. staging_paths is exactly
+        two files: the MICROSKILL.md and its profiles/base.yaml. Run the validator
+        ONCE, passing BOTH paths (the config arg is not optional — a draft always
+        writes profiles/base.yaml):
+        `.claude/scripts/validate-microskill <MICROSKILL.md> <profiles/base.yaml>`.
+        Parse its stdout JSON {pass, issues:[{severity, location, message}]} and its
+        exit code. If it fails to start (non-zero exit with empty or non-JSON
+        stdout), emit exactly one floor finding: severity blocker, location
+        environment, source validate-microskill, message quoting the exit code and
+        stderr. Otherwise map each entry in `issues` to one floor finding: severity
+        block→blocker and warn→warn (verbatim), location and message copied
+        verbatim, source validate-microskill. There is no compile step in this
+        domain. Assign ids floor-1, floor-2, … in the order issues appear.
+
+output_schema:
+  type: object
+  required: [dimension, findings]
+  properties:
+    dimension: { type: string }
+    findings:
+      type: array
+      items:
+        type: object
+        required: [id, severity, location, message, source]
+        properties:
+          id: { type: string }
+          severity: { type: string, enum: [blocker, warn] }
+          location: { type: string }
+          message: { type: string }
+          source: { type: string }

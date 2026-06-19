@@ -1,0 +1,3 @@
+version: 1
+# Microskill-creation domain. Inherits the base floor contract verbatim;
+# declared explicitly so a caller can select `profile: microskill`.
