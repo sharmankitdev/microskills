@@ -1,3 +1,9 @@
+## [0.25.0](https://github.com/sharmankitdev/microskills/compare/v0.24.0...v0.25.0) (2026-06-19)
+
+### Features
+
+* **scripts:** subgraph bounded convergence — local do/while (PR3) ([#29](https://github.com/sharmankitdev/microskills/issues/29)) ([fb781b4](https://github.com/sharmankitdev/microskills/commit/fb781b48b898583f650104bfa9a9949a4611430e))
+
 ## [0.24.0](https://github.com/sharmankitdev/microskills/compare/v0.23.0...v0.24.0) (2026-06-19)
 
 ### Features
