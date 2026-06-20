@@ -859,15 +859,50 @@ def test_workflow_import_cycle_blocks(tmp_path):
 
 
 def test_workflow_depth_two_blocks(tmp_path):
-    # The child itself contains a workflow: node (grandchild) → depth-2 blocked.
-    grandchild = CHILD.replace("name: child-flow", "name: grand-flow").replace(
-        "imports: []", "imports: []")
-    make_def(tmp_path, "grand-flow", grandchild)
-    child = CHILD.replace("imports: []\n", "imports: [grand-flow]\n").replace(
-        "  - id: work\n    agent: ag\n    prompt: work on ${workflow.inputs.seed}\n",
-        "  - id: work\n    workflow: grand-flow\n    inputs:\n      seed: hi\n")
+    # Under compile-time inlining a STATIC nested workflow flattens; the depth cap
+    # now governs the surviving RUNTIME (for_each) nesting. A for_each child that
+    # itself for_each-nests a grandchild is depth-2 → blocked.
+    make_def(tmp_path, "grand-flow", CHILD.replace("name: child-flow", "name: grand-flow"))
+    child = """\
+version: 1
+name: child-flow
+imports: [grand-flow]
+inputs:
+  seed: { type: string, required: true }
+  items: { type: array, required: true }
+nodes:
+  - id: pre
+    agent: ag
+    prompt: pre ${workflow.inputs.seed}
+  - id: work
+    workflow: grand-flow
+    for_each: ${workflow.inputs.items}
+    as: it
+    inputs:
+      seed: hi
+output:
+  from: pre
+"""
     make_def(tmp_path, "child-flow", child)
-    parent = make_def(tmp_path, "parent-flow", PARENT)
+    parent = make_def(tmp_path, "parent-flow", """\
+version: 1
+name: parent-flow
+imports: [child-flow]
+inputs:
+  items: { type: array, required: true }
+nodes:
+  - id: a
+    agent: ag
+    prompt: do a
+  - id: build
+    workflow: child-flow
+    depends_on: [a]
+    for_each: ${workflow.inputs.items}
+    as: it
+    inputs:
+      seed: ${a.output.x}
+      items: ${workflow.inputs.items}
+""")
     rc, data, _ = run_defs(tmp_path, parent)
     assert rc == 1 and data["pass"] is False
     assert any("depth" in i["message"] or "grandchild" in i["message"]
@@ -923,20 +958,46 @@ KID = CHILD.replace("name: child-flow", "name: kid-flow")
 
 
 def test_nested_profile_added_grandchild_blocks_depth(tmp_path):
-    # kid-flow's profile `withgrand` ADDS a workflow: grand-flow node (nodes.add).
-    # Invisible to a RAW child read; the profile-merged read makes it depth-2.
+    # kid-flow's profile `withgrand` ADDS a for_each workflow: grand-flow node — a
+    # surviving RUNTIME grandchild (the static-inline retarget only flattens STATIC
+    # nests), so the profile-merged depth read makes it depth-2.
     make_def(tmp_path, "grand-flow", CHILD.replace("name: child-flow", "name: grand-flow"))
     make_def(tmp_path, "kid-flow", KID)
     _mk_child_profile(tmp_path, "kid-flow", "withgrand", """\
 version: 1
+inputs:
+  items:
+    type: array
+    required: false
 nodes:
   add:
     - id: deep
       workflow: grand-flow
+      for_each: ${workflow.inputs.items}
+      as: it
       inputs:
         seed: hi
 """)
-    parent = make_def(tmp_path, "parent-flow", PARENT_PROF % "withgrand")
+    parent = make_def(tmp_path, "parent-flow", """\
+version: 1
+name: parent-flow
+imports: [kid-flow]
+inputs:
+  items: { type: array, required: true }
+nodes:
+  - id: a
+    agent: ag
+    prompt: do a
+  - id: build
+    workflow: kid-flow
+    depends_on: [a]
+    for_each: ${workflow.inputs.items}
+    as: it
+    customize:
+      profile: withgrand
+    inputs:
+      seed: ${a.output.x}
+""")
     rc, data, _ = run_defs(tmp_path, parent)
     assert rc == 1 and data["pass"] is False, data
     assert any("depth" in i["message"] for i in data["issues"]), data
@@ -3620,6 +3681,8 @@ nodes:
   - id: build
     workflow: child-flow
     depends_on: [a]
+    for_each: ${a.output.items}
+    as: it
     customize:
       profile: strict
 """)
@@ -3675,7 +3738,12 @@ imports: [child-flow]
 nodes:
   - id: build
     workflow: child-flow
+    for_each: ${read0.output.items}
+    as: it
     inputs: {}
+  - id: read0
+    agent: ag
+    prompt: seed
   - id: read
     agent: ag
     depends_on: [build]

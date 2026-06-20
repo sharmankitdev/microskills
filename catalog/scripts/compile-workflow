@@ -668,7 +668,7 @@ def subgraph_convergence_contiguity_error(order, node_by_id, gates_after, conver
     return None
 
 
-def desugar_subgraphs(wf, subgraphs_dir):
+def desugar_subgraphs(wf, subgraphs_dir, check_reserved=True):
     """SHARED `subgraph:` desugar used by BOTH compile and validate. Runs
     immediately AFTER expand_static_fanout and BEFORE the wf_-prefix check + schema
     validation — placement is load-bearing: the FIFTH node kind (`subgraph:
@@ -712,14 +712,19 @@ def desugar_subgraphs(wf, subgraphs_dir):
     # Reserved-id guard (defense in depth, always): the splice namespace is
     # <splice>__<inner>, so a hand-authored node id carrying '__' could collide
     # with a spliced id. Block it regardless of whether a subgraph is present.
-    for n in nodes:
-        if isinstance(n, dict) and isinstance(n.get("id"), str) and "__" in n["id"]:
-            errors.append(
-                f"node id '{n['id']}' may not contain '__' — the double-underscore "
-                f"is reserved for the subgraph splice namespace "
-                f"(<splice-id>__<inner-id>)")
-    if errors:
-        return wf, errors, converge
+    # SKIPPED (check_reserved=False) when desugar_nested_workflows ran FIRST in the
+    # pipeline: it already guarded the AUTHOR ids at every level and minted the
+    # surviving '__' ids itself (a full-workflow inline's <splice>__<inner>), so
+    # re-checking them here is a false positive.
+    if check_reserved:
+        for n in nodes:
+            if isinstance(n, dict) and isinstance(n.get("id"), str) and "__" in n["id"]:
+                errors.append(
+                    f"node id '{n['id']}' may not contain '__' — the double-underscore "
+                    f"is reserved for the subgraph splice namespace "
+                    f"(<splice-id>__<inner-id>)")
+        if errors:
+            return wf, errors, converge
 
     if not any(isinstance(n, dict) and "subgraph" in n for n in nodes):
         # Byte-identical no-op when no subgraph node exists — the registry and its
@@ -1041,6 +1046,435 @@ def desugar_subgraphs(wf, subgraphs_dir):
 
     wf["nodes"] = new_nodes
     return wf, errors, converge
+
+
+# Anchored (whole-inner == workflow.inputs.X) and token (anywhere, .field/expression
+# tail rides along — mirrors translate_ref line ~2336) forms of a child workflow-input
+# ref. The token form is load-bearing: ${workflow.inputs.X.field} and an embedded
+# ${workflow.inputs.dir + '/x'} are real supported constructs the anchored form misses.
+_WF_INPUT_RE = re.compile(r"\s*workflow\.inputs\.([A-Za-z0-9_]+)\s*$")
+_WF_INPUT_TOKEN_RE = re.compile(r"\bworkflow\.inputs\.([A-Za-z0-9_]+)")
+
+
+def _binding_inner(binding):
+    """The host binding string as it must appear INSIDE a ${...} after rebinding a
+    workflow.inputs.X TOKEN (the tail case). A ${ref} binding contributes its inner
+    (so a child ref's .field / operator tail rides along: ${a.output} + .foo ->
+    ${a.output.foo}); a bare literal contributes itself."""
+    b = binding.strip()
+    m = REF_RE.fullmatch(b)
+    return m.group(1) if m else b
+
+
+def _nested_seam_leak_names(obj, declared):
+    """Undeclared workflow-input names referenced anywhere in a child's scoped object
+    (node fields OR a gate's prompt/present/when), in first-seen order. A child may
+    reference ${workflow.inputs.X} ONLY for an X it DECLARES (then rebound to the host
+    binding); an undeclared X would silently re-resolve to the PARENT's input X after
+    splicing. Token-form (finditer) so a .field-tailed ref leaks loudly too."""
+    seen, out = set(), []
+    for s in collect_strings(obj):
+        for m in _WF_INPUT_TOKEN_RE.finditer(s):
+            name = m.group(1)
+            if name not in declared and name not in seen:
+                seen.add(name)
+                out.append(name)
+    return out
+
+
+def _nested_rewrite_ref(s, bindings, inner_ids, splice_id):
+    """Rewrite the ${...} refs in a SPLICED child node's scoped-field string for a
+    FULL-WORKFLOW inline. Per ${...} inner, in order:
+      1. WHOLE-INNER ${workflow.inputs.X} (X bound) -> the host binding VERBATIM (a
+         bare literal stays bare, a ${ref} binding stays a ${ref}).
+      2. TAILED / EMBEDDED workflow.inputs.X tokens (X bound) -> the host binding's
+         INNER expression, so a .field / operator tail rides along.
+      3. sibling ${<inner>.output|items} -> ${<splice>__<inner>.output|items}.
+    Step 1 returns the binding verbatim (REF_RE.sub never re-scans a replacement), so a
+    host binding naming a node (${seed.output}) is inserted as-is, never re-namespaced.
+    A child uses the ${workflow.inputs.X} seam (vs a subgraph's ${inputs.X})."""
+    def repl(m):
+        inner = m.group(1)
+        wm = _WF_INPUT_RE.match(inner)
+        if wm and wm.group(1) in bindings:
+            return bindings[wm.group(1)]
+        # Tail/embedded form: rebind tokens to the binding's inner expression.
+        def wf_repl(wmm):
+            name = wmm.group(1)
+            return _binding_inner(bindings[name]) if name in bindings else wmm.group(0)
+        inner = _WF_INPUT_TOKEN_RE.sub(wf_repl, inner)
+        # items BEFORE output (mirrors translate_ref / _subgraph_rewrite_ref): the
+        # NODE_ITEMS_RE lookbehind keeps ${prod.output.items} from mis-firing on the
+        # field tail before ${prod.output} is rewritten.
+        def items_repl(mm):
+            nid = mm.group(1)
+            return f"{splice_id}__{nid}.items" if nid in inner_ids else mm.group(0)
+        def out_repl(mm):
+            nid = mm.group(1)
+            return f"{splice_id}__{nid}.output" if nid in inner_ids else mm.group(0)
+        inner = NODE_ITEMS_RE.sub(items_repl, inner)
+        inner = NODE_OUTPUT_RE.sub(out_repl, inner)
+        return "${" + inner + "}"
+    return REF_RE.sub(repl, s)
+
+
+def _nested_namespace_path(path, inner_ids, splice_id):
+    """Namespace the leading `<id>` of a gate `present` field-path string (or a
+    {read_file: <path>} value): `<inner>.output.<field>` -> `<splice>__<inner>...`
+    when the leading id is a child node id. These are bare paths (no ${...}), so they
+    are rewritten directly rather than through the ref rewriter."""
+    if not isinstance(path, str):
+        return path
+    head = path.split(".", 1)[0]
+    return f"{splice_id}__{path}" if head in inner_ids else path
+
+
+def desugar_nested_workflows(wf, defs_root, _stack=None):
+    """Inline every STATIC (non-for_each) `workflow:` node into the host DAG before
+    partition — the compile-time half of the depth-1 model: the compiler flattens
+    STATIC nesting, so the runtime never recurses past one FLAT child. Generalizes
+    desugar_subgraphs from a node-group to a full child WORKFLOW.yaml (which also
+    carries an inputs contract, internal gates, its own loop, and an output:).
+
+    Runs FIRST in the pipeline (before expand_static_fanout), so the combined flat
+    graph's expand:/subgraph: sugar — parent AND inlined-child — all process
+    uniformly through the single later passes. Recursive + BOTTOM-UP: a child's own
+    static nesting inlines before it is spliced, so a spliced child is already flat.
+    A static inline cycle (A->B->A) is rejected loud (distinct from the runtime
+    for_each depth check). A `for_each` workflow: node is NOT inlined — it stays a
+    runtime orchestrator checkpoint that re-enters the dispatcher per item, and
+    because its child is now compiled flat the re-entry is depth-1 by construction.
+
+    Each static node N (id `sid`, target T, profile P = N.customize.profile):
+      - child resolved via _profile_merged_child_doc (boundary-profile-aware),
+      - every child node id namespaced <sid>__<inner> (the '__' splice namespace),
+      - child ${workflow.inputs.X} rebound to N.inputs[X] (or the input's default),
+      - sibling ${<inner>.output|items} re-pointed at the namespaced sibling,
+      - child gates spliced (namespaced) onto the host gate list — a full-workflow
+        inline ALLOWS gates (unlike a subgraph splice), they fall out of the
+        re-partition as ordinary checkpoints,
+      - downstream host ${sid.output|items} / depends_on / gate.after / output.from
+        re-pointed at the child's exit (its `output.from` node, namespaced).
+
+    Deterministic: the spliced child bytes fingerprint normally → a registry /
+    profile / inputs edit moves manifest_hash (subgraph precedent). A doc with no
+    STATIC workflow: node is returned UNCHANGED. Returns (wf, errors); non-empty
+    errors are a HARD block. Compile/validate call desugar_subgraphs with
+    check_reserved=False afterward (this pass already guarded the author '__' ids).
+
+    NOTE (sub-PR 1 scope): a loop-bearing child is not yet unioned as a loop region
+    — that is a fail-loud error here until the multiple-loop-region engine lands."""
+    errors = []
+    if not isinstance(wf, dict) or not isinstance(wf.get("nodes"), list):
+        return wf, errors, False
+    nodes = wf["nodes"]
+    _stack = _stack or []
+
+    static = [n for n in nodes
+              if isinstance(n, dict) and n.get("workflow") and not n.get("for_each")]
+    if not static:
+        # No STATIC workflow: node — a true no-op (the registry is not read; a
+        # for_each workflow: node is left untouched for the runtime). Returns
+        # did_inline=False so the caller KEEPS desugar_subgraphs's own reserved-'__'
+        # guard, which still governs subgraph splices + plain docs with the original
+        # message. (A doc that DID inline mints '__' ids itself, so its subgraph pass
+        # must run with check_reserved=False — see the guard below.)
+        return wf, errors, False
+
+    # Author reserved-'__' guard, on the AUTHOR ids at THIS level (parent or a
+    # recursively-inlined child), BEFORE any splice — but ONLY when we will actually
+    # inline (a no-static doc leaves the guard to desugar_subgraphs). By the time
+    # desugar_subgraphs runs (check_reserved=False), every surviving '__' id is a
+    # legitimate splice product of this pass.
+    for n in nodes:
+        if isinstance(n, dict) and isinstance(n.get("id"), str) and "__" in n["id"]:
+            errors.append(
+                f"node id '{n['id']}' may not contain '__' — the double-underscore "
+                f"is reserved for the splice namespace (<splice-id>__<inner-id>)")
+    if errors:
+        return wf, errors, True
+
+    here = wf.get("name")
+    spliced = {}            # sid -> [namespaced child nodes]
+    spliced_gates = {}      # sid -> [namespaced child gates]
+    exit_of = {}            # sid -> namespaced child exit id (or None)
+    inlined_imports = []    # union of each inlined child's imports (M2 allowlist)
+
+    for n in static:
+        sid = n["id"]
+        target = n["workflow"]
+        cz = n.get("customize") or {}
+        prof = cz.get("profile")
+
+        # A clean inline candidate carries NONE of the fields that only make sense
+        # on a non-inlined (checkpoint) node. A static workflow node with
+        # delegation: auto / retry / side_effect / customize.overrides is NOT inlined
+        # — it is left in place so the existing downstream validators reject it with
+        # their specific message (delegation/retry/overrides-on-workflow), rather
+        # than this pass swallowing it into an inline-resolution error. wire: auto is
+        # likewise left as a checkpoint: auto_wire materializes the child input
+        # forwards at a LATER pass, so an inline candidate must bind its inputs
+        # EXPLICITLY (inlining a wire: auto node is a later enhancement). A `when`-
+        # guarded static node is ALSO left as a checkpoint: the guard maps to a
+        # region-level if-wrap that needs the region-guard engine (a later change) —
+        # splicing it now would SILENTLY DROP the guard and run the child
+        # unconditionally. Until then the guard rides on the surviving checkpoint.
+        if (n.get("delegation") == "auto" or n.get("retry") is not None
+                or n.get("side_effect") is True or cz.get("overrides")
+                or n.get("wire") == "auto" or n.get("when") is not None):
+            continue
+
+        # Not allowlisted by THIS workflow's imports → leave it in place for the
+        # allowlist check (validate owns allowlist enforcement; compile leaves it to
+        # validate). Never inline an un-allowlisted target.
+        if target not in (wf.get("imports") or []):
+            continue
+
+        # A customize.profile naming a non-existent profile file would silently
+        # inline with base (the requested overlay lost) — fail loud instead.
+        if isinstance(prof, str) and prof not in ("", "base") and not (
+                Path(defs_root) / target / "profiles" / f"{prof}.yaml").exists():
+            errors.append(
+                f"node '{sid}': workflow '{target}' customize.profile '{prof}' "
+                f"not found")
+            continue
+
+        if target in _stack or target == here:
+            chain = [x for x in (_stack + [here, target]) if x]
+            errors.append(f"static nested-workflow inline cycle: {' -> '.join(chain)}")
+            continue
+
+        child, err = _profile_merged_child_doc(defs_root, target, prof)
+        if child is None:
+            errors.append(f"node '{sid}': workflow '{target}' {err}")
+            continue
+
+        # Author reserved-'__' guard on the child's RAW node ids, BEFORE recursion
+        # (which mints legitimate '__' splice ids). A LEAF child (no static node)
+        # returns early from its own recursion WITHOUT guarding, and the parent runs
+        # desugar_subgraphs with check_reserved=False — so without this, a '__' in a
+        # leaf child's author id would escape BOTH guards. Checked pre-recursion so a
+        # deeper splice product (g__leaf) is never mistaken for an author id.
+        for cn in (child.get("nodes") or []):
+            if isinstance(cn, dict) and isinstance(cn.get("id"), str) and "__" in cn["id"]:
+                errors.append(
+                    f"node id '{cn['id']}' (in inlined '{target}') may not contain "
+                    f"'__' — reserved for the splice namespace (<splice>__<inner>)")
+        if errors:
+            continue
+
+        # Recurse BOTTOM-UP: inline the child's own static nesting first.
+        child, cerr, _ = desugar_nested_workflows(
+            child, defs_root, _stack + [here])
+        if cerr:
+            errors.extend(cerr)
+            continue
+
+        # Resolve the child's own {{snippet:...}} vars in its namespace (the parent's
+        # vars pre-pass already ran and would otherwise miss them).
+        child, _uv, _se = apply_workflow_vars(
+            child, snippets_dir=Path(defs_root) / "_snippets")
+        if _se:
+            errors.extend(_se)
+            continue
+
+        if child.get("loop"):
+            # TRANSITIONAL (sub-PR 1): a loop-bearing child contributes a loop
+            # REGION, which needs the multiple-loop-region engine (sub-PR 2). Until
+            # then it is NOT inlined — the node is left in place as an ordinary
+            # runtime checkpoint (its prior behavior + the depth check still govern
+            # it), so an in-scope def that statically nests a loop-bearing child
+            # (e.g. workflow-create -> build-workflow-from-plan) keeps compiling.
+            continue
+
+        inner_nodes = child.get("nodes") or []
+        inner_ids = {cn["id"] for cn in inner_nodes
+                     if isinstance(cn, dict) and isinstance(cn.get("id"), str)}
+
+        # Bindings: each child-declared input -> the host node's inputs binding, else
+        # the input's own default, else (optional + unbound) a null literal. An
+        # EXPLICIT binding must be a string (a ${ref} or literal) — a non-string would
+        # corrupt the substitution into a string position (mirrors the subgraph path).
+        declared = child.get("inputs") or {}
+        host_inputs = n.get("inputs") or {}
+        bindings = {}
+        for in_name, spec in declared.items():
+            spec = spec if isinstance(spec, dict) else {}
+            if in_name in host_inputs:
+                b = host_inputs[in_name]
+                if not isinstance(b, str):
+                    errors.append(
+                        f"node '{sid}': input '{in_name}' binding must be a string "
+                        f"(a ${{ref}} or literal), not {type(b).__name__}")
+                    continue
+                bindings[in_name] = b
+            elif "default" in spec:
+                d = spec["default"]
+                bindings[in_name] = d if isinstance(d, str) else json.dumps(d)
+            elif spec.get("required"):
+                errors.append(
+                    f"node '{sid}': child '{target}' requires input '{in_name}' "
+                    f"but the host node binds no value for it")
+            else:
+                # Declared, optional, no default, unbound → absent in the inline.
+                # Bind to a null literal so the child's ${workflow.inputs.X} ref
+                # resolves to null, NOT the parent's same-named input (a dangling
+                # cross-namespace leak the checkpoint model never had).
+                bindings[in_name] = "null"
+
+        # Host node's own depends_on (ordering-only edges) must survive the splice:
+        # prefix them onto each child ROOT node (no intra-child dependency), else a
+        # pure ordering constraint is silently lost when the node is replaced.
+        host_deps = [d for d in (n.get("depends_on") or []) if isinstance(d, str)]
+
+        # Namespace + rewrite each child node.
+        gen = []
+        for cn in inner_nodes:
+            cn = copy.deepcopy(cn)
+            iid = cn.get("id")
+            # Seam-leak guard (BEFORE rewrite — rebinding erases the distinction): a
+            # child node may reference ${workflow.inputs.X} only for an X the child
+            # DECLARES. An undeclared X (any position, including a .field tail) would
+            # silently re-resolve to the PARENT's input X after splicing.
+            for leaked in _nested_seam_leak_names(
+                    {k: cn.get(k) for k in SCOPED_REF_FIELDS if k in cn}, declared):
+                errors.append(
+                    f"node '{sid}__{iid}': child '{target}' references undeclared "
+                    f"input '{leaked}' (${{workflow.inputs.{leaked}}} seam leak)")
+            for f in SCOPED_REF_FIELDS:
+                if f in cn:
+                    cn[f] = _subgraph_map_strings(
+                        cn[f],
+                        lambda s, _b=bindings, _ii=inner_ids, _s=sid:
+                            _nested_rewrite_ref(s, _b, _ii, _s))
+            child_dep = [f"{sid}__{d}" for d in (cn.get("depends_on") or [])
+                         if isinstance(d, str)]
+            cn["depends_on"] = (host_deps + child_dep) if not child_dep else child_dep
+            if not cn["depends_on"]:
+                del cn["depends_on"]
+            cn["id"] = f"{sid}__{iid}"
+            gen.append(cn)
+        spliced[sid] = gen
+
+        # Namespace the child's gates (full-workflow inline ALLOWS them).
+        cgates = []
+        for g in (child.get("gates") or []):
+            g = copy.deepcopy(g)
+            # Seam-leak guard over a gate's ref-bearing fields too (prompt / when).
+            for leaked in _nested_seam_leak_names(
+                    {k: g.get(k) for k in ("prompt", "when") if k in g}, declared):
+                errors.append(
+                    f"gate '{sid}__{g.get('id', '?')}': child '{target}' references "
+                    f"undeclared input '{leaked}' (seam leak)")
+            if isinstance(g.get("id"), str):
+                g["id"] = f"{sid}__{g['id']}"
+            if isinstance(g.get("after"), str):
+                g["after"] = f"{sid}__{g['after']}"
+            for gf in ("prompt", "when"):
+                if gf in g:
+                    g[gf] = _subgraph_map_strings(
+                        g[gf],
+                        lambda s, _b=bindings, _ii=inner_ids, _s=sid:
+                            _nested_rewrite_ref(s, _b, _ii, _s))
+            # `present` field-paths name child node ids by their leading segment —
+            # namespace them (a bare string path, or {read_file: <path>}); these are
+            # NOT ${...} refs, so they bypass the ref rewriter.
+            if isinstance(g.get("present"), list):
+                g["present"] = [
+                    {"read_file": _nested_namespace_path(p["read_file"], inner_ids, sid)}
+                    if isinstance(p, dict) and isinstance(p.get("read_file"), str)
+                    else _nested_namespace_path(p, inner_ids, sid)
+                    for p in g["present"]]
+            cgates.append(g)
+        spliced_gates[sid] = cgates
+
+        # A surviving for_each grandchild's target lives in the CHILD's imports; merge
+        # them into the host allowlist (used by validate + the depth/cycle walk).
+        inlined_imports.extend(
+            imp for imp in (child.get("imports") or []) if isinstance(imp, str))
+
+        child_out = (child.get("output") or {}).get("from")
+        exit_of[sid] = f"{sid}__{child_out}" if isinstance(child_out, str) else None
+
+    if errors:
+        return wf, errors, True
+
+    # Pass 2: splice child nodes in place; append namespaced child gates.
+    new_nodes = []
+    for n in nodes:
+        if isinstance(n, dict) and n.get("id") in spliced:
+            new_nodes.extend(spliced[n["id"]])
+        else:
+            new_nodes.append(n)
+    all_gates = list(wf.get("gates") or [])
+    for sid in spliced:
+        all_gates.extend(spliced_gates.get(sid, []))
+
+    # Pass 3: downstream host rewrite — ${<splice>.output|items} -> the child exit,
+    # and a depends_on / gate.after entry == <splice> re-points too. Runs over ALL
+    # nodes + gates (a cross-splice ${B.output} binding inside A's spliced nodes also
+    # re-points). _subgraph_rewrite_exit matches the EXACT splice id, so a namespaced
+    # sibling ${<splice>__<inner>.output} is left alone.
+    def _rewrite_exits(items):
+        for n in items:
+            if not isinstance(n, dict):
+                continue
+            for sid, exit_id in exit_of.items():
+                if not exit_id:
+                    continue
+                for f in SCOPED_REF_FIELDS:
+                    if f in n:
+                        n[f] = _subgraph_map_strings(
+                            n[f],
+                            lambda s, _s=sid, _e=exit_id: _subgraph_rewrite_exit(s, _s, _e))
+                if isinstance(n.get("depends_on"), list):
+                    n["depends_on"] = [exit_id if d == sid else d for d in n["depends_on"]]
+                if isinstance(n.get("after"), str) and n["after"] == sid:
+                    n["after"] = exit_id
+    _rewrite_exits(new_nodes)
+    _rewrite_exits(all_gates)
+
+    out = wf.get("output")
+    if isinstance(out, dict) and out.get("from") in exit_of and exit_of[out["from"]]:
+        out["from"] = exit_of[out["from"]]
+
+    # A child with NO output: consumed downstream leaves a dangling ${sid.output} /
+    # depends_on / output.from (exit_of[sid] is None, so Pass 3 could not re-point
+    # it) — fail loud rather than emit a broken edge.
+    for sid, exit_id in exit_of.items():
+        if exit_id is not None:
+            continue
+        ref_hit = any(
+            sid in NODE_OUTPUT_RE.findall(s) or sid in NODE_ITEMS_RE.findall(s)
+            for item in (new_nodes + all_gates) if isinstance(item, dict)
+            for s in collect_strings(
+                {k: item.get(k) for k in SCOPED_REF_FIELDS if k in item}))
+        dep_hit = any(
+            isinstance(item.get("depends_on"), list) and sid in item["depends_on"]
+            for item in new_nodes if isinstance(item, dict))
+        out_hit = isinstance(out, dict) and out.get("from") == sid
+        if ref_hit or dep_hit or out_hit:
+            errors.append(
+                f"inlined workflow '{sid}' declares no output: but is consumed "
+                f"downstream (${{{sid}.output}} / depends_on / output.from) — the "
+                f"child must declare an output: block")
+
+    # Merge each inlined child's imports into the host allowlist (M2): a surviving
+    # for_each grandchild target must be allowlisted for validate + the depth walk.
+    if inlined_imports:
+        host_imports = list(wf.get("imports") or [])
+        for imp in inlined_imports:
+            if imp not in host_imports:
+                host_imports.append(imp)
+        wf["imports"] = host_imports
+
+    wf["nodes"] = new_nodes
+    if all_gates:
+        wf["gates"] = all_gates
+    # did_inline is True only if something was actually spliced (all-skipped
+    # loop-bearing/guarded children leave the doc unchanged → caller keeps
+    # desugar_subgraphs' own reserved-'__' guard).
+    return wf, errors, bool(spliced)
 
 
 def collect_strings(obj):
@@ -1673,13 +2107,22 @@ def nested_workflow_depth_cycle_errors(defs_root, merged):
         doc, _err = child_doc(target, _node_profile(n))
         if doc is None:
             continue
-        gtargets = workflow_node_targets(doc)
+        # RETARGET (compile-time inlining): a STATIC nested workflow flattens at
+        # compile, so the depth cap no longer governs it — it governs only the
+        # surviving RUNTIME (for_each) nesting. Inline the child's OWN static nests
+        # first; a workflow: node surviving in the FLAT child (a for_each grandchild,
+        # or — until the multiple-loop engine lands — a loop-bearing static one) is a
+        # true depth-2 the dispatcher cannot re-enter. (A for_each child that merely
+        # statically nests a leaf grandchild is depth-1 and legal.)
+        flat_doc, _ie, _di = desugar_nested_workflows(
+            copy.deepcopy(doc), defs_root)
+        gtargets = workflow_node_targets(flat_doc)
         if gtargets:
             errors.append((
                 f"nodes/{nid}",
-                f"workflow: '{target}' itself contains a nested workflow: node "
-                f"({', '.join(sorted(set(gtargets)))}); nesting depth > 1 is "
-                f"not allowed"))
+                f"workflow: '{target}' itself contains a surviving runtime "
+                f"workflow: node ({', '.join(sorted(set(gtargets)))}); nesting "
+                f"depth > 1 is not allowed"))
 
     root_name = merged.get("name")
     IWHITE, IGRAY, IBLACK = 0, 1, 2
@@ -2731,6 +3174,19 @@ def main():
     for _uk in unresolved_vars:
         sys.stderr.write(f"warning: unresolved workflow var '{_uk}' left intact\n")
 
+    # --- COMPILE-TIME INLINE: flatten STATIC nested workflows (shared desugar) ---
+    # Runs FIRST — before expand — so the combined flat graph's expand:/subgraph:
+    # sugar (parent AND inlined-child) all process uniformly through the later
+    # passes. Every static (non-for_each) workflow: node is spliced into the host
+    # DAG as namespaced <splice>__<inner> nodes (+ its gates, + its output exit),
+    # the node deleted; a for_each workflow: node is left for the runtime. Errors
+    # are a HARD block (an inline must never half-resolve). Because this pass
+    # guarded the author '__' ids at every level, the subgraph splice below is
+    # called with check_reserved=False (its surviving '__' ids are this pass's).
+    wf, nw_inline_errors, nw_did_inline = desugar_nested_workflows(wf, defs_root)
+    if nw_inline_errors:
+        die("nested-workflow inline failed", 1, nested_workflow_errors=nw_inline_errors)
+
     # --- COMPILE-TIME EXPAND: static fan-out templates (shared desugar) ---
     # Immediately after the vars pre-pass and BEFORE schema validation (placement is
     # load-bearing: the closed node schema never sees the expand:/inputs_each:
@@ -2748,7 +3204,8 @@ def main():
     # <splice>__<inner> nodes, so the closed node schema never sees it). The
     # spliced nodes fingerprint normally → a registry/with/inputs edit is
     # closure-visible. Errors are a HARD block (the splice must never half-resolve).
-    wf, sg_errors, converge = desugar_subgraphs(wf, defs_root / "_subgraphs")
+    wf, sg_errors, converge = desugar_subgraphs(
+        wf, defs_root / "_subgraphs", check_reserved=not nw_did_inline)
     if sg_errors:
         die("subgraph: desugar failed", 1, subgraph_errors=sg_errors)
 
