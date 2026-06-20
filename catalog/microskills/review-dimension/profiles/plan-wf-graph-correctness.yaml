@@ -1,0 +1,42 @@
+version: 1
+
+# plan-wf-graph-correctness lens for review-dimension (create pipeline, §8 step 7). Reviews
+# the workflow PLAN object (plan.yaml) the workflow-planner wrote — NOT the built WORKFLOW.yaml
+# (that is the draft-stage wf-* lenses) and NOT a programmatic floor (none runs at the plan
+# stage). Sibling of the step-6 spec-* lenses. A plain list REPLACES base's correctness
+# snippet wholesale. output_schema, inputs, runtime, and the body inherit from base.
+vars:
+  dimension: plan-wf-graph-correctness
+  artifact_kind: workflow plan (plan.yaml)
+
+context:
+  snippets:
+    - name: plan-wf-graph-correctness-rubric
+      text: >-
+        Graph-correctness rubric for a workflow plan — answer "do the declared nodes form a
+        sound DAG that realizes the requirement, with edges and references that resolve?"
+        against the plan_yaml design's inputs/nodes/output. The planner contract is binding
+        here: a ${<id>.output...} ref already implies its dependency edge, so it must NOT be
+        restated in depends_on (depends_on is reserved for pure ordering edges that carry no
+        ref); every ${workflow.inputs.x} a node consumes must be declared in the top-level
+        inputs; and each node's dispatch form must match its work (use: a microskill for a
+        deterministic atomic action, agent: for open LLM judgment, delegation: orchestrator
+        for human interaction, filesystem side-effects, or nested-workflow calls). Flag only
+        graph-wiring defects: output.from naming a node id that no node defines; a node
+        consuming a ${workflow.inputs.x} that the top-level inputs never declare (an
+        unresolvable reference); a node ref pointing at a node id that does not exist; a
+        cycle in the dependency graph; a dispatch form mismatched to the node's work; a
+        ${<id>.output...} ref redundantly restated in depends_on; a pure-ordering edge
+        expressed as depends_on where it should instead carry a data ref. Severity mapping:
+        a reference that cannot resolve (output.from to a missing node, an undeclared
+        ${workflow.inputs.x}, a ref to a non-existent node) or a cycle = blocker; a dispatch
+        form mismatched to the work, or a missing data ref expressed only as a bare
+        depends_on = major; a borderline depends_on-vs-ref edge judgment = minor; a
+        ${ref}-restated-in-depends_on redundancy (harmless duplication the planner contract
+        warns against) or a cosmetic graph wording issue = nit. Set finding.file to the
+        plan's path and line to the cited node's line. Do not raise plan-wf-completeness
+        (whether a declared element is present/buildable), plan-wf-control-flow (gate /
+        loop / when / for_each coherence and termination), plan-wf-reuse-survey (whether the
+        reuse decision and missing_microskills/_new_profiles set are right), plan-wf-scope-fit
+        (whether this is one workflow), or plan-wf-name-capability (registry naming) concerns
+        — those sibling lenses own them.
