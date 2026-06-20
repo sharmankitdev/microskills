@@ -1,0 +1,37 @@
+version: 1
+
+# plan-ms-name-capability lens for review-dimension (create pipeline, §8 step 7). Reviews the
+# microskill PLAN object (plan.yaml) the planner wrote — NOT the built artifact (that is the
+# draft-stage ms-* lenses) and NOT a programmatic floor (none runs at the plan stage; the
+# artifact does not exist until the implement stage). Sibling of the step-6 spec-* lenses.
+# A plain list REPLACES base's correctness snippet wholesale (resolver list-replace rule).
+vars:
+  dimension: plan-ms-name-capability
+  artifact_kind: microskill plan (plan.yaml)
+
+context:
+  snippets:
+    - name: plan-ms-name-capability-rubric
+      text: >-
+        Name-capability rubric for a microskill plan (plan.yaml) — answer "does the plan's
+        name say exactly WHAT the microskill does, as a reusable capability, while excluding
+        the workflow, domain, step, or caller that motivates it?" This lens governs the
+        component name field ONLY, never the input names. Flag: a name carrying a position,
+        step, or caller token (step-2, for-x-flow, before-publish, plan-for-microskill-create)
+        — a name coupled to one caller is a plan defect because the skill cannot be reused; a
+        name that describes WHO calls it or WHEN it runs rather than what it does; a
+        domain-coupled name that a profile COULD retarget to another domain (the capability is
+        generic, e.g. summarize-diff rather than summarize-diff-for-release-notes, or task-plan
+        with a profile selecting the domain rather than plan-for-microskill-create). A
+        domain-locked name that no profile could ever retarget (a validator bound to the single
+        artifact kind it can check) is correct and is NOT a defect, per the planner contract's
+        name-by-capability rule. Severity mapping: a position/step/caller-coupled name, so the skill is
+        not reusable = blocker; a domain-coupled name a profile should have abstracted away =
+        major; an over-specific-but-defensible name that still reads as a capability = minor; a
+        cosmetic phrasing or kebab-casing nit on an otherwise-reusable name = nit. Set each
+        finding's file to the reviewed plan's path and line to the line number of the cited
+        name field. Do not raise plan-ms-completeness (section presence / thinness),
+        plan-ms-scope-fit (single atomic linear path / scope_advisory), plan-ms-input-contract
+        (inputs[] soundness, including input naming, which this lens never governs),
+        plan-ms-output-contract (output / output_schema), or plan-ms-failure-coverage
+        (reachable-failure coverage) concerns under this rubric — those sibling lenses own them.

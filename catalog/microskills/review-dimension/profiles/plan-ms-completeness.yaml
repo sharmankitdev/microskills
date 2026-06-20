@@ -1,0 +1,39 @@
+version: 1
+
+# plan-ms-completeness lens overlay for review-dimension (create pipeline, §8 step 7).
+# Reviews the microskill PLAN object (plan.yaml) the planner wrote — NOT the built artifact
+# (that is the draft-stage ms-* lenses) and NOT a programmatic floor (no validator runs at
+# the plan stage; the artifact does not exist until the implement stage). Sibling of the
+# step-6 spec-* lenses. A plain list REPLACES base's correctness snippet wholesale (resolver
+# list-replace rule). output_schema, inputs, runtime, and the body inherit from base.
+vars:
+  dimension: plan-ms-completeness
+  artifact_kind: microskill plan (plan.yaml)
+
+context:
+  snippets:
+    - name: plan-ms-completeness-rubric
+      text: >-
+        Completeness rubric for a microskill plan (plan.yaml) — answer "which plan sections
+        are absent, empty, or too thin to build a microskill from?" against the plan's
+        sections (name · description · purpose · inputs[] · steps[] · output ·
+        output_schema · failure_modes[] · config.axes · scope_advisory). Flag only
+        completeness gaps: a buildable section absent or present-but-empty; a purpose that
+        does not state the one-sentence input → action → output; a description that never
+        ends with what the microskill produces (the caller's invoke signal); steps that are
+        placeholders or stop short of producing the stated output; an output paragraph that
+        names neither artifact nor destination text at all. Two omissions are LEGITIMATE and
+        are NOT findings here: output_schema is correctly omitted for purely human-facing
+        prose (whether the omission is right is output-contract's call), and scope_advisory
+        is correctly omitted when the task fits one atomic microskill (whether it is right is
+        scope-fit's call) — do not flag either omission under this rubric. Severity mapping: a
+        core buildable section (purpose, inputs, steps, or output) absent or empty = blocker;
+        a present-but-thin element a builder could not implement without guessing = major; a
+        peripheral omission worth recording (a sparse config.axes the requirement motivated) =
+        minor; a cosmetic thinness on an otherwise-complete section = nit. Set each finding's
+        file to the reviewed plan's path and line to the line number of the cited section.
+        Do not raise plan-ms-scope-fit (single atomic linear path / scope_advisory),
+        plan-ms-input-contract (implied or invented inputs / requiredness-type-default),
+        plan-ms-output-contract (output_schema correctness / composability), plan-ms-name-
+        capability (name reusability), or plan-ms-failure-coverage (which reachable failures
+        are covered) concerns under this rubric — those sibling lenses own them.

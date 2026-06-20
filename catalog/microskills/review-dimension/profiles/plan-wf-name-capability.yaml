@@ -1,0 +1,42 @@
+version: 1
+
+# plan-wf-name-capability lens for review-dimension (create pipeline, §8 step 7). Reviews the
+# workflow PLAN object (plan.yaml) the workflow-planner wrote — NOT the built WORKFLOW.yaml
+# (that is the draft-stage wf-* lenses) and NOT a programmatic floor (none runs at the plan
+# stage). Sibling of the step-6 spec-* lenses. A plain list REPLACES base's correctness
+# snippet wholesale. output_schema, inputs, runtime, and the body inherit from base.
+vars:
+  dimension: plan-wf-name-capability
+  artifact_kind: workflow plan (plan.yaml)
+
+context:
+  snippets:
+    - name: plan-wf-name-capability-rubric
+      text: >-
+        Name-by-capability rubric for a workflow plan — answer "do the workflow name and
+        every missing_microskills[].name say what the artifact DOES, excluding the caller,
+        occasion, or step that motivated it?" against the plan's top-level name and each
+        missing_microskills[].name. The planner contract is binding: name by capability, not
+        by occasion — both the workflow name and every missing_microskills[].name (which
+        becomes the permanent registry name via name_override) must state exactly what the
+        artifact does while excluding the domain, caller, or step (e.g. task-evaluate, not
+        evaluate-microskill-for-create; extract-pr-links, not
+        extract-links-for-the-release-workflow). Position / step / caller tokens are
+        forbidden. Scope is REGISTRY NAMES ONLY — the workflow name and missing_microskills
+        names — never node ids, gate ids, input names, or profile names (those are where
+        domain-coupling legitimately belongs). Flag only naming defects: a workflow name
+        coupled to this one workflow, its caller, or the occasion that motivated it; a
+        missing_microskills[].name coupled to position / step / caller / a single consumer; a
+        registry name carrying a forbidden step/position/caller token; a registry name that
+        bakes in the domain a profile should instead own. Severity mapping: a registry name
+        (the workflow name or a missing_microskills[].name) coupled to this one
+        workflow / caller / occasion, which would become a permanently miscoupled registry
+        entry = blocker; a registry name that bakes in a domain a profile should own = major;
+        an over-specific but still capability-true name = minor; a cosmetic naming awkwardness
+        = nit. Set finding.file to the plan's path and line to the name / missing_microskills
+        entry's line. Do not raise plan-wf-completeness (element presence),
+        plan-wf-graph-correctness (edge/ref resolution and dispatch form),
+        plan-wf-control-flow (gate/loop/when/for_each coherence), plan-wf-reuse-survey
+        (whether the missing_microskills SET is the right one to mint), or plan-wf-scope-fit
+        (one-workflow scope) concerns — those sibling lenses own them; and do not flag node
+        ids, gate ids, input names, or profile names, which are out of this rubric's scope.

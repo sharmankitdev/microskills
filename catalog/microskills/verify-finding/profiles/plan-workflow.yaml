@@ -1,0 +1,11 @@
+version: 1
+
+# Workflow-plan adversarial-verify overlay for verify-finding (§8 step 7). Swaps ONLY the
+# artifact-kind var so the adversarial seat reasons about the PLAN object (plan.yaml: the
+# WORKFLOW.yaml-design node graph + missing_microskills + _new_profiles/_reuse annotations)
+# the planner wrote — NOT the built workflow draft and NOT a diff. inputs (finding +
+# artifact_path materialize:file + seat), runtime, and output_schema deep-merge in from base
+# untouched. The caller threads the SAME plan.yaml as artifact_path that the plan-stage review
+# panel saw, so counter-cases hold against the same evidence.
+vars:
+  artifact_kind: "workflow plan (the planner's plan.yaml: the WORKFLOW.yaml-design node graph + missing_microskills + _new_profiles/_reuse annotations)"

@@ -1,0 +1,41 @@
+version: 1
+
+# plan-wf-scope-fit lens for review-dimension (create pipeline, §8 step 7). Reviews the
+# workflow PLAN object (plan.yaml) the workflow-planner wrote — NOT the built WORKFLOW.yaml
+# (that is the draft-stage wf-* lenses) and NOT a programmatic floor (none runs at the plan
+# stage). Sibling of the step-6 spec-* lenses. A plain list REPLACES base's correctness
+# snippet wholesale. output_schema, inputs, runtime, and the body inherit from base.
+vars:
+  dimension: plan-wf-scope-fit
+  artifact_kind: workflow plan (plan.yaml)
+
+context:
+  snippets:
+    - name: plan-wf-scope-fit-rubric
+      text: >-
+        Scope-fit rubric for a workflow plan — answer "is this genuinely ONE workflow, and is
+        scope_advisory correctly absent or present?" against the plan's scope_advisory and
+        the shape of its plan_yaml design. The planner contract is binding on the three
+        advisory kinds: a single atomic task that needs no multi-node orchestration must
+        carry scope_advisory.kind promote (recommend microskill-create); two or more
+        independent workflows fused together must carry scope_advisory.kind split (list the
+        candidates); a requirement an existing workflow already covers must carry
+        scope_advisory.kind adapt (name it plus the delta). Flag only scope-fit defects: a
+        plan that designs a multi-node workflow for a single atomic task that needs no
+        orchestration (should be promote); a plan that fuses two or more independent
+        workflows into one DAG (should be split); a plan that re-designs a workflow an
+        existing one already covers (should be adapt); a scope_advisory asserted when the
+        work genuinely IS one cohesive workflow (a false advisory that would wrongly block a
+        valid build); a scope_advisory whose recommendation is missing or names the wrong
+        remedy. Severity mapping: a genuine multi-workflow fusion that should split, or a
+        single atomic task flattened into a workflow that should promote = blocker; a
+        should-be-adapt over an existing workflow not flagged, or a false advisory blocking a
+        valid single workflow = major; a borderline one-workflow-vs-two judgment a reviewer
+        could not resolve = minor; a cosmetic advisory-wording issue = nit. Set finding.file
+        to the plan's path and line to the scope_advisory line (or the plan_yaml line the
+        misscope is read from). Do not raise plan-wf-completeness (element presence),
+        plan-wf-graph-correctness (edge/ref resolution), plan-wf-control-flow
+        (gate/loop/when/for_each coherence), plan-wf-reuse-survey (whether individual nodes
+        reuse existing microskills/agents and whether the missing_microskills set is right),
+        or plan-wf-name-capability (registry naming) concerns — those sibling lenses own
+        them.

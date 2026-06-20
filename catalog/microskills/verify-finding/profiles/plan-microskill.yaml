@@ -1,0 +1,11 @@
+version: 1
+
+# Microskill-plan adversarial-verify overlay for verify-finding (§8 step 7). Swaps ONLY the
+# artifact-kind var so the adversarial seat reasons about the PLAN object (plan.yaml: name/
+# purpose/inputs/steps/output/output_schema/failure_modes/config/scope_advisory) the planner
+# wrote — NOT the built draft (that is the microskill-draft profile) and NOT a diff. inputs
+# (finding + artifact_path materialize:file + seat), runtime, and output_schema deep-merge in
+# from base untouched. The caller threads the SAME plan.yaml as artifact_path that the
+# plan-stage review panel saw, so counter-cases hold against the same evidence.
+vars:
+  artifact_kind: microskill plan (the planner's plan.yaml design)

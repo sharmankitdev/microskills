@@ -1,0 +1,39 @@
+version: 1
+
+# plan-wf-control-flow lens for review-dimension (create pipeline, §8 step 7). Reviews the
+# workflow PLAN object (plan.yaml) the workflow-planner wrote — NOT the built WORKFLOW.yaml
+# (that is the draft-stage wf-* lenses) and NOT a programmatic floor (none runs at the plan
+# stage). Sibling of the step-6 spec-* lenses. A plain list REPLACES base's correctness
+# snippet wholesale. output_schema, inputs, runtime, and the body inherit from base.
+vars:
+  dimension: plan-wf-control-flow
+  artifact_kind: workflow plan (plan.yaml)
+
+context:
+  snippets:
+    - name: plan-wf-control-flow-rubric
+      text: >-
+        Control-flow rubric for a workflow plan — answer "are the gates, loop, when, and
+        for_each coherent, terminating, and placed where they can actually run?" against the
+        plan_yaml design's gates/loop/nodes (when/for_each). The workflow layer owns all
+        control flow; the planner contract is binding: keep loop-body nodes contiguous and
+        keep orchestrator (delegation: orchestrator) nodes OUT of the loop body, and place
+        any human interaction (a human-approval gate / AskUserQuestion) only where it can
+        pause — never inside a background segment, where it would silently fabricate. Flag
+        only control-flow defects: a loop whose body nodes are not contiguous, or whose body
+        contains an orchestrator node; a loop with no while condition or no max_iters bound
+        (non-termination); a human-approval gate placed where it cannot pause for a human (a
+        background segment); a for_each fan-out with no matching fan-in / collection node; a
+        when guard whose source field is unresolvable from the graph; a gate placed where it
+        does not actually guard the side-effect or branch it is meant to; a bounded loop with
+        no stated convergence / exit signal. Severity mapping: a loop with no bound
+        (non-termination), an orchestrator node inside a loop body, or a gate / interaction
+        placed in a background segment where it cannot run = blocker; a non-contiguous loop
+        body, an unguarded or misplaced gate, or a fan-out with no fan-in = major; an
+        underspecified-but-recoverable guard or convergence signal = minor; a cosmetic
+        control-flow wording issue = nit. Set finding.file to the plan's path and line to
+        the cited gate / loop / node's line. Do not raise plan-wf-completeness (whether a
+        control-flow element the requirement needs is even present), plan-wf-graph-correctness
+        (data-edge/ref resolution and dispatch-form choice), plan-wf-reuse-survey (reuse and
+        the missing_microskills/_new_profiles set), plan-wf-scope-fit (one-workflow scope), or
+        plan-wf-name-capability (registry naming) concerns — those sibling lenses own them.

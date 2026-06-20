@@ -1,0 +1,41 @@
+version: 1
+
+# plan-wf-completeness lens for review-dimension (create pipeline, §8 step 7). Reviews the
+# workflow PLAN object (plan.yaml) the workflow-planner wrote — NOT the built WORKFLOW.yaml
+# (that is the draft-stage wf-* lenses) and NOT a programmatic floor (none runs at the plan
+# stage; the validators run later, on the implemented artifact). Sibling of the step-6 spec-*
+# lenses. A plain list REPLACES base's correctness snippet wholesale. output_schema, inputs,
+# runtime, and the body inherit from base.
+vars:
+  dimension: plan-wf-completeness
+  artifact_kind: workflow plan (plan.yaml)
+
+context:
+  snippets:
+    - name: plan-wf-completeness-rubric
+      text: >-
+        Completeness rubric for a workflow plan — answer "which plan.yaml element is
+        absent, empty, or too thin to build a WORKFLOW.yaml from?" against the plan's
+        shape (top-level name · missing_microskills[] · scope_advisory · the plan_yaml
+        design block it carries: version/name/description/inputs/nodes/gates/loop/output ·
+        the reserved _new_profiles[] and _reuse[] annotations). Flag only presence /
+        buildability gaps: the plan_yaml design block absent; an empty nodes list (no graph
+        to build); a node with no dispatch form (none of use/agent/delegation) or with its
+        inputs left unspecified; the requirement plainly calling for a human-approval gate,
+        a loop, or a fan-out yet the plan designs none; output absent (no output.from);
+        description or inputs absent; a missing_microskills entry that names a capability
+        but gives no requirement line for microskill-create; a _new_profiles entry that
+        names a microskill+profile but supplies no contents body to mint. Severity mapping:
+        a core buildable element absent (the plan_yaml block, the nodes list, a node's
+        dispatch form, or output) = blocker; a present-but-thin element a builder could not
+        implement without guessing (a node with unspecified inputs, a missing_microskills
+        entry with no requirement, a _new_profiles entry with no contents) = major; a
+        peripheral omission worth recording = minor; a cosmetic thinness on an
+        otherwise-complete element = nit. Set finding.file to the plan's path and line to
+        the cited element's line. Do not raise plan-wf-graph-correctness (whether the
+        declared edges/refs/output.from actually wire and resolve), plan-wf-control-flow
+        (gate/loop/when/for_each coherence and termination), plan-wf-reuse-survey (whether
+        the reuse decision and the missing_microskills/_new_profiles SET are right),
+        plan-wf-scope-fit (whether this is genuinely one workflow), or plan-wf-name-capability
+        (whether the registry names are capability-coupled) concerns — those sibling lenses
+        own them.
