@@ -4818,25 +4818,29 @@ def test_on_exhaust_continue_is_hash_visible_too(tmp_path):
     assert hashes["base"] != hashes["continue"]
 
 
-def test_on_exhaust_body_must_form_own_segment_trailing_merge_dies(tmp_path):
-    # action: fail + a background node AFTER the body with no checkpoint
-    # between — it merges into the loop segment and the policy would silently
-    # evaporate (no scaffold, no throw, hash-invisible). Die instead.
+def test_on_exhaust_body_with_trailing_node_isolates(tmp_path):
+    # action: fail + a background node AFTER the body. The loop-region boundary flush
+    # now ISOLATES the body into its own segment automatically (no manual checkpoint
+    # needed) — the do/while + throw are emitted and the trailing node is a separate
+    # segment. (Previously this merged + dropped the scaffold, so it had to die; the
+    # region machinery makes that obsolete.)
     merged = OX_FAIL.replace(
         "gates:\n",
         "  - id: report\n    agent: ag\n    depends_on: [ev]\n"
         "    prompt: report ${ev.output.pass}\ngates:\n")
     make_flow(tmp_path, "ox-flow", merged)
     rc, data, out, err = run(tmp_path, "ox-flow")
-    assert rc == 1
-    assert "must compile into its OWN background segment" in data["error"]
-    assert "report" in data["error"]
+    assert rc == 0, out + err
+    m = json.loads((tmp_path / "ox-flow" / ".compiled" / "manifest.json").read_text())
+    loop_steps = [s for s in m["steps"] if s.get("is_loop")]
+    assert len(loop_steps) == 1 and set(loop_steps[0]["nodes"]) == {"impl", "ev"}
+    assert "report" not in loop_steps[0]["nodes"]
 
 
-def test_on_exhaust_body_must_form_own_segment_leading_merge_dies(tmp_path):
-    # action: escalate + a background node BETWEEN the gate and the body — it
-    # merges into the loop segment; without the die the synthetic gate's
-    # `when` would reference a `loop` result no step ever produces.
+def test_on_exhaust_body_with_leading_node_isolates(tmp_path):
+    # action: escalate + background nodes BEFORE the body. The region-boundary flush
+    # isolates the body, so the synthetic gate's `when` references a `loop` result the
+    # loop segment really produces. Compiles (no die).
     merged = OX_ESCALATE.replace(
         "gates:\n",
         "  - id: prep\n    agent: ag\n    depends_on: [plan]\n"
@@ -4847,8 +4851,10 @@ def test_on_exhaust_body_must_form_own_segment_leading_merge_dies(tmp_path):
         "    depends_on: [prep2]\n    prompt: impl")
     make_flow(tmp_path, "ox-flow", merged)
     rc, data, out, err = run(tmp_path, "ox-flow")
-    assert rc == 1
-    assert "must compile into its OWN background segment" in data["error"]
+    assert rc == 0, out + err
+    m = json.loads((tmp_path / "ox-flow" / ".compiled" / "manifest.json").read_text())
+    loop_steps = [s for s in m["steps"] if s.get("is_loop")]
+    assert len(loop_steps) == 1 and set(loop_steps[0]["nodes"]) == {"impl", "ev"}
 
 
 def test_on_exhaust_escalate_empty_body_dies_via_shared_helper(tmp_path):

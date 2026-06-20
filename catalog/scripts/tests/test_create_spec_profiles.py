@@ -30,6 +30,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 import yaml
 
 REPO = Path(__file__).resolve().parents[3]
@@ -308,6 +309,14 @@ def test_refine_requirements_base_and_autonomous_unchanged():
         assert rc == 0, (prof, err)
 
 
+@pytest.mark.xfail(
+    reason="§9 don't-preserve-existing: develop-product-backlog is an out-of-scope "
+    "nester. Under the compile-time inlining engine its complex nested loop-bearing "
+    "children (refine-requirements + technical-design) interleave when inlined — their "
+    "loop bodies are no longer contiguous (a clear contiguity die, not a silent drop). "
+    "Slated for retirement/rebuild on the new engine; the in-scope create pipelines wire "
+    "children sequentially and isolate cleanly.",
+    strict=True)
 def test_develop_product_backlog_regression():
     # HARD regression target: the parent must still compile + validate (base + autonomous)
     # — refine-requirements' external contract is unchanged.

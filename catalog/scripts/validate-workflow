@@ -270,7 +270,7 @@ def main():
     # gates the subgraph splice's reserved-'__' guard (it minted '__' ids itself).
     nw_did_inline = False
     if isinstance(merged, dict) and args.defs_root:
-        merged, nw_inline_errors, nw_did_inline = desugar_nested_workflows(
+        merged, nw_inline_errors, nw_did_inline, _nw_regions = desugar_nested_workflows(
             merged, Path(args.defs_root))
         for ie in nw_inline_errors:
             add(issues, "block", "nested-workflow", ie)

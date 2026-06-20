@@ -1082,7 +1082,7 @@ def _nested_seam_leak_names(obj, declared):
     return out
 
 
-def _nested_rewrite_ref(s, bindings, inner_ids, splice_id):
+def _nested_rewrite_ref(s, bindings, inner_ids, splice_id, result_rekey=None):
     """Rewrite the ${...} refs in a SPLICED child node's scoped-field string for a
     FULL-WORKFLOW inline. Per ${...} inner, in order:
       1. WHOLE-INNER ${workflow.inputs.X} (X bound) -> the host binding VERBATIM (a
@@ -1090,9 +1090,16 @@ def _nested_rewrite_ref(s, bindings, inner_ids, splice_id):
       2. TAILED / EMBEDDED workflow.inputs.X tokens (X bound) -> the host binding's
          INNER expression, so a .field / operator tail rides along.
       3. sibling ${<inner>.output|items} -> ${<splice>__<inner>.output|items}.
+      4. loop PSEUDO-RESULT consumer ${<key>.output...} -> the namespaced key via
+         result_rekey ({old_key: new_key}); the producing region's key was namespaced
+         (loop -> loop_<splice>), so a child node CONSUMING its own loop result
+         OUTSIDE the body must re-key to match — else it reads the PARENT's `loop`
+         (silent cross-wire) or a missing key. In-body ${loop.carry.X} carries no
+         `.output` tail, so NODE_OUTPUT_RE never matches it (left segment-local).
     Step 1 returns the binding verbatim (REF_RE.sub never re-scans a replacement), so a
     host binding naming a node (${seed.output}) is inserted as-is, never re-namespaced.
     A child uses the ${workflow.inputs.X} seam (vs a subgraph's ${inputs.X})."""
+    result_rekey = result_rekey or {}
     def repl(m):
         inner = m.group(1)
         wm = _WF_INPUT_RE.match(inner)
@@ -1111,11 +1118,30 @@ def _nested_rewrite_ref(s, bindings, inner_ids, splice_id):
             return f"{splice_id}__{nid}.items" if nid in inner_ids else mm.group(0)
         def out_repl(mm):
             nid = mm.group(1)
-            return f"{splice_id}__{nid}.output" if nid in inner_ids else mm.group(0)
+            if nid in inner_ids:
+                return f"{splice_id}__{nid}.output"
+            if nid in result_rekey:
+                return f"{result_rekey[nid]}.output"
+            return mm.group(0)
         inner = NODE_ITEMS_RE.sub(items_repl, inner)
         inner = NODE_OUTPUT_RE.sub(out_repl, inner)
         return "${" + inner + "}"
     return REF_RE.sub(repl, s)
+
+
+def _nested_namespace_depends_on(obj, splice_id):
+    """Recursively namespace any `depends_on` list (node-id strings) inside a nested
+    structure — e.g. an `expand` block's over-entries / customize — so spliced
+    references point at the namespaced <splice>__<id> nodes. Mutates in place."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k == "depends_on" and isinstance(v, list):
+                obj[k] = [f"{splice_id}__{d}" if isinstance(d, str) else d for d in v]
+            else:
+                _nested_namespace_depends_on(v, splice_id)
+    elif isinstance(obj, list):
+        for v in obj:
+            _nested_namespace_depends_on(v, splice_id)
 
 
 def _nested_namespace_path(path, inner_ids, splice_id):
@@ -1166,7 +1192,7 @@ def desugar_nested_workflows(wf, defs_root, _stack=None):
     — that is a fail-loud error here until the multiple-loop-region engine lands."""
     errors = []
     if not isinstance(wf, dict) or not isinstance(wf.get("nodes"), list):
-        return wf, errors, False
+        return wf, errors, False, []
     nodes = wf["nodes"]
     _stack = _stack or []
 
@@ -1179,7 +1205,7 @@ def desugar_nested_workflows(wf, defs_root, _stack=None):
         # guard, which still governs subgraph splices + plain docs with the original
         # message. (A doc that DID inline mints '__' ids itself, so its subgraph pass
         # must run with check_reserved=False — see the guard below.)
-        return wf, errors, False
+        return wf, errors, False, []
 
     # Author reserved-'__' guard, on the AUTHOR ids at THIS level (parent or a
     # recursively-inlined child), BEFORE any splice — but ONLY when we will actually
@@ -1192,13 +1218,14 @@ def desugar_nested_workflows(wf, defs_root, _stack=None):
                 f"node id '{n['id']}' may not contain '__' — the double-underscore "
                 f"is reserved for the splice namespace (<splice-id>__<inner-id>)")
     if errors:
-        return wf, errors, True
+        return wf, errors, True, []
 
     here = wf.get("name")
     spliced = {}            # sid -> [namespaced child nodes]
     spliced_gates = {}      # sid -> [namespaced child gates]
     exit_of = {}            # sid -> namespaced child exit id (or None)
     inlined_imports = []    # union of each inlined child's imports (M2 allowlist)
+    regions = []            # (origin, namespaced loop dict) per inlined loop-bearing child
 
     for n in static:
         sid = n["id"]
@@ -1263,8 +1290,10 @@ def desugar_nested_workflows(wf, defs_root, _stack=None):
         if errors:
             continue
 
-        # Recurse BOTTOM-UP: inline the child's own static nesting first.
-        child, cerr, _ = desugar_nested_workflows(
+        # Recurse BOTTOM-UP: inline the child's own static nesting first. The child's
+        # OWN loop regions (from its inlined grandchildren) bubble up; they are
+        # re-namespaced under this splice id below (after inner_ids is known).
+        child, cerr, _, child_regions = desugar_nested_workflows(
             child, defs_root, _stack + [here])
         if cerr:
             errors.extend(cerr)
@@ -1276,15 +1305,6 @@ def desugar_nested_workflows(wf, defs_root, _stack=None):
             child, snippets_dir=Path(defs_root) / "_snippets")
         if _se:
             errors.extend(_se)
-            continue
-
-        if child.get("loop"):
-            # TRANSITIONAL (sub-PR 1): a loop-bearing child contributes a loop
-            # REGION, which needs the multiple-loop-region engine (sub-PR 2). Until
-            # then it is NOT inlined — the node is left in place as an ordinary
-            # runtime checkpoint (its prior behavior + the depth check still govern
-            # it), so an in-scope def that statically nests a loop-bearing child
-            # (e.g. workflow-create -> build-workflow-from-plan) keeps compiling.
             continue
 
         inner_nodes = child.get("nodes") or []
@@ -1327,6 +1347,20 @@ def desugar_nested_workflows(wf, defs_root, _stack=None):
         # pure ordering constraint is silently lost when the node is replaced.
         host_deps = [d for d in (n.get("depends_on") or []) if isinstance(d, str)]
 
+        # Loop pseudo-result CONSUMER re-key map: a child node OUTSIDE a loop body that
+        # reads ${loop.output...} / ${loop_exhaust.output...} (the child's own loop) or
+        # ${loop_<go>.output...} (a grandchild loop) must re-key to the namespaced
+        # producing key, else it reads the parent's `loop` (cross-wire) or a missing
+        # key. Built from the child's own loop + each bubbled grandchild region.
+        result_rekey = {
+            LOOP_RESULT_ID: f"{LOOP_RESULT_ID}_{sid}",
+            LOOP_EXHAUST_GATE_ID: f"{LOOP_EXHAUST_GATE_ID}_{sid}",
+        }
+        for _go, _ in child_regions:
+            result_rekey[f"{LOOP_RESULT_ID}_{_go}"] = f"{LOOP_RESULT_ID}_{sid}__{_go}"
+            result_rekey[f"{LOOP_EXHAUST_GATE_ID}_{_go}"] = (
+                f"{LOOP_EXHAUST_GATE_ID}_{sid}__{_go}")
+
         # Namespace + rewrite each child node.
         gen = []
         for cn in inner_nodes:
@@ -1335,26 +1369,82 @@ def desugar_nested_workflows(wf, defs_root, _stack=None):
             # Seam-leak guard (BEFORE rewrite — rebinding erases the distinction): a
             # child node may reference ${workflow.inputs.X} only for an X the child
             # DECLARES. An undeclared X (any position, including a .field tail) would
-            # silently re-resolve to the PARENT's input X after splicing.
+            # silently re-resolve to the PARENT's input X after splicing. `expand`
+            # over-entry extras are scanned too (an undeclared input in an over-entry
+            # would otherwise evade the guard and silently rebind).
+            _scan_fields = list(SCOPED_REF_FIELDS) + ["expand"]
             for leaked in _nested_seam_leak_names(
-                    {k: cn.get(k) for k in SCOPED_REF_FIELDS if k in cn}, declared):
+                    {k: cn.get(k) for k in _scan_fields if k in cn}, declared):
                 errors.append(
                     f"node '{sid}__{iid}': child '{target}' references undeclared "
                     f"input '{leaked}' (${{workflow.inputs.{leaked}}} seam leak)")
-            for f in SCOPED_REF_FIELDS:
+            for f in _scan_fields:
                 if f in cn:
                     cn[f] = _subgraph_map_strings(
                         cn[f],
-                        lambda s, _b=bindings, _ii=inner_ids, _s=sid:
-                            _nested_rewrite_ref(s, _b, _ii, _s))
+                        lambda s, _b=bindings, _ii=inner_ids, _s=sid, _rk=result_rekey:
+                            _nested_rewrite_ref(s, _b, _ii, _s, _rk))
+            # `expand` over-entries may carry depends_on (node-id lists) — namespace
+            # them like the node's own depends_on (refs already rewritten above).
+            if isinstance(cn.get("expand"), (dict, list)):
+                _nested_namespace_depends_on(cn["expand"], sid)
             child_dep = [f"{sid}__{d}" for d in (cn.get("depends_on") or [])
                          if isinstance(d, str)]
             cn["depends_on"] = (host_deps + child_dep) if not child_dep else child_dep
             if not cn["depends_on"]:
                 del cn["depends_on"]
+            # inputs_each names an expand TEMPLATE node id (fan-in sugar resolved by
+            # the LATER expand pass) — namespace it like depends_on so it matches the
+            # template's now-namespaced id (<sid>__<template>).
+            if isinstance(cn.get("inputs_each"), str):
+                cn["inputs_each"] = f"{sid}__{cn['inputs_each']}"
             cn["id"] = f"{sid}__{iid}"
             gen.append(cn)
         spliced[sid] = gen
+
+        # Collect this child's loop (if any) as a namespaced region, plus the child's
+        # OWN bubbled-up grandchild regions re-namespaced under this splice id. The
+        # body ids gain the <sid>__ prefix and while/until/carry refs are rewritten
+        # exactly like a node's scoped field (child sibling refs namespaced, child
+        # ${workflow.inputs.X} rebound to the host binding). Only the pseudo-result
+        # key + exhaust-gate id are namespaced at emit (segment-local vars never
+        # collide), so a region's loop dict carries no var names.
+        def _rw(s, _b=bindings, _ii=inner_ids, _s=sid):
+            return _subgraph_map_strings(
+                s, lambda x: _nested_rewrite_ref(x, _b, _ii, _s))
+
+        def _ns_loop(lp, _s=sid, _binds=bindings):
+            out = {"body": [f"{_s}__{b}" for b in (lp.get("body") or [])],
+                   "max_iters": lp.get("max_iters")}
+            for k in ("while", "until"):
+                if lp.get(k) is not None:
+                    out[k] = _rw(lp[k])
+            if lp.get("carry"):
+                out["carry"] = {nm: _rw(ex) for nm, ex in lp["carry"].items()}
+            if isinstance(lp.get("on_exhaust"), dict):
+                oe = copy.deepcopy(lp["on_exhaust"])
+                # notes_input names a CHILD input (where the dispatcher folds the
+                # human's extend-guidance). After inlining, remap it to the PARENT
+                # input the host binding forwards (${workflow.inputs.Y}); if the
+                # binding is a node output / literal / unbound, the extend-guidance
+                # channel cannot thread through the inline — drop it (escalate still
+                # works, just without a notes channel).
+                ni = oe.get("notes_input")
+                if isinstance(ni, str):
+                    b = _binds.get(ni, "")
+                    wm = (_WF_INPUT_RE.match(b[2:-1])
+                          if b.startswith("${") and b.endswith("}") else None)
+                    if wm:
+                        oe["notes_input"] = wm.group(1)
+                    else:
+                        oe.pop("notes_input", None)
+                out["on_exhaust"] = oe
+            return out
+
+        if isinstance(child.get("loop"), dict):
+            regions.append((sid, _ns_loop(child["loop"])))
+        for gorigin, gloop in child_regions:
+            regions.append((f"{sid}__{gorigin}", _ns_loop(gloop)))
 
         # Namespace the child's gates (full-workflow inline ALLOWS them).
         cgates = []
@@ -1374,8 +1464,8 @@ def desugar_nested_workflows(wf, defs_root, _stack=None):
                 if gf in g:
                     g[gf] = _subgraph_map_strings(
                         g[gf],
-                        lambda s, _b=bindings, _ii=inner_ids, _s=sid:
-                            _nested_rewrite_ref(s, _b, _ii, _s))
+                        lambda s, _b=bindings, _ii=inner_ids, _s=sid, _rk=result_rekey:
+                            _nested_rewrite_ref(s, _b, _ii, _s, _rk))
             # `present` field-paths name child node ids by their leading segment —
             # namespace them (a bare string path, or {read_file: <path>}); these are
             # NOT ${...} refs, so they bypass the ref rewriter.
@@ -1397,7 +1487,7 @@ def desugar_nested_workflows(wf, defs_root, _stack=None):
         exit_of[sid] = f"{sid}__{child_out}" if isinstance(child_out, str) else None
 
     if errors:
-        return wf, errors, True
+        return wf, errors, True, []
 
     # Pass 2: splice child nodes in place; append namespaced child gates.
     new_nodes = []
@@ -1472,9 +1562,10 @@ def desugar_nested_workflows(wf, defs_root, _stack=None):
     if all_gates:
         wf["gates"] = all_gates
     # did_inline is True only if something was actually spliced (all-skipped
-    # loop-bearing/guarded children leave the doc unchanged → caller keeps
-    # desugar_subgraphs' own reserved-'__' guard).
-    return wf, errors, bool(spliced)
+    # guarded/wire-auto children leave the doc unchanged → caller keeps
+    # desugar_subgraphs' own reserved-'__' guard). `regions` carries each inlined
+    # loop-bearing child's namespaced loop for the caller to union into loop_regions.
+    return wf, errors, bool(spliced), regions
 
 
 def collect_strings(obj):
@@ -2114,7 +2205,7 @@ def nested_workflow_depth_cycle_errors(defs_root, merged):
         # or — until the multiple-loop engine lands — a loop-bearing static one) is a
         # true depth-2 the dispatcher cannot re-enter. (A for_each child that merely
         # statically nests a leaf grandchild is depth-1 and legal.)
-        flat_doc, _ie, _di = desugar_nested_workflows(
+        flat_doc, _ie, _di, _ir = desugar_nested_workflows(
             copy.deepcopy(doc), defs_root)
         gtargets = workflow_node_targets(flat_doc)
         if gtargets:
@@ -2722,6 +2813,19 @@ async function withRetry(thunk, maxAttempts) {
 """.strip("\n")
 
 
+def _loop_vars(origin):
+    """The cross-manifest names for a loop region. Segment-local vars (__iter/__max/
+    carry_*/__rounds/__exhausted/__ran) are NOT namespaced — each region is its own
+    segment file, so they never collide. Only the pseudo-result KEY (stored in
+    run-state, referenced by the synthetic gate's `when`) and the synthetic
+    exhaust-gate ID (a manifest-global gate id) are namespaced per region. The lone
+    top-level loop (origin '__top') keeps the LEGACY names → byte-identical."""
+    if origin == "__top":
+        return {"result": LOOP_RESULT_ID, "exhaust_gate": LOOP_EXHAUST_GATE_ID}
+    return {"result": f"{LOOP_RESULT_ID}_{origin}",
+            "exhaust_gate": f"{LOOP_EXHAUST_GATE_ID}_{origin}"}
+
+
 def emit_local_do_while(body_js, while_js, iter_var, max_var, carry=None):
     """The `do { <body> } while ((<cond>) && <iter> < <max>)` wrapper, FACTORED so
     the top-level loop segment and a subgraph bounded group share ONE emit shape.
@@ -2778,22 +2882,32 @@ def emit_rank_calls(seg_node_objs, seg_var_ids, declare=True, phase_line=True, i
     return out
 
 
-def emit_segment_js(seg_nodes, wf, loop, seg_index, converge_groups=None):
+def emit_segment_js(seg_nodes, wf, loop_regions, seg_index, converge_groups=None):
     """Emit a Workflow-JS file for one background segment. Returns (js, needs, produces).
+
+    loop_regions: the workflow's loop regions [{origin, loop}, ...]. This segment is a
+    loop body iff its node-set EXACTLY equals some region's body; that region's emit
+    uses the LEGACY segment-local var names (__iter/__max/carry_*) — they never collide
+    across distinct segment files — and namespaces only the cross-manifest pseudo-result
+    KEY (loop -> loop_<origin>) so N regions' results stay distinct in run-state.
 
     converge_groups: ordered bounded-convergence descriptors that land in THIS segment
     (each {splice, nodes, max_iters, while, exit}); None/empty for an ordinary segment.
-    A group's spliced nodes are emitted as a SELF-CONTAINED local do/while (a `let`
-    declaration + `do { <group calls> __cv<idx>_iter++ } while ((cond) && iter < max)`),
-    the surrounding non-group nodes by ordinary dependency rank. Mutually exclusive with
-    is_loop_seg (the top-level loop never references a subgraph splice, so its body
-    segment never carries a group)."""
+    A group's spliced nodes are emitted as a SELF-CONTAINED local do/while, the
+    surrounding non-group nodes by ordinary dependency rank. Mutually exclusive with
+    is_loop_seg (a loop body segment never carries a bounded subgraph group)."""
     converge_groups = converge_groups or []
     seg_ids = [n["id"] for n in seg_nodes]
     seg_var_ids = set(seg_ids)
     needs = Needs()
-    loop_body = set((loop or {}).get("body") or [])
-    is_loop_seg = bool(loop) and set(seg_ids) == loop_body and loop_body
+    seg_region = next(
+        (r for r in (loop_regions or [])
+         if r["loop"].get("body") and set(seg_ids) == set(r["loop"]["body"])),
+        None)
+    loop = seg_region["loop"] if seg_region else None
+    is_loop_seg = seg_region is not None
+    result_key = (_loop_vars(seg_region["origin"])["result"]
+                  if seg_region else LOOP_RESULT_ID)
 
     # Scan refs for needs (carry only relevant on the loop segment).
     for n in seg_nodes:
@@ -2924,13 +3038,14 @@ def emit_segment_js(seg_nodes, wf, loop, seg_index, converge_groups=None):
             carry_obj = "{ " + ", ".join(
                 f"{json.dumps(v)}: carry_{v}" for v in carry) + " }" if carry else "{}"
             exhaust_js = f"const __exhausted = (__iter >= __max) && ({while_js})\n"
-            # The 'loop' pseudo-result IS committed (unlike __rounds it joins
-            # `produces`): the synthetic gate's `when` and an extend re-run's
-            # carry seeding both resolve from stored results.
+            # The pseudo-result IS committed (unlike __rounds it joins `produces`):
+            # the synthetic gate's `when` and an extend re-run's carry seeding both
+            # resolve from stored results. Keyed per region (loop -> loop_<origin>)
+            # so N regions' results never collide in run-state.
             ret = ("{ " + ", ".join(f"{json.dumps(i)}: {jsvar(i)}" for i in seg_ids)
-                   + ', "loop": { "converged": !__exhausted, "rounds": __iter, '
-                     '"carry": ' + carry_obj + ' }, "__rounds": __iter }')
-            produces = produces + [LOOP_RESULT_ID]
+                   + f', {json.dumps(result_key)}: {{ "converged": !__exhausted, '
+                     '"rounds": __iter, "carry": ' + carry_obj + ' }, "__rounds": __iter }')
+            produces = produces + [result_key]
         loop_body_js = (f"{ran_init}{loop_calls}{break_line}{carry_assign}"
                         f"  __iter++\n")
         scaffold = emit_local_do_while(loop_body_js, while_js, "__iter", "__max")
@@ -3183,7 +3298,8 @@ def main():
     # are a HARD block (an inline must never half-resolve). Because this pass
     # guarded the author '__' ids at every level, the subgraph splice below is
     # called with check_reserved=False (its surviving '__' ids are this pass's).
-    wf, nw_inline_errors, nw_did_inline = desugar_nested_workflows(wf, defs_root)
+    wf, nw_inline_errors, nw_did_inline, nw_loop_regions = desugar_nested_workflows(
+        wf, defs_root)
     if nw_inline_errors:
         die("nested-workflow inline failed", 1, nested_workflow_errors=nw_inline_errors)
 
@@ -3331,6 +3447,18 @@ def main():
             die(wu_err, 1)
         desugar_loop_until(loop)
 
+    # --- Multiple loop regions: __top (parent's own, now desugared) + each inlined
+    # loop-bearing child (threaded from desugar_nested_workflows). Per-region
+    # until->while desugar keeps emit uniform. Only the pseudo-result key + synthetic
+    # exhaust-gate id are namespaced per region (segment-local vars never collide). ---
+    loop_regions = [{"origin": "__top", "loop": loop}] if isinstance(loop, dict) else []
+    for _o, _cl in (nw_loop_regions or []):
+        _wu = loop_while_until_error(_cl)
+        if _wu:
+            die(f"loop region '{_o}': {_wu}", 1)
+        desugar_loop_until(_cl)
+        loop_regions.append({"origin": _o, "loop": _cl})
+
     # --- loop.on_exhaust: declared cap-exhaustion policy (shared helpers) ---
     # Coherence first (gate-shaped fields only under escalate; default: extend
     # refused; notes_input must be declared), then the escalate-scoped reserved
@@ -3388,12 +3516,68 @@ def main():
                     f"rails as authored gates)", 1)
         gates_after.setdefault(last_body, []).insert(0, synth_gate)
 
+    # --- Per-region (non-__top) on_exhaust + synthetic exhaust gate ---
+    # Each inlined loop-bearing child region with on_exhaust: escalate gets its OWN
+    # synthetic gate (id loop_exhaust_<origin>), anchored after that region's last
+    # body node, with a `when` keyed to that region's pseudo-result
+    # (loop_<origin>.output.converged). __top keeps the single-loop path above
+    # (byte-identical); this loop is a no-op when no child loop was inlined.
+    nw_regions = [r for r in loop_regions if r["origin"] != "__top"]
+    synth_region_gate_when = {}
+    _all_ids = ({nd["id"] for nd in nodes if isinstance(nd, dict) and nd.get("id")}
+                | {gg["id"] for gg in (wf.get("gates") or [])
+                   if isinstance(gg, dict) and isinstance(gg.get("id"), str)})
+    for _r in nw_regions:
+        # Reserved-id guard (mirrors loop_reserved_id_errors for __top): no flattened
+        # node/gate id may collide with this region's pseudo-result key or synthetic
+        # gate id, else a run-state key double-produces silently.
+        _rv = _loop_vars(_r["origin"])
+        for _rid in (_rv["result"], _rv["exhaust_gate"]):
+            if _rid in _all_ids:
+                die(f"loop region '{_r['origin']}': a node/gate id collides with its "
+                    f"reserved key/gate id '{_rid}'", 1)
+        _rloop = _r["loop"]
+        _roe = (_rloop.get("on_exhaust")
+                if isinstance(_rloop.get("on_exhaust"), dict) else None)
+        if _roe is None:
+            continue
+        _oe_errs = loop_on_exhaust_errors(_rloop, wf.get("inputs") or {})
+        if _oe_errs:
+            die(f"loop region '{_r['origin']}' on_exhaust: {_oe_errs[0]}", 1)
+        if _roe.get("action") != "escalate":
+            continue
+        _rbody = set(_rloop.get("body") or [])
+        _rlast = next((nid for nid in reversed(order) if nid in _rbody), None)
+        if _rlast is None:
+            die(f"loop region '{_r['origin']}' on_exhaust: escalate requires a "
+                f"non-empty body", 1)
+        _vars = _loop_vars(_r["origin"])
+        _sg = synth_loop_exhaust_gate(_roe)
+        _sg["id"] = _vars["exhaust_gate"]
+        _sg["after"] = _rlast
+        _sg_pol = gate_policy_errors([_sg])
+        if _sg_pol:
+            die(f"loop region '{_r['origin']}' on_exhaust: {_sg_pol[0][1]}", 1)
+        if effective_gate_mode == "auto":
+            _sg_head = gate_headless_errors([_sg])
+            if _sg_head:
+                die(f"loop region '{_r['origin']}' on_exhaust: {_sg_head[0][1]} "
+                    f"(the compiler-emitted '{_vars['exhaust_gate']}' gate rides the "
+                    f"same headless rails as authored gates)", 1)
+        gates_after.setdefault(_rlast, []).insert(0, _sg)
+        synth_region_gate_when[_sg["id"]] = (
+            "${!(" + _vars["result"] + ".output.converged)}")
+
     # --- S-LOOP: loop body must stay contiguous (pre-emit, mirrors validate) ---
     # A split body silently drops the do/while scaffold; die before any emit so
-    # compile and validate can never disagree.
-    contig_err = loop_contiguity_error(order, node_by_id, gates_after, loop)
-    if contig_err:
-        die(contig_err, 1)
+    # compile and validate can never disagree. Runs PER region — an inlined child
+    # loop whose body is interleaved by parent nodes is caught here with a clear
+    # message (before the generic isolation fail-loud below).
+    for _r in loop_regions:
+        contig_err = loop_contiguity_error(order, node_by_id, gates_after, _r["loop"])
+        if contig_err:
+            die(contig_err if _r["origin"] == "__top"
+                else f"loop region '{_r['origin']}': {contig_err}", 1)
 
     # --- SUBGRAPH bounded convergence: each group occupies a contiguous topo window
     # (no interleaved out-of-group node, no hard/human_approval gate between its
@@ -3452,8 +3636,8 @@ def main():
     # do/while scaffold would be SILENTLY dropped (loop runs exactly once). Die
     # before any emit. (loop_contiguity_error cannot catch this: the member is IN
     # the body, so the window contains no interleaved out-of-body node.)
-    if loop:
-        for b in (loop.get("body") or []):
+    for _r in loop_regions:
+        for b in (_r["loop"].get("body") or []):
             if classes.get(b) == "orchestrator":
                 b_reason = next((c["reason"] for c in classification if c["node"] == b), "")
                 die(f"loop.body node '{b}' classifies as an orchestrator checkpoint "
@@ -3578,15 +3762,27 @@ def main():
             isinstance(spec, dict) and spec.get("inject_from")
             for spec in ((pruned.get("config") or {}).get("inputs") or {}).values())
 
+    # Each node's owning loop-region origin (or None). The partition flushes at a
+    # region boundary so each region's body forms its OWN segment: a spliced child
+    # loop region is NOT checkpoint-bounded the way a top-level loop is, so without
+    # this flush its do/while would silently merge with adjacent background nodes and
+    # be dropped (the sub-PR-0 spike finding).
+    region_of = {}
+    for _r in loop_regions:
+        for _b in (_r["loop"].get("body") or []):
+            region_of[_b] = _r["origin"]
+
     # --- partition into manifest steps ---
     steps = []
     seg = []
+    seg_region = [None]  # the open segment's loop-region origin (or None)
 
     def flush_segment():
         nonlocal seg
         if seg:
             steps.append({"kind": "segment", "nodes": list(seg)})
             seg = []
+        seg_region[0] = None
 
     for nid in order:
         node = node_by_id[nid]
@@ -3626,7 +3822,14 @@ def main():
             chk["label"] = node.get("name") or humanize_id(nid)
             steps.append(chk)
         else:
+            nr = region_of.get(nid)
+            if seg and nr != seg_region[0]:
+                # Crossing a loop-region boundary (into/out of a region body, or
+                # between two regions) — flush so each region's body is its own
+                # segment (is_loop_seg requires exact node-set equality).
+                flush_segment()
             seg.append(nid)
+            seg_region[0] = nr
         for g in gates_after.get(nid, []):
             if g.get("type") == "human_approval" or g.get("severity", "hard") == "hard":
                 flush_segment()
@@ -3638,6 +3841,8 @@ def main():
                 # converged) skips the gate.
                 if synth_gate is not None and g is synth_gate:
                     gstep["when"] = "${!(loop.output.converged)}"
+                elif g.get("id") in synth_region_gate_when:
+                    gstep["when"] = synth_region_gate_when[g["id"]]
                 gstep["label"] = g.get("name") or humanize_id(g["id"])
                 steps.append(gstep)
     flush_segment()
@@ -3662,6 +3867,24 @@ def main():
                 f"background segment for on_exhaust to attach{extra} — separate "
                 f"the adjacent background node(s) from the body with a hard "
                 f"gate or an orchestrator checkpoint", 1)
+
+    # --- FAIL-LOUD (sub-PR-0 spike): every loop region must isolate ---
+    # Each region's body must form EXACTLY one background segment, else is_loop_seg's
+    # set-equality silently fails and the region's do/while is dropped with no error
+    # (the legacy single-loop engine returned 0 in this case). The region-boundary
+    # flush above keeps a region contiguous; this asserts it actually isolated.
+    for _r in loop_regions:
+        _body = set(_r["loop"].get("body") or [])
+        if not _body:
+            continue
+        if not any(s["kind"] == "segment" and set(s["nodes"]) == _body for s in steps):
+            _merged = next((s for s in steps if s["kind"] == "segment"
+                            and _body < set(s["nodes"])), None)
+            _extra = (f" (it shares segment[{','.join(_merged['nodes'])}] with "
+                      f"non-body background node(s))" if _merged else "")
+            die(f"loop region '{_r['origin']}' did not isolate into its own "
+                f"background segment{_extra} — its do/while would be silently "
+                f"dropped; separate the body with a checkpoint", 1)
 
     # Spill substitution happens ONLY at the dispatcher's threading boundary, so
     # a consumer in the SAME segment as the producer reads the in-memory VALUE
@@ -3804,7 +4027,14 @@ def main():
                     "exit": info["exit"],
                 })
             js, needs, produces = emit_segment_js(
-                seg_nodes, wf, loop, seg_index, seg_converge)
+                seg_nodes, wf, loop_regions, seg_index, seg_converge)
+            # The loop region (if any) whose body this segment IS — drives is_loop +
+            # the per-region on_exhaust manifest record below.
+            _seg_region = next(
+                (r for r in loop_regions
+                 if set(step["nodes"]) == set(r["loop"].get("body") or [])
+                 and r["loop"].get("body")),
+                None)
             fname = f"seg-{seg_index}.js"
             # Hash the FULL emitted body (the meta header is reproducible — name,
             # description, phases are pure functions of the def; no timestamp/env).
@@ -3823,7 +4053,7 @@ def main():
                 # (.claude/workflow-defs/<name>/<script>).
                 "script": f".compiled/{fname}",
                 "nodes": step["nodes"],
-                "is_loop": bool(loop) and set(step["nodes"]) == set((loop or {}).get("body") or []),
+                "is_loop": _seg_region is not None,
                 "needs": needs,
                 "produces": produces,
                 # Per-node IO contract for every produced node (topo order) —
@@ -3860,15 +4090,24 @@ def main():
             # the `loop` pseudo-result's IO contract (check-step-io validates
             # the committed value; run-step args keys its carry seeding off
             # this record).
-            if manifest_step["is_loop"] and isinstance(
-                    (loop or {}).get("on_exhaust"), dict):
-                _oe = loop["on_exhaust"]
+            if _seg_region is not None and isinstance(
+                    _seg_region["loop"].get("on_exhaust"), dict):
+                _rloop = _seg_region["loop"]
+                _oe = _rloop["on_exhaust"]
+                _rkey = _loop_vars(_seg_region["origin"])["result"]
                 oe_rec = {"action": _oe.get("action")}
                 if _oe.get("action") == "escalate":
-                    oe_rec["carry_vars"] = sorted((loop.get("carry") or {}).keys())
+                    oe_rec["carry_vars"] = sorted((_rloop.get("carry") or {}).keys())
                     if _oe.get("notes_input"):
                         oe_rec["notes_input"] = _oe["notes_input"]
-                    manifest_step["io"][LOOP_RESULT_ID] = LOOP_RESULT_IO
+                    manifest_step["io"][_rkey] = LOOP_RESULT_IO
+                    # The dispatcher's --extend reseed reads carry from this region's
+                    # pseudo-result key. __top keeps the legacy 'loop' default (key
+                    # OMITTED → byte-identical); a child region stamps its namespaced
+                    # key so run-step never seeds from the wrong (or a coexisting
+                    # parent) loop result.
+                    if _seg_region["origin"] != "__top":
+                        manifest_step["loop_result_key"] = _rkey
                 manifest_step["on_exhaust"] = oe_rec
             _seg_labels = {nid: (node_by_id[nid].get("name") or humanize_id(nid))
                            for nid in step["nodes"]}
