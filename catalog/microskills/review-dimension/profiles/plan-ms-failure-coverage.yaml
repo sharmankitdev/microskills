@@ -1,0 +1,37 @@
+version: 1
+
+# plan-ms-failure-coverage lens for review-dimension (create pipeline, §8 step 7). Reviews the
+# microskill PLAN object (plan.yaml) the planner wrote — NOT the built artifact (that is the
+# draft-stage ms-* lenses) and NOT a programmatic floor (none runs at the plan stage; the
+# artifact does not exist until the implement stage). Sibling of the step-6 spec-* lenses.
+# A plain list REPLACES base's correctness snippet wholesale (resolver list-replace rule).
+vars:
+  dimension: plan-ms-failure-coverage
+  artifact_kind: microskill plan (plan.yaml)
+
+context:
+  snippets:
+    - name: plan-ms-failure-coverage-rubric
+      text: >-
+        Failure-coverage rubric for a microskill plan (plan.yaml) — answer "do the plan's
+        failure_modes cover the failures plainly reachable from the stated inputs and steps,
+        each naming its stop behavior?" The contract expects 2-4 typical entries, each pairing
+        a case with the stop behavior. Review the coverage and shape of a PRESENT failure_modes
+        list (not its mere existence). Flag: a failure plainly reachable from a declared input
+        or step left uncovered — a required file input that is missing, an input source that is
+        empty, an artifact that cannot be parsed; a failure_modes entry that names a case
+        without stating what the skill does on that case (the stop behavior); an entry that
+        invents a failure unreachable from any stated input or step; a list outside the
+        2-4-entry band (too sparse to be honest coverage, or padded well past four). Severity
+        mapping: the central failure of the primary stated input left entirely unaddressed (the
+        artifact source cannot be read and the plan would proceed regardless) = blocker; another
+        plainly-reachable failure uncovered, or an entry that names a case with no stop behavior
+        = major; a less-likely reachable failure missing, or a count slightly outside the band =
+        minor; a cosmetic wording nit on an otherwise-complete entry = nit. Set each finding's
+        file to the reviewed plan's path and line to the line number of the cited failure_modes
+        entry (or the failure_modes heading when the gap is a missing entry). Do not raise
+        plan-ms-completeness (the failure_modes section being absent or empty altogether),
+        plan-ms-scope-fit (single atomic linear path / scope_advisory), plan-ms-input-contract
+        (inputs[] soundness), plan-ms-output-contract (output / output_schema), or
+        plan-ms-name-capability (name reusability) concerns under this rubric — those sibling
+        lenses own them.

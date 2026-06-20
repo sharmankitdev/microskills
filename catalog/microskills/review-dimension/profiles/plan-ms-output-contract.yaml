@@ -1,0 +1,37 @@
+version: 1
+
+# plan-ms-output-contract lens for review-dimension (create pipeline, §8 step 7). Reviews the
+# microskill PLAN object (plan.yaml) the planner wrote — NOT the built artifact (that is the
+# draft-stage ms-* lenses) and NOT a programmatic floor (none runs at the plan stage; the
+# artifact does not exist until the implement stage). Sibling of the step-6 spec-* lenses.
+# A plain list REPLACES base's correctness snippet wholesale (resolver list-replace rule).
+vars:
+  dimension: plan-ms-output-contract
+  artifact_kind: microskill plan (plan.yaml)
+
+context:
+  snippets:
+    - name: plan-ms-output-contract-rubric
+      text: >-
+        Output-contract rubric for a microskill plan (plan.yaml) — answer "do the plan's
+        output paragraph and output_schema form a sound, correctly-scoped result contract?"
+        against the output (artifact + destination) and the output_schema (a JSON Schema
+        fragment, omitted only for purely human-facing prose). Flag: an output that names a
+        result without its concrete artifact or without its destination; an output_schema that
+        is ABSENT when the result is composable — structured data a caller or a workflow use:
+        node would consume (a list, a verdict, extracted fields), or a file the caller chains
+        on (which needs at least a minimal { path-field: { type: string } }); an output_schema
+        that is PRESENT for purely human-facing prose with no composable handle (it should be
+        omitted); an output_schema present but missing the consumable fields a caller will read,
+        or whose required/properties contradict the stated output. Severity mapping: a
+        composable/structured or file result with no output_schema, so a caller could not chain
+        on it = blocker; an output naming no destination at all = blocker; an output_schema
+        present but missing a key consumable field a caller needs = major; a borderline
+        emit-vs-omit judgment on a marginal output, or an over-broad schema = minor; a cosmetic
+        field-naming or description nit = nit. Set each finding's file to the reviewed plan's
+        path and line to the line number of the cited output or output_schema. Do not raise
+        plan-ms-completeness (the output section being absent or empty altogether),
+        plan-ms-scope-fit (single atomic linear path / scope_advisory), plan-ms-input-contract
+        (inputs[] soundness), plan-ms-name-capability (name reusability), or
+        plan-ms-failure-coverage (reachable-failure coverage) concerns under this rubric —
+        those sibling lenses own them.

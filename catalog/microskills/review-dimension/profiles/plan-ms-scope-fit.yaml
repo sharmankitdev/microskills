@@ -1,0 +1,39 @@
+version: 1
+
+# plan-ms-scope-fit lens for review-dimension (create pipeline, §8 step 7). Reviews the
+# microskill PLAN object (plan.yaml) the planner wrote — NOT the built artifact (that is the
+# draft-stage ms-* lenses) and NOT a programmatic floor (none runs at the plan stage; the
+# artifact does not exist until the implement stage). Sibling of the step-6 spec-* lenses.
+# A plain list REPLACES base's correctness snippet wholesale (resolver list-replace rule).
+vars:
+  dimension: plan-ms-scope-fit
+  artifact_kind: microskill plan (plan.yaml)
+
+context:
+  snippets:
+    - name: plan-ms-scope-fit-rubric
+      text: >-
+        Scope-fit rubric for a microskill plan (plan.yaml) — answer "is this plan ONE atomic
+        task on a single straight linear path?" A microskill is the atomic unit: a single
+        straight path from one entry to one exit, no branch, conditional, loop, retry, or
+        parallel track (that control flow lives in the workflow layer). Flag: a step that
+        hides a branch, conditional, loop, retry, or parallel track — the plan must instead
+        carry scope_advisory.kind promote, and a step that rationalizes the branch away as an
+        absorbed abstraction is the same defect; a plan whose steps decompose into two or more
+        independent straight-line tasks — the plan must instead carry scope_advisory.kind
+        split with candidate names; an internally contradictory requirement (a single task
+        that must both send and receive by mode, or mutually exclusive outputs) flattened into
+        one plan by picking a side rather than surfaced as scope_advisory.kind promote; a
+        scope_advisory that is present but wrong (split where it should promote, or present
+        where the task genuinely fits one atomic microskill). Severity mapping: a smuggled
+        branch/loop/parallel track, or a flattened contradiction a builder would have to
+        resolve = blocker (the unit is not atomic / not linear and cannot be a microskill); a
+        borderline two-tasks-in-one a profile could not separate, needing a human split
+        decision = major; a step doing slightly too much yet still strictly linear = minor; a
+        cosmetic phrasing overreach around a genuinely single action = nit. Set each finding's
+        file to the reviewed plan's path and line to the line number of the cited step or the
+        scope_advisory. Do not raise plan-ms-completeness (section presence / thinness),
+        plan-ms-input-contract (implied or invented inputs), plan-ms-output-contract
+        (output_schema / composability), plan-ms-name-capability (name reusability), or
+        plan-ms-failure-coverage (reachable-failure coverage) concerns under this rubric —
+        those sibling lenses own them.

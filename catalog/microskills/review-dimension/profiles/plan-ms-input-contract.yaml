@@ -1,0 +1,38 @@
+version: 1
+
+# plan-ms-input-contract lens for review-dimension (create pipeline, §8 step 7). Reviews the
+# microskill PLAN object (plan.yaml) the planner wrote — NOT the built artifact (that is the
+# draft-stage ms-* lenses) and NOT a programmatic floor (none runs at the plan stage; the
+# artifact does not exist until the implement stage). Sibling of the step-6 spec-* lenses.
+# A plain list REPLACES base's correctness snippet wholesale (resolver list-replace rule).
+vars:
+  dimension: plan-ms-input-contract
+  artifact_kind: microskill plan (plan.yaml)
+
+context:
+  snippets:
+    - name: plan-ms-input-contract-rubric
+      text: >-
+        Input-contract rubric for a microskill plan (plan.yaml) — answer "is the plan's
+        inputs[] list complete and sound against what the requirement implies?" Review the
+        soundness of the inputs[] entries (their presence-given-the-requirement, requiredness,
+        type, default, and description), NOT whether the inputs section as a whole exists. Flag:
+        an input the requirement explicitly states or obviously implies that is MISSING from
+        inputs[] — a task that writes a file implies an output path, a task that classifies an
+        artifact implies the artifact's source; an omitted implied input is a plan defect. Flag
+        an INVENTED input the requirement does not imply. Flag an incoherent contract on a
+        declared input: required true paired with a non-null default (a required input has no
+        default), a type that does not match what the description says the input carries, or a
+        requiredness that contradicts the step that consumes it. Flag a default mis-routed into
+        config.axes when input defaults must travel through inputs[].default. Severity mapping:
+        a missing requirement-implied input, or an invented input a builder would wire into a
+        wrong contract = blocker; an incoherent requiredness/type/default a builder must guess
+        to resolve = major; a thin or borderline default/description on an otherwise-sound input
+        = minor; a cosmetic naming or wording nit on an input = nit. Set each finding's file to
+        the reviewed plan's path and line to the line number of the cited input entry. Do not
+        raise plan-ms-completeness (the inputs section being absent or empty altogether),
+        plan-ms-scope-fit (single atomic linear path / scope_advisory), plan-ms-output-contract
+        (output / output_schema), plan-ms-name-capability (the component name — note this lens
+        governs input soundness, name-capability never governs input names), or
+        plan-ms-failure-coverage (reachable-failure coverage) concerns under this rubric —
+        those sibling lenses own them.
