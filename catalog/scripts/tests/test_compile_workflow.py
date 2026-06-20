@@ -320,15 +320,23 @@ def test_real_workflow_create_compiles():
 
 
 def test_real_build_workflow_from_plan_compiles():
-    # The shared build half extracted from workflow-create: the implement/evaluate
-    # loop segment, its on_exhaust escalation gate (conditional — skipped when
-    # the loop converges), and the canonical finalize orchestrator node. No plan
-    # node and no authored gate (those live in the caller).
+    # The shared build half extracted from workflow-create, rewired (§8 step 7) to
+    # the host-inline review→verify→synthesize loop: ONE background segment holding
+    # the whole RVS body (implement → floor → parallel review fan-out → collect →
+    # in-loop for_each verify → synth), its on_exhaust escalation gate (conditional —
+    # skipped when the loop converges), and the canonical finalize orchestrator node.
+    # No plan node and no authored gate (those live in the caller).
     rc, data, out, err = run(REAL_DEFS, "build-workflow-from-plan")
     assert rc == 0, err
     assert data["segments"] == 1
-    assert data["sequence"] == [
-        "segment[implement,evaluate]", "gate", "orchestrator_node"]
+    assert data["sequence"][1:] == ["gate", "orchestrator_node"]
+    seg = data["sequence"][0]
+    assert seg.startswith("segment[implement,") and "verify,synth]" in seg
+    for nid in ("floor", "collect", "verify", "synth",
+                "review_wf_dag_decomposition_correctness", "xreview_duplicate_capability"):
+        assert nid in seg, f"{nid} missing from RVS loop segment: {seg}"
+    # the single-LLM evaluator is retired here (D3)
+    assert "evaluate" not in seg
 
 
 # --- Nested-workflow profile passthrough -------------------------------------

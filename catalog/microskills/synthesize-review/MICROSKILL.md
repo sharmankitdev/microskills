@@ -1,5 +1,6 @@
 ---
 name: synthesize-review
+base: true
 description: >-
   Use when you have verified code-review findings and need them consolidated into
   one report. Joins per-finding verdicts to their findings by id, drops

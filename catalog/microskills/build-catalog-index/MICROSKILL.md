@@ -1,5 +1,6 @@
 ---
 name: build-catalog-index
+base: true
 description: Use when a cross-artifact review needs catalog-wide grounding — enumerate the component catalog (and any vendored custom components) into a deterministic catalog-index.json the duplicate-capability, naming-collision, and reverse-consumer dimensions read, by running the build-catalog-index script. Produces the index path plus the component and consumer-edge counts.
 ---
 

@@ -1,0 +1,12 @@
+version: 1
+# Workflow-draft COMBINED adversarial-verify overlay for verify-finding (§8 step 7).
+# The host-inline RVS runs ONE verify fan-out over the UNION of the workflow-draft
+# findings (need the draft bundle) and the cross-artifact findings (need the catalog
+# index), so the seat reads the draft bundle AND the frozen catalog-index.json,
+# concatenated, as the single artifact_path — covering both finding kinds and keeping
+# the cross refute reproducible (verify reads the same index the cross panel saw).
+# verify-finding has no context_path slot, so the index rides inside artifact_path
+# (mirrors verify-finding/profiles/cross-artifact.yaml). Var-only: inputs (finding +
+# artifact_path materialize:file + seat), runtime, and output_schema inherit from base.
+vars:
+  artifact_kind: workflow draft bundle (WORKFLOW.yaml + profiles/*.yaml, concatenated) followed by the catalog index (catalog-index.json), concatenated

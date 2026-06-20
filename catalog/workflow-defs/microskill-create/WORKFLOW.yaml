@@ -48,6 +48,11 @@ vars:
   finalize_name_source: <name> from the plan
   finalize_dest_subdir: microskills
   finalize_staged_layout: MICROSKILL.md + profiles/*
+  # The quality-node refs the shared finalize-protocol presents before vendoring.
+  # microskill-create keeps the single-LLM evaluator (its RVS rewire is sub-PR 5),
+  # so these resolve to the evaluate node — byte-identical to the pre-vars snippet.
+  finalize_verdict_ref: ${evaluate.output.pass}
+  finalize_issues_ref: ${evaluate.output.issues}
   finalize_epilogue: >-
     done. Print a summary: the harness/ source path, the synced .claude/ paths +
     generated shim .claude/commands/<name>.md, and the manifest entry. Do not claim

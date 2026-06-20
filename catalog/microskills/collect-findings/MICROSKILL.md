@@ -1,5 +1,6 @@
 ---
 name: collect-findings
+base: true
 description: "Use after a review workflow's per-dimension reviews complete, when you have optional dimension result objects (base names six code-review dimensions; other profiles declare their own input names), each shaped {dimension, findings}, and need them fanned in. Concatenates the supplied findings arrays into one flat list — flattening any input that is itself an array of result objects into its elements first — stamps each finding with its source dimension, assigns workflow-wide global_ids, and drops exact duplicates sharing file, line, and title. Produces a single JSON object {findings, count}."
 ---
 
