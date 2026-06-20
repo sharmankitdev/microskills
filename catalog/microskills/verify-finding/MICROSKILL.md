@@ -1,5 +1,6 @@
 ---
 name: verify-finding
+base: true
 description: Use when a review pipeline holds a single finding or claim and the artifact it cites — the active profile's artifact kind, e.g. a unified diff (base) or a design/requirements document — and you need to adversarially test whether that finding actually holds. Locates the cited evidence, builds the strongest case both for and against the finding using only the artifact evidence, weighs them, and renders a judgment. Produces a single JSON object with finding_id, verdict (confirmed, refuted, or needs_human), rationale, adjusted_severity, and false_positive.
 ---
 

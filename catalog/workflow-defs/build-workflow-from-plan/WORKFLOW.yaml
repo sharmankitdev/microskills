@@ -2,12 +2,12 @@ version: 1
 name: build-workflow-from-plan
 base: true
 description: >
-  Build a workflow from an already-approved plan — the implement ↔ evaluate loop plus the
-  canonical finalize (vendor into harness/, upsert the manifest, sync, compile). The shared
-  build half of workflow-create: callers (workflow-create, decompose-monolith-orchestrator)
-  run their own plan + approval gate + provision, then invoke this with the approved plan.
-  Has no plan node, no approval gate, and no provision — it starts from plan_path, so there
-  is exactly one finalize and the two creators cannot drift.
+  Build a workflow from an already-approved plan — a self-correcting implement→review→verify→
+  synthesize (RVS) loop plus the canonical finalize (vendor into harness/, upsert the manifest,
+  sync, compile). The shared build half of workflow-create: callers (workflow-create,
+  decompose-monolith-orchestrator) run their own plan + approval gate + provision, then invoke
+  this with the approved plan. Has no plan node, no approval gate, and no provision — it starts
+  from plan_path, so there is exactly one finalize and the two creators cannot drift.
 
 # Caller-supplied inputs. plan_path/name/requirement are produced by the caller's own plan;
 # the harness_* plumbing mirrors workflow-create's finalize so the vendoring is identical.
@@ -15,7 +15,7 @@ inputs:
   plan_path:
     type: string
     required: true
-    description: Path to the approved WORKFLOW.yaml-design plan file under staging_dir.
+    description: Path to the approved WORKFLOW.yaml-design plan file under staging_dir; the implementer Reads it.
   name:
     type: string
     required: true
@@ -25,8 +25,10 @@ inputs:
     required: true
     materialize: file
     description: >-
-      The originating requirement — the evaluator's semantic ground truth.
-      task-evaluate Reads the path.
+      The originating requirement — the review panel's semantic ground truth (threaded to each
+      review dimension as context_path; an absent grounding makes a fidelity dimension raise a
+      blocker). The on_exhaust "extend" choice appends human guidance here, so the next round's
+      review re-reads it and the resulting findings steer the next implement pass.
   harness_root:
     type: string
     required: false
@@ -36,27 +38,45 @@ inputs:
     type: string
     required: false
     default: harness/harness.yaml
-    description: Harness manifest. Finalize upserts the component's entry here (source custom) before syncing.
+    description: Harness manifest. Finalize upserts the component's entry here (source custom) before syncing; the catalog-index node also folds its source:custom components into the cross-artifact grounding index.
   staging_dir:
     type: string
     required: true
-    description: Sandbox dir; the implementer writes <staging_dir>/<name>/ before finalize moves it.
+    description: Sandbox dir; the implementer writes <staging_dir>/<name>/ before finalize moves it, and the review bundle + evidence are written under here.
+  catalog_root:
+    type: string
+    required: false
+    default: .claude
+    description: >-
+      Component registry the cross-artifact dimensions (duplicate-capability / naming-collision /
+      reverse-consumer) compare the draft against. Defaults to the deployed runtime (.claude); a
+      caller/test can point it at another catalog-shaped root (microskills/ + workflow-defs/).
 
 imports:
   - microskills/task-implement
-  - microskills/task-evaluate
+  - microskills/bundle-draft
+  - microskills/build-catalog-index
+  - microskills/run-validators
+  - microskills/review-dimension
+  - microskills/collect-findings
+  - microskills/verify-finding
+  - microskills/synthesize-review
 
 # Parameters for the SHARED finalize protocol (_snippets/finalize-protocol.md,
 # included below via {{snippet:finalize-protocol}} — snippets resolve before vars,
 # so these {{...}} tokens parameterize the shared prose). microskill-create carries
 # the microskill-domain twin of this block; the protocol text itself lives in ONE
-# place so the two finalizes cannot drift.
+# place so the two finalizes cannot drift. finalize_verdict_ref/finalize_issues_ref
+# name the loop's terminal quality node — here the RVS synth (microskill-create still
+# names its evaluate node until its own RVS rewire).
 vars:
   finalize_kind: workflow
   finalize_plan_ref: ${workflow.inputs.plan_path}
   finalize_name_source: <name> = ${workflow.inputs.name}
   finalize_dest_subdir: workflow-defs
   finalize_staged_layout: WORKFLOW.yaml + profiles/* + references/* — do NOT include any .compiled/ dir
+  finalize_verdict_ref: ${synth.output.verdict}
+  finalize_issues_ref: ${synth.output.findings}
   finalize_epilogue: >-
     proceed. FINALLY, now that sync has vendored the source into
     .claude/workflow-defs/<name>/, run `.claude/scripts/compile-workflow <name>` to
@@ -65,56 +85,185 @@ vars:
     .compiled/ was regenerated. Do not claim success on an unresolved sync conflict
     or a failed compile.
 
-# No plan node and no approval gate (those live in the caller).
+# No plan node and no approval gate (those live in the caller). The single loop is the
+# self-correcting implement→review→verify→synthesize stage; finalize is the only checkpoint,
+# so the loop body owns its own background segment (on_exhaust body-own-segment rule).
 nodes:
-  # The implement ↔ evaluate loop assembling and validating the WORKFLOW.yaml
-  # from the approved plan.
+  # ════ The implement-stage RVS loop body (ALL background; contiguous; listed by id /
+  #      GENERATED id in loop.body) ═══════════════════════════════════════════════════════
+
+  # Fix pass. Round 1 receives carry null → a fresh implementation; later rounds receive the
+  # surviving findings from the prior round's synth and remediate them. Reads the approved plan.
   - id: implement
     use: task-implement
     customize: { profile: workflow }
     inputs:
       plan_path: ${workflow.inputs.plan_path}
       staging_dir: ${workflow.inputs.staging_dir}
-      last_findings: ${loop.carry.last_findings}
+      last_findings: ${loop.carry.findings}      # null on round 1 → fresh pass
 
-  - id: evaluate
-    use: task-evaluate
+  # Stage-invariant cross-artifact grounding. Deterministic pure-script index of the existing
+  # component registry; no dependency on implement → rank 0, runs in PARALLEL with implement.
+  # Re-running it per round is cheap (the registry doesn't change mid-build) and keeps the
+  # whole RVS inside one segment (a pre-loop background node would merge the segments and break
+  # the on_exhaust body-own-segment rule, since this def has no pre-loop checkpoint).
+  - id: catalog_index
+    use: build-catalog-index
+    depends_on: []
+    inputs:
+      catalog_root: ${workflow.inputs.catalog_root}
+      output_dir: ${workflow.inputs.staging_dir}
+      harness_path: ${workflow.inputs.harness_yaml}
+
+  # Concatenate the staged draft files into ONE review bundle with per-file provenance markers,
+  # so the single-artifact_path review/verify contract holds. Deterministic; depends on implement.
+  - id: bundle
+    use: bundle-draft
+    inputs:
+      staging_paths: ${implement.output.staging_paths}
+      out: ${workflow.inputs.staging_dir}/review-bundle.md
+
+  # The cross-artifact VERIFY bundle: the same draft bundle with the catalog index appended,
+  # because verify-finding has no context_path slot — the cross seat's grounding rides inside
+  # artifact_path. The wf-draft findings tolerate the appended index as extra context.
+  - id: bundle_xref
+    use: bundle-draft
+    inputs:
+      staging_paths: ${implement.output.staging_paths}
+      append: ${catalog_index.output.index_path}
+      out: ${workflow.inputs.staging_dir}/review-bundle-xref.md
+
+  # The deterministic floor: validate-workflow + compile-workflow over the staged draft. Output
+  # {dimension: deterministic-floor, findings:[{severity blocker|warn,…}]}, no pass. These are
+  # deterministic facts — they BYPASS verify and join at synth as pre-confirmed (floor_findings).
+  - id: floor
+    use: run-validators
     customize: { profile: workflow }
     inputs:
       staging_paths: ${implement.output.staging_paths}
-      requirement_path: ${workflow.inputs.requirement_path}
-      plan_path: ${workflow.inputs.plan_path}
       name: ${workflow.inputs.name}
       staging_base: ${workflow.inputs.staging_dir}
 
-  # THE canonical workflow finalize. Vendor the approved workflow into harness/
-  # (source of truth), upsert the manifest, let sync-harness generate the
-  # .claude/ runtime copy + shim + ledger, THEN compile-workflow to populate
-  # .compiled/ (sync does not compile). Shared by every creator so the vendoring
-  # can never diverge. The prompt is the SHARED finalize protocol (one snippet,
-  # parameterized by the vars: block above) — edit _snippets/finalize-protocol.md,
-  # not a per-def copy; its ${implement.output...}/${evaluate.output...} refs
-  # imply the dependency edges.
+  # The artifact-stage review panel — ONE expand template → 7 generated review_<dim> siblings,
+  # each running review-dimension under that wf dimension's rubric profile. They depend only on
+  # bundle, so they share a rank and the engine emits them as ONE parallel([...]) batch inside
+  # the do/while (sub-PR 1). context_path = the requirement (the panel's semantic ground truth).
+  - id: review
+    use: review-dimension
+    customize: { profile: "{{each.item}}" }
+    phase_group: review
+    expand:
+      over:
+        - wf-dag-decomposition-correctness
+        - wf-guard-logic-intent
+        - wf-prompt-task-fidelity
+        - wf-gate-prompt-options-quality
+        - wf-profile-overlay-coherence
+        - wf-spill-materialize-judgment
+        - wf-output-schema-downstream-fit
+    inputs:
+      artifact_path: ${bundle.output.bundle_path}
+      context_path: ${workflow.inputs.requirement_path}
+
+  # The cross-artifact review panel — a SEPARATE expand template (different context_path: the
+  # catalog index) → 3 generated xreview_<dim> siblings. Same draft bundle as artifact_path; the
+  # catalog index as the catalog-wide grounding each cross dimension compares the draft against.
+  - id: xreview
+    use: review-dimension
+    customize: { profile: "{{each.item}}" }
+    phase_group: review
+    expand:
+      over:
+        - duplicate-capability
+        - naming-collision
+        - reverse-consumer
+    inputs:
+      artifact_path: ${bundle.output.bundle_path}
+      context_path: ${catalog_index.output.index_path}
+
+  # Fan the WHOLE review panel (7 wf + 3 cross) into one combined, dimension-stamped,
+  # globally-identified, deduplicated list. The 7 wf siblings ride via inputs_each: review; the
+  # 3 cross siblings are wired explicitly (inputs_each + explicit inputs coexist). The
+  # wf-create-all profile registers all 10 input names. ONE collect → one findings array → one
+  # verify, because collect-findings cannot losslessly merge two already-collected sets.
+  - id: collect
+    use: collect-findings
+    customize: { profile: wf-create-all }
+    inputs_each: review
+    inputs:
+      duplicate_capability: ${xreview_duplicate_capability.output}
+      naming_collision: ${xreview_naming_collision.output}
+      reverse_consumer: ${xreview_reverse_consumer.output}
+
+  # Adversarially verify each collected REVIEW finding (floor findings bypass verify). for_each
+  # fan-out — newly legal inside an UNGUARDED loop body (sub-PR 1): it composes as its own
+  # await parallel(map(...)) rank inside the do/while, run EVERY round so false positives are
+  # dropped before the next fix. artifact_path = the draft bundle WITH the catalog index appended,
+  # so both wf-draft findings (need the bundle) and cross findings (need the index) are grounded.
+  - id: verify
+    use: verify-finding
+    customize: { profile: workflow-draft-xref }
+    for_each: ${collect.output.findings}
+    as: finding
+    max_parallel: 4
+    inputs:
+      finding: ${finding}
+      artifact_path: ${bundle_xref.output.bundle_path}
+
+  # Synthesize floor ∪ verified-review survivors into ONE whole-branch verdict + ranked must-fix.
+  # The create profile folds the deterministic floor findings as pre-confirmed (floor_findings),
+  # joins the verify verdicts to the review findings (dropping refuted / false positives), merges
+  # duplicates, re-ranks, and maps severities to the verdict. Its REPLACED schema RETAINS findings —
+  # the load-bearing loop carry (surviving findings seed the next implement pass).
+  - id: synth
+    use: synthesize-review
+    customize: { profile: create }
+    inputs:
+      findings: ${collect.output.findings}
+      verifications: ${verify.items}
+      floor_findings: ${floor.output.findings}
+      report_path: ${workflow.inputs.staging_dir}/evidence/review.md
+
+  # ════ post-loop ═══════════════════════════════════════════════════════════════════════════
+
+  # THE canonical workflow finalize. Vendor the approved workflow into harness/ (source of truth),
+  # upsert the manifest, let sync-harness generate the .claude/ runtime copy + shim + ledger, THEN
+  # compile-workflow to populate .compiled/ (sync does not compile). Shared by every creator so the
+  # vendoring can never diverge. The prompt is the SHARED finalize protocol (one snippet,
+  # parameterized by the vars: block above) — edit _snippets/finalize-protocol.md, not a per-def
+  # copy; its ${implement.output...}/${synth.output...} refs imply the dependency edges.
   - id: finalize
     delegation: orchestrator
     prompt: "{{snippet:finalize-protocol}}"
 
-# Guarded loop: repeat implement→evaluate until the evaluator passes or the cap.
+# The ONE convergence loop (at most one per workflow — spent here, on the artifact's self-
+# correction). Body = the RVS pipeline by id / GENERATED id, all background use: nodes,
+# contiguous in definition order; nothing precedes implement and finalize (orchestrator) follows,
+# so the body owns its own segment (on_exhaust body-own-segment rule). An overlay that patches
+# the review/xreview `over` lists MUST patch this body in the same overlay.
 loop:
-  while: ${!evaluate.output.pass}
+  until: ${synth.output.verdict == 'approve'}
   max_iters: 3
-  body: [implement, evaluate]
+  body: [implement, catalog_index, bundle, bundle_xref, floor,
+         review_wf_dag_decomposition_correctness, review_wf_guard_logic_intent,
+         review_wf_prompt_task_fidelity, review_wf_gate_prompt_options_quality,
+         review_wf_profile_overlay_coherence, review_wf_spill_materialize_judgment,
+         review_wf_output_schema_downstream_fit,
+         xreview_duplicate_capability, xreview_naming_collision, xreview_reverse_consumer,
+         collect, verify, synth]
   carry:
-    last_findings: ${evaluate.output}
+    findings: ${synth.output.findings}           # surviving findings seed the next implement
+                                                 # pass — RETAINED in the create profile's
+                                                 # replaced schema (without it the carry rides
+                                                 # undefined and every round-2+ fix no-ops).
   on_exhaust:
-    # Cap exhaustion is a verdict, not a budget overrun: delegate it to the
-    # orchestrator instead of letting a still-failing draft flow into finalize.
-    # extend re-runs the loop with the committed carry (guidance appended to the
-    # materialized requirement file); accept proceeds on an explicit human
-    # choice; headless runs PARK resumable here (on_headless: fail — the
-    # do-the-work-overnight, approve-in-the-morning pattern).
+    # Cap exhaustion is a verdict, not a budget overrun: delegate it to the orchestrator instead
+    # of letting a still-failing draft flow into finalize. extend re-runs the loop with the
+    # committed carry (guidance appended to the materialized requirement file → next round's
+    # review re-reads it); accept proceeds on an explicit human choice; headless runs PARK
+    # resumable here (on_headless: fail — the do-the-work-overnight, approve-in-the-morning pattern).
     action: escalate
-    prompt: The implement-evaluate loop hit its round cap with the evaluator still failing - extend with another round budget (optionally with guidance), accept the draft as-is, or abandon?
+    prompt: The implement→review→verify→synthesize loop hit its round cap with the synthesis verdict still requesting changes - extend with another round budget (optionally with guidance), accept the draft as-is, or abandon?
     options: [extend, accept, abandon]
     notes_input: requirement_path
     on_headless: fail

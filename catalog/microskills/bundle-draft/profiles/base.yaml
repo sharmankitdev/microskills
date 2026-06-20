@@ -1,0 +1,23 @@
+version: 1
+
+# Thin script-runner: the body invokes the deterministic bundle-draft helper and
+# returns its stdout summary. staging_paths + out are Required=yes in the table, so
+# the resolver needs them required:true to gather them; append is optional with a
+# null default (no entry). The body runs a Bash command, so Bash must be
+# allowlisted; no Read (the helper does all I/O).
+inputs:
+  staging_paths:
+    required: true
+  out:
+    required: true
+
+runtime:
+  allowed_tools: [Bash]
+  model: haiku
+
+output_schema:
+  type: object
+  required: [bundle_path, file_count]
+  properties:
+    bundle_path: { type: string }
+    file_count: { type: integer }

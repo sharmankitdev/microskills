@@ -69,6 +69,10 @@ microskills:
     source: plugin
   - name: build-catalog-index
     source: plugin
+  # domain: create-pipeline RVS bundling (§8 step 7) — concatenates a staged draft's
+  # files into one review bundle for the host-inline review/verify panel.
+  - name: bundle-draft
+    source: plugin
 workflows:
   - name: microskill-create
     source: plugin

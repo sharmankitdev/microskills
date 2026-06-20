@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""
+bundle-draft — deterministic concatenation of a staged draft's files into ONE
+review bundle with per-file provenance markers (§8 step 7).
+
+Usage:
+  bundle-draft --out <path> [--append <p> ...] <file1> [<file2> ...]
+
+The create-pipeline review/verify dimensions consume a SINGLE artifact_path, but
+task-implement stages a LIST of files. This builder glues those files into one
+bundle so the single-artifact_path contract holds while cross-file reasoning stays
+possible. Each file is emitted under a
+
+  ===== FILE: <path> =====
+
+marker (the path exactly as supplied), then its verbatim content. The review
+rubrics map a finding's `file` back to the real source via these markers, and a
+finding's `line` is the line number WITHIN that file's section (content line 1 =
+source line 1, since the content is copied verbatim).
+
+`--append <p>` files are concatenated AFTER the staged files under the same marker
+form — used to fold the catalog index (catalog-index.json) onto the bundle for the
+cross-artifact verify seat (verify-finding has no context_path slot, so its
+grounding rides inside artifact_path).
+
+Byte-deterministic: input order is preserved; no timestamps or run-varying data.
+
+Output (stdout): JSON {bundle_path, file_count}. file_count counts the STAGED
+(positional) files only — appended grounding files are not draft files.
+Exit codes: 0 ok; 2 environment error (a missing/unreadable input file or an
+unwritable out path — emitted as a JSON {error} on stderr).
+"""
+import argparse
+import json
+import sys
+from pathlib import Path
+
+
+class BundleError(Exception):
+    """An unreadable input file or unwritable out path — surfaced as a JSON
+    {error} + exit 2, never a raw traceback (matches the sibling scripts)."""
+
+
+def _read(path):
+    p = Path(path)
+    try:
+        return p.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        raise BundleError(f"cannot read input file {path}: {e}")
+
+
+def build_bundle(files, appends):
+    """Return the bundle text. Each entry (staged then appended) is one
+    `===== FILE: <path> =====` marker line followed by the file's verbatim
+    content; sections are separated by a blank line. Deterministic in the
+    supplied order."""
+    sections = []
+    for f in list(files) + list(appends):
+        content = _read(f)
+        # Guarantee the marker and the content are newline-separated and the
+        # next marker starts on its own line, without disturbing the file's own
+        # internal byte content (line N of the section == line N of the source).
+        body = content if content.endswith("\n") else content + "\n"
+        sections.append(f"===== FILE: {f} =====\n{body}")
+    return "\n".join(sections)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Concatenate staged draft files into one review bundle.")
+    ap.add_argument("--out", required=True, help="Path the bundle is written to.")
+    ap.add_argument("--append", action="append", default=[],
+                    help="Extra file concatenated AFTER the staged files (repeatable).")
+    ap.add_argument("files", nargs="+", help="Staged draft files, in order.")
+    args = ap.parse_args()
+
+    try:
+        text = build_bundle(args.files, args.append)
+        out = Path(args.out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(text, encoding="utf-8")
+    except BundleError as e:
+        print(json.dumps({"error": str(e)}), file=sys.stderr)
+        sys.exit(2)
+    except OSError as e:
+        print(json.dumps({"error": f"cannot write bundle to {args.out}: {e}"}), file=sys.stderr)
+        sys.exit(2)
+
+    print(json.dumps({"bundle_path": str(out), "file_count": len(args.files)}, indent=2))
+
+
+if __name__ == "__main__":
+    main()

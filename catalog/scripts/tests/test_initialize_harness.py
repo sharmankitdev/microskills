@@ -111,9 +111,14 @@ workflows:
     source: plugin
 """
 
-# Base-tagged catalog components absent from PARTIAL_MANIFEST.
+# Base-tagged catalog components absent from PARTIAL_MANIFEST. The §8-step-7 RVS
+# rewire made build-workflow-from-plan import (and base-tag, for import-closure) the
+# review/verify/synth + floor + grounding + bundling microskills, so the flagship
+# base set a fresh consumer seeds now includes them.
 MISSING_BASE = {"analyze-monolith-orchestrator", "decompose-monolith-orchestrator",
-                "build-workflow-from-plan"}
+                "build-workflow-from-plan", "run-validators", "build-catalog-index",
+                "review-dimension", "collect-findings", "verify-finding",
+                "synthesize-review", "bundle-draft"}
 
 
 def write_manifest(tmp, text):
