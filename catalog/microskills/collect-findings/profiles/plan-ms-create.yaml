@@ -1,0 +1,14 @@
+version: 1
+
+# Microskill PLAN-stage critique fan-in overlay for collect-findings (§8 step 7). Registers
+# the 6 plan-ms-* review-dimension input names the plan-stage RVS panel fans over
+# (review-dimension profiles plan-ms-*). Base's six code-review inputs deep-merge in unused.
+# Each entry is an empty map (declaring the name is the whole point). Names = the plan-ms
+# dimension names with hyphen→underscore (the inputs_each desugar contract).
+inputs:
+  plan_ms_completeness: {}
+  plan_ms_scope_fit: {}
+  plan_ms_input_contract: {}
+  plan_ms_output_contract: {}
+  plan_ms_name_capability: {}
+  plan_ms_failure_coverage: {}

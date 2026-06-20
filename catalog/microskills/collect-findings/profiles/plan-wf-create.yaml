@@ -1,0 +1,14 @@
+version: 1
+
+# Workflow PLAN-stage critique fan-in overlay for collect-findings (§8 step 7). Registers
+# the 6 plan-wf-* review-dimension input names the plan-stage RVS panel fans over
+# (review-dimension profiles plan-wf-*). Base's six code-review inputs deep-merge in unused.
+# Each entry is an empty map (declaring the name is the whole point). Names = the plan-wf
+# dimension names with hyphen→underscore (the inputs_each desugar contract).
+inputs:
+  plan_wf_completeness: {}
+  plan_wf_graph_correctness: {}
+  plan_wf_control_flow: {}
+  plan_wf_reuse_survey: {}
+  plan_wf_scope_fit: {}
+  plan_wf_name_capability: {}
