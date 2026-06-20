@@ -1,3 +1,9 @@
+## [0.32.0](https://github.com/sharmankitdev/microskills/compare/v0.31.0...v0.32.0) (2026-06-20)
+
+### Features
+
+* **workflow:** rewire build-workflow-from-plan to host-inline RVS (§8 step 7 sub-PR 4) ([#36](https://github.com/sharmankitdev/microskills/issues/36)) ([cb22d45](https://github.com/sharmankitdev/microskills/commit/cb22d45b8e27c99e5df2b11474178d1bacb7f01f))
+
 ## [0.31.0](https://github.com/sharmankitdev/microskills/compare/v0.30.0...v0.31.0) (2026-06-20)
 
 ### Features
