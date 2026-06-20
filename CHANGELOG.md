@@ -1,3 +1,9 @@
+## [0.31.0](https://github.com/sharmankitdev/microskills/compare/v0.30.0...v0.31.0) (2026-06-20)
+
+### Features
+
+* **microskill:** plan-critique review/collect/verify profiles (plan-stage RVS) ([#35](https://github.com/sharmankitdev/microskills/issues/35)) ([0c41001](https://github.com/sharmankitdev/microskills/commit/0c410018c09c09aa3411a537a593a8a74e322c63))
+
 ## [0.30.0](https://github.com/sharmankitdev/microskills/compare/v0.29.0...v0.30.0) (2026-06-19)
 
 ### Features
