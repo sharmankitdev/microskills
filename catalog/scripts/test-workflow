@@ -104,6 +104,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import yaml
+
 SCRIPT = Path(__file__).resolve()
 SCRIPTS_DIR = SCRIPT.parent
 PROJECT_ROOT = SCRIPT.parents[2]
@@ -155,6 +157,41 @@ def copy_tree(src, dst, label):
     shutil.copytree(src, dst, ignore=shutil.ignore_patterns(".compiled", "__pycache__"))
 
 
+def wf_import_closure(defs_source, name):
+    """Transitive workflow-def import closure of `name` (EXCLUDING name itself),
+    in deterministic discovery order. A workflow-def import is a BARE entry in a
+    def's `imports:` list that resolves to <defs_source>/<entry>/WORKFLOW.yaml; a
+    `microskills/<name>` entry is a microskill (the whole microskills registry is
+    copied separately) and is skipped, as is any entry that does not name a def
+    in this registry. Recurses so a nested-import def (e.g. microskill-create →
+    refine-requirements / plan-rvs / implement-rvs, each of which the compiler
+    INLINES) brings its whole workflow: closure into the throwaway world and can
+    therefore compile there — without this the world-builder copied only the
+    named def and a nested-import def failed to resolve its children."""
+    defs_source = Path(defs_source)
+    seen = {name}
+    order = []
+    stack = [name]
+    while stack:
+        cur = stack.pop(0)
+        wf = defs_source / cur / "WORKFLOW.yaml"
+        if not wf.is_file():
+            continue
+        try:
+            doc = yaml.safe_load(wf.read_text()) or {}
+        except yaml.YAMLError as e:
+            die(f"could not parse imports of workflow def '{cur}': {e}")
+        for imp in (doc.get("imports") or []):
+            if not isinstance(imp, str) or "/" in imp or imp in seen:
+                continue  # microskills/<name>, non-string, or already queued
+            if not (defs_source / imp / "WORKFLOW.yaml").is_file():
+                continue  # not a workflow def in this registry
+            seen.add(imp)
+            order.append(imp)
+            stack.append(imp)
+    return order
+
+
 def gate_pauses(gate):
     return gate.get("severity", "hard") == "hard"
 
@@ -202,6 +239,14 @@ class Harness:
         self.defs_root.mkdir(parents=True)
         copy_tree(defs_source / self.name, self.defs_root / self.name,
                   f"workflow def '{self.name}'")
+        # Copy the named def's transitive workflow: import closure so a
+        # nested-import def (e.g. microskill-create → refine-requirements /
+        # plan-rvs / implement-rvs) can resolve its inlined children and compile
+        # in the throwaway world. The microskills registry is copied wholesale
+        # below, so only workflow-def imports need this recursive copy.
+        for imp in wf_import_closure(defs_source, self.name):
+            copy_tree(defs_source / imp, self.defs_root / imp,
+                      f"nested workflow def '{imp}'")
         if (defs_source / "_snippets").is_dir():
             copy_tree(defs_source / "_snippets", self.defs_root / "_snippets",
                       "_snippets")

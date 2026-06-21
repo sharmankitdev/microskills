@@ -262,30 +262,39 @@ def main():
         for uk in unresolved_vars:
             add(issues, "warn", "vars", f"unresolved variable '{{{{{uk}}}}}' left intact")
 
-    # --- COMPILE-TIME INLINE: flatten STATIC nested workflows (shared desugar) ---
-    # Mirror compile-workflow: runs FIRST (before expand) so the combined flat graph's
-    # expand:/subgraph: sugar all process uniformly. Needs the component registry, so
-    # it runs only with --defs-root (a single-file validate skips nested-workflow
-    # handling, exactly like the depth/cycle check below). A static (non-for_each)
-    # workflow: node is spliced; a for_each one is left for the runtime. did_inline
-    # gates the subgraph splice's reserved-'__' guard (it minted '__' ids itself).
+    # --- NESTED-WORKFLOW STATIC GOVERNANCE (opaque-node model) ---
+    # validate the AUTHORED graph: a static `workflow:` node stays OPAQUE here. Its
+    # internals are validated when the CHILD def is validated standalone (the CI loop
+    # validates every def), and compile owns the FLATTENED composition. We do NOT
+    # splice the child into `merged`: inlining made validate's downstream ref / fork /
+    # expand checks see the child's post-inline loop pseudo-results (loop_<origin>) and
+    # generated expand siblings, false-blocking the parent and diverging from compile
+    # (compile is authoritative for inlined regions). Instead we run the shared inline
+    # pass on a THROWAWAY copy ONLY to surface its legit static governance — an
+    # unresolvable / un-allowlisted target, a static import cycle, a seam leak, and the
+    # per-region while|until / max_iters / reserved-id checks compile also enforces.
+    # `merged` is left authored, so the depth=1 / import-cycle / required-child-input
+    # checks below run on it directly (nested_workflow_depth_cycle_errors self-inlines
+    # each child internally, so it still computes the retargeted flat-child depth).
+    # nw_did_inline stays False → the subgraph splice's reserved-'__' guard stays armed
+    # (no '__' ids were minted into `merged`).
     nw_did_inline = False
     if isinstance(merged, dict) and args.defs_root:
-        merged, nw_inline_errors, nw_did_inline, _nw_regions = desugar_nested_workflows(
-            merged, Path(args.defs_root))
+        _probe, nw_inline_errors, _nw_di, _nw_regions = desugar_nested_workflows(
+            copy.deepcopy(merged), Path(args.defs_root))
         for ie in nw_inline_errors:
             add(issues, "block", "nested-workflow", ie)
         if nw_inline_errors:
             print(json.dumps({"pass": False, "issues": issues}, indent=2))
             sys.exit(1)
-        # Per-region governance parity with compile (the inlined-child loop regions are
-        # NOT re-checked by the parent loop's own validation, so a guarded loop-bearing
-        # inline could pass validate yet die at compile). Run the cheap, statically
-        # determinable checks compile runs per region: exactly-one-of while/until,
-        # max_iters >= 1, and the reserved pseudo-result / exhaust-gate id collision.
-        _reg_ids = ({n["id"] for n in (merged.get("nodes") or [])
+        # Per-region governance parity with compile, computed on the probe copy: the
+        # cheap statically determinable checks compile runs per inlined loop region —
+        # exactly-one-of while/until, max_iters >= 1, reserved pseudo-result / exhaust
+        # gate id collision. Defense in depth (the child's own standalone validate also
+        # covers its loop); runs on the probe so `merged` is never mutated.
+        _reg_ids = ({n["id"] for n in (_probe.get("nodes") or [])
                      if isinstance(n, dict) and isinstance(n.get("id"), str)}
-                    | {g["id"] for g in (merged.get("gates") or [])
+                    | {g["id"] for g in (_probe.get("gates") or [])
                        if isinstance(g, dict) and isinstance(g.get("id"), str)})
         for _ro, _rl, _rg in (_nw_regions or []):
             _wu = loop_while_until_error(_rl)
