@@ -1,0 +1,20 @@
+{
+  "manifest_hash": "b9d30d70a80e504039ff589e358460c5025dcad763648d735f64157da0c2d567",
+  "name": "plan-rvs",
+  "node_fingerprints": {
+    "collect": "c383149a9734036d3afcb957e55b6240d0026a364a5b05ba736892d9577ac251",
+    "plan": "773b480ee6dd23fd9edc54fd5a0e0d0396cf9acccc813ce5ce98add37825e599",
+    "review_plan_wf_completeness": "b99ad1b8f26d2973941e508e38cb52031a87aedb3ce0fd48b80b8be4466783f7",
+    "review_plan_wf_control_flow": "25ef0fd26035206063e1136bb11d9dd3757be93dc09b84c5d216cfec7cd65cea",
+    "review_plan_wf_graph_correctness": "1954acef34593c6d5813901131be2923eaf3311f82d1982932f5a17b509080ca",
+    "review_plan_wf_name_capability": "fd36a47f66a4f000329c0b1cba18c054b90f77dca61b06489a07f4411beeda55",
+    "review_plan_wf_reuse_survey": "549e41efeaade60294932f5cfab7c95643c77b89fb2e0fab71600f02d95b6fc0",
+    "review_plan_wf_scope_fit": "2c1afa16f2b040edd8b59ef400c382797b5c4d485205af7010e717aafa4c3a3f",
+    "synth": "a36f31fac50d85d8cf4b3535b9eff38b79251c9baddc51467273dff912aab7d5",
+    "verify": "6eb8084191c64b9a2a0e54605b2590d3df9386c888f22e723fc2ad4b09d0b5b0"
+  },
+  "profile_used": "base",
+  "segment_digests": {
+    "seg-1.js": "0b6abe2c87dcfd30e429592c786f5f1beb5ab746921d78124d25da69891eba26"
+  }
+}
