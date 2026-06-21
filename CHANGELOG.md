@@ -1,3 +1,13 @@
+## [0.34.0](https://github.com/sharmankitdev/microskills/compare/v0.33.0...v0.34.0) (2026-06-21)
+
+### ⚠ BREAKING CHANGES
+
+* **workflow:** rewire create pipelines onto plan-rvs + implement-rvs; strip catalog to two pipelines + engine
+
+### Features
+
+* **workflow:** rewire create pipelines onto plan-rvs + implement-rvs; strip catalog to two pipelines + engine ([8bbf347](https://github.com/sharmankitdev/microskills/commit/8bbf347f09b5b2cbe2d50bb9283b5c41ebde839c))
+
 ## [0.33.0](https://github.com/sharmankitdev/microskills/compare/v0.32.0...v0.33.0) (2026-06-21)
 
 ### Features
