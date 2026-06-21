@@ -1,0 +1,30 @@
+version: 1
+# plan-rvs / workflow-create-autonomous — the workflow-domain plan critique WITH the convergence
+# loop (re-plan on carried findings; exit on approve OR a scope_advisory). Unattended: the cap
+# escalates and, headless, parks at the synthetic exhaust gate. Adds the loop the loop-less base
+# omits + wires the planner's last_findings to the carry.
+gate_mode: auto
+
+nodes:
+  patch:
+    # Round 2+ re-plans against the surviving findings (round 1 carries null → a fresh plan).
+    - id: plan
+      inputs:
+        last_findings: ${loop.carry.findings}
+
+loop:
+  until: ${synth.output.verdict == 'approve' || synth.output.scope_advisory != null}
+  max_iters: 2
+  body: [plan,
+         review_plan_wf_completeness, review_plan_wf_graph_correctness,
+         review_plan_wf_control_flow, review_plan_wf_reuse_survey,
+         review_plan_wf_scope_fit, review_plan_wf_name_capability,
+         collect, verify, synth]
+  carry:
+    findings: ${synth.output.findings}
+  on_exhaust:
+    action: escalate
+    prompt: The plan→review→verify→synthesize loop hit its round cap with the synthesis verdict still requesting changes - extend with another round budget (optionally with guidance), accept the plan as-is, or abandon?
+    options: [extend, accept, abandon]
+    notes_input: requirement_path
+    on_headless: fail

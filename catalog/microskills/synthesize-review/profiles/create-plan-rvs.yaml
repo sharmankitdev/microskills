@@ -1,0 +1,80 @@
+version: 1
+
+# The plan-rvs synthesis profile — `create` PLUS a plan-identity passthrough. plan-rvs is a
+# first-class loop whose `output: { from: synth }` is the workflow's aggregate output (synth
+# is the TERMINAL node, so a host gate `after: plan_rvs` correctly anchors after the whole
+# review — not after the early plan node). The host wires ${plan_rvs.output.plan_path /
+# .name / .scope_advisory} to gate + build the plan, so synth ECHOES those three planner
+# fields verbatim alongside the verdict + carried findings.
+#
+# Identical to synthesize-review/profiles/create.yaml (the review fuse; plan stage has no
+# floor, so floor_findings folds nothing) EXCEPT for the plan_path/name/scope_advisory
+# passthrough. Separate profile so build-workflow-from-plan / implement-rvs stay untouched.
+vars:
+  verdict_mapping: >-
+    a surviving blocker-severity finding (whether a deterministic-floor blocker or a review
+    blocker) or a review major-severity finding gives request_changes; only review
+    minor/nit survivors or deterministic-floor warn survivors give comment; no survivors
+    gives approve.
+  report_target: >-
+    write the severity-grouped markdown report to the exact file named by the report_path
+    input (creating parent directories), AND write a .json sidecar next to it (same path +
+    ".json") carrying the verdict, every count field, and the merged surviving findings;
+    return that report_path in the structured result.
+
+inputs:
+  findings:
+    required: true             # the collected, dimension-tagged plan-critique findings
+  verifications:
+    required: false            # the per-finding verdicts; null = keep all, join nothing
+  change_summary:
+    required: false            # the plan has no diff summary
+  floor_findings:
+    required: false            # plan stage has no floor → null folds nothing
+  report_path:
+    required: true             # exact evidence file to write (+ .json sidecar)
+  plan_path:
+    required: false            # echoed verbatim — the host builds from this plan
+  name:
+    required: false            # echoed verbatim — the proposed component name
+  scope_advisory:
+    required: false            # echoed verbatim — non-null routes the host past build
+
+runtime:
+  allowed_tools: [Read, Write]
+
+# Fold the floor findings (after: 1; a null floor_findings folds nothing — plan stage), then
+# echo the three planner-identity fields. Both phrased with NO branching vocabulary.
+steps:
+  add:
+    - after: 1
+      text: >-
+        Fold the supplied floor_findings into the survivor set as pre-confirmed
+        deterministic findings — never joined to a verification and never dropped:
+        keep each floor finding's id and source, map its location to the file field, its
+        message to the title and the explanation, preserve its severity (blocker or warn),
+        set confidence to high, and set line to null. A null or empty floor_findings folds
+        nothing.
+    - after: 2
+      text: >-
+        Set the result's plan_path, name, and scope_advisory to the supplied plan_path,
+        name, and scope_advisory inputs verbatim — the host reads exactly these to gate and
+        build the plan. A null or absent value sets that field to null.
+
+# REPLACES base wholesale — RETAINS findings (the loop carry) + ADDS the three planner fields
+# so the {plan_path, scope_advisory, name, verdict, findings} contract rides this exit node.
+output_schema:
+  type: object
+  required: [verdict, blocker_count, comment_count, summary, findings, report_path]
+  properties:
+    verdict: { type: string, enum: [approve, comment, request_changes] }
+    blocker_count: { type: integer }
+    comment_count: { type: integer }
+    summary: { type: string }
+    findings:
+      type: array
+      items: { type: object }
+    report_path: { type: string }
+    plan_path: { type: ["string", "null"] }      # echoed — the host builds from this plan
+    name: { type: ["string", "null"] }           # echoed — the proposed component name
+    scope_advisory: { type: ["object", "null"] } # echoed — non-null routes past build

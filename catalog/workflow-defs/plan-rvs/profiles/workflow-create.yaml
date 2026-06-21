@@ -1,0 +1,5 @@
+version: 1
+# plan-rvs / workflow-create — the workflow-domain plan critique, LOOP-LESS (single pass; the
+# host's approve_plan gate is the backstop). The WORKFLOW.yaml already bakes the plan-wf-*
+# critique set, so this is the named entry point with no overlay. Symmetric with
+# microskill-create; the *-autonomous variant adds the convergence loop.

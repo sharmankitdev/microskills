@@ -98,3 +98,7 @@ workflows:
     source: plugin
   - name: develop-product-backlog
     source: plugin
+  - name: implement-rvs
+    source: plugin
+  - name: plan-rvs
+    source: plugin

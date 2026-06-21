@@ -2017,3 +2017,15 @@ def test_override_value_typed_yaml_parsing_unchanged(tmp_path):
         skill_root=tmp_path)
     assert code == 0, err
     assert data["config"]["runtime"]["allowed_tools"] == ["Read", "Grep"]
+
+
+def test_task_plan_declares_last_findings_replan_input():
+    """task-plan carries the optional last_findings re-plan input (plan-rvs bounded
+    variant): it appears in the resolved inputs contract + the draft-plan step folds
+    it. Resolves the REAL catalog task-plan."""
+    code, data, out, err = run("task-plan", skill_root=REAL_MICROSKILLS_ROOT)
+    assert code == 0, err
+    body = data["rendered_skill_body"]
+    assert "last_findings" in body
+    # The re-plan instruction folds it into the draft step (no branching vocabulary).
+    assert "re-plan pass" in body

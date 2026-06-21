@@ -1,0 +1,43 @@
+version: 1
+# plan-rvs / microskill-create-autonomous — the MICROSKILL-domain plan critique WITH the
+# convergence loop. Composes the microskill-create domain swap (planner + critique panel + fan-in
+# + verify) with the autonomous loop (re-plan on carried findings; exit on approve OR a
+# scope_advisory; cap escalates, parks headless). loop.body carries the ms review_plan_ms_* ids.
+gate_mode: auto
+
+nodes:
+  patch:
+    - id: plan
+      customize: { profile: microskill }
+      inputs:
+        last_findings: ${loop.carry.findings}
+    - id: review
+      expand:
+        over:
+          - plan-ms-completeness
+          - plan-ms-scope-fit
+          - plan-ms-input-contract
+          - plan-ms-output-contract
+          - plan-ms-name-capability
+          - plan-ms-failure-coverage
+    - id: collect
+      customize: { profile: plan-ms-create }
+    - id: verify
+      customize: { profile: plan-microskill }
+
+loop:
+  until: ${synth.output.verdict == 'approve' || synth.output.scope_advisory != null}
+  max_iters: 2
+  body: [plan,
+         review_plan_ms_completeness, review_plan_ms_scope_fit,
+         review_plan_ms_input_contract, review_plan_ms_output_contract,
+         review_plan_ms_name_capability, review_plan_ms_failure_coverage,
+         collect, verify, synth]
+  carry:
+    findings: ${synth.output.findings}
+  on_exhaust:
+    action: escalate
+    prompt: The plan→review→verify→synthesize loop hit its round cap with the synthesis verdict still requesting changes - extend with another round budget (optionally with guidance), accept the plan as-is, or abandon?
+    options: [extend, accept, abandon]
+    notes_input: requirement_path
+    on_headless: fail
