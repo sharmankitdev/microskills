@@ -39,6 +39,10 @@ inputs:
     required: false            # echoed verbatim — the proposed component name
   scope_advisory:
     required: false            # echoed verbatim — non-null routes the host past build
+  missing_microskills:
+    required: false            # echoed verbatim — the wf-domain planner's gaps a host provision
+                               # for_each fans out over; null in the microskill domain (the ms
+                               # task-plan profile does not emit it), which folds harmlessly
 
 runtime:
   allowed_tools: [Read, Write]
@@ -57,12 +61,16 @@ steps:
         nothing.
     - after: 2
       text: >-
-        Set the result's plan_path, name, and scope_advisory to the supplied plan_path,
-        name, and scope_advisory inputs verbatim — the host reads exactly these to gate and
-        build the plan. A null or absent value sets that field to null.
+        Set the result's plan_path, name, scope_advisory, and missing_microskills to the
+        supplied plan_path, name, scope_advisory, and missing_microskills inputs verbatim —
+        the host reads exactly these to gate and build the plan, and to fan a provision
+        for_each out over the gaps the workflow planner flagged. A null or absent value sets
+        that field to null (the microskill domain emits no missing_microskills → null, which
+        a host provision treats as an empty fan-out).
 
-# REPLACES base wholesale — RETAINS findings (the loop carry) + ADDS the three planner fields
-# so the {plan_path, scope_advisory, name, verdict, findings} contract rides this exit node.
+# REPLACES base wholesale — RETAINS findings (the loop carry) + ADDS the four planner fields
+# so the {plan_path, scope_advisory, name, missing_microskills, verdict, findings} contract
+# rides this exit node.
 output_schema:
   type: object
   required: [verdict, blocker_count, comment_count, summary, findings, report_path]
@@ -78,3 +86,4 @@ output_schema:
     plan_path: { type: ["string", "null"] }      # echoed — the host builds from this plan
     name: { type: ["string", "null"] }           # echoed — the proposed component name
     scope_advisory: { type: ["object", "null"] } # echoed — non-null routes past build
+    missing_microskills: { type: ["array", "null"] }  # echoed — a host provision fans out over it

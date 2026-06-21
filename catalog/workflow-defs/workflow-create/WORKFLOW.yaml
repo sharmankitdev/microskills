@@ -1,7 +1,7 @@
 version: 1
 name: workflow-create
 base: true
-description: Declarative pipeline that turns a requirement into a validated WORKFLOW.yaml — plan (agent) → approval gate → provision missing microskills → implement-rvs loop → finalize.
+description: Create a workflow from a requirement — refine-requirements (intent capture + critic-proven spec) → Gate 1 (requirements) → plan-rvs (planner-in-review) → Gate 2 (plan) → provision missing microskills → implement-rvs (self-correcting implement→review→verify→synthesize loop) → finalize. refine, plan-rvs, and implement-rvs run as inlined first-class workflows (profile workflow-create); provision re-enters the now-flat microskill-create per missing microskill.
 
 # Top-level workflow inputs (referenced as ${workflow.inputs.<name>}).
 inputs:
@@ -10,9 +10,9 @@ inputs:
     required: true
     materialize: file
     description: >-
-      Natural-language description of the workflow to create. task-plan Reads the
-      path; the nested implement-rvs loop receives the same path as its review
-      panel's semantic ground truth.
+      Natural-language description of the workflow to create. refine-requirements
+      Reads the path to assemble the spec; plan-rvs's planner and the implement-rvs
+      review panel then ground against the REFINED document, not this raw path.
   name:
     type: string
     required: false
@@ -21,20 +21,21 @@ inputs:
     type: string
     required: false
     default: harness
-    description: Committed harness source-of-truth root. Finalize vendors the new workflow to <harness_root>/workflow-defs/<name>/; sync-harness then generates the .claude/ runtime copy + shim, and finalize compiles it.
+    description: Committed harness source-of-truth root. Finalize vendors the new workflow to <harness_root>/workflow-defs/<name>/; sync-harness then generates the .claude/ runtime copy + shim, and finalize compiles it. Also forwarded to each provisioned microskill.
   harness_yaml:
     type: string
     required: false
     default: harness/harness.yaml
-    description: Harness manifest. Finalize upserts the component's entry here (source custom) before syncing.
+    description: Harness manifest. Finalize upserts the component's entry here (source custom) before syncing. Also forwarded to provision + build.
   staging_dir:
     type: string
     required: false
     default: .claude/.workflow-staging/wf-create
-    description: Sandbox dir; the implementer writes <staging_dir>/<name>/ before finalize moves it.
+    description: Sandbox dir; refine writes the spec here and the implementer writes <staging_dir>/<name>/ before finalize moves it.
 
 imports:
-  - microskills/task-plan
+  - refine-requirements
+  - plan-rvs
   - implement-rvs
   - microskill-create
 
@@ -44,11 +45,12 @@ imports:
 # prose). The 2026-06-21 rewire retired the old build-from-plan workflow: the
 # implement RVS loop now runs in the `build` node (workflow: implement-rvs) and
 # the host owns the single finalize, so the workflow-domain twin of this block
-# lives here.
+# lives here. The plan-identity refs read off plan_rvs's aggregate exit (synth,
+# the loop-region terminal) — symmetric with microskill-create.
 vars:
   finalize_kind: workflow
-  finalize_plan_ref: ${plan.output.plan_path}
-  finalize_name_source: <name> = ${plan.output.name}
+  finalize_plan_ref: ${plan_rvs.output.plan_path}
+  finalize_name_source: <name> = ${plan_rvs.output.name}
   finalize_dest_subdir: workflow-defs
   finalize_staged_layout: WORKFLOW.yaml + profiles/* + references/* — do NOT include any .compiled/ dir
   finalize_verdict_ref: ${build.output.verdict}
@@ -63,32 +65,76 @@ vars:
     or a failed compile.
 
 nodes:
-  # Plan the workflow. The planner enumerates reusable microskills/agents/
-  # workflows, designs the node graph + profile reuse, and lists any microskills
-  # that must be created first. Human approves at the gate. Node output shape:
-  # the resolved task-plan (workflow profile) output_schema (inherited).
-  - id: plan
-    use: task-plan
-    customize: { profile: workflow }
+  # Refine the raw requirement into a structured, critic-proven workflow spec via the
+  # reusable refine-requirements front-end (create-spec-workflow profile: the 3 workflow-spec
+  # lenses + the 8-section workflow spec template + wider budgets). A STATIC `workflow:` node
+  # with EXPLICIT inputs (no `wire: auto`), so the compiler INLINES it: refine's nodes splice
+  # into this host — its critique loop becomes a loop region, its clarify / present_refined /
+  # triage_reopened orchestrators become checkpoints, and its terminal approve_requirements
+  # gate becomes Gate 1 (refine__approve_requirements, HARD; flipped warn→hard in the
+  # create-spec-workflow profile). The refined document at ${refine.output.document_path}
+  # (refine's output: from assemble_req_evidence) is the semantic ground truth plan_rvs and
+  # build review against — replacing the raw requirement_path.
+  - id: refine
+    workflow: refine-requirements
+    customize: { profile: create-spec-workflow }
     inputs:
-      requirement_path: ${workflow.inputs.requirement_path}
+      sources_path: ${workflow.inputs.requirement_path}
+      output_dir: ${workflow.inputs.staging_dir}
+      staging_dir: ${workflow.inputs.staging_dir}
+
+  # Plan the workflow via the reusable plan-stage RVS (planner-in-review:
+  # plan→review×N→verify→synth over the plan.yaml). The base ships LOOP-LESS (a
+  # single pass; the approve_plan gate below is the backstop); the autonomous
+  # pipeline profile swaps in plan-rvs[workflow-create-autonomous], which adds the
+  # bounded convergence loop. A STATIC `workflow:` node with EXPLICIT inputs (no
+  # `wire: auto`, which would suppress inlining), so the compiler INLINES it: the
+  # plan-rvs nodes splice into this host (the autonomous loop becomes one region).
+  # Output carries {plan_path, name, scope_advisory, missing_microskills, verdict,
+  # findings}; the HUMAN approves it at the gate below. missing_microskills (the
+  # workflow planner's gaps) rides synth's aggregate exit so provision can fan out.
+  - id: plan_rvs
+    workflow: plan-rvs
+    customize: { profile: workflow-create }
+    depends_on: [refine]
+    inputs:
+      requirement_path: ${refine.output.document_path}
       name_override: ${workflow.inputs.name}
       staging_dir: ${workflow.inputs.staging_dir}
 
+  # When the planner returns a scope_advisory instead of a plan, surface it and
+  # stop — no workflow gets built. Guarded by `when`; the guard also if-wraps the
+  # provision / build region / finalize below so the advisory path skips the build
+  # entirely.
+  - id: advise
+    delegation: orchestrator
+    when: ${plan_rvs.output.scope_advisory != null}
+    prompt: >
+      The planner returned a scope advisory instead of a plan:
+      ${plan_rvs.output.scope_advisory}. Present it to the user. For kind=split, list
+      the candidate workflows to create separately. For kind=promote, explain the
+      work is a single atomic task — recommend microskill-create instead. For
+      kind=adapt, name the existing workflow that already covers this. Do not
+      implement anything — stop here.
+
   # Create the microskills the planner flagged as missing, one per item, by
-  # invoking microskill-create with the autonomous (gates-warn) profile — passed
-  # structurally via customize.profile, so no human pause. First-class workflow:
-  # node (mirrors `build` below): runs in the main loop — the only place a node
-  # may invoke a nested workflow. for_each fans out one child run per missing
-  # microskill; each vendors into harness/microskills/<name>/, upserts
-  # harness.yaml, and runs sync-harness so later nodes can reference it.
-  # microskill-create is a leaf (no nested workflow: node) so depth stays ≤ 1.
-  # Guarded so the advisory path skips it.
+  # invoking microskill-create with the autonomous (gates-auto) profile — passed
+  # structurally via customize.profile, so no human pause. A `for_each` `workflow:`
+  # node: its fan-out N is RUNTIME (the planner's missing_microskills list), so the
+  # compiler keeps it a nested_workflow checkpoint (depth-1, NOT inlined) — it
+  # re-enters the now-flat microskill-create once per missing microskill, each
+  # vendoring into harness/microskills/<name>/, upserting harness.yaml, and syncing
+  # so the build's review can ground against it. microskill-create is leaf-flat
+  # (refine / plan-rvs / implement-rvs all inline) so depth stays ≤ 1. Guarded so
+  # the advisory path skips it. Reads missing_microskills off plan_rvs's aggregate
+  # exit (synth), repositioned AFTER Gate 2 so the human approves the plan (and the
+  # microskills it lists) before any provisioning happens.
   - id: provision
     workflow: microskill-create
-    when: ${plan.output.scope_advisory == null}
-    for_each: ${plan.output.missing_microskills}
+    when: ${plan_rvs.output.scope_advisory == null}
+    for_each: ${plan_rvs.output.missing_microskills}
     as: ms_spec
+    depends_on: [plan_rvs]
     customize: { profile: autonomous }
     inputs:
       requirement_path: ${ms_spec.requirement}
@@ -96,46 +142,30 @@ nodes:
       harness_root: ${workflow.inputs.harness_root}
       harness_yaml: ${workflow.inputs.harness_yaml}
 
-  # When the planner returns a scope_advisory instead of a plan, surface it and
-  # stop.
-  - id: advise
-    delegation: orchestrator
-    when: ${plan.output.scope_advisory != null}
-    prompt: >
-      The planner returned a scope advisory instead of a plan:
-      ${plan.output.scope_advisory}. Present it to the user. For kind=split, list
-      the candidate workflows to create separately. For kind=promote, explain the
-      work is a single atomic task — recommend microskill-create instead. For
-      kind=adapt, name the existing workflow that already covers this. Do not
-      implement anything — stop here.
-
-  # Build the approved plan into a workflow draft by invoking the reusable
-  # implement-rvs loop (the self-correcting implement→review→verify→synthesize
-  # cycle). implement-rvs is the PURE loop — it has NO finalize; it returns
-  # {verdict, findings, staging_paths, report_path} and the HOST owns the single
-  # vendor→manifest→sync→compile finalize (the `finalize` node below). This is a
-  # STATIC `workflow:` node, so the compiler INLINES it: implement-rvs's loop
-  # splices into this host as ONE guarded do/while loop region (region-guarded on
-  # the same `when`), keeping the whole pipeline flat (compile-time inlining IS
-  # the static-nested-workflow model). NOTE: inputs are bound EXPLICITLY (no
-  # `wire: auto`) — `wire: auto` suppresses inlining (keeps the node a nested
-  # checkpoint), so the host wires the one optional child input it forwards,
-  # harness_yaml, by hand; catalog_root has no host source, so the child keeps
-  # its own default (.claude). The explicit depends_on edge on `provision` is
-  # PURE ORDERING (no ref carries it): the provisioned microskills must exist
-  # before the build's review grounds against the catalog. The child's REQUIRED
-  # inputs stay explicit — `name` must be the planner's proposal (NOT this
-  # workflow's optional `name` override), and requirement_path / staging_dir stay
-  # deliberate wires for the same reason.
+  # Build the approved plan into a workflow draft via the reusable implement-rvs
+  # loop (the self-correcting implement→review→verify→synthesize cycle). implement-rvs
+  # is the PURE loop — it has NO finalize; it returns {verdict, findings,
+  # staging_paths, report_path} and the HOST owns the single vendor→manifest→sync→
+  # compile finalize (the `finalize` node below). A STATIC `workflow:` node with
+  # EXPLICIT inputs (no `wire: auto`, which would suppress inlining), so the compiler
+  # INLINES it as ONE guarded do/while loop region (region-guarded on the same
+  # `when`), keeping the pipeline flat. The explicit depends_on: [provision] is
+  # LOAD-BEARING: it is pure ORDERING (the provisioned microskills must exist before
+  # the build's review grounds against the catalog) AND it anchors the inlined
+  # region's zero-dep internal node (implement-rvs's catalog_index, depends_on: [])
+  # after provision — which itself follows plan_rvs after refine — so the whole build
+  # region stays contiguous (the "zero-dep node floats" lesson). requirement_path is
+  # the REFINED document (not the raw path); harness_yaml is forwarded by hand (the
+  # one optional child input the host carries).
   - id: build
     workflow: implement-rvs
     customize: { profile: workflow-create }
-    when: ${plan.output.scope_advisory == null}
+    when: ${plan_rvs.output.scope_advisory == null}
     depends_on: [provision]
     inputs:
-      plan_path: ${plan.output.plan_path}
-      name: ${plan.output.name}
-      requirement_path: ${workflow.inputs.requirement_path}
+      plan_path: ${plan_rvs.output.plan_path}
+      name: ${plan_rvs.output.name}
+      requirement_path: ${refine.output.document_path}
       staging_dir: ${workflow.inputs.staging_dir}
       harness_yaml: ${workflow.inputs.harness_yaml}
 
@@ -148,24 +178,25 @@ nodes:
   # advisory path skips it.
   - id: finalize
     delegation: orchestrator
-    when: ${plan.output.scope_advisory == null}
+    when: ${plan_rvs.output.scope_advisory == null}
     prompt: "{{snippet:finalize-protocol}}"
 
-# Human-approval gate after `plan`. Approving the plan also authorizes creation
-# of the microskills it lists under missing_microskills.
+# Human-approval gate after `plan_rvs` (Gate 2 of the north-star). Approving the
+# plan also authorizes creation of the microskills it lists under
+# missing_microskills (provision runs after this gate). The plan-rvs review
+# evidence is the whole-branch-confirm material the human signs off on.
 gates:
   - id: approve_plan
     name: "Approve workflow plan"
-    after: plan
+    after: plan_rvs
     type: human_approval
     severity: hard
     prompt: Review the plan (node graph, reuse/profile decisions, microskills to be created — check each name is a reusable capability, not coupled to this workflow/step). Approve to build, revise to re-plan, or abandon.
     options: [approve, revise, abandon]
 
-# The implement→review→verify→synthesize retry loop now lives inside implement-rvs,
-# which the `build` node invokes (kept as a nested_workflow checkpoint — wire: auto
-# currently suppresses inlining); the host's `finalize` node owns the
-# vendor→sync→compile step.
+# No top-level loop: the convergence loops now live INSIDE the inlined refine
+# (create-spec-workflow critique), plan-rvs (autonomous), and implement-rvs
+# children, each spliced in as its own loop region.
 
 output:
   from: finalize

@@ -306,25 +306,37 @@ nodes:
 
 
 def test_real_workflow_create_compiles():
-    # 2026-06-21 production rewire (sub-PR 1): build-workflow-from-plan is retired —
-    # workflow-create's `build` node is now `workflow: implement-rvs` with EXPLICIT
-    # inputs (no wire: auto), so the compiler INLINES it as ONE guarded do/while loop
-    # region; the host gained its own `finalize` orchestrator node. Shape: a background
-    # segment (plan) → approve_plan gate → `provision` (nested workflow:
-    # microskill-create, autonomous, for_each over missing microskills) → `advise`
-    # (orchestrator node) → the inlined `build` loop region (its own segment) →
-    # loop_exhaust_build gate → `finalize` (orchestrator node — vendor→sync→compile).
+    # 2026-06-21 production rewire (sub-PR 4): workflow-create is now SYMMETRIC to
+    # microskill-create. The `refine` (refine-requirements, create-spec-workflow),
+    # `plan_rvs` (plan-rvs), and `build` (implement-rvs) `workflow:` children all INLINE
+    # FLAT (EXPLICIT inputs, no wire: auto); only `provision` (for_each microskill-create)
+    # stays a runtime nested_workflow checkpoint (depth-1). Base (interactive) shape:
+    #   refine__assemble seg → clarify (orch) → refine critique loop region →
+    #   loop_exhaust_refine gate → present_refined (orch) → extract/refute seg →
+    #   triage_reopened (orch) → assemble_req_evidence seg → Gate 1
+    #   (refine__approve_requirements, HARD) → plan_rvs seg (base loop-less) → Gate 2
+    #   (approve_plan, HARD) → advise (orch) → provision (nested_workflow) → inlined
+    #   build loop region → loop_exhaust_build gate → finalize (orch).
     rc, data, out, err = run(REAL_DEFS, "workflow-create")
     assert rc == 0, err
-    assert data["segments"] == 2, data["sequence"]
+    assert data["segments"] == 6, data["sequence"]
     seq = data["sequence"]
-    assert seq[0] == "segment[plan]"
-    assert seq[1] == "gate"                       # approve_plan
-    assert seq[2] == "nested_workflow"            # provision (for_each, runtime depth-1)
-    assert seq[3] == "orchestrator_node"          # advise
-    assert seq[4].startswith("segment[build__implement"), seq[4]   # inlined build loop region
-    assert seq[5] == "gate"                       # loop_exhaust_build
-    assert seq[6] == "orchestrator_node"          # finalize
+    assert seq[0] == "segment[refine__assemble]", seq[0]
+    assert seq[1] == "orchestrator_node"          # refine__clarify
+    assert seq[2].startswith("segment[refine__revise_req"), seq[2]   # refine critique loop region
+    assert seq[3] == "gate"                       # loop_exhaust_refine
+    assert seq[4] == "orchestrator_node"          # refine__present_refined
+    assert seq[5].startswith("segment[refine__extract_claims"), seq[5]
+    assert seq[6] == "orchestrator_node"          # refine__triage_reopened
+    assert seq[7] == "segment[refine__assemble_req_evidence]", seq[7]
+    assert seq[8] == "gate"                       # Gate 1: refine__approve_requirements
+    assert seq[9].startswith("segment[plan_rvs__plan"), seq[9]       # plan_rvs (base loop-less)
+    assert seq[10] == "gate"                      # Gate 2: approve_plan
+    assert seq[11] == "orchestrator_node"         # advise
+    assert seq[12] == "nested_workflow"           # provision (for_each, runtime depth-1)
+    assert seq[13].startswith("segment[build__implement"), seq[13]   # inlined build loop region
+    assert seq[14] == "gate"                      # loop_exhaust_build
+    assert seq[15] == "orchestrator_node"         # finalize
 
 
 # --- Nested-workflow profile passthrough -------------------------------------
@@ -541,11 +553,11 @@ def test_real_autonomous_gate_patch_applies():
         assert rc == 0, err
         m = json.loads((REAL_DEFS / name / ".compiled" / "manifest.json").read_text())
         assert m["gate_mode"] == "auto"
-        # microskill-create now runs an AUTONOMOUS plan-rvs whose convergence loop adds
-        # a loop_exhaust_plan_rvs gate BEFORE approve_plan — so select the approval gate
-        # by id (not "the first gate"). After-anchor: microskill-create's approve_plan
-        # sits after the inlined plan-rvs terminal (plan_rvs__synth); workflow-create
-        # still carries a top-level `plan` node (its guts rewire is sub-PR 4).
+        # Both pipelines now run an AUTONOMOUS plan-rvs whose convergence loop adds a
+        # loop_exhaust_plan_rvs gate BEFORE approve_plan — so select the approval gate
+        # by id (not "the first gate"). After-anchor: approve_plan sits after the inlined
+        # plan-rvs terminal (plan_rvs__synth) for BOTH (workflow-create's guts rewire
+        # landed in sub-PR 4 — symmetric with microskill-create).
         gate = next(s["gate"] for s in m["steps"]
                     if s.get("checkpoint_type") == "gate"
                     and s.get("gate", {}).get("id") == "approve_plan")
@@ -553,8 +565,7 @@ def test_real_autonomous_gate_patch_applies():
         assert gate["severity"] == "hard"          # NOT flipped any more
         assert gate["default"] == "approve"        # the patch merged by id
         assert "(autonomous)" not in gate["prompt"]
-        assert gate["after"] == (
-            "plan_rvs__synth" if name == "microskill-create" else "plan")
+        assert gate["after"] == "plan_rvs__synth"
         assert gate["type"] == "human_approval"
         assert gate["options"] == ["approve", "revise", "abandon"]
 
