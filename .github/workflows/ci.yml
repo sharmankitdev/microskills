@@ -41,12 +41,6 @@ jobs:
             # Skip non-def dirs (e.g. _snippets/, the engine-owned shared-prompt
             # includes) — only a dir with a WORKFLOW.yaml is a compilable def.
             [ -f "$d/WORKFLOW.yaml" ] || continue
-            # §9 (workflow-inlining engine): the inlining engine flattens static nested
-            # workflows, and an out-of-scope nester whose heavy children interleave when
-            # flattened is EXPLICITLY allowed to break until its production rewire — gates
-            # are scoped to the in-scope set. develop-product-backlog (refine-requirements
-            # + technical-design children interleave) stays xfailed in the pytest suite.
-            case "$(basename "$d")" in develop-product-backlog) continue;; esac
             catalog/scripts/compile-workflow "$(basename "$d")" --defs-root catalog/workflow-defs --check
           done
       # Full-registry static validation: every catalog def must pass
@@ -58,8 +52,6 @@ jobs:
         run: |
           for d in catalog/workflow-defs/*/; do
             [ -f "$d/WORKFLOW.yaml" ] || continue
-            # §9: same in-scope-only scoping as the closure gate above.
-            case "$(basename "$d")" in develop-product-backlog) continue;; esac
             catalog/scripts/validate-workflow "$d/WORKFLOW.yaml" "$d/profiles/base.yaml" --defs-root catalog/workflow-defs
           done
       - name: Run tests

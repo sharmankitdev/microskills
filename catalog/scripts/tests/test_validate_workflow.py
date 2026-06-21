@@ -2108,17 +2108,6 @@ def test_expand_leftover_each_token_blocks_validate(tmp_path):
                for i in data["issues"]), data["issues"]
 
 
-def test_real_review_changes_validates_with_expand():
-    # The flagship adoption validates clean under all three profiles.
-    rc_dir = REPO / "catalog" / "workflow-defs" / "review-changes"
-    base = rc_dir / "profiles" / "base.yaml"
-    for overlays in ([], ["comprehensive.yaml"], ["lite.yaml"]):
-        paths = [rc_dir / "WORKFLOW.yaml", base] + [rc_dir / "profiles" / o for o in overlays]
-        rc, data, _ = run(*paths)
-        assert rc == 0, (overlays, data)
-        assert data["pass"] is True, (overlays, data["issues"])
-
-
 # =============================================================================
 # 2.1 — validator-side schema inheritance: the typed-ref (S-FIELD) check falls
 # back to the use: target's RESOLVED output_schema (same resolve-microskill

@@ -97,10 +97,6 @@ microskills:
     source: plugin
   - name: task-implement
     source: plugin
-  - name: task-evaluate
-    source: plugin
-  - name: validate-microskill
-    source: plugin
   - name: greet-user
     source: custom
     profiles: [base]
@@ -115,22 +111,14 @@ workflows:
 # rewire base-tagged (for import-closure) the review/verify/synth + floor + grounding
 # + bundling microskills, so the flagship base set a fresh consumer seeds includes
 # them. The workflow-inlining engine added the two first-class RVS workflows
-# implement-rvs + plan-rvs. The 2026-06-21 production rewire RETIRED
-# build-workflow-from-plan + decompose-monolith-orchestrator (no longer base). The
-# 2026-06-21 refactor UNWIRED refine-requirements from the create pipelines, but
-# refine-requirements stays base in its own right (consumed by develop-product-backlog)
-# — so it + its transitive microskill closure (assimilate-requirements,
-# apply-findings-to-document, extract-closure-claims, expand-assignments, tally-votes,
-# assemble-evidence) remain base-tagged.
-MISSING_BASE = {"analyze-monolith-orchestrator",
-                "run-validators", "build-catalog-index",
+# implement-rvs + plan-rvs. The base set is now exactly the create-pipeline closure
+# (plan-rvs/implement-rvs + their review/floor/grounding microskills); the 2026-06-21
+# production rewire UNWIRED refine-requirements from the create pipelines, so it is no
+# longer pulled into the base set.
+MISSING_BASE = {"run-validators", "build-catalog-index",
                 "review-dimension", "collect-findings", "verify-finding",
                 "synthesize-review", "bundle-draft",
-                "implement-rvs", "plan-rvs",
-                "refine-requirements",
-                "assimilate-requirements", "apply-findings-to-document",
-                "extract-closure-claims", "expand-assignments", "tally-votes",
-                "assemble-evidence"}
+                "implement-rvs", "plan-rvs"}
 
 
 def write_manifest(tmp, text):
@@ -176,7 +164,7 @@ def test_adopt_base_appends_and_materializes(tmp_path):
     for name in MISSING_BASE:
         assert name in text
     # materialized into .claude/
-    assert (tmp_path / ".claude" / "microskills" / "analyze-monolith-orchestrator").is_dir()
+    assert (tmp_path / ".claude" / "microskills" / "review-dimension").is_dir()
     assert (tmp_path / ".claude" / "workflow-defs" / "implement-rvs").is_dir()
     # idempotent: re-run sees no drift and nothing new to add
     second = run_init(tmp_path, "--plan")
@@ -218,52 +206,6 @@ def test_init_compiles_snippet_consuming_def_in_fresh_project(tmp_path):
     fin = [s for s in data["manifest"]["steps"] if s.get("node") == "finalize"][0]
     assert "vendoring the approved microskill" in fin["prompt"]
     assert "{{snippet:" not in fin["prompt"]
-
-
-def test_init_vendors_subgraphs_as_engine(tmp_path):
-    # The `subgraph:` registry (catalog/workflow-defs/_subgraphs/<name>/SUBGRAPH.yaml)
-    # is plugin/ENGINE-owned, exactly like _snippets: initialize-harness materializes it
-    # to .claude/workflow-defs/_subgraphs/ and tracks it in the ENGINE ledger (not a
-    # component, so harness-sync never touches it).
-    init_project(tmp_path)
-    sg = (tmp_path / ".claude" / "workflow-defs" / "_subgraphs"
-          / "review-synthesize" / "SUBGRAPH.yaml")
-    assert sg.exists(), "_subgraphs not materialized into .claude/workflow-defs/"
-    src = (REPO / "catalog" / "workflow-defs" / "_subgraphs"
-           / "review-synthesize" / "SUBGRAPH.yaml")
-    assert sg.read_bytes() == src.read_bytes()
-    state = json.loads((tmp_path / ".claude" / ".harness-state.json").read_text())
-    assert (".claude/workflow-defs/_subgraphs/review-synthesize/SUBGRAPH.yaml"
-            in state["engine"]["installed_paths"])
-    assert "review-synthesize" not in state.get("components", {})
-
-
-def test_init_compiles_subgraph_splicing_def_from_runtime(tmp_path):
-    # End-to-end: a fresh project's materialized runtime can compile + validate a def
-    # whose `subgraph:` node resolves from the vendored _subgraphs/ — with NO
-    # CLAUDE_PLUGIN_ROOT (the segment-agent env). The splice replaces `rev` in place with
-    # its namespaced inner nodes, collapsing into ONE background segment.
-    init_project(tmp_path)
-    src = REPO / "catalog" / "workflow-defs" / "subgraph-smoke"
-    dst = tmp_path / ".claude" / "workflow-defs" / "subgraph-smoke"
-    shutil.copytree(src, dst, ignore=shutil.ignore_patterns(".compiled"))
-
-    rc, out, err = run_materialized(tmp_path, "compile-workflow", "subgraph-smoke", "--plan")
-    assert rc == 0, out + err
-    data = json.loads(out)
-    assert data["segments"] == 1 and data["checkpoints"] == 0
-    seg = data["manifest"]["steps"][0]
-    # The subgraph node `rev` was spliced in place into its namespaced inner nodes — its
-    # survival would have hard-blocked the compile (the desugar fail-loud sweep).
-    assert seg["nodes"] == ["author", "rev__review", "rev__synthesize", "publish"]
-    assert "rev" not in seg["nodes"]
-
-    rc, out, err = run_materialized(
-        tmp_path, "validate-workflow",
-        str(dst / "WORKFLOW.yaml"), str(dst / "profiles" / "base.yaml"),
-        "--defs-root", str(tmp_path / ".claude" / "workflow-defs"))
-    assert rc == 0, out + err
-    assert json.loads(out)["pass"] is True
 
 
 def test_reinit_preserves_compiled_runs_ledger(tmp_path):

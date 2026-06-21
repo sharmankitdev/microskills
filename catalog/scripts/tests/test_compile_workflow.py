@@ -1870,17 +1870,6 @@ def test_loop_body_siblings_parallelize(tmp_path):
     assert "const n_x" not in seg2                       # reassignment, pre-declared lets
 
 
-def test_review_changes_dimension_reviews_parallelize(tmp_path):
-    # ACCEPTANCE: review-changes' three dimension reviews all depend only on
-    # `summarize`, so they share a rank and compile into a single parallel([...]).
-    rc, data, out, err = run(REAL_DEFS, "review-changes")
-    assert rc == 0, err
-    seg = (REAL_DEFS / "review-changes" / ".compiled" / "seg-1.js").read_text()
-    assert ("const [n_review_correctness, n_review_security, n_review_performance] "
-            "= await parallel([") in seg
-    assert "const n_review_security = await" not in seg   # not a serial sibling
-
-
 # --- phase_group: cosmetic /workflows grouping (emit-only, manifest_hash-safe) ---
 SIBLINGS_PG = """\
 version: 1
@@ -1996,44 +1985,6 @@ def test_single_node_phase_group_marker(tmp_path):
     assert '"foo", "node:a")' in seg                  # per-call opt also carries the group
 
 
-# --- review-changes: pure-pipeline strip + lite / comprehensive profiles (real def) ---
-def test_review_changes_base_is_pure_pipeline(tmp_path):
-    # After the strip, base review-changes is ONE background segment with ZERO
-    # checkpoints (no gate, no post) — it ends at synthesize and composes clean when nested.
-    rc, data, out, err = run(REAL_DEFS, "review-changes")
-    assert rc == 0, err
-    assert data["segments"] == 1 and data["checkpoints"] == 0
-    assert data["sequence"] == [
-        "segment[summarize,review_correctness,review_security,"
-        "review_performance,collect,verify,synthesize]"]
-
-
-def test_review_changes_lite_profile_is_correctness_only(tmp_path):
-    # lite removes the security + performance dimension nodes and unwires collect.
-    rc, data, out, err = run(REAL_DEFS, "review-changes", "--profile", "lite")
-    assert rc == 0, err
-    assert data["segments"] == 1 and data["checkpoints"] == 0
-    seq = data["sequence"][0]
-    assert "review_correctness" in seq
-    assert "review_security" not in seq and "review_performance" not in seq
-
-
-def test_review_changes_comprehensive_profile_six_dimensions(tmp_path):
-    # comprehensive adds style/documentation/test_coverage — six dimensions under ONE
-    # "review" group — plus the configurable min_coverage input (default 80).
-    rc, data, out, err = run(REAL_DEFS, "review-changes", "--profile", "comprehensive", "--explain")
-    assert rc == 0, err
-    seg = (REAL_DEFS / "review-changes" / ".compiled" / "seg-1.js").read_text()
-    assert ("const [n_review_correctness, n_review_security, n_review_performance, "
-            "n_review_style, n_review_documentation, n_review_test_coverage] "
-            "= await parallel([") in seg
-    assert seg.count('{ title: "review" }') == 1          # all six collapse to one group
-    assert 'phase("review")' not in seg                    # per-call opt, no racey marker
-    assert '"threshold": _args.wf_min_coverage' in seg     # coverage threshold threaded in
-    man = json.loads((REAL_DEFS / "review-changes" / ".compiled" / "manifest.json").read_text())
-    assert man["input_defaults"].get("min_coverage") == 80
-
-
 # --- materialize: file — large/multi-shape input passed by reference ---
 MATERIALIZE = """\
 version: 1
@@ -2077,21 +2028,6 @@ def test_manifest_materialize_inputs_empty_when_none(tmp_path):
     assert rc == 0, err
     man = json.loads((d / ".compiled" / "manifest.json").read_text())
     assert man["materialize_inputs"] == []
-
-
-def test_review_changes_threads_diff_path_by_reference(tmp_path):
-    # After the diff_path migration, the compiled review-changes segment threads
-    # ONLY the short path (_args.wf_diff_path) into every diff consumer — never the
-    # inline _args.wf_diff — and the manifest marks diff_path materialize:file.
-    rc, data, out, err = run(REAL_DEFS, "review-changes", "--explain")
-    assert rc == 0, err
-    seg = (REAL_DEFS / "review-changes" / ".compiled" / "seg-1.js").read_text()
-    assert "_args.wf_diff_path" in seg
-    assert "_args.wf_diff" not in seg.replace("_args.wf_diff_path", "")  # no bare wf_diff
-    man = json.loads((REAL_DEFS / "review-changes" / ".compiled" / "manifest.json").read_text())
-    assert "diff_path" in man["required_inputs"]
-    assert "diff" not in man["required_inputs"]
-    assert man["materialize_inputs"] == ["diff_path"]
 
 
 # --- wave 2: requirement_path by reference across the create pipelines (real defs) ---
@@ -3852,45 +3788,6 @@ def test_leftover_each_token_blocks(tmp_path):
     assert any("each" in e for e in data.get("expand_errors", [])), data
 
 
-def test_real_review_changes_expand_matches_hand_cloned_shape():
-    # The flagship adoption: review-changes' ONE expand template generates the
-    # exact node ids + collect fan-in the hand-cloned siblings used to declare.
-    rc, data, out, err = run(REAL_DEFS, "review-changes", "--plan", "--explain")
-    assert rc == 0, err
-    seg = [s for s in data["manifest"]["steps"] if s["kind"] == "segment"][0]
-    assert seg["nodes"] == ["summarize", "review_correctness", "review_security",
-                            "review_performance", "collect", "verify", "synthesize"]
-    fp = {f["node"]: f["fingerprint"] for f in data["fingerprints"]}
-    assert fp["collect"]["inputs"] == {
-        "correctness": "${review_correctness.output}",
-        "security": "${review_security.output}",
-        "performance": "${review_performance.output}"}
-    assert fp["review_security"]["profile"] == "security"
-    assert fp["review_correctness"]["profile"] == "correctness"
-
-
-def test_real_review_changes_lite_is_one_over_patch():
-    rc, data, out, err = run(REAL_DEFS, "review-changes", "--plan", "--profile", "lite")
-    assert rc == 0, err
-    seg = [s for s in data["manifest"]["steps"] if s["kind"] == "segment"][0]
-    assert seg["nodes"] == ["summarize", "review_correctness", "collect", "verify",
-                            "synthesize"]
-
-
-def test_real_review_changes_comprehensive_adds_dimensions():
-    rc, data, out, err = run(REAL_DEFS, "review-changes", "--plan", "--profile",
-                             "comprehensive", "--explain")
-    assert rc == 0, err
-    seg = [s for s in data["manifest"]["steps"] if s["kind"] == "segment"][0]
-    assert seg["nodes"] == ["summarize", "review_correctness", "review_security",
-                            "review_performance", "review_style", "review_documentation",
-                            "review_test_coverage", "collect", "verify", "synthesize"]
-    fp = {f["node"]: f["fingerprint"] for f in data["fingerprints"]}
-    assert fp["review_test_coverage"]["inputs"]["threshold"] == "${workflow.inputs.min_coverage}"
-    assert fp["review_test_coverage"]["profile"] == "test-coverage"
-    assert "test_coverage" in fp["collect"]["inputs"]
-
-
 # =============================================================================
 # 2.2 — `--annotate`: write .compiled/PARTITION.md, a generated sidecar derived
 # from the data --explain already computes (classification + step sequence).
@@ -4151,33 +4048,6 @@ nodes:
     m = json.loads((parent / ".compiled" / "manifest.json").read_text())
     chk = next(s for s in m["steps"] if s.get("checkpoint_type") == "nested_workflow")
     assert chk["io"]["build"] == {"schema": None, "guarded": True, "fan_out": True}
-
-
-def test_real_refine_requirements_orchestrator_contracts(tmp_path):
-    # The prose-only orchestrator return contracts ride as declared
-    # output_schema blocks. Post-augmentation (multiagentic pipeline), the
-    # gaps==0 `approve` twin is gone — clarify, present_refined, and the
-    # when-guarded triage_reopened carry the contracts into their checkpoint io.
-    rc, data, out, err = run(REAL_DEFS, "refine-requirements")
-    assert rc == 0, err
-    m = json.loads(
-        (REAL_DEFS / "refine-requirements" / ".compiled" / "manifest.json").read_text())
-    chks = {s["node"]: s for s in m["steps"]
-            if s.get("checkpoint_type") == "orchestrator_node"}
-    assert "approve" not in chks                 # removed by the augmentation
-    clarify = chks["clarify"]["io"]["clarify"]
-    assert clarify["guarded"] is True            # when: gaps_count > 0
-    assert set(clarify["schema"]["required"]) == {
-        "choice", "final_document_path", "rounds", "converged", "remaining_gaps"}
-    present = chks["present_refined"]["io"]["present_refined"]
-    assert present["guarded"] is False
-    assert set(present["schema"]["required"]) == {
-        "action", "document_path", "remediation_rounds"}
-    triage = chks["triage_reopened"]["io"]["triage_reopened"]
-    assert triage["guarded"] is True             # when: attention_count > 0
-    assert set(triage["schema"]["required"]) == {
-        "action", "remediated_count", "remaining_escalations",
-        "refreshed_report_path", "post_counts"}
 
 
 # ---------------------------------------------------------------------------

@@ -1,8 +1,0 @@
-version: 1
-
-# GitHub publish overlay — interactive everywhere; only the publish target changes.
-# backlog-publication's github profile retargets its publish node to gh milestones/issues
-# (null github_repo = "publish to the current repo"). Everything else stays the base graph.
-nodes:
-  patch:
-    - { id: backlog_publication, customize: { profile: github } }
