@@ -364,6 +364,8 @@ nodes:
   - id: call
     workflow: child-flow
     depends_on: [a]
+    for_each: ${a.output.items}
+    as: item
     customize: { profile: autonomous }
     inputs:
       x: ${a.output.x}
@@ -381,6 +383,8 @@ nodes:
   - id: call
     workflow: child-flow
     depends_on: [a]
+    for_each: ${a.output.items}
+    as: item
     inputs:
       x: ${a.output.x}
 """
@@ -596,6 +600,8 @@ nodes:
   - id: build
     workflow: child-flow
     depends_on: [a]
+    for_each: ${a.output.items}
+    as: item
     inputs:
       seed: ${a.output.x}
       topic: ${workflow.inputs.topic}
@@ -727,13 +733,23 @@ nodes:
 """)
 
 
+# Under compile-time inlining a STATIC nested workflow flattens (the depth cap no
+# longer applies to it); the cap now governs the surviving RUNTIME (for_each)
+# nesting — a for_each child that itself holds a for_each workflow: node is depth-2.
+_FE_ITEMS = "inputs:\n  items: { type: array, required: true }\n"
+
+
 def test_depth_two_nesting_dies_in_compile(tmp_path):
     _nesting_def(tmp_path, "grand-flow", "",
                  "  - id: g\n    agent: ag\n    prompt: leaf work\n")
-    _nesting_def(tmp_path, "child-flow", "grand-flow",
-                 "  - id: call\n    workflow: grand-flow\n    inputs: {}\n")
-    _nesting_def(tmp_path, "parent-flow", "child-flow",
-                 "  - id: build\n    workflow: child-flow\n    inputs: {}\n")
+    make_flow(tmp_path, "child-flow",
+              "version: 1\nname: child-flow\nimports: [grand-flow]\n" + _FE_ITEMS +
+              "nodes:\n  - id: call\n    workflow: grand-flow\n"
+              "    for_each: ${workflow.inputs.items}\n    as: it\n    inputs: {}\n")
+    make_flow(tmp_path, "parent-flow",
+              "version: 1\nname: parent-flow\nimports: [child-flow]\n" + _FE_ITEMS +
+              "nodes:\n  - id: build\n    workflow: child-flow\n"
+              "    for_each: ${workflow.inputs.items}\n    as: it\n    inputs: {}\n")
     rc, data, out, err = run(tmp_path, "parent-flow")
     assert rc == 1, out + err
     msgs = json.dumps(data)
@@ -755,10 +771,14 @@ def test_import_cycle_dies_in_compile(tmp_path):
 
 
 def test_depth_one_nesting_still_compiles(tmp_path):
+    # A for_each child that is a leaf (no nested workflow: node) is depth-1 — it
+    # stays a runtime checkpoint and compiles.
     _nesting_def(tmp_path, "child-flow", "",
                  "  - id: c\n    agent: ag\n    prompt: leaf work\n")
-    _nesting_def(tmp_path, "parent-flow", "child-flow",
-                 "  - id: build\n    workflow: child-flow\n    inputs: {}\n")
+    make_flow(tmp_path, "parent-flow",
+              "version: 1\nname: parent-flow\nimports: [child-flow]\n" + _FE_ITEMS +
+              "nodes:\n  - id: build\n    workflow: child-flow\n"
+              "    for_each: ${workflow.inputs.items}\n    as: it\n    inputs: {}\n")
     rc, data, out, err = run(tmp_path, "parent-flow")
     assert rc == 0, out + err
     assert data["checkpoints"] == 1
@@ -772,15 +792,18 @@ def test_depth_one_nesting_still_compiles(tmp_path):
 def test_depth_two_via_customize_profile_dies_in_compile(tmp_path):
     _nesting_def(tmp_path, "grand-flow", "",
                  "  - id: g\n    agent: ag\n    prompt: leaf work\n")
-    _nesting_def(tmp_path, "child-flow", "grand-flow",
-                 "  - id: c\n    agent: ag\n    prompt: leaf work\n")
-    child = tmp_path / "child-flow"
+    child = make_flow(tmp_path, "child-flow",
+                      "version: 1\nname: child-flow\nimports: [grand-flow]\n" + _FE_ITEMS +
+                      "nodes:\n  - id: c\n    agent: ag\n    prompt: leaf work\n")
     (child / "profiles" / "withgc.yaml").write_text(
         "version: 1\nnodes:\n  add:\n    - id: deep\n"
-        "      workflow: grand-flow\n      inputs: {}\n")
-    _nesting_def(tmp_path, "parent-flow", "child-flow",
-                 "  - id: build\n    workflow: child-flow\n"
-                 "    customize: {profile: withgc}\n    inputs: {}\n")
+        "      workflow: grand-flow\n      for_each: ${workflow.inputs.items}\n"
+        "      as: it\n      inputs: {}\n")
+    make_flow(tmp_path, "parent-flow",
+              "version: 1\nname: parent-flow\nimports: [child-flow]\n" + _FE_ITEMS +
+              "nodes:\n  - id: build\n    workflow: child-flow\n"
+              "    for_each: ${workflow.inputs.items}\n    as: it\n"
+              "    customize: { profile: withgc }\n    inputs: {}\n")
     rc, data, out, err = run(tmp_path, "parent-flow")
     assert rc == 1, out + err
     assert "depth" in json.dumps(data), data
@@ -793,20 +816,18 @@ def test_depth_two_via_child_default_profile_dies_in_compile(tmp_path):
     # selects the grandchild-adding profile (mirrors compile's root resolution).
     _nesting_def(tmp_path, "grand-flow", "",
                  "  - id: g\n    agent: ag\n    prompt: leaf work\n")
-    child = make_flow(tmp_path, "child-flow", """\
-version: 1
-name: child-flow
-imports: [grand-flow]
-nodes:
-  - id: c
-    agent: ag
-    prompt: leaf work
-""", base="version: 1\nprofile:\n  default: withgc\n")
+    child = make_flow(tmp_path, "child-flow",
+                      "version: 1\nname: child-flow\nimports: [grand-flow]\n" + _FE_ITEMS +
+                      "nodes:\n  - id: c\n    agent: ag\n    prompt: leaf work\n",
+                      base="version: 1\nprofile:\n  default: withgc\n")
     (child / "profiles" / "withgc.yaml").write_text(
         "version: 1\nnodes:\n  add:\n    - id: deep\n"
-        "      workflow: grand-flow\n      inputs: {}\n")
-    _nesting_def(tmp_path, "parent-flow", "child-flow",
-                 "  - id: build\n    workflow: child-flow\n    inputs: {}\n")
+        "      workflow: grand-flow\n      for_each: ${workflow.inputs.items}\n"
+        "      as: it\n      inputs: {}\n")
+    make_flow(tmp_path, "parent-flow",
+              "version: 1\nname: parent-flow\nimports: [child-flow]\n" + _FE_ITEMS +
+              "nodes:\n  - id: build\n    workflow: child-flow\n"
+              "    for_each: ${workflow.inputs.items}\n    as: it\n    inputs: {}\n")
     rc, data, out, err = run(tmp_path, "parent-flow")
     assert rc == 1, out + err
     assert "depth" in json.dumps(data), data
@@ -4107,6 +4128,8 @@ nodes:
     workflow: child-flow
     when: ${a.output.ok}
     depends_on: [a]
+    for_each: ${a.output.items}
+    as: item
     inputs: {}
 """)
     (parent / "profiles" / "base.yaml").write_text("version: 1\n")
@@ -4114,7 +4137,7 @@ nodes:
     assert rc == 0, err
     m = json.loads((parent / ".compiled" / "manifest.json").read_text())
     chk = next(s for s in m["steps"] if s.get("checkpoint_type") == "nested_workflow")
-    assert chk["io"]["build"] == {"schema": None, "guarded": True, "fan_out": False}
+    assert chk["io"]["build"] == {"schema": None, "guarded": True, "fan_out": True}
 
 
 def test_real_refine_requirements_orchestrator_contracts(tmp_path):
@@ -4795,25 +4818,29 @@ def test_on_exhaust_continue_is_hash_visible_too(tmp_path):
     assert hashes["base"] != hashes["continue"]
 
 
-def test_on_exhaust_body_must_form_own_segment_trailing_merge_dies(tmp_path):
-    # action: fail + a background node AFTER the body with no checkpoint
-    # between — it merges into the loop segment and the policy would silently
-    # evaporate (no scaffold, no throw, hash-invisible). Die instead.
+def test_on_exhaust_body_with_trailing_node_isolates(tmp_path):
+    # action: fail + a background node AFTER the body. The loop-region boundary flush
+    # now ISOLATES the body into its own segment automatically (no manual checkpoint
+    # needed) — the do/while + throw are emitted and the trailing node is a separate
+    # segment. (Previously this merged + dropped the scaffold, so it had to die; the
+    # region machinery makes that obsolete.)
     merged = OX_FAIL.replace(
         "gates:\n",
         "  - id: report\n    agent: ag\n    depends_on: [ev]\n"
         "    prompt: report ${ev.output.pass}\ngates:\n")
     make_flow(tmp_path, "ox-flow", merged)
     rc, data, out, err = run(tmp_path, "ox-flow")
-    assert rc == 1
-    assert "must compile into its OWN background segment" in data["error"]
-    assert "report" in data["error"]
+    assert rc == 0, out + err
+    m = json.loads((tmp_path / "ox-flow" / ".compiled" / "manifest.json").read_text())
+    loop_steps = [s for s in m["steps"] if s.get("is_loop")]
+    assert len(loop_steps) == 1 and set(loop_steps[0]["nodes"]) == {"impl", "ev"}
+    assert "report" not in loop_steps[0]["nodes"]
 
 
-def test_on_exhaust_body_must_form_own_segment_leading_merge_dies(tmp_path):
-    # action: escalate + a background node BETWEEN the gate and the body — it
-    # merges into the loop segment; without the die the synthetic gate's
-    # `when` would reference a `loop` result no step ever produces.
+def test_on_exhaust_body_with_leading_node_isolates(tmp_path):
+    # action: escalate + background nodes BEFORE the body. The region-boundary flush
+    # isolates the body, so the synthetic gate's `when` references a `loop` result the
+    # loop segment really produces. Compiles (no die).
     merged = OX_ESCALATE.replace(
         "gates:\n",
         "  - id: prep\n    agent: ag\n    depends_on: [plan]\n"
@@ -4824,8 +4851,10 @@ def test_on_exhaust_body_must_form_own_segment_leading_merge_dies(tmp_path):
         "    depends_on: [prep2]\n    prompt: impl")
     make_flow(tmp_path, "ox-flow", merged)
     rc, data, out, err = run(tmp_path, "ox-flow")
-    assert rc == 1
-    assert "must compile into its OWN background segment" in data["error"]
+    assert rc == 0, out + err
+    m = json.loads((tmp_path / "ox-flow" / ".compiled" / "manifest.json").read_text())
+    loop_steps = [s for s in m["steps"] if s.get("is_loop")]
+    assert len(loop_steps) == 1 and set(loop_steps[0]["nodes"]) == {"impl", "ev"}
 
 
 def test_on_exhaust_escalate_empty_body_dies_via_shared_helper(tmp_path):

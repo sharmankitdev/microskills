@@ -1,0 +1,5 @@
+version: 1
+# implement-rvs / workflow-create — the workflow-domain RVS. The WORKFLOW.yaml already bakes
+# the wf dimension set (review over the 7 wf-* dimensions + 3 cross dimensions, collect
+# wf-create-all, verify workflow-draft-xref, floor workflow), so this profile is the named
+# entry point with no overlay needed. Symmetric with microskill-create, which DOES overlay.

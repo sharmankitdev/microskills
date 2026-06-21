@@ -1,0 +1,5 @@
+version: 1
+# implement-rvs base — the WORKFLOW.yaml bakes the workflow-domain dimension set, so base
+# is the workflow-create default with no overlay. The two named profiles
+# (workflow-create / microskill-create) are the domain entry points; selecting `base`
+# resolves to the workflow domain verbatim.

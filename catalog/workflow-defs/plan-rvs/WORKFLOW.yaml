@@ -1,0 +1,111 @@
+version: 1
+name: plan-rvs
+base: true
+description: >
+  The reusable plan-stage RVS — a planner-in-review cycle: plan→review→verify→synthesize over
+  the PLAN object (the planner's plan.yaml), producing {plan_path, scope_advisory, name} plus the
+  review verdict/findings. The BASE ships LOOP-LESS (a single pass; the host create pipeline's
+  approve_plan gate is the backstop). The autonomous overlays ADD the convergence loop (re-plan
+  on carried findings via task-plan's last_findings, exit on approve OR a scope_advisory). Domain
+  is profile-selected: workflow-create (plan-wf-* critique, baked here) vs microskill-create
+  (plan-ms-* critique). A static `workflow: plan-rvs` node inlines into the host; the autonomous
+  variant inlines as a guarded/ungarded loop region (compile-time inlining).
+
+inputs:
+  requirement_path:
+    type: string
+    required: true
+    materialize: file
+    description: >-
+      The originating requirement — the planner Reads it, AND each critique dimension reads it as
+      context_path (the semantic ground truth). The on_exhaust "extend" choice appends human
+      guidance here so the next re-plan round re-reads it.
+  name_override:
+    type: string
+    required: false
+    description: Optional kebab-case name the planner folds into the plan (echoed out as name).
+  staging_dir:
+    type: string
+    required: true
+    description: Sandbox dir; the planner writes plan.yaml here and the review evidence lands under here.
+
+imports:
+  - microskills/task-plan
+  - microskills/review-dimension
+  - microskills/collect-findings
+  - microskills/verify-finding
+  - microskills/synthesize-review
+
+# Plan-stage RVS. The base is a single linear pass (no loop:); the autonomous overlays add the
+# loop. synth is the TERMINAL node so a host gate `after: plan-rvs` anchors after the full review,
+# and synth (create-plan-rvs) echoes the planner identity so the single exit carries
+# {plan_path, scope_advisory, name, verdict, findings}.
+nodes:
+  # Plan the artifact. Base passes no last_findings (no loop); the autonomous overlay patches in
+  # last_findings: ${loop.carry.findings} so round 2+ re-plans against the surviving findings.
+  - id: plan
+    use: task-plan
+    customize: { profile: workflow }
+    inputs:
+      requirement_path: ${workflow.inputs.requirement_path}
+      name_override: ${workflow.inputs.name_override}
+      staging_dir: ${workflow.inputs.staging_dir}
+
+  # The plan-critique panel — ONE expand template → generated review_<dim> siblings, each running
+  # review-dimension under that plan-stage rubric. They depend only on plan, so they share a rank
+  # → ONE parallel([...]) batch. artifact_path = the written plan.yaml; context_path = the
+  # requirement. The microskill-create profile swaps this `over` list (+ co-patched loop.body).
+  - id: review
+    use: review-dimension
+    customize: { profile: "{{each.item}}" }
+    phase_group: review
+    expand:
+      over:
+        - plan-wf-completeness
+        - plan-wf-graph-correctness
+        - plan-wf-control-flow
+        - plan-wf-reuse-survey
+        - plan-wf-scope-fit
+        - plan-wf-name-capability
+    inputs:
+      artifact_path: ${plan.output.plan_path}
+      context_path: ${workflow.inputs.requirement_path}
+
+  # Fan the critique panel into one combined, dimension-stamped, deduplicated list. The plan-wf-create
+  # profile registers the 6 plan-wf-* input names (microskill-create swaps it to plan-ms-create).
+  - id: collect
+    use: collect-findings
+    customize: { profile: plan-wf-create }
+    inputs_each: review
+
+  # Adversarially verify each collected finding against the SAME plan.yaml the panel saw. for_each
+  # fan-out — its own await parallel(map(...)) rank; run every round so false positives drop.
+  - id: verify
+    use: verify-finding
+    customize: { profile: plan-workflow }
+    for_each: ${collect.output.findings}
+    as: finding
+    max_parallel: 4
+    inputs:
+      finding: ${finding}
+      artifact_path: ${plan.output.plan_path}
+
+  # Synthesize the verified critique into a verdict + ranked must-fix, and ECHO the planner
+  # identity (create-plan-rvs profile) so the single exit carries {plan_path, scope_advisory,
+  # name, verdict, findings}. Plan stage has no floor → floor_findings folds nothing.
+  - id: synth
+    use: synthesize-review
+    customize: { profile: create-plan-rvs }
+    inputs:
+      findings: ${collect.output.findings}
+      verifications: ${verify.items}
+      plan_path: ${plan.output.plan_path}
+      name: ${plan.output.name}
+      scope_advisory: ${plan.output.scope_advisory}
+      report_path: ${workflow.inputs.staging_dir}/evidence/plan-review.md
+
+# The single aggregate exit. synth carries the {plan_path, scope_advisory, name, verdict,
+# findings} contract via the create-plan-rvs profile, and is the terminal node so a host gate
+# `after: <this node>` fires after the whole review.
+output:
+  from: synth

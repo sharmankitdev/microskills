@@ -14,6 +14,10 @@ inputs:
     materialize: file
   staging_dir:
     required: true
+  # Optional re-plan input (plan-rvs bounded variant): the prior round's review
+  # findings. Round 1 carries null → a fresh plan; later rounds re-plan to address
+  # each finding (mirrors task-implement's last_findings — declared in the MICROSKILL.md
+  # inputs table; optional, so no required/materialize metadata is needed here).
 
 # Executor identity for workflow use: nodes — run AS this agent on this model
 # (background segments can't nest-dispatch, so the executor IS the planner).

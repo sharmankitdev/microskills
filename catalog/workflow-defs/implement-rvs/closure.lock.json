@@ -1,0 +1,28 @@
+{
+  "manifest_hash": "eaf1498a4c722ddbbfe4c2e5e6b12ef53a68a2159d4692d40666e22a34c6bab7",
+  "name": "implement-rvs",
+  "node_fingerprints": {
+    "bundle": "53d0b6604573ab4dcb26ca05d347c69fc25439a7198e4d545282b7446e7335cb",
+    "bundle_xref": "947103d4264ddceb7aa7dcacdb57703b29c241767e98df3fa860b218d2894cde",
+    "catalog_index": "3e234471762e344bc8a423be55034caabd39fb3f54fbfaa28444d21b2acc6a3e",
+    "collect": "2e37c81224a3d46199248f7e172776b73ec71bd8a622c78061b505edc036b362",
+    "floor": "5c4750caf8b9713c101a0ad7de2fdb19d6995e08b7f2ca2778e0b9a6f1c71f0a",
+    "implement": "346809a67a3092ab7606e86031ef1ac0900868b518ea023da711c4716f2dfe98",
+    "review_wf_dag_decomposition_correctness": "12ea331ffc71037d696b1d783196d4c70d8576625fdc6b3f7ca0029aa45f0570",
+    "review_wf_gate_prompt_options_quality": "65af53fe3c80a4df94b8072a2e04a17c0c72906702bcf0bedb66829058574d37",
+    "review_wf_guard_logic_intent": "6d9e12d802fbf66ef0b0b66e6a2d5272f95e2e2bb98c3ea28651ea4f88d823a5",
+    "review_wf_output_schema_downstream_fit": "ddf610ec0924ed9487d5399423d8ab5b584b08fe2cb8834cbddda20979fc8378",
+    "review_wf_profile_overlay_coherence": "f65b9c976af39c9484a8dd6fa1bda184e619ef27645e9fb139edaaf64e8aa3fc",
+    "review_wf_prompt_task_fidelity": "8d3cfbe5361fe97b5038164a8182c63423d284630cf62df30095da414ebaf565",
+    "review_wf_spill_materialize_judgment": "1e640eef7da55ad1f1318b543b99c4f8126b1eacf90072601376f74391129f93",
+    "synth": "51d6ee219192d40b73b09c4a6e717a7846a5bd3c43fe13c4dddd3b642382b161",
+    "verify": "ac46680fc39a7a07586e19d507c0fa7f792417dd18ad2cf9fe4f5ee7c24df333",
+    "xreview_duplicate_capability": "c5648725999e2e6a2d1a7359880d9a59585e60cb77a44a897d3612bd2588eb5e",
+    "xreview_naming_collision": "cf30125c8b959a0d974c09ea23d6f088f3771064f8c4001c801b0d73797ddcca",
+    "xreview_reverse_consumer": "354f67ea0f463ae042a5effbd97ac1de9bfcee7c98064e5bb4483773eafd5297"
+  },
+  "profile_used": "base",
+  "segment_digests": {
+    "seg-1.js": "cd2b0864a13156659f8fbcac22d23458426526b23df955a21f116098b746377a"
+  }
+}

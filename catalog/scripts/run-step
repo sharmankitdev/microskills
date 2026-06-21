@@ -347,11 +347,16 @@ def cmd_args(a):
         if not escalate:
             die("--extend is only valid on a loop segment whose manifest step "
                 "declares on_exhaust: escalate — this step does not")
-        prior = results.get("loop")
+        # The pseudo-result key is per region: __top uses the legacy 'loop'
+        # (loop_result_key omitted from the step); an inlined child region stamps
+        # its namespaced key (loop_<origin>) so the reseed never reads the wrong
+        # (or a coexisting parent) loop result.
+        loop_key = step.get("loop_result_key", "loop")
+        prior = results.get(loop_key)
         if not (isinstance(prior, dict) and isinstance(prior.get("carry"), dict)):
-            die("--extend requires a committed 'loop' pseudo-result in "
-                "run-state results — the extend re-entry seeds carry from "
-                "results.loop.carry, and nothing is committed to seed from")
+            die(f"--extend requires a committed '{loop_key}' pseudo-result in "
+                f"run-state results — the extend re-entry seeds carry from "
+                f"results.{loop_key}.carry, and nothing is committed to seed from")
         loop_seed = prior["carry"]
     carry_vars = sorted(set(needs.get("carry") or [])
                         | (set(oe_rec.get("carry_vars") or []) if escalate else set()))

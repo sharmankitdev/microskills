@@ -106,6 +106,7 @@ loop_max_parallel_errors = _cw.loop_max_parallel_errors
 apply_workflow_vars = _cw.apply_workflow_vars
 expand_static_fanout = _cw.expand_static_fanout
 desugar_subgraphs = _cw.desugar_subgraphs
+desugar_nested_workflows = _cw.desugar_nested_workflows
 # Bounded-convergence grammar + until->while desugar run INSIDE the shared
 # desugar_subgraphs (which validate calls), so they are not imported separately;
 # only the contiguity check is re-run here against validate's own topo order.
@@ -122,6 +123,7 @@ loop_reserved_id_errors = _cw.loop_reserved_id_errors
 synth_loop_exhaust_gate = _cw.synth_loop_exhaust_gate
 LOOP_EXHAUST_GATE_ID = _cw.LOOP_EXHAUST_GATE_ID
 LOOP_RESULT_ID = _cw.LOOP_RESULT_ID
+_loop_vars = _cw._loop_vars
 spill_placement_errors = _cw.spill_placement_errors
 spill_schema_errors = _cw.spill_schema_errors
 spill_guard_ref_errors = _cw.spill_guard_ref_errors
@@ -260,6 +262,51 @@ def main():
         for uk in unresolved_vars:
             add(issues, "warn", "vars", f"unresolved variable '{{{{{uk}}}}}' left intact")
 
+    # --- COMPILE-TIME INLINE: flatten STATIC nested workflows (shared desugar) ---
+    # Mirror compile-workflow: runs FIRST (before expand) so the combined flat graph's
+    # expand:/subgraph: sugar all process uniformly. Needs the component registry, so
+    # it runs only with --defs-root (a single-file validate skips nested-workflow
+    # handling, exactly like the depth/cycle check below). A static (non-for_each)
+    # workflow: node is spliced; a for_each one is left for the runtime. did_inline
+    # gates the subgraph splice's reserved-'__' guard (it minted '__' ids itself).
+    nw_did_inline = False
+    if isinstance(merged, dict) and args.defs_root:
+        merged, nw_inline_errors, nw_did_inline, _nw_regions = desugar_nested_workflows(
+            merged, Path(args.defs_root))
+        for ie in nw_inline_errors:
+            add(issues, "block", "nested-workflow", ie)
+        if nw_inline_errors:
+            print(json.dumps({"pass": False, "issues": issues}, indent=2))
+            sys.exit(1)
+        # Per-region governance parity with compile (the inlined-child loop regions are
+        # NOT re-checked by the parent loop's own validation, so a guarded loop-bearing
+        # inline could pass validate yet die at compile). Run the cheap, statically
+        # determinable checks compile runs per region: exactly-one-of while/until,
+        # max_iters >= 1, and the reserved pseudo-result / exhaust-gate id collision.
+        _reg_ids = ({n["id"] for n in (merged.get("nodes") or [])
+                     if isinstance(n, dict) and isinstance(n.get("id"), str)}
+                    | {g["id"] for g in (merged.get("gates") or [])
+                       if isinstance(g, dict) and isinstance(g.get("id"), str)})
+        for _ro, _rl, _rg in (_nw_regions or []):
+            _wu = loop_while_until_error(_rl)
+            if _wu:
+                add(issues, "block", "nested-workflow",
+                    f"loop region '{_ro}': {_wu}")
+            _mi = _rl.get("max_iters")
+            if not isinstance(_mi, int) or _mi < 1:
+                add(issues, "block", "nested-workflow",
+                    f"loop region '{_ro}': max_iters must be an integer >= 1 "
+                    f"(got {_mi!r})")
+            _rv = _loop_vars(_ro)
+            for _rid in (_rv["result"], _rv["exhaust_gate"]):
+                if _rid in _reg_ids:
+                    add(issues, "block", "nested-workflow",
+                        f"loop region '{_ro}': a node/gate id collides with its "
+                        f"reserved key/gate id '{_rid}'")
+        if any(i["severity"] == "block" for i in issues):
+            print(json.dumps({"pass": False, "issues": issues}, indent=2))
+            sys.exit(1)
+
     # --- COMPILE-TIME EXPAND: static fan-out templates (shared desugar) ---
     # Mirror compile-workflow EXACTLY: desugar expand:/inputs_each: immediately after
     # the vars pre-pass and BEFORE schema validation (the closed node schema never
@@ -295,7 +342,7 @@ def main():
         sg_root = (Path(args.defs_root) if args.defs_root
                    else wf_path.resolve().parent.parent)
         merged, subgraph_errors, converge = desugar_subgraphs(
-            merged, sg_root / "_subgraphs")
+            merged, sg_root / "_subgraphs", check_reserved=not nw_did_inline)
         for se in subgraph_errors:
             add(issues, "block", "subgraph", se)
         if subgraph_errors:

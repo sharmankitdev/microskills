@@ -1,0 +1,4 @@
+version: 1
+# plan-rvs base — the WORKFLOW.yaml bakes the workflow-domain plan-critique set and ships
+# LOOP-LESS (a single pass; the host's approve_plan gate is the backstop). base resolves to the
+# loop-less workflow domain. The named profiles are the domain × loop entry points.
