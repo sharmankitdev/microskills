@@ -34,39 +34,36 @@ headless no matter how it is invoked: a doc/profile-declared `gate_mode` wins ov
 
 | Def | Headless? | How |
 |---|---|---|
-| `review-changes` | **Yes, today, with no gate-mode at all** — it is gate-free and fully background (summarize → fan-out reviews → collect → verify → synthesize; it ends at the report and never posts or pauses — the caller owns what happens next). It is runnable under `claude -p` as-is; this recipe only documents the (previously recipe-only) gap. | `claude -p "/workflow review-changes diff_path=..."` |
-| `microskill-create` | Yes | `--profile autonomous` (declares `gate_mode: auto` + `default: approve` on the plan gate). Its implement/evaluate loop declares `on_exhaust: escalate` with `on_headless: fail`: a headless run whose loop exhausts the cap UNCONVERGED **stops at the `loop_exhaust` gate with committed run-state** instead of silently shipping the failing draft; a converging loop skips the gate and runs straight through. Continue the parked run interactively with `/workflow microskill-create pickup` — the parking gate re-presents with the full extend/accept/abandon protocol (the "approve in the morning" half of the pattern). |
+| `plan-rvs` | **Yes, today, with no gate-mode at all** — its base is gate-free and fully background (plan → review → verify → synthesize over the plan object; it ends at the synthesized plan and never pauses — inside a create pipeline the host's `approve_plan` gate is the backstop, but run standalone it just returns the plan). It is runnable under `claude -p` as-is. | `claude -p "/workflow plan-rvs requirement_path=..."` |
+| `microskill-create` | Yes | `--profile autonomous` (declares `gate_mode: auto` + `default: approve` on the plan gate). Its implement-rvs loop (the self-correcting implement → review → verify → synthesize cycle) declares `on_exhaust: escalate` with `on_headless: fail`: a headless run whose loop exhausts the cap UNCONVERGED **stops at the `loop_exhaust` gate with committed run-state** instead of silently shipping the failing draft; a converging loop skips the gate and runs straight through. Continue the parked run interactively with `/workflow microskill-create pickup` — the parking gate re-presents with the full extend/accept/abandon protocol (the "approve in the morning" half of the pattern). |
 | `workflow-create` | Yes | `--profile autonomous` (same mechanism). Its provision children (`microskill-create` autonomous) and nested `build` (`implement-rvs`, compile-time inlined as a guarded loop region) carry the same `on_exhaust` loop policy — an unconverged child stops at its `loop_exhaust` gate and ends the headless run early. NOTE: a park INSIDE a nested child is out of pickup's scope through the parent — picking up the parent re-runs the child afresh (interactively); the committed child work is not adopted. |
-| `refine-requirements` | **Not via gate mode.** Its interactivity lives in the `clarify` ORCHESTRATOR node (a bounded AskUserQuestion loop), which `gate_mode` cannot soften — under a headless run the dispatcher stops naming `clarify`. | use `--profile autonomous`, which rewrites the prompts to an unattended single pass |
 
 ## GitHub Actions example
 
 ```yaml
-# .github/workflows/nightly-review.yml
-name: nightly-headless-review
+# .github/workflows/nightly-plan.yml
+name: nightly-headless-plan
 on:
   schedule: [{ cron: "0 3 * * *" }]
 jobs:
-  review:
+  plan:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
-      - name: Generate the diff under review
-        run: git diff origin/main...HEAD > /tmp/pr.diff
-      - name: Headless review-changes (gate-free — runnable under claude -p today)
+      - name: Headless plan-rvs (gate-free — runnable under claude -p today)
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           MICROSKILLS_HEADLESS: "1"   # belt-and-braces: any gated def compiled in this job goes auto
         run: |
-          claude -p "/workflow review-changes diff_path=/tmp/pr.diff" \
+          claude -p "/workflow plan-rvs requirement_path=./req.md" \
             --permission-mode acceptEdits
 ```
 
 For a **gated** def, the same job shape works once the gates carry defaults — e.g.
 `claude -p "/workflow microskill-create autonomous requirement_path=./req.md ..."`; the
 `autonomous` profile's `gate_mode: auto` makes the dispatcher record `{choice: approve}` at the plan
-gate and continue. A run that hits an `on_headless: fail` gate (or a clarify-style node) exits
+gate and continue. A run that hits an `on_headless: fail` gate (or an orchestrator node that must ask the user) exits
 nonzero with the gate/node named in the run journal
 (`.claude/workflow-defs/<name>/.compiled/runs/<run-id>/journal.jsonl`) — its run-state is resumable
 interactively.

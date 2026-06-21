@@ -5,7 +5,7 @@ version: 1
 # and no inputs.<name>.default lines
 # are emitted. This is a pure in-memory fan-in transformation that writes
 # nothing to disk and runs no domain agent, so — matching the sibling fan-in
-# microskills (synthesize-review, verify-finding, summarize-diff) — no runtime
+# microskills (synthesize-review, verify-finding) — no runtime
 # section is declared.
 output_schema:
   type: object

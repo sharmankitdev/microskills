@@ -164,7 +164,7 @@ def wf_import_closure(defs_source, name):
     `microskills/<name>` entry is a microskill (the whole microskills registry is
     copied separately) and is skipped, as is any entry that does not name a def
     in this registry. Recurses so a nested-import def (e.g. microskill-create →
-    refine-requirements / plan-rvs / implement-rvs, each of which the compiler
+    plan-rvs / implement-rvs, each of which the compiler
     INLINES) brings its whole workflow: closure into the throwaway world and can
     therefore compile there — without this the world-builder copied only the
     named def and a nested-import def failed to resolve its children."""
@@ -240,8 +240,8 @@ class Harness:
         copy_tree(defs_source / self.name, self.defs_root / self.name,
                   f"workflow def '{self.name}'")
         # Copy the named def's transitive workflow: import closure so a
-        # nested-import def (e.g. microskill-create → refine-requirements /
-        # plan-rvs / implement-rvs) can resolve its inlined children and compile
+        # nested-import def (e.g. microskill-create → plan-rvs /
+        # implement-rvs) can resolve its inlined children and compile
         # in the throwaway world. The microskills registry is copied wholesale
         # below, so only workflow-def imports need this recursive copy.
         for imp in wf_import_closure(defs_source, self.name):

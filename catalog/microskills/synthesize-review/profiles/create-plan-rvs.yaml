@@ -9,7 +9,7 @@ version: 1
 #
 # Identical to synthesize-review/profiles/create.yaml (the review fuse; plan stage has no
 # floor, so floor_findings folds nothing) EXCEPT for the plan_path/name/scope_advisory
-# passthrough. Separate profile so build-workflow-from-plan / implement-rvs stay untouched.
+# passthrough. Separate profile so the implement-rvs review fuse stays untouched.
 vars:
   verdict_mapping: >-
     a surviving blocker-severity finding (whether a deterministic-floor blocker or a review

@@ -19,8 +19,8 @@ context:
         missing_microskills[].name. The planner contract is binding: name by capability, not
         by occasion — both the workflow name and every missing_microskills[].name (which
         becomes the permanent registry name via name_override) must state exactly what the
-        artifact does while excluding the domain, caller, or step (e.g. task-evaluate, not
-        evaluate-microskill-for-create; extract-pr-links, not
+        artifact does while excluding the domain, caller, or step (e.g. task-plan, not
+        plan-microskill-for-create; extract-pr-links, not
         extract-links-for-the-release-workflow). Position / step / caller tokens are
         forbidden. Scope is REGISTRY NAMES ONLY — the workflow name and missing_microskills
         names — never node ids, gate ids, input names, or profile names (those are where

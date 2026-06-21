@@ -6,7 +6,7 @@ contract, and diffs results + the mock call journal against goldens).
 
 Hermetic tests build throwaway segments / worlds under tmp_path and pass all
 roots as flags. The two SCENARIO tests intentionally point at the real
-catalog/ (review-changes lite, microskill-create autonomous) — their worlds
+catalog/ (the microskill-create autonomous + park-pickup scenarios) — their worlds
 are still copied into tmp_path, so nothing in the repo is written. Tests that
 execute JS require node and skip cleanly when it is absent; the committed
 GOLDEN files themselves are asserted on without node.
@@ -380,14 +380,14 @@ def run_scenario(name, workdir):
 @pytest.mark.xfail(
     reason="PERMANENT — the 2026-06-21 production rewire replaced microskill-create's "
     "single plan -> loop[implement,evaluate] -> finalize flow with the inlined "
-    "north-star graph (refine-requirements + plan-rvs + implement-rvs): 16 manifest "
-    "steps, THREE independent convergence loop regions each with its own loop_exhaust "
-    "gate, plus refine's clarify / present_refined / triage_reopened orchestrator "
-    "checkpoints and a refute_closure for_each over seats. The world-builder now copies "
+    "RVS north-star graph (plan-rvs + implement-rvs): the autonomous profile inlines "
+    "TWO independent convergence loop regions (plan_rvs + impl_rvs) each with its own "
+    "loop_exhaust gate, behind the sole approve_plan human gate and ending at finalize. "
+    "The world-builder now copies "
     "the nested workflow: import closure so the def COMPILES in the throwaway world "
     "(verified above — the run reaches step 0 and only the STALE fixtures stop it), but "
     "a faithful golden run would need bespoke deterministic fixtures driving every node "
-    "across all three loops to convergence (prompt-matcher-disambiguated queues per loop "
+    "across both loops to convergence (prompt-matcher-disambiguated queues per loop "
     "round) — large new fixture machinery out of proportion to its value, since the "
     "rewired graph's shape / regions / guards / node --check are already pinned by "
     "test_microskill_create_rewire.py and the live RVS-UX behavior is covered by the "
@@ -455,7 +455,7 @@ def test_golden_microskill_create_auto_gate_and_guarded_skip():
 @pytest.mark.xfail(
     reason="PERMANENT — same 2026-06-21 rewire as test_scenario_microskill_create_"
     "autonomous. This scenario modeled the SINGLE retired implement/evaluate loop "
-    "parking at its one loop_exhaust gate; the rewired graph has THREE loop regions, "
+    "parking at its one loop_exhaust gate; the rewired graph has TWO loop regions (plan_rvs + impl_rvs), "
     "each with its own loop_exhaust gate, so 'the park point' is no longer a single "
     "well-defined seam and reconstructing a faithful park->pickup golden needs the same "
     "large bespoke fixture machinery as the autonomous scenario. The world-builder now "

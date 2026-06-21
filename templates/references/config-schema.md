@@ -328,7 +328,7 @@ output_schema:
       items: { type: string }
 ```
 
-When present, the resolver (1) surfaces `output_schema` as a top-level field in its JSON payload and (2) appends an `## Output (required structured result)` directive to `rendered_skill_body` instructing the skill to return **only** a JSON object matching this schema (no prose, no fences). This makes the skill emit structured output whether run standalone (via the dispatcher) or composed inside a workflow `use:` node — a node can then rely on the declared shape, and the workflow evaluator checks the node's `output_schema` against it.
+When present, the resolver (1) surfaces `output_schema` as a top-level field in its JSON payload and (2) appends an `## Output (required structured result)` directive to `rendered_skill_body` instructing the skill to return **only** a JSON object matching this schema (no prose, no fences). This makes the skill emit structured output whether run standalone (via the dispatcher) or composed inside a workflow `use:` node — a node can then rely on the declared shape, and `validate-workflow` checks the node's `output_schema` against it.
 
 Declare it when the microskill returns structured/consumable data (a list, a verdict, extracted fields), or a minimal `{ <path-field>: { type: string } }` when the artifact is a file the caller chains on. Omit it for purely human-facing prose with no composable handle. For an interactive skill, the directive governs only the **final** result, after any Q&A.
 

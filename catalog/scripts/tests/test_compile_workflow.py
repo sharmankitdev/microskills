@@ -4838,23 +4838,23 @@ name: seg-shared-pg
 nodes:
   - id: summarize
     agent: ag
-    phase_group: review-changes
+    phase_group: review-pass
     prompt: do a
   - id: review_bugs
     agent: ag
-    phase_group: review-changes
+    phase_group: review-pass
     depends_on: [summarize]
     prompt: do b ${summarize.output.v}
   - id: collect
     agent: ag
-    phase_group: review-changes
+    phase_group: review-pass
     depends_on: [review_bugs]
     prompt: do c ${review_bugs.output.v}
 """
 
-SEG_NO_PG = SEG_SHARED_PG.replace("    phase_group: review-changes\n", "")
+SEG_NO_PG = SEG_SHARED_PG.replace("    phase_group: review-pass\n", "")
 SEG_MIXED_PG = SEG_SHARED_PG.replace(
-    "  - id: collect\n    agent: ag\n    phase_group: review-changes\n",
+    "  - id: collect\n    agent: ag\n    phase_group: review-pass\n",
     "  - id: collect\n    agent: ag\n    phase_group: other\n")
 
 
@@ -4867,7 +4867,7 @@ def test_segment_label_from_shared_phase_group(tmp_path):
     make_flow(tmp_path, "seg-shared-pg", SEG_SHARED_PG)
     rc, data, out, err = run(tmp_path, "seg-shared-pg")
     assert rc == 0, err
-    assert _seg(tmp_path, "seg-shared-pg")["label"] == "Review Changes"
+    assert _seg(tmp_path, "seg-shared-pg")["label"] == "Review Pass"
 
 
 def test_segment_label_concise_slug_when_no_phase_group(tmp_path):

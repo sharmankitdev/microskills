@@ -86,7 +86,7 @@ def test_scope_advisory_is_readable_not_json(tmp_path):
         "name": None,
         "scope_advisory": {
             "kind": "promote",
-            "reason": "ux-design is an inherently multi-stage pipeline",
+            "reason": "implement-rvs is an inherently multi-stage pipeline",
             "recommendation": "Promote, not microskill.",
         },
     }
@@ -99,7 +99,7 @@ def test_scope_advisory_is_readable_not_json(tmp_path):
     assert "**Name:** (none)" in out
     assert "**Scope advisory:**" in out
     assert "**Kind:** promote" in out
-    assert "ux-design is an inherently multi-stage pipeline" in out
+    assert "implement-rvs is an inherently multi-stage pipeline" in out
     assert "Promote, not microskill." in out
 
 

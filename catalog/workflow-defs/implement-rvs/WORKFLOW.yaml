@@ -3,8 +3,8 @@ name: implement-rvs
 base: true
 description: >
   The reusable implement-stage RVS loop — a self-correcting implement→review→verify→synthesize
-  cycle, promoted out of build-workflow-from-plan (which kept finalize inside). implement-rvs is
-  the PURE loop: it starts from an approved plan, drives the draft to an approve verdict (or
+  cycle. implement-rvs is the PURE loop (the host create pipeline owns finalize): it starts
+  from an approved plan, drives the draft to an approve verdict (or
   escalates at the cap), and returns {verdict, findings, staging_paths} for the host to finalize.
   It has NO finalize node — the host (a create pipeline) owns the single vendor→sync→compile
   finalize, so a static `workflow: implement-rvs` node inlines into the host as ONE guarded loop

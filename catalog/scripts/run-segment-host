@@ -20,7 +20,7 @@ runs the SAME bytes deterministically:
 FIXTURES — ORDERED QUEUES PER LABEL, never flat label keys. Every agent()
 call carries a label (`ms:<microskill>` from runMicroskill, the node label
 from runAgent). A label is NOT unique per call: expanded sibling nodes share
-`ms:<name>` (review-changes' review_<dimension> siblings), and a for_each
+`ms:<name>` (implement-rvs' review_<dimension> siblings), and a for_each
 fan-out calls the same label once per item. Call order under this mock is
 deterministic (the mock `parallel` awaits its thunks SEQUENTIALLY in array
 order — see the host-contract note below), so the fixtures file maps each

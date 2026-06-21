@@ -1,5 +1,5 @@
 {
-  "manifest_hash": "eaf1498a4c722ddbbfe4c2e5e6b12ef53a68a2159d4692d40666e22a34c6bab7",
+  "manifest_hash": "af93895ef140f1da6978551b8af8f474feddde648df4a5738899dfd6528dd0bd",
   "name": "implement-rvs",
   "node_fingerprints": {
     "bundle": "53d0b6604573ab4dcb26ca05d347c69fc25439a7198e4d545282b7446e7335cb",
@@ -8,18 +8,18 @@
     "collect": "2e37c81224a3d46199248f7e172776b73ec71bd8a622c78061b505edc036b362",
     "floor": "5c4750caf8b9713c101a0ad7de2fdb19d6995e08b7f2ca2778e0b9a6f1c71f0a",
     "implement": "346809a67a3092ab7606e86031ef1ac0900868b518ea023da711c4716f2dfe98",
-    "review_wf_dag_decomposition_correctness": "12ea331ffc71037d696b1d783196d4c70d8576625fdc6b3f7ca0029aa45f0570",
-    "review_wf_gate_prompt_options_quality": "65af53fe3c80a4df94b8072a2e04a17c0c72906702bcf0bedb66829058574d37",
-    "review_wf_guard_logic_intent": "6d9e12d802fbf66ef0b0b66e6a2d5272f95e2e2bb98c3ea28651ea4f88d823a5",
-    "review_wf_output_schema_downstream_fit": "ddf610ec0924ed9487d5399423d8ab5b584b08fe2cb8834cbddda20979fc8378",
-    "review_wf_profile_overlay_coherence": "f65b9c976af39c9484a8dd6fa1bda184e619ef27645e9fb139edaaf64e8aa3fc",
-    "review_wf_prompt_task_fidelity": "8d3cfbe5361fe97b5038164a8182c63423d284630cf62df30095da414ebaf565",
-    "review_wf_spill_materialize_judgment": "1e640eef7da55ad1f1318b543b99c4f8126b1eacf90072601376f74391129f93",
-    "synth": "51d6ee219192d40b73b09c4a6e717a7846a5bd3c43fe13c4dddd3b642382b161",
-    "verify": "ac46680fc39a7a07586e19d507c0fa7f792417dd18ad2cf9fe4f5ee7c24df333",
-    "xreview_duplicate_capability": "c5648725999e2e6a2d1a7359880d9a59585e60cb77a44a897d3612bd2588eb5e",
-    "xreview_naming_collision": "cf30125c8b959a0d974c09ea23d6f088f3771064f8c4001c801b0d73797ddcca",
-    "xreview_reverse_consumer": "354f67ea0f463ae042a5effbd97ac1de9bfcee7c98064e5bb4483773eafd5297"
+    "review_wf_dag_decomposition_correctness": "111cdc2314d94f011f2115a62418d1b49c3c4b99b9c448ab4e35e3ddc51ece79",
+    "review_wf_gate_prompt_options_quality": "e4a772435d815f0f3032c7617fe0cf8aee395f22dae32371bd84dbaf6b24e39c",
+    "review_wf_guard_logic_intent": "229d096fc17f48d2b9de7922bcaac3b658b69c6ba0f125019fa9ff4db18e71a2",
+    "review_wf_output_schema_downstream_fit": "472406267e9c10ea09a42e8847b7e4127f61369d28893f1147de3833abe105b8",
+    "review_wf_profile_overlay_coherence": "71c0ad2d2c98c18834e50f013418d5626d97b0bc62166385d28cc02ff69e0b08",
+    "review_wf_prompt_task_fidelity": "eb58423b91d2c50a62035d517bb7e024b21b34bd12efa2a259537fd68473e5a6",
+    "review_wf_spill_materialize_judgment": "15b7358f66b82cd9392ef2356e0264a05ffc406b03ef849811e75470c3b283ee",
+    "synth": "227fbd6ada2c9afcc5c3583dc33cf4c318dbe9f83a24bdf007d2c6501e29dee6",
+    "verify": "32ea8257d33a610613626c6f269c1d1bdcdb9552c9cd7c9b7bf4b695e0896911",
+    "xreview_duplicate_capability": "be6515e7dd08b63b6b57076e29310cc38ace1bbd413c8afdc8bcaa3759a68a2c",
+    "xreview_naming_collision": "90408ca4d7d2f58e50e7efe7424665d4b238371db64850814bc96b69a737a411",
+    "xreview_reverse_consumer": "75b4a0553d3de71942df2e68619662b572cb371657428ceb5e1cfaacd85f4bd4"
   },
   "profile_used": "base",
   "segment_digests": {
