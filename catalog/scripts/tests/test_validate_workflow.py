@@ -551,19 +551,9 @@ def test_real_workflow_create_passes():
     assert data["pass"] is True
 
 
-def test_real_decompose_nested_validates_with_defs_root():
-    # decompose's `build` is now a first-class workflow: node. Validate WITH --defs-root so the
-    # nested checks engage (import allowlist, target resolution, import-cycle, depth=1,
-    # required-child-input) against the real catalog defs. decompose is committed source but not
-    # materialized in this harness's .claude selection, so point --defs-root at catalog/.
-    catalog_defs = REPO / "catalog" / "workflow-defs"
-    d = catalog_defs / "decompose-monolith-orchestrator"
-    proc = subprocess.run(
-        [sys.executable, str(SCRIPT), str(d / "WORKFLOW.yaml"),
-         str(d / "profiles" / "base.yaml"), "--defs-root", str(catalog_defs)],
-        capture_output=True, text=True, cwd=str(REPO), env=_ENV)
-    data = json.loads(proc.stdout)
-    assert data["pass"] is True, [i for i in data["issues"] if i["severity"] == "block"]
+# test_real_decompose_nested_validates_with_defs_root REMOVED — the
+# decompose-monolith-orchestrator def was retired by the 2026-06-21 production rewire
+# (out-of-scope nester importing the deleted build-workflow-from-plan).
 
 
 # --- nested-workflow customize.profile resolution (needs --defs-root) ---

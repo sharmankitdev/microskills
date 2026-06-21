@@ -1,6 +1,6 @@
 # Autonomous overlay for workflow-create — used when the flow runs as a sub-step
-# of another workflow (e.g. decompose-monolith-orchestrator's `provision` node
-# building a missing nested workflow), where no human is present to approve the plan.
+# of another workflow (a parent's `provision`-style node building a missing
+# nested workflow), where no human is present to approve the plan.
 #
 # Pure flip to the declared gate-policy mechanism: `gate_mode: auto` makes the
 # dispatcher take each gate's declared default and record it VERBATIM (never a
@@ -8,16 +8,17 @@
 # gate by id — after/type/severity/options/prompt are inherited from the base
 # gate, not restated. The gate stays hard + human_approval, so the compiled
 # shape is unchanged (a human_approval gate ALWAYS flushes the segment; the
-# `build` orchestrator node stays after its own boundary); under gate_mode: auto
+# inlined `build` loop region stays after its own boundary); under gate_mode: auto
 # the dispatcher records {choice: approve} and continues WITHOUT pausing. Net
 # effect: same partition, no human pause, an author-declared recorded choice.
 #
 # The doc-declared gate_mode also WINS over a parent's inherited `--gate-mode`
 # flag, so this profile is headless regardless of how the parent runs. The build
-# half (the implement ↔ evaluate loop + finalize) runs inside
-# build-workflow-from-plan, which `build` invokes; it stays non-interactive as
-# long as the caller supplies a fresh, collision-free workflow name (a collision
-# would escalate).
+# half (the implement→review→verify→synthesize loop) lives in implement-rvs,
+# which `build` compile-time INLINES as a guarded do/while loop region (explicit
+# inputs, no wire: auto); the host's `finalize` node then vendors/syncs/compiles.
+# It stays non-interactive as long as the caller supplies a fresh, collision-free
+# workflow name (a collision would escalate).
 version: 1
 
 gate_mode: auto

@@ -78,10 +78,6 @@ workflows:
     source: plugin
   - name: workflow-create
     source: plugin
-  - name: build-workflow-from-plan
-    source: plugin
-  - name: decompose-monolith-orchestrator
-    source: plugin
   # domain: software-engineering (code-review) — flagship pipeline over the review microskills.
   - name: review-changes
     source: plugin

@@ -39,7 +39,7 @@ imports:
 
 # Parameters for the SHARED finalize protocol (_snippets/finalize-protocol.md,
 # included below via {{snippet:finalize-protocol}} — snippets resolve before vars,
-# so these {{...}} tokens parameterize the shared prose). build-workflow-from-plan
+# so these {{...}} tokens parameterize the shared prose). workflow-create
 # carries the workflow-domain twin of this block; the protocol text itself lives in
 # ONE place so the two finalizes cannot drift.
 vars:
@@ -53,6 +53,10 @@ vars:
   # so these resolve to the evaluate node — byte-identical to the pre-vars snippet.
   finalize_verdict_ref: ${evaluate.output.pass}
   finalize_issues_ref: ${evaluate.output.issues}
+  # The finalize-protocol snippet is parameterized on the staging-paths ref (the
+  # 2026-06-21 rewire); microskill-create keeps the implement/evaluate loop until
+  # sub-PR 2, so this still points at the implement node's output.
+  finalize_staging_ref: ${implement.output.staging_paths}
   finalize_epilogue: >-
     done. Print a summary: the harness/ source path, the synced .claude/ paths +
     generated shim .claude/commands/<name>.md, and the manifest entry. Do not claim

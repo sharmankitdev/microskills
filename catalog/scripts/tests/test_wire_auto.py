@@ -538,10 +538,15 @@ def test_validate_wire_auto_materializes_like_compile(tmp_path):
 # manifest_hash) to the hand-desugared rewrite of the same def. Intentionally
 # points at the real catalog/.
 
-ADOPTED = {
-    "workflow-create": {"build": ["harness_root", "harness_yaml"]},
-    "decompose-monolith-orchestrator": {"build": ["harness_root", "harness_yaml"]},
-}
+# 2026-06-21 production rewire: NO shipped def currently adopts `wire: auto`.
+# workflow-create's `build` (workflow: implement-rvs) now binds its inputs
+# EXPLICITLY and is compile-time INLINED as a guarded loop region — keeping
+# wire: auto would SUPPRESS that inlining (the node would stay a nested_workflow
+# checkpoint). decompose-monolith-orchestrator (the other former adopter) was
+# retired. The hermetic test_wire_auto_emits_handwritten_bytes remains the
+# byte-identity correctness proof for the feature; the real-catalog adoption pin
+# below is skipped until a shipped def adopts wire: auto again.
+ADOPTED = {}
 
 
 def copy_catalog_world(tmp_path):
@@ -552,7 +557,12 @@ def copy_catalog_world(tmp_path):
     return defs_root
 
 
-@pytest.mark.parametrize("name", sorted(ADOPTED))
+@pytest.mark.parametrize("name", [
+    pytest.param("workflow-create", marks=pytest.mark.skip(
+        reason="post-2026-06-21 rewire: no shipped def adopts wire: auto "
+               "(workflow-create's build is inlined with explicit inputs); "
+               "hermetic test_wire_auto_emits_handwritten_bytes covers byte-identity")),
+])
 def test_real_adopted_def_wire_auto_equals_handwritten(tmp_path, name):
     defs_root = copy_catalog_world(tmp_path)
     d = defs_root / name

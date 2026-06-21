@@ -306,37 +306,25 @@ nodes:
 
 
 def test_real_workflow_create_compiles():
-    # The implement/evaluate loop moved out into build-workflow-from-plan, so
-    # workflow-create is now a single background segment (plan) followed by three
-    # checkpoints: `provision` (nested workflow: microskill-create, autonomous
-    # profile, for_each over missing microskills), `advise` (orchestrator node),
-    # and `build` (nested workflow: build-workflow-from-plan).
+    # 2026-06-21 production rewire (sub-PR 1): build-workflow-from-plan is retired —
+    # workflow-create's `build` node is now `workflow: implement-rvs` with EXPLICIT
+    # inputs (no wire: auto), so the compiler INLINES it as ONE guarded do/while loop
+    # region; the host gained its own `finalize` orchestrator node. Shape: a background
+    # segment (plan) → approve_plan gate → `provision` (nested workflow:
+    # microskill-create, autonomous, for_each over missing microskills) → `advise`
+    # (orchestrator node) → the inlined `build` loop region (its own segment) →
+    # loop_exhaust_build gate → `finalize` (orchestrator node — vendor→sync→compile).
     rc, data, out, err = run(REAL_DEFS, "workflow-create")
     assert rc == 0, err
-    assert data["segments"] == 1
-    assert data["sequence"] == [
-        "segment[plan]", "gate", "nested_workflow", "orchestrator_node",
-        "nested_workflow"]
-
-
-def test_real_build_workflow_from_plan_compiles():
-    # The shared build half extracted from workflow-create, rewired (§8 step 7) to
-    # the host-inline review→verify→synthesize loop: ONE background segment holding
-    # the whole RVS body (implement → floor → parallel review fan-out → collect →
-    # in-loop for_each verify → synth), its on_exhaust escalation gate (conditional —
-    # skipped when the loop converges), and the canonical finalize orchestrator node.
-    # No plan node and no authored gate (those live in the caller).
-    rc, data, out, err = run(REAL_DEFS, "build-workflow-from-plan")
-    assert rc == 0, err
-    assert data["segments"] == 1
-    assert data["sequence"][1:] == ["gate", "orchestrator_node"]
-    seg = data["sequence"][0]
-    assert seg.startswith("segment[implement,") and "verify,synth]" in seg
-    for nid in ("floor", "collect", "verify", "synth",
-                "review_wf_dag_decomposition_correctness", "xreview_duplicate_capability"):
-        assert nid in seg, f"{nid} missing from RVS loop segment: {seg}"
-    # the single-LLM evaluator is retired here (D3)
-    assert "evaluate" not in seg
+    assert data["segments"] == 2, data["sequence"]
+    seq = data["sequence"]
+    assert seq[0] == "segment[plan]"
+    assert seq[1] == "gate"                       # approve_plan
+    assert seq[2] == "nested_workflow"            # provision (for_each, runtime depth-1)
+    assert seq[3] == "orchestrator_node"          # advise
+    assert seq[4].startswith("segment[build__implement"), seq[4]   # inlined build loop region
+    assert seq[5] == "gate"                       # loop_exhaust_build
+    assert seq[6] == "orchestrator_node"          # finalize
 
 
 # --- Nested-workflow profile passthrough -------------------------------------
@@ -2076,10 +2064,11 @@ def test_review_changes_threads_diff_path_by_reference(tmp_path):
 
 # --- wave 2: requirement_path by reference across the create pipelines (real defs) ---
 def test_create_pipelines_requirement_by_reference(tmp_path):
-    # microskill-create / workflow-create / build-workflow-from-plan all carry the
-    # requirement BY REFERENCE: manifest required_inputs has requirement_path (not the
-    # old inline requirement) and materialize_inputs lists it.
-    for wf in ("microskill-create", "workflow-create", "build-workflow-from-plan"):
+    # microskill-create / workflow-create both carry the requirement BY REFERENCE:
+    # manifest required_inputs has requirement_path (not the old inline requirement)
+    # and materialize_inputs lists it. (build-workflow-from-plan retired by the
+    # 2026-06-21 production rewire.)
+    for wf in ("microskill-create", "workflow-create"):
         rc, data, out, err = run(REAL_DEFS, wf)
         assert rc == 0, f"{wf}: {err}"
         man = json.loads((REAL_DEFS / wf / ".compiled" / "manifest.json").read_text())
@@ -2088,18 +2077,9 @@ def test_create_pipelines_requirement_by_reference(tmp_path):
         assert "requirement_path" in man["materialize_inputs"], wf
 
 
-def test_decompose_analyze_writes_requirement_path_plan_reads_it(tmp_path):
-    # decompose's analyze→plan is one background segment (mechanism b): analyze must
-    # PRODUCE the requirement as a file path (decomposition_requirement_path) and plan
-    # must thread that path into task-plan's requirement_path — so only a short path
-    # rides inline, never the full requirement text.
-    rc, data, out, err = run(REAL_DEFS, "decompose-monolith-orchestrator")
-    assert rc == 0, err
-    assert data["sequence"][0] == "segment[analyze,plan]"
-    seg = (REAL_DEFS / "decompose-monolith-orchestrator" / ".compiled" / "seg-1.js").read_text()
-    assert "decomposition_requirement_path" in seg
-    assert '"requirement_path"' in seg            # plan node consumes the path
-    assert "decomposition_requirement" not in seg.replace("decomposition_requirement_path", "")
+# test_decompose_analyze_writes_requirement_path_plan_reads_it REMOVED — the
+# decompose-monolith-orchestrator def was retired by the 2026-06-21 production
+# rewire (out-of-scope nester importing the deleted build-workflow-from-plan).
 
 
 # --- FAIL-LOUD CLASSIFICATION (rank: fail-loud-classification) ---
@@ -3648,9 +3628,10 @@ def test_snippet_trailing_newline_stripped_once(tmp_path):
 
 
 def test_real_finalize_snippet_renders_in_both_creators():
-    # The shared finalize protocol (ONE snippet, ~6 vars) renders into BOTH
-    # microskill-create and build-workflow-from-plan with the domain literals
-    # substituted and no token residue.
+    # The shared finalize protocol (ONE snippet, ~7 vars incl. finalize_staging_ref)
+    # renders into BOTH microskill-create and workflow-create with the domain literals
+    # substituted and no token residue. (workflow-create now hosts the workflow-domain
+    # finalize directly — the 2026-06-21 rewire retired build-workflow-from-plan.)
     rc, data, out, err = run(REAL_DEFS, "microskill-create", "--plan")
     assert rc == 0, err
     fin = [s for s in data["manifest"]["steps"] if s.get("node") == "finalize"][0]
@@ -3658,7 +3639,7 @@ def test_real_finalize_snippet_renders_in_both_creators():
     assert "harness_root}/microskills/<name>" in fin["prompt"]
     assert "`microskills:` list" in fin["prompt"]
     assert "{{" not in fin["prompt"]
-    rc, data, out, err = run(REAL_DEFS, "build-workflow-from-plan", "--plan")
+    rc, data, out, err = run(REAL_DEFS, "workflow-create", "--plan")
     assert rc == 0, err
     fin = [s for s in data["manifest"]["steps"] if s.get("node") == "finalize"][0]
     assert "vendoring the approved workflow" in fin["prompt"]

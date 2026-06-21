@@ -1,7 +1,7 @@
 version: 1
 name: workflow-create
 base: true
-description: Declarative pipeline that turns a requirement into a validated WORKFLOW.yaml — plan (agent) → approval gate → provision missing microskills → implement/evaluate loop → finalize.
+description: Declarative pipeline that turns a requirement into a validated WORKFLOW.yaml — plan (agent) → approval gate → provision missing microskills → implement-rvs loop → finalize.
 
 # Top-level workflow inputs (referenced as ${workflow.inputs.<name>}).
 inputs:
@@ -10,8 +10,9 @@ inputs:
     required: true
     materialize: file
     description: >-
-      Natural-language description of the workflow to create. task-plan / task-evaluate
-      Read the path; the nested build-workflow-from-plan receives the same path.
+      Natural-language description of the workflow to create. task-plan Reads the
+      path; the nested implement-rvs loop receives the same path as its review
+      panel's semantic ground truth.
   name:
     type: string
     required: false
@@ -34,8 +35,32 @@ inputs:
 
 imports:
   - microskills/task-plan
-  - build-workflow-from-plan
+  - implement-rvs
   - microskill-create
+
+# Parameters for the SHARED finalize protocol (_snippets/finalize-protocol.md,
+# included below on the `finalize` node via {{snippet:finalize-protocol}} —
+# snippets resolve before vars, so these {{...}} tokens parameterize the shared
+# prose). The 2026-06-21 rewire retired the old build-from-plan workflow: the
+# implement RVS loop now runs in the `build` node (workflow: implement-rvs) and
+# the host owns the single finalize, so the workflow-domain twin of this block
+# lives here.
+vars:
+  finalize_kind: workflow
+  finalize_plan_ref: ${plan.output.plan_path}
+  finalize_name_source: <name> = ${plan.output.name}
+  finalize_dest_subdir: workflow-defs
+  finalize_staged_layout: WORKFLOW.yaml + profiles/* + references/* — do NOT include any .compiled/ dir
+  finalize_verdict_ref: ${build.output.verdict}
+  finalize_issues_ref: ${build.output.findings}
+  finalize_staging_ref: ${build.output.staging_paths}
+  finalize_epilogue: >-
+    proceed. FINALLY, now that sync has vendored the source into
+    .claude/workflow-defs/<name>/, run `.claude/scripts/compile-workflow <name>` to
+    populate its .compiled/ run manifest (sync does not compile). Print a summary:
+    the harness/ source path, the synced .claude/ paths + generated shim, and that
+    .compiled/ was regenerated. Do not claim success on an unresolved sync conflict
+    or a failed compile.
 
 nodes:
   # Plan the workflow. The planner enumerates reusable microskills/agents/
@@ -84,33 +109,47 @@ nodes:
       kind=adapt, name the existing workflow that already covers this. Do not
       implement anything — stop here.
 
-  # Build the approved plan into a finalized workflow by invoking the shared
-  # build-workflow-from-plan workflow (implement ↔ evaluate loop + the canonical
-  # vendor→manifest→sync→compile finalize): it vendors the workflow into
-  # harness/workflow-defs/<name>/, upserts harness.yaml, runs sync-harness to
-  # install .claude/workflow-defs/<name>/ + its shim, and compiles .compiled/.
-  # First-class nested workflow call — runs in the main loop, the only place a
-  # node may invoke a nested workflow. Guarded so the advisory path skips it. The
-  # build half lives in ONE place so workflow-create and
-  # decompose-monolith-orchestrator cannot drift; build-workflow-from-plan
-  # invokes no further nested workflow, so recursion stays bounded (depth = 1).
-  # The explicit depends_on edge on `provision` is PURE ORDERING (no ref carries
-  # it): the provisioned microskills must exist before the build starts.
-  # wire: auto forwards the OPTIONAL harness plumbing the child declares
-  # (harness_root, harness_yaml) as ${workflow.inputs.<name>} pass-throughs;
-  # the child's REQUIRED inputs stay explicit — `name` must be the planner's
-  # proposal (NOT this workflow's optional `name` override), and
-  # requirement_path / staging_dir stay deliberate wires for the same reason.
+  # Build the approved plan into a workflow draft by invoking the reusable
+  # implement-rvs loop (the self-correcting implement→review→verify→synthesize
+  # cycle). implement-rvs is the PURE loop — it has NO finalize; it returns
+  # {verdict, findings, staging_paths, report_path} and the HOST owns the single
+  # vendor→manifest→sync→compile finalize (the `finalize` node below). This is a
+  # STATIC `workflow:` node, so the compiler INLINES it: implement-rvs's loop
+  # splices into this host as ONE guarded do/while loop region (region-guarded on
+  # the same `when`), keeping the whole pipeline flat (compile-time inlining IS
+  # the static-nested-workflow model). NOTE: inputs are bound EXPLICITLY (no
+  # `wire: auto`) — `wire: auto` suppresses inlining (keeps the node a nested
+  # checkpoint), so the host wires the one optional child input it forwards,
+  # harness_yaml, by hand; catalog_root has no host source, so the child keeps
+  # its own default (.claude). The explicit depends_on edge on `provision` is
+  # PURE ORDERING (no ref carries it): the provisioned microskills must exist
+  # before the build's review grounds against the catalog. The child's REQUIRED
+  # inputs stay explicit — `name` must be the planner's proposal (NOT this
+  # workflow's optional `name` override), and requirement_path / staging_dir stay
+  # deliberate wires for the same reason.
   - id: build
-    workflow: build-workflow-from-plan
+    workflow: implement-rvs
+    customize: { profile: workflow-create }
     when: ${plan.output.scope_advisory == null}
     depends_on: [provision]
-    wire: auto
     inputs:
       plan_path: ${plan.output.plan_path}
       name: ${plan.output.name}
       requirement_path: ${workflow.inputs.requirement_path}
       staging_dir: ${workflow.inputs.staging_dir}
+      harness_yaml: ${workflow.inputs.harness_yaml}
+
+  # Vendor the approved workflow into harness/ (source of truth), upsert the
+  # manifest, run sync-harness to install .claude/workflow-defs/<name>/ + its
+  # shim, then compile .compiled/. No agent/use → an orchestrator-native step.
+  # The prompt is the SHARED finalize protocol (one snippet, parameterized by the
+  # vars: block above) — edit _snippets/finalize-protocol.md, not a per-def copy.
+  # Reads ${build.output.staging_paths} via finalize_staging_ref. Guarded so the
+  # advisory path skips it.
+  - id: finalize
+    delegation: orchestrator
+    when: ${plan.output.scope_advisory == null}
+    prompt: "{{snippet:finalize-protocol}}"
 
 # Human-approval gate after `plan`. Approving the plan also authorizes creation
 # of the microskills it lists under missing_microskills.
@@ -123,8 +162,10 @@ gates:
     prompt: Review the plan (node graph, reuse/profile decisions, microskills to be created — check each name is a reusable capability, not coupled to this workflow/step). Approve to build, revise to re-plan, or abandon.
     options: [approve, revise, abandon]
 
-# The implement ↔ evaluate retry loop now lives inside build-workflow-from-plan, which the
-# `build` node invokes; workflow-create no longer carries its own loop.
+# The implement→review→verify→synthesize retry loop now lives inside implement-rvs,
+# which the `build` node invokes (kept as a nested_workflow checkpoint — wire: auto
+# currently suppresses inlining); the host's `finalize` node owns the
+# vendor→sync→compile step.
 
 output:
-  from: build
+  from: finalize

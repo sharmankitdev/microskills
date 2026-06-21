@@ -112,12 +112,13 @@ workflows:
 """
 
 # Base-tagged catalog components absent from PARTIAL_MANIFEST. The §8-step-7 RVS
-# rewire made build-workflow-from-plan import (and base-tag, for import-closure) the
-# review/verify/synth + floor + grounding + bundling microskills, so the flagship
-# base set a fresh consumer seeds now includes them. The workflow-inlining engine
-# (sub-PRs 4/5) added the two first-class RVS workflows implement-rvs + plan-rvs.
-MISSING_BASE = {"analyze-monolith-orchestrator", "decompose-monolith-orchestrator",
-                "build-workflow-from-plan", "run-validators", "build-catalog-index",
+# rewire base-tagged (for import-closure) the review/verify/synth + floor + grounding
+# + bundling microskills, so the flagship base set a fresh consumer seeds includes
+# them. The workflow-inlining engine added the two first-class RVS workflows
+# implement-rvs + plan-rvs. The 2026-06-21 production rewire RETIRED
+# build-workflow-from-plan + decompose-monolith-orchestrator (no longer base).
+MISSING_BASE = {"analyze-monolith-orchestrator",
+                "run-validators", "build-catalog-index",
                 "review-dimension", "collect-findings", "verify-finding",
                 "synthesize-review", "bundle-draft",
                 "implement-rvs", "plan-rvs"}
@@ -167,8 +168,7 @@ def test_adopt_base_appends_and_materializes(tmp_path):
         assert name in text
     # materialized into .claude/
     assert (tmp_path / ".claude" / "microskills" / "analyze-monolith-orchestrator").is_dir()
-    assert (tmp_path / ".claude" / "workflow-defs" / "decompose-monolith-orchestrator").is_dir()
-    assert (tmp_path / ".claude" / "workflow-defs" / "build-workflow-from-plan").is_dir()
+    assert (tmp_path / ".claude" / "workflow-defs" / "implement-rvs").is_dir()
     # idempotent: re-run sees no drift and nothing new to add
     second = run_init(tmp_path, "--plan")
     assert second["available_base"] == []
