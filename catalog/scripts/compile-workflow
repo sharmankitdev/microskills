@@ -1155,6 +1155,16 @@ def _nested_namespace_path(path, inner_ids, splice_id):
     return f"{splice_id}__{path}" if head in inner_ids else path
 
 
+def _combine_guards(a, b):
+    """AND two ${...} region guards (either may be None). Returns a single ${...}
+    expression, or None when both are absent. Used when a guard sits BOTH on a static
+    workflow node and inside the loop-bearing child it inlines — the span is gated only
+    when both hold."""
+    if a and b:
+        return "${(" + strip_ref_wrapper(a) + ") && (" + strip_ref_wrapper(b) + ")}"
+    return a or b
+
+
 def desugar_nested_workflows(wf, defs_root, _stack=None):
     """Inline every STATIC (non-for_each) `workflow:` node into the host DAG before
     partition — the compile-time half of the depth-1 model: the compiler flattens
@@ -1241,15 +1251,18 @@ def desugar_nested_workflows(wf, defs_root, _stack=None):
         # than this pass swallowing it into an inline-resolution error. wire: auto is
         # likewise left as a checkpoint: auto_wire materializes the child input
         # forwards at a LATER pass, so an inline candidate must bind its inputs
-        # EXPLICITLY (inlining a wire: auto node is a later enhancement). A `when`-
-        # guarded static node is ALSO left as a checkpoint: the guard maps to a
-        # region-level if-wrap that needs the region-guard engine (a later change) —
-        # splicing it now would SILENTLY DROP the guard and run the child
-        # unconditionally. Until then the guard rides on the surviving checkpoint.
+        # EXPLICITLY (inlining a wire: auto node is a later enhancement).
         if (n.get("delegation") == "auto" or n.get("retry") is not None
                 or n.get("side_effect") is True or cz.get("overrides")
-                or n.get("wire") == "auto" or n.get("when") is not None):
+                or n.get("wire") == "auto"):
             continue
+        # A `when`-guarded static node maps to a REGION-LEVEL if-wrap (sub-PR 3): the
+        # guard wraps the whole spliced loop region as ONE block, leaving the loop
+        # body unguarded (so a for_each verify inside stays legal). Captured here;
+        # the loop-bearing / internal-checkpoint decisioning runs after the child is
+        # resolved (a loop-LESS guarded node has no region to wrap and rides on as a
+        # checkpoint — the pre-sub-PR-3 behavior, non-breaking).
+        guard = n.get("when")
 
         # Not allowlisted by THIS workflow's imports → leave it in place for the
         # allowlist check (validate owns allowlist enforcement; compile leaves it to
@@ -1298,6 +1311,41 @@ def desugar_nested_workflows(wf, defs_root, _stack=None):
         if cerr:
             errors.extend(cerr)
             continue
+
+        # Region-guard decisioning (sub-PR 3). A guarded static node is inlined ONLY
+        # when it is loop-bearing — its loop region is a checkpoint-bounded segment the
+        # guard can if-wrap as ONE JS block. A loop-LESS guarded node has no region to
+        # wrap, so it is left in place as a nested_workflow checkpoint (the guard rides
+        # the surviving node — the pre-sub-PR-3 behavior, non-breaking). A loop-bearing
+        # guarded span carrying an INTERNAL checkpoint (an authored human/hard gate, an
+        # orchestrator node, or a surviving for_each workflow re-entry) cannot if-wrap
+        # across the checkpoint → hard block (the spike's §5 constraint).
+        if guard is not None:
+            loop_bearing = isinstance(child.get("loop"), dict) or bool(child_regions)
+            if not loop_bearing:
+                continue
+            internal_ckpt = any(
+                (g.get("type") == "human_approval"
+                 or g.get("severity", "hard") == "hard")
+                for g in (child.get("gates") or []) if isinstance(g, dict)) or any(
+                cn.get("delegation") == "orchestrator"
+                or (cn.get("workflow") and cn.get("for_each"))
+                for cn in (child.get("nodes") or []) if isinstance(cn, dict))
+            if internal_ckpt:
+                # The guard if-wraps only the loop SEGMENT; an authored gate /
+                # orchestrator / for_each re-entry inside the child is a SEPARATE
+                # checkpoint the if-wrap can't span. Fall back to the pre-sub-PR-3
+                # behavior — keep N as a nested_workflow checkpoint, where the
+                # dispatcher evaluates the guard and re-enters the (now-flat) child at
+                # runtime. Non-breaking (workflow-create's build node rides on as a
+                # checkpoint) and never silent — warn so the non-inline is visible.
+                sys.stderr.write(
+                    f"warning: node '{sid}': guarded loop-bearing workflow "
+                    f"'{target}' has an internal checkpoint (a gate / orchestrator "
+                    f"node / for_each re-entry) — kept as a nested_workflow "
+                    f"checkpoint, not inlined; the when-guard cannot if-wrap across "
+                    f"a checkpoint\n")
+                continue
 
         # Resolve the child's own {{snippet:...}} vars in its namespace (the parent's
         # vars pre-pass already ran and would otherwise miss them).
@@ -1356,10 +1404,21 @@ def desugar_nested_workflows(wf, defs_root, _stack=None):
             LOOP_RESULT_ID: f"{LOOP_RESULT_ID}_{sid}",
             LOOP_EXHAUST_GATE_ID: f"{LOOP_EXHAUST_GATE_ID}_{sid}",
         }
-        for _go, _ in child_regions:
+        for _go, _, _ in child_regions:
             result_rekey[f"{LOOP_RESULT_ID}_{_go}"] = f"{LOOP_RESULT_ID}_{sid}__{_go}"
             result_rekey[f"{LOOP_EXHAUST_GATE_ID}_{_go}"] = (
                 f"{LOOP_EXHAUST_GATE_ID}_{sid}__{_go}")
+
+        # Loop-body inner ids of THIS guarded child (own loop + bubbled grandchild
+        # regions). A guarded child's LOOP nodes are gated by the region if-wrap; its
+        # NON-loop nodes (pre/post-loop background) have no if-wrap, so the guard must
+        # ride each one's own `when` — else they run unconditionally when the guard is
+        # false (a silent `when`-semantics violation). Loop-body nodes stay unguarded
+        # so the region if-wrap is the single gate (a per-body ternary would re-block a
+        # for_each verify inside the body).
+        body_inner_ids = set((child.get("loop") or {}).get("body") or [])
+        for _go, _gl, _gg in child_regions:
+            body_inner_ids |= set((_gl or {}).get("body") or [])
 
         # Namespace + rewrite each child node.
         gen = []
@@ -1399,6 +1458,15 @@ def desugar_nested_workflows(wf, defs_root, _stack=None):
             if isinstance(cn.get("inputs_each"), str):
                 cn["inputs_each"] = f"{sid}__{cn['inputs_each']}"
             cn["id"] = f"{sid}__{iid}"
+            # Guard the child's NON-loop nodes (the loop nodes are if-wrapped). The
+            # guard is PARENT-scoped — set it AFTER the child-ref rewrite above so it is
+            # not mis-rewritten as a child ref; Pass 3 (_rewrite_exits) then re-points
+            # any guard ref that names a spliced sibling at that sibling's exit, exactly
+            # as it does for every other scoped field. cn["when"] is already the
+            # child-rewritten guard (if the node carried one), so the combine ANDs two
+            # parent-scoped expressions.
+            if guard is not None and iid not in body_inner_ids:
+                cn["when"] = _combine_guards(guard, cn.get("when"))
             gen.append(cn)
         spliced[sid] = gen
 
@@ -1441,10 +1509,16 @@ def desugar_nested_workflows(wf, defs_root, _stack=None):
                 out["on_exhaust"] = oe
             return out
 
+        # Each region carries its guard (None when unguarded). This-level guard is
+        # PARENT-scoped (rewritten for spliced-exit re-pointing in Pass 3 below). A
+        # bubbled grandchild region's own guard (child-scoped) is rewritten via _rw and
+        # ANDed with this node's guard, so a guard at either level still gates the span.
         if isinstance(child.get("loop"), dict):
-            regions.append((sid, _ns_loop(child["loop"])))
-        for gorigin, gloop in child_regions:
-            regions.append((f"{sid}__{gorigin}", _ns_loop(gloop)))
+            regions.append((sid, _ns_loop(child["loop"]), guard))
+        for gorigin, gloop, gguard in child_regions:
+            regions.append((
+                f"{sid}__{gorigin}", _ns_loop(gloop),
+                _combine_guards(guard, _rw(gguard) if gguard else None)))
 
         # Namespace the child's gates (full-workflow inline ALLOWS them).
         cgates = []
@@ -1523,6 +1597,17 @@ def desugar_nested_workflows(wf, defs_root, _stack=None):
                     n["after"] = exit_id
     _rewrite_exits(new_nodes)
     _rewrite_exits(all_gates)
+
+    # A region guard references PARENT siblings; re-point any that names a spliced
+    # node's output at that node's exit (same re-pointing the node/gate refs got).
+    def _rewrite_exit_str(s):
+        if not isinstance(s, str):
+            return s
+        for _sid2, _exit_id in exit_of.items():
+            if _exit_id:
+                s = _subgraph_rewrite_exit(s, _sid2, _exit_id)
+        return s
+    regions = [(o, lp, _rewrite_exit_str(g)) for (o, lp, g) in regions]
 
     out = wf.get("output")
     if isinstance(out, dict) and out.get("from") in exit_of and exit_of[out["from"]]:
@@ -2920,6 +3005,10 @@ def emit_segment_js(seg_nodes, wf, loop_regions, seg_index, converge_groups=None
         needs.scan((loop or {}).get("while"), seg_var_ids)
         for expr in ((loop or {}).get("carry") or {}).values():
             needs.scan(expr, seg_var_ids)
+        # A region guard references upstream (cross-segment) nodes — scan it so the
+        # if-wrap's deref reads a present _args key, never undefined.
+        if seg_region.get("guard"):
+            needs.scan(seg_region["guard"], seg_var_ids)
     # A bounded group's continue-signal references only its own in-segment exit var
     # (grammar-enforced), but scan it defensively (re-wrapped in ${...} since the
     # descriptor stores it ${}-stripped) so emit and needs can never disagree.
@@ -3049,6 +3138,15 @@ def emit_segment_js(seg_nodes, wf, loop_regions, seg_index, converge_groups=None
         loop_body_js = (f"{ran_init}{loop_calls}{break_line}{carry_assign}"
                         f"  __iter++\n")
         scaffold = emit_local_do_while(loop_body_js, while_js, "__iter", "__max")
+        # Region guard (sub-PR 3): a `when`-guarded static workflow node if-wraps the
+        # WHOLE do/while as ONE block — not each body node (a per-node ternary would
+        # re-block a for_each verify inside the body). When the guard is false the loop
+        # never runs: the node vars stay null and the escalate pseudo-result reports
+        # converged (rounds 0; __iter < __max short-circuits the exhaust check below).
+        if seg_region.get("guard"):
+            guard_js = translate_ref(
+                strip_ref_wrapper(seg_region["guard"]), seg_var_ids)
+            scaffold = f"if ({guard_js}) {{\n{scaffold}}}\n"
         body = (carry_init +
                 f"let __iter = 0\nconst __max = {max_iters}\n"
                 f"let {', '.join(jsvar(i) for i in seg_ids)}\n"
@@ -3451,13 +3549,22 @@ def main():
     # loop-bearing child (threaded from desugar_nested_workflows). Per-region
     # until->while desugar keeps emit uniform. Only the pseudo-result key + synthetic
     # exhaust-gate id are namespaced per region (segment-local vars never collide). ---
-    loop_regions = [{"origin": "__top", "loop": loop}] if isinstance(loop, dict) else []
-    for _o, _cl in (nw_loop_regions or []):
+    loop_regions = ([{"origin": "__top", "loop": loop, "guard": None}]
+                    if isinstance(loop, dict) else [])
+    for _o, _cl, _guard in (nw_loop_regions or []):
         _wu = loop_while_until_error(_cl)
         if _wu:
             die(f"loop region '{_o}': {_wu}", 1)
+        # An inlined region's loop bypassed the authored-loop schema (max_iters >= 1),
+        # so enforce it here: a max_iters < 1 region would emit `__max = 0`, and on the
+        # guard-false skip path `(__iter >= __max)` is `0 >= 0` → the exhaust check then
+        # derefs an undefined node var. Fail loud, mirroring the parent loop's bound.
+        _mi = _cl.get("max_iters")
+        if not isinstance(_mi, int) or _mi < 1:
+            die(f"loop region '{_o}': max_iters must be an integer >= 1 "
+                f"(got {_mi!r})", 1)
         desugar_loop_until(_cl)
-        loop_regions.append({"origin": _o, "loop": _cl})
+        loop_regions.append({"origin": _o, "loop": _cl, "guard": _guard})
 
     # --- loop.on_exhaust: declared cap-exhaustion policy (shared helpers) ---
     # Coherence first (gate-shaped fields only under escalate; default: extend
@@ -3565,8 +3672,15 @@ def main():
                     f"(the compiler-emitted '{_vars['exhaust_gate']}' gate rides the "
                     f"same headless rails as authored gates)", 1)
         gates_after.setdefault(_rlast, []).insert(0, _sg)
+        # A guarded region's loop segment is if-wrapped: when the guard is false the
+        # loop never runs and its pseudo-result reports converged (rounds 0). AND the
+        # guard into the gate `when` so a skipped region's exhaust gate short-circuits
+        # to false BEFORE dereferencing the (trivially-converged) loop result.
+        _rguard = _r.get("guard")
+        _conv = "!(" + _vars["result"] + ".output.converged)"
         synth_region_gate_when[_sg["id"]] = (
-            "${!(" + _vars["result"] + ".output.converged)}")
+            "${(" + strip_ref_wrapper(_rguard) + ") && " + _conv + "}"
+            if _rguard else "${" + _conv + "}")
 
     # --- S-LOOP: loop body must stay contiguous (pre-emit, mirrors validate) ---
     # A split body silently drops the do/while scaffold; die before any emit so
@@ -4109,6 +4223,16 @@ def main():
                     if _seg_region["origin"] != "__top":
                         manifest_step["loop_result_key"] = _rkey
                 manifest_step["on_exhaust"] = oe_rec
+            # Region guard (sub-PR 3): stamped on the LOOP step ONLY when present
+            # (guard-free defs stay byte-identical), and INSIDE the hashed manifest. The
+            # guard's only other footprint is the seg-JS if-wrap (segment_digests, which
+            # is EXCLUDED from manifest_hash) and — for escalate regions ONLY — the synth
+            # gate `when`. Without this stamp a guard SEMANTIC edit (e.g. `== null` →
+            # `!= null`) on a non-escalate region leaves manifest_hash unchanged, so a
+            # parked run would resume across a guard flip uninvalidated. Mirrors the
+            # converge / on_exhaust stamps (same seg-JS-only-structure reasoning).
+            if _seg_region is not None and _seg_region.get("guard"):
+                manifest_step["region_guard"] = _seg_region["guard"]
             _seg_labels = {nid: (node_by_id[nid].get("name") or humanize_id(nid))
                            for nid in step["nodes"]}
             # Segment display label (cosmetic — popped from manifest_hash below, so
