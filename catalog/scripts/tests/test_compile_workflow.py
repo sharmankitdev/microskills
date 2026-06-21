@@ -307,37 +307,24 @@ nodes:
 
 
 def test_real_workflow_create_compiles():
-    # 2026-06-21 production rewire (sub-PR 4): workflow-create is now SYMMETRIC to
-    # microskill-create. The `refine` (refine-requirements, create-spec-workflow),
-    # `plan_rvs` (plan-rvs), and `build` (implement-rvs) `workflow:` children all INLINE
-    # FLAT (EXPLICIT inputs, no wire: auto); only `provision` (for_each microskill-create)
-    # stays a runtime nested_workflow checkpoint (depth-1). Base (interactive) shape:
-    #   refine__assemble seg → clarify (orch) → refine critique loop region →
-    #   loop_exhaust_refine gate → present_refined (orch) → extract/refute seg →
-    #   triage_reopened (orch) → assemble_req_evidence seg → Gate 1
-    #   (refine__approve_requirements, HARD) → plan_rvs seg (base loop-less) → Gate 2
-    #   (approve_plan, HARD) → advise (orch) → provision (nested_workflow) → inlined
-    #   build loop region → loop_exhaust_build gate → finalize (orch).
+    # 2026-06-21 refactor: the refine-requirements front-end was REMOVED. workflow-create's
+    # `plan_rvs` (plan-rvs) and `build` (implement-rvs) `workflow:` children INLINE FLAT
+    # (EXPLICIT inputs, no wire: auto); only `provision` (for_each microskill-create) stays
+    # a runtime nested_workflow checkpoint (depth-1). Base (interactive) shape:
+    #   plan_rvs seg (base loop-less) → Gate 1 (approve_plan, HARD) → advise (orch) →
+    #   provision (nested_workflow) → inlined build loop region → loop_exhaust_build gate →
+    #   finalize (orch).
     rc, data, out, err = run(REAL_DEFS, "workflow-create")
     assert rc == 0, err
-    assert data["segments"] == 6, data["sequence"]
+    assert data["segments"] == 2, data["sequence"]
     seq = data["sequence"]
-    assert seq[0] == "segment[refine__assemble]", seq[0]
-    assert seq[1] == "orchestrator_node"          # refine__clarify
-    assert seq[2].startswith("segment[refine__revise_req"), seq[2]   # refine critique loop region
-    assert seq[3] == "gate"                       # loop_exhaust_refine
-    assert seq[4] == "orchestrator_node"          # refine__present_refined
-    assert seq[5].startswith("segment[refine__extract_claims"), seq[5]
-    assert seq[6] == "orchestrator_node"          # refine__triage_reopened
-    assert seq[7] == "segment[refine__assemble_req_evidence]", seq[7]
-    assert seq[8] == "gate"                       # Gate 1: refine__approve_requirements
-    assert seq[9].startswith("segment[plan_rvs__plan"), seq[9]       # plan_rvs (base loop-less)
-    assert seq[10] == "gate"                      # Gate 2: approve_plan
-    assert seq[11] == "orchestrator_node"         # advise
-    assert seq[12] == "nested_workflow"           # provision (for_each, runtime depth-1)
-    assert seq[13].startswith("segment[build__implement"), seq[13]   # inlined build loop region
-    assert seq[14] == "gate"                      # loop_exhaust_build
-    assert seq[15] == "orchestrator_node"         # finalize
+    assert seq[0].startswith("segment[plan_rvs__plan"), seq[0]       # plan_rvs (base loop-less)
+    assert seq[1] == "gate"                       # Gate 1: approve_plan
+    assert seq[2] == "orchestrator_node"          # advise
+    assert seq[3] == "nested_workflow"            # provision (for_each, runtime depth-1)
+    assert seq[4].startswith("segment[build__implement"), seq[4]     # inlined build loop region
+    assert seq[5] == "gate"                       # loop_exhaust_build
+    assert seq[6] == "orchestrator_node"          # finalize
 
 
 # --- Nested-workflow profile passthrough -------------------------------------
@@ -416,22 +403,20 @@ def test_nested_workflow_omits_profile_when_no_customize(tmp_path):
 
 
 def test_real_flow_segments_and_advisory_branch():
-    # 2026-06-21 production rewire (sub-PRs 2-3): the old plan/implement/evaluate guts
-    # are gone — microskill-create now compile-time INLINES three workflow children:
-    # refine-requirements (create-spec-microskill — its critique loop region + the
-    # clarify/present_refined/triage_reopened orchestrator checkpoints + Gate 1
-    # refine__approve_requirements) → plan-rvs (loop-less in base) → implement-rvs (one
+    # 2026-06-21 refactor: the refine-requirements front-end was REMOVED (redundant with
+    # the adversarial plan phase + the approve_plan gate). microskill-create now compile-time
+    # INLINES two workflow children: plan-rvs (loop-less in base) → implement-rvs (one
     # guarded loop region), keeping the `advise` advisory branch + the host `finalize`.
-    # Base: 6 segments / 9 checkpoints; refine inlines fully flat (0 nested_workflow);
-    # Gate 1 (refine__approve_requirements) precedes Gate 2 (approve_plan).
+    # Base: 2 segments / 4 checkpoints; fully flat (0 nested_workflow); approve_plan is
+    # the sole human-approval gate.
     rc, data, out, err = run(REAL_DEFS, "microskill-create")
     assert rc == 0, err
-    assert data["segments"] == 6
-    assert data["checkpoints"] == 9
+    assert data["segments"] == 2
+    assert data["checkpoints"] == 4
     man = json.loads(
         (REAL_DEFS / "microskill-create" / ".compiled" / "manifest.json").read_text())
     steps = man["steps"]
-    # Refine inlines fully flat — no surviving nested_workflow checkpoint.
+    # Both children inline fully flat — no surviving nested_workflow checkpoint.
     assert not any(s.get("checkpoint_type") == "nested_workflow" for s in steps)
     # plan_rvs is a loop-less segment in base; impl_rvs is the one guarded loop region.
     seg_plan = next(s for s in steps if s["kind"] == "segment"
@@ -440,21 +425,20 @@ def test_real_flow_segments_and_advisory_branch():
     seg_impl = next(s for s in steps if s["kind"] == "segment"
                     and all(n.startswith("impl_rvs__") for n in s["nodes"]))
     assert seg_impl["is_loop"] is True
-    # refine's nodes inline under the refine__ namespace (assemble + critique loop +
-    # refute + evidence segments).
-    assert any(s["kind"] == "segment" and all(n.startswith("refine__") for n in s["nodes"])
-               for s in steps)
+    # No refine__ nodes survive — the front-end is gone.
+    assert not any(s["kind"] == "segment" and any(n.startswith("refine__") for n in s["nodes"])
+                   for s in steps)
     assert any(s.get("node") == "advise" for s in steps)
     assert any(s.get("node") == "finalize" for s in steps)
     gate_ids = [s["gate"]["id"] for s in steps if s.get("checkpoint_type") == "gate"]
-    assert gate_ids.index("refine__approve_requirements") < gate_ids.index("approve_plan")
+    assert "approve_plan" in gate_ids
+    assert "refine__approve_requirements" not in gate_ids
 
 
 def test_real_flow_guarded_loop_breaks_when_skipped():
     # The guarded impl_rvs loop body must emit the __ran flag + break so the advisory
-    # path doesn't read a skipped (null) node in the while condition. (Post sub-PR 3 the
-    # impl_rvs region trails refine's segments + plan_rvs — locate it by its guard rather
-    # than a hardcoded segment number.)
+    # path doesn't read a skipped (null) node in the while condition. (The impl_rvs region
+    # trails plan_rvs — locate it by its guard rather than a hardcoded segment number.)
     run(REAL_DEFS, "microskill-create")
     compiled = REAL_DEFS / "microskill-create" / ".compiled"
     guarded = [p for p in compiled.glob("seg-*.js")
@@ -466,12 +450,12 @@ def test_real_flow_guarded_loop_breaks_when_skipped():
 
 
 def test_autonomous_profile_softens_gate():
-    # The autonomous profile adds plan-rvs's convergence loop (3 loop regions total) but
-    # keeps the 6-segment partition + the gate checkpoints; under gate_mode: auto the
-    # dispatcher takes each gate's default (no human pause at runtime).
+    # The autonomous profile adds plan-rvs's convergence loop (2 loop regions total:
+    # plan_rvs + impl_rvs) and keeps the 2-segment partition + the gate checkpoints;
+    # under gate_mode: auto the dispatcher takes each gate's default (no human pause).
     rc, data, out, err = run(REAL_DEFS, "microskill-create", "--profile", "autonomous")
     assert rc == 0, err
-    assert data["segments"] == 6
+    assert data["segments"] == 2
     assert "gate" in data["sequence"]
 
 

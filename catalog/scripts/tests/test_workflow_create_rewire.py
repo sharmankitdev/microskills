@@ -1,17 +1,16 @@
-"""workflow-create rewired to the symmetric north-star (2026-06-21, sub-PRs 1 + 4).
+"""workflow-create rewired to the north-star (2026-06-21, sub-PRs 1 + 4), with the
+refine-requirements front-end REMOVED (2026-06-21 refactor — redundant with the
+adversarial plan phase + the approve_plan human gate).
 
 Sub-PR 1 retired build-workflow-from-plan: workflow-create's `build` node became
 `workflow: implement-rvs` + a host `finalize` orchestrator, and BWFP +
 decompose-monolith-orchestrator defs were deleted.
 
-Sub-PR 4 makes workflow-create SYMMETRIC to microskill-create: a `refine` front-end
-(refine-requirements, create-spec-workflow — its critique loop becomes a loop region,
-its clarify / present_refined / triage_reopened orchestrators become checkpoints, and
-its terminal approve_requirements becomes Gate 1, HARD) → `plan_rvs` (plan-rvs; base
-loop-less, autonomous adds a convergence loop region) → Gate 2 (approve_plan) →
-`provision` (microskill-create per missing microskill) → `build` (implement-rvs, one
-guarded loop region) → host `finalize`. plan_rvs + build review against the REFINED
-document (${refine.output.document_path}).
+The pipeline is now: `plan_rvs` (plan-rvs; base loop-less, autonomous adds a
+convergence loop region) → Gate 1 (approve_plan) → `provision` (microskill-create per
+missing microskill) → `build` (implement-rvs, one guarded loop region) → host
+`finalize`. plan_rvs + build review against the RAW requirement_path
+(${workflow.inputs.requirement_path}) — there is no upstream refine front-end.
 
 The workflow planner's gaps flow as missing_microskills off plan-rvs's aggregate exit
 (synth): the create-plan-rvs synth profile declares + echoes the field, the plan-rvs
@@ -23,9 +22,9 @@ nested_workflow checkpoint — its fan-out N is RUNTIME (depth-1, NOT inlined).
 manifest shape (confirmed): `compile --plan` prints JSON to stdout (no --json flag);
 `data["manifest"]["steps"]` carries kind / is_loop / region_guard / checkpoint_type /
 gate / node / nodes / for_each. A loop region = a segment step with is_loop True.
-Region count: base = 2 (refine critique + build; plan-rvs base loop-less); autonomous
-= 3 (refine critique + plan_rvs + build). Points --defs-root at the REAL catalog so the
-imported workflows + microskill registry resolve.
+Region count: base = 1 (build; plan-rvs base loop-less); autonomous = 2 (plan_rvs +
+build). Points --defs-root at the REAL catalog so the imported workflows + microskill
+registry resolve.
 """
 import json
 import subprocess
@@ -61,11 +60,6 @@ def _gates(manifest):
             for s in manifest["steps"] if s.get("checkpoint_type") == "gate"}
 
 
-def _gate_order(manifest):
-    return [(s.get("gate") or {}).get("id")
-            for s in manifest["steps"] if s.get("checkpoint_type") == "gate"]
-
-
 def _nested_workflow_nodes(manifest):
     return [s.get("node") for s in manifest["steps"]
             if s.get("checkpoint_type") == "nested_workflow"]
@@ -90,9 +84,17 @@ def test_no_task_plan_import():
     assert "task-plan" not in WF
 
 
-def test_imports_symmetric_set():
-    for imp in ("refine-requirements", "plan-rvs", "implement-rvs", "microskill-create"):
+def test_imports_set():
+    for imp in ("plan-rvs", "implement-rvs", "microskill-create"):
         assert imp in WF, imp
+
+
+def test_refine_front_end_removed():
+    # The refine-requirements front-end was unwired: no import, no refine node, no
+    # ${refine.output...} ref. The raw requirement_path is the ground truth now.
+    assert "refine-requirements" not in WF
+    assert "${refine.output" not in WF
+    assert "workflow: refine-requirements" not in WF
 
 
 def test_base_compiles():
@@ -105,23 +107,21 @@ def test_autonomous_compiles():
     assert r.returncode == 0, r.stderr or r.stdout
 
 
-def test_base_two_loop_regions():
-    # plan-rvs base is loop-less; refine's critique loop + the build (implement-rvs)
-    # region are the two regions on the base (interactive) profile.
+def test_base_one_loop_region():
+    # plan-rvs base is loop-less and refine is gone → the build (implement-rvs) region
+    # is the SOLE region on the base (interactive) profile.
     m = _manifest("base")
     loops = _loops(m)
-    assert len(loops) == 2, [s["nodes"] for s in loops]
-    assert any(any("refine" in n for n in s["nodes"]) for s in loops), [s["nodes"] for s in loops]
+    assert len(loops) == 1, [s["nodes"] for s in loops]
     assert any(any("build" in n for n in s["nodes"]) for s in loops), [s["nodes"] for s in loops]
 
 
-def test_autonomous_three_loop_regions():
-    # autonomous adds plan-rvs's convergence loop → three regions: refine critique +
-    # plan_rvs + build (implement-rvs).
+def test_autonomous_two_loop_regions():
+    # autonomous adds plan-rvs's convergence loop → two regions: plan_rvs + build
+    # (implement-rvs).
     m = _manifest("autonomous")
     loops = _loops(m)
-    assert len(loops) >= 3, [s["nodes"] for s in loops]
-    assert any(any("refine" in n for n in s["nodes"]) for s in loops), [s["nodes"] for s in loops]
+    assert len(loops) == 2, [s["nodes"] for s in loops]
     assert any(any("plan_rvs" in n for n in s["nodes"]) for s in loops), [s["nodes"] for s in loops]
     assert any(any("build" in n for n in s["nodes"]) for s in loops), [s["nodes"] for s in loops]
 
@@ -135,9 +135,9 @@ def test_build_region_guarded_on_scope_advisory():
     assert "scope_advisory" in (build.get("region_guard") or ""), build.get("region_guard")
 
 
-def test_refine_and_rvs_inline_only_provision_stays_nested():
-    # refine / plan-rvs / implement-rvs all inline FLAT; the ONLY surviving
-    # nested_workflow checkpoint is provision (runtime for_each, depth-1).
+def test_rvs_inline_only_provision_stays_nested():
+    # plan-rvs / implement-rvs both inline FLAT; the ONLY surviving nested_workflow
+    # checkpoint is provision (runtime for_each, depth-1).
     for profile in ("base", "autonomous"):
         m = _manifest(profile)
         assert _nested_workflow_nodes(m) == ["provision"], _nested_workflow_nodes(m)
@@ -181,26 +181,16 @@ def test_provision_for_each_reads_missing_microskills_after_inlining():
         assert "plan_rvs__synth" in fe, fe
 
 
-def test_two_hard_gates_requirements_then_plan():
-    # Gate 1 = refine's inlined approve_requirements (namespaced refine__…, flipped
-    # warn→hard in create-spec-workflow); Gate 2 = the host approve_plan. Both present,
-    # both severity hard, Gate 1 precedes Gate 2 — on both profiles.
+def test_single_plan_approval_gate():
+    # approve_plan is the sole human-approval gate (Gate 1, severity hard) on both
+    # profiles; the old refine__approve_requirements gate is gone with the front-end.
+    # (loop_exhaust_* escalation gates come from the inlined RVS loops, not requirements.)
     for profile in ("base", "autonomous"):
         m = _manifest(profile)
         gates = _gates(m)
-        assert "refine__approve_requirements" in gates, list(gates)
         assert "approve_plan" in gates, list(gates)
-        assert gates["refine__approve_requirements"].get("severity") == "hard"
         assert gates["approve_plan"].get("severity") == "hard"
-        order = _gate_order(m)
-        assert order.index("refine__approve_requirements") < order.index("approve_plan"), order
-
-
-def test_create_spec_workflow_gate1_hard():
-    p = (DEFS / "refine-requirements" / "profiles" / "create-spec-workflow.yaml").read_text()
-    # The warn→hard flip (sub-PR 4 step 5): Gate 1 is the requirements checkpoint.
-    assert "severity: hard" in p
-    assert "severity: warn" not in p
+        assert "refine__approve_requirements" not in gates, list(gates)
 
 
 def test_finalize_is_terminal_orchestrator():

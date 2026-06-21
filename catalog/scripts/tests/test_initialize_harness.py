@@ -116,12 +116,12 @@ workflows:
 # + bundling microskills, so the flagship base set a fresh consumer seeds includes
 # them. The workflow-inlining engine added the two first-class RVS workflows
 # implement-rvs + plan-rvs. The 2026-06-21 production rewire RETIRED
-# build-workflow-from-plan + decompose-monolith-orchestrator (no longer base) and
-# (sub-PR 3) bound refine-requirements into microskill-create as its front-end — so
-# refine-requirements + its transitive microskill closure (assimilate-requirements,
+# build-workflow-from-plan + decompose-monolith-orchestrator (no longer base). The
+# 2026-06-21 refactor UNWIRED refine-requirements from the create pipelines, but
+# refine-requirements stays base in its own right (consumed by develop-product-backlog)
+# — so it + its transitive microskill closure (assimilate-requirements,
 # apply-findings-to-document, extract-closure-claims, expand-assignments, tally-votes,
-# assemble-evidence) are now base-tagged: an in-scope create pipeline must seed its
-# whole import closure.
+# assemble-evidence) remain base-tagged.
 MISSING_BASE = {"analyze-monolith-orchestrator",
                 "run-validators", "build-catalog-index",
                 "review-dimension", "collect-findings", "verify-finding",

@@ -8,8 +8,7 @@
 #     plan.last_findings = ${loop.carry.findings}. The interactive base runs plan-rvs
 #     LOOP-LESS (one pass) and leans on the human at approve_plan; the autonomous
 #     variant re-plans against surviving findings until it converges or hits the cap.
-#     (implement-rvs already carries its own loop in both modes; refine carries its
-#     own critique loop.)
+#     (implement-rvs already carries its own loop in both modes.)
 #  2. `gate_mode: auto` makes the dispatcher take each gate's declared default and
 #     record it VERBATIM (never a fabricated pick); the `gates: patch` declares that
 #     default on approve_plan by id — after/type/severity/options/prompt are inherited
@@ -21,8 +20,8 @@
 #     author-declared recorded choice.
 #
 # The doc-declared gate_mode also WINS over a parent's inherited `--gate-mode` flag,
-# so this profile is headless regardless of how the parent runs (Gate 1, the inlined
-# refine__approve_requirements, is auto-taken the same way). The build half (the
+# so this profile is headless regardless of how the parent runs (approve_plan, now
+# the sole gate, is auto-taken). The build half (the
 # implement→review→verify→synthesize loop) lives in implement-rvs, which `build`
 # compile-time INLINES as a guarded do/while loop region (explicit inputs, no
 # wire: auto); the host's `finalize` node then vendors/syncs/compiles. It stays
