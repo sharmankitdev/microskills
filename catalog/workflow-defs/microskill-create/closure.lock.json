@@ -1,5 +1,5 @@
 {
-  "manifest_hash": "cabada8a9d6a0497713ccac6048221009468cc426978e5002667c026d145ef04",
+  "manifest_hash": "1f4cb9f712cf151f8d8c20ae8087c75b2da41e9ac26f3ac1ebfcb02bc3802167",
   "name": "microskill-create",
   "node_fingerprints": {
     "advise": "01820cd75c406b7bcac77fd2cee4a4957d145097c1518277338b7e8747d04640",
@@ -7,7 +7,7 @@
     "impl_rvs__bundle": "e438dbb8307b4dc9e67f3cf28e3ef5f10b01e4c2df759c86b6355a9fbbd871f3",
     "impl_rvs__bundle_xref": "d846dfc823a519f05992952c11f1551a44ff8eb8ea3ffc56062d5623ab69f2f7",
     "impl_rvs__catalog_index": "1ed7c7d4b5545bf7c491cd231745060166d157584d77785147e96e4a68f3c33d",
-    "impl_rvs__collect": "9c71da891f4d60be2671396994878530d9b5bc5fd4e58d5e85995d37aa710fda",
+    "impl_rvs__collect": "d6d56914b2566b318fe72bc0dfad821626cfa552a6f3db461c3db7964a4bfb06",
     "impl_rvs__floor": "6d8c5e88e9f5e678552d4452fc4510efdda57f1e1bd3266ee0ec8601da3efd4d",
     "impl_rvs__implement": "8b892233d2d32bfeb3373c80080a5fadb2219c726d24afbb1e796655dd22f277",
     "impl_rvs__review_ms_atomicity_single_purpose": "603527090ba22980848ecc366aa9937bed162be427de0afca4756ed83167443e",
@@ -58,6 +58,6 @@
     "seg-3.js": "2b246b5f4a68815a907bcf1c5021cefb75783300f66372c449ba9c3bb29a4692",
     "seg-4.js": "c8c03620e6dd76721d234aad5aa207721b29d13841d2235c57c508b1d7b63370",
     "seg-5.js": "955eb60f13222d64c65fd50384c8b33084006f1d9c9ab0ceab1ffbdbb467aee8",
-    "seg-6.js": "1fe0c8a0c3615bd07b76e0752e98e12e17b3c1d88c0598fbff95af478d5f4685"
+    "seg-6.js": "8194ea28b6e7120d204c18d3a18ffb2c5f4f7a5cd175886db49a623094235b52"
   }
 }

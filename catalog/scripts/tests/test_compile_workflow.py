@@ -6,6 +6,7 @@ compiles the real microskill-create.
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -6334,3 +6335,164 @@ def test_guarded_loop_body_independent_siblings_stay_serial(tmp_path):
     assert seg2.count("__ran = true") >= 3          # ga, gb, col each set it
     assert "let __ran = false" in seg2 and "if (!__ran) break" in seg2
     assert_seg_parses(seg2)
+
+
+# --- inline + expand-sibling ref namespacing (RUNTIME-gap regression) ---------
+# desugar_nested_workflows runs BEFORE expand_static_fanout, so a spliced child
+# node's explicit ${<template>_<item>.output} ref to a not-yet-generated expand
+# SIBLING must be namespaced like any child id (the projected-sibling-id fix). The
+# pre-fix bug left it BARE → it surfaced as a phantom external need.nodes entry,
+# and `run-step args` failed loud ("no recorded result for node '<bare-sibling>'")
+# even though compile / structure / node --check all passed (none resolve args).
+
+RUN_STEP = REPO / "catalog" / "scripts" / "run-step"
+
+XREF_CHILD = """\
+version: 1
+name: xref-child
+inputs:
+  src:
+    type: string
+    required: true
+nodes:
+  # The expand TEMPLATE — its generated siblings (xreview_duplicate_capability,
+  # xreview_naming_collision) only exist AFTER the later expand pass.
+  - id: xreview
+    agent: ag
+    expand:
+      over:
+        - duplicate-capability
+        - naming-collision
+    prompt: review ${workflow.inputs.src} for {{each.item}}
+  # The fan-in — mirrors implement-rvs's `collect`: it names the generated siblings
+  # by id in its EXPLICIT inputs (the path inputs_each does NOT cover).
+  - id: collect
+    agent: ag
+    depends_on: [xreview_duplicate_capability, xreview_naming_collision]
+    inputs:
+      duplicate_capability: ${xreview_duplicate_capability.output}
+      naming_collision: ${xreview_naming_collision.output}
+    prompt: combine the panel
+output:
+  from: collect
+"""
+
+XREF_HOST = """\
+version: 1
+name: xref-host
+imports:
+  - xref-child
+nodes:
+  - id: seed
+    agent: ag
+    prompt: seed
+  # Static (non-for_each) workflow node → INLINED under the impl_rvs__ namespace.
+  - id: impl_rvs
+    workflow: xref-child
+    depends_on: [seed]
+    inputs:
+      src: ${seed.output.x}
+  - id: done
+    agent: ag
+    depends_on: [impl_rvs]
+    prompt: use ${impl_rvs.output}
+output:
+  from: done
+"""
+
+
+def _run_step_args(manifest_path, step_index, results=None, wf_inputs=None):
+    """Build a run-state and shell `run-step args` for one segment step. Returns
+    (rc, parsed_json)."""
+    man = json.loads(Path(manifest_path).read_text())
+    rs = {
+        "manifest_hash": man["manifest_hash"],
+        "step_index": step_index,
+        "inputs": wf_inputs or {},
+        "results": results or {},
+    }
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        f.write(json.dumps(rs))
+        rs_path = f.name
+    try:
+        p = subprocess.run(
+            [sys.executable, str(RUN_STEP), "args", "--manifest", str(manifest_path),
+             "--run-state", rs_path, "--step", str(step_index)],
+            capture_output=True, text=True)
+    finally:
+        os.unlink(rs_path)
+    data = json.loads(p.stdout) if p.stdout.strip().startswith("{") else None
+    return p.returncode, data
+
+
+def test_inline_expand_sibling_refs_are_namespaced(tmp_path):
+    # PRIMARY regression: a spliced child's explicit ref to an expand-generated
+    # sibling must be namespaced <splice>__<sibling>, not left bare.
+    make_flow(tmp_path, "xref-child", XREF_CHILD)
+    d = make_flow(tmp_path, "xref-host", XREF_HOST)
+    rc, data, out, err = run(tmp_path, "xref-host")
+    assert rc == 0, err
+    man_path = d / ".compiled" / "manifest.json"
+    man = json.loads(man_path.read_text())
+    blob = json.dumps(man)
+
+    # (a) NO bare xreview-sibling ref survives anywhere in the manifest — every one
+    # must wear the impl_rvs__ splice namespace (matching the post-expand node id).
+    bare = re.compile(r"(?<![_A-Za-z0-9])xreview_duplicate_capability")
+    assert not bare.search(blob), (
+        "bare (un-namespaced) expand-sibling ref leaked into the compiled manifest: "
+        + blob)
+    assert "impl_rvs__xreview_duplicate_capability" in blob
+
+    # (b) the collect node's segment must NOT carry the phantom bare need.
+    seg = next(s for s in man["steps"] if s.get("kind") == "segment")
+    assert "xreview_duplicate_capability" not in seg["needs"]["nodes"]
+    assert "xreview_naming_collision" not in seg["needs"]["nodes"]
+
+    # (c) the post-expand sibling IS a produced node under the splice namespace.
+    assert "impl_rvs__xreview_duplicate_capability" in seg["produces"]
+
+    # (d) RUNTIME proof: `run-step args` resolves with no "no recorded result" error
+    # (the gap the compile-only suite missed). seed + siblings are all produced in
+    # this single segment, so its needs.nodes is empty → empty results suffices.
+    seg_idx = man["steps"].index(seg)
+    rc2, payload = _run_step_args(man_path, seg_idx)
+    assert rc2 == 0, payload
+    assert not payload.get("errors"), payload
+
+    # (e) the spliced segment still parses (the namespacing edits the baked refs).
+    assert_seg_parses((d / seg["script"]).read_text())
+
+
+def test_real_microskill_create_no_bare_xreview_refs():
+    # Real-flow guard: the production implement-rvs `collect` ↔ `xreview` shape (the
+    # bug's origin) must compile with every xreview-sibling ref namespaced under the
+    # impl_rvs__ splice, and `run-step args` for the impl_rvs loop step must resolve.
+    rc, data, out, err = run(REAL_DEFS, "microskill-create")
+    assert rc == 0, err
+    man_path = REAL_DEFS / "microskill-create" / ".compiled" / "manifest.json"
+    man = json.loads(man_path.read_text())
+    blob = json.dumps(man)
+    bare = re.compile(r"(?<![_A-Za-z0-9])xreview_")
+    assert not bare.search(blob), (
+        "bare xreview ref leaked into microskill-create manifest")
+    # RUNTIME proof: `run-step args` for the impl_rvs loop step must resolve every
+    # need from the recorded upstream results. We seed ONLY the legitimate external
+    # producers — deliberately NOT seeding anything that looks like a bare xreview
+    # sibling. Post-fix every xreview sibling is namespaced impl_rvs__xreview_* and
+    # produced INSIDE the splice (never a bare need), so the filter is a no-op and
+    # all real needs resolve. Pre-fix the bug leaks bare xreview_* into needs.nodes;
+    # the filter then leaves them UNSEEDED, so run-step args reports "no recorded
+    # result" for them — i.e. this block actually catches the regression instead of
+    # tautologically fabricating a result for the very phantom needs under test.
+    impl = next(s for s in man["steps"] if s.get("kind") == "segment"
+                and any(n.startswith("impl_rvs__") for n in s.get("nodes", []))
+                and s.get("is_loop"))
+    results = {nid: {} for nid in impl["needs"]["nodes"]
+               if not nid.startswith("xreview_")}
+    wf_inputs = {n: "x" for n in impl["needs"].get("wf_inputs", [])}
+    rc2, payload = _run_step_args(man_path, man["steps"].index(impl),
+                                  results=results, wf_inputs=wf_inputs)
+    no_result = [e for e in (payload.get("errors") or []) if "no recorded result" in e]
+    assert not no_result, payload
+    assert rc2 == 0, payload
