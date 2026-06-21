@@ -1,0 +1,78 @@
+version: 1
+
+# The implement-rvs synthesis profile — `create` PLUS a staging_paths passthrough.
+# implement-rvs is a first-class loop whose `output: { from: synth }` is the workflow's
+# aggregate output (the engine allows exactly ONE output node). The host that finalizes
+# the build needs the staged draft paths, so synth ECHOES the implementer's
+# staging_paths verbatim into its result alongside the verdict + carried findings — the
+# whole {verdict, findings, staging_paths} contract rides one exit node.
+#
+# Identical to synthesize-review/profiles/create.yaml (the floor∪review fuse) EXCEPT for
+# the staging_paths input + output field + echo step. Kept a SEPARATE profile so
+# build-workflow-from-plan (which uses `create` and has finalize INSIDE, reading
+# implement.output.staging_paths directly) stays byte-identical — zero re-baseline.
+vars:
+  verdict_mapping: >-
+    a surviving blocker-severity finding (whether a deterministic-floor blocker or a review
+    blocker) or a review major-severity finding gives request_changes; only review
+    minor/nit survivors or deterministic-floor warn survivors give comment; no survivors
+    gives approve.
+  report_target: >-
+    write the severity-grouped markdown report to the exact file named by the report_path
+    input (creating parent directories), AND write a .json sidecar next to it (same path +
+    ".json") carrying the verdict, every count field, and the merged surviving findings;
+    return that report_path in the structured result.
+
+inputs:
+  findings:
+    required: true             # the collected, dimension-tagged REVIEW findings
+  verifications:
+    required: false            # the per-review-finding verdicts; null = keep all, join nothing
+  change_summary:
+    required: false            # the create draft has no diff summary
+  floor_findings:
+    required: false            # run-validators output's findings[]; null/absent = no floor (plan stage)
+  report_path:
+    required: true             # exact evidence file to write (+ .json sidecar)
+  staging_paths:
+    required: false            # the implementer's staged draft paths — echoed verbatim to output
+
+runtime:
+  allowed_tools: [Read, Write]
+
+# Fold the floor findings in as pre-confirmed survivors (after: 1, right after "Join
+# verdicts"), then echo staging_paths verbatim. Both phrased with NO branching vocabulary
+# (validate-microskill BRANCH_RE). The renumber places these before merge/re-rank/verdict.
+steps:
+  add:
+    - after: 1
+      text: >-
+        Fold the supplied floor_findings into the survivor set as pre-confirmed
+        deterministic findings — never joined to a verification and never dropped:
+        keep each floor finding's id and source, map its location to the file field, its
+        message to the title and the explanation, preserve its severity (blocker or warn),
+        set confidence to high, and set line to null. A null or empty floor_findings folds
+        nothing.
+    - after: 2
+      text: >-
+        Set the result's staging_paths to the supplied staging_paths input verbatim — the
+        host finalize vendors exactly these staged draft paths. A null or absent
+        staging_paths sets it to null.
+
+# REPLACES base wholesale — RETAINS findings (the loop carry) + ADDS staging_paths so the
+# {verdict, findings, staging_paths} contract is exposed through this single exit node.
+output_schema:
+  type: object
+  required: [verdict, blocker_count, comment_count, summary, findings, report_path]
+  properties:
+    verdict: { type: string, enum: [approve, comment, request_changes] }
+    blocker_count: { type: integer }      # floor blockers + review blockers
+    comment_count: { type: integer }      # surviving comment-tier (review minor/nit + floor warn)
+    summary: { type: string }
+    findings:                              # RETAINED — the loop carry (surviving, re-ranked)
+      type: array
+      items: { type: object }
+    report_path: { type: string }
+    staging_paths:                         # echoed from the implementer — the host vendors these
+      type: array
+      items: { type: string }

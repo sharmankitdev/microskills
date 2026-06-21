@@ -1,0 +1,48 @@
+version: 1
+# implement-rvs / microskill-create — retarget the workflow-domain RVS (baked in WORKFLOW.yaml)
+# to the MICROSKILL domain: the implementer + floor switch to the ms validators, the review panel
+# swaps the 7 wf dimensions for the 11 ms dimensions, and the fan-in / verify switch to the ms
+# combined profiles. The xreview cross panel + synth (create-impl-rvs) are domain-neutral and
+# stay. A profile that swaps review.expand.over MUST co-patch loop.body to the new generated
+# review_ms_* ids (the resolver list-replaces both).
+nodes:
+  patch:
+    # Implement + floor → the microskill domain validators.
+    - id: implement
+      customize: { profile: microskill }
+    - id: floor
+      customize: { profile: microskill }
+    # Review panel → the 11 artifact-stage microskill dimensions (expand.over REPLACES wholesale).
+    - id: review
+      expand:
+        over:
+          - ms-atomicity-single-purpose
+          - ms-single-linear-path-semantic
+          - ms-step-atomicity-linearity
+          - ms-inputs-contract-adequacy
+          - ms-output-contract-appropriate
+          - ms-failure-modes-coverage
+          - ms-output-section-vs-schema-fields
+          - ms-step-input-reference-undeclared
+          - ms-declared-input-unused
+          - ms-purpose-contract-fidelity
+          - ms-description-trigger-quality
+    # Fan-in → the ms combined collect (11 ms names + 3 cross names).
+    - id: collect
+      customize: { profile: ms-create-all }
+    # Verify → the ms combined adversarial seat (microskill draft bundle + catalog index).
+    - id: verify
+      customize: { profile: microskill-draft-xref }
+
+# Co-patch loop.body to the GENERATED review_ms_* ids (replaces the wf body wholesale). The cross
+# xreview ids + the fixed pipeline ids are unchanged.
+loop:
+  body: [implement, catalog_index, bundle, bundle_xref, floor,
+         review_ms_atomicity_single_purpose, review_ms_single_linear_path_semantic,
+         review_ms_step_atomicity_linearity, review_ms_inputs_contract_adequacy,
+         review_ms_output_contract_appropriate, review_ms_failure_modes_coverage,
+         review_ms_output_section_vs_schema_fields, review_ms_step_input_reference_undeclared,
+         review_ms_declared_input_unused, review_ms_purpose_contract_fidelity,
+         review_ms_description_trigger_quality,
+         xreview_duplicate_capability, xreview_naming_collision, xreview_reverse_consumer,
+         collect, verify, synth]
