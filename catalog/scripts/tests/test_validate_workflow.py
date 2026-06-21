@@ -551,19 +551,9 @@ def test_real_workflow_create_passes():
     assert data["pass"] is True
 
 
-def test_real_decompose_nested_validates_with_defs_root():
-    # decompose's `build` is now a first-class workflow: node. Validate WITH --defs-root so the
-    # nested checks engage (import allowlist, target resolution, import-cycle, depth=1,
-    # required-child-input) against the real catalog defs. decompose is committed source but not
-    # materialized in this harness's .claude selection, so point --defs-root at catalog/.
-    catalog_defs = REPO / "catalog" / "workflow-defs"
-    d = catalog_defs / "decompose-monolith-orchestrator"
-    proc = subprocess.run(
-        [sys.executable, str(SCRIPT), str(d / "WORKFLOW.yaml"),
-         str(d / "profiles" / "base.yaml"), "--defs-root", str(catalog_defs)],
-        capture_output=True, text=True, cwd=str(REPO), env=_ENV)
-    data = json.loads(proc.stdout)
-    assert data["pass"] is True, [i for i in data["issues"] if i["severity"] == "block"]
+# test_real_decompose_nested_validates_with_defs_root REMOVED — the
+# decompose-monolith-orchestrator def was retired by the 2026-06-21 production rewire
+# (out-of-scope nester importing the deleted build-workflow-from-plan).
 
 
 # --- nested-workflow customize.profile resolution (needs --defs-root) ---
@@ -2116,17 +2106,6 @@ def test_expand_leftover_each_token_blocks_validate(tmp_path):
     assert rc == 1 and data["pass"] is False
     assert any(i["location"] == "expand" and "each" in i["message"]
                for i in data["issues"]), data["issues"]
-
-
-def test_real_review_changes_validates_with_expand():
-    # The flagship adoption validates clean under all three profiles.
-    rc_dir = REPO / "catalog" / "workflow-defs" / "review-changes"
-    base = rc_dir / "profiles" / "base.yaml"
-    for overlays in ([], ["comprehensive.yaml"], ["lite.yaml"]):
-        paths = [rc_dir / "WORKFLOW.yaml", base] + [rc_dir / "profiles" / o for o in overlays]
-        rc, data, _ = run(*paths)
-        assert rc == 0, (overlays, data)
-        assert data["pass"] is True, (overlays, data["issues"])
 
 
 # =============================================================================

@@ -92,7 +92,12 @@ nodes:
 
   # Synthesize the verified critique into a verdict + ranked must-fix, and ECHO the planner
   # identity (create-plan-rvs profile) so the single exit carries {plan_path, scope_advisory,
-  # name, verdict, findings}. Plan stage has no floor → floor_findings folds nothing.
+  # name, missing_microskills, verdict, findings}. Plan stage has no floor → floor_findings
+  # folds nothing. missing_microskills is the workflow-domain planner's list of microskills the
+  # planned workflow needs but that do not exist yet (task-plan's workflow profile emits it;
+  # the microskill profile does not → the ref resolves null, harmless); echoing it through synth
+  # lets a host's provision for_each read ${plan_rvs.output.missing_microskills} off the single
+  # aggregate exit (the loop-region terminal), instead of the early plan node.
   - id: synth
     use: synthesize-review
     customize: { profile: create-plan-rvs }
@@ -102,10 +107,11 @@ nodes:
       plan_path: ${plan.output.plan_path}
       name: ${plan.output.name}
       scope_advisory: ${plan.output.scope_advisory}
+      missing_microskills: ${plan.output.missing_microskills}
       report_path: ${workflow.inputs.staging_dir}/evidence/plan-review.md
 
-# The single aggregate exit. synth carries the {plan_path, scope_advisory, name, verdict,
-# findings} contract via the create-plan-rvs profile, and is the terminal node so a host gate
-# `after: <this node>` fires after the whole review.
+# The single aggregate exit. synth carries the {plan_path, scope_advisory, name,
+# missing_microskills, verdict, findings} contract via the create-plan-rvs profile, and is the
+# terminal node so a host gate `after: <this node>` fires after the whole review.
 output:
   from: synth

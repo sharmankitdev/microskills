@@ -1,7 +1,8 @@
 """implement-rvs compiles under both creation profiles (sub-PR 4).
 
-implement-rvs is the reusable implement-stage RVS loop (build-workflow-from-plan minus
-finalize). It must compile standalone under workflow-create AND microskill-create. Points
+implement-rvs is the reusable implement-stage RVS loop (the now-retired
+build-workflow-from-plan minus its finalize). It must compile standalone under
+workflow-create AND microskill-create. Points
 --defs-root at the REAL catalog so the profile/microskill registry resolves.
 """
 import subprocess

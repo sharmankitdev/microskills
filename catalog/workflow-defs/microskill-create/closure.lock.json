@@ -1,16 +1,45 @@
 {
-  "manifest_hash": "d068c96a8884fb561e01ce3db4485c1615c5c7a3149d1365def41f0fe3e0cdbb",
+  "manifest_hash": "b3dbe69ad2f7004071acfcd38e8bae173be8801d7d670fa3d50c94b75e9ff875",
   "name": "microskill-create",
   "node_fingerprints": {
-    "advise": "1ec258019009c4a878fec97fce9cfb1d90f6cc9d1f69f38737d0b0bb6801e2ac",
-    "evaluate": "8c1456616e112f4da166cd1682183871e467adcb8a1af2faa67c18e163362af3",
-    "finalize": "a2182f28faf2d70866d311c8050f01a1001e5745b5983d14f0f5f73fce63e3bc",
-    "implement": "7250ad6fbb9f0ee299565601accca5da0ce046c5b373eea6450a0fee5d4d25aa",
-    "plan": "af5d52ae6a0d8daf39e4d7e495f99d851a4ce318efd90a06ca8a05a0759f4b64"
+    "advise": "01820cd75c406b7bcac77fd2cee4a4957d145097c1518277338b7e8747d04640",
+    "finalize": "7606923456d28e2e29cdd0eebb4a0565ca6aa388a57034c67f0d805fd754999f",
+    "impl_rvs__bundle": "e438dbb8307b4dc9e67f3cf28e3ef5f10b01e4c2df759c86b6355a9fbbd871f3",
+    "impl_rvs__bundle_xref": "d846dfc823a519f05992952c11f1551a44ff8eb8ea3ffc56062d5623ab69f2f7",
+    "impl_rvs__catalog_index": "1ed7c7d4b5545bf7c491cd231745060166d157584d77785147e96e4a68f3c33d",
+    "impl_rvs__collect": "d6d56914b2566b318fe72bc0dfad821626cfa552a6f3db461c3db7964a4bfb06",
+    "impl_rvs__floor": "6d8c5e88e9f5e678552d4452fc4510efdda57f1e1bd3266ee0ec8601da3efd4d",
+    "impl_rvs__implement": "8b892233d2d32bfeb3373c80080a5fadb2219c726d24afbb1e796655dd22f277",
+    "impl_rvs__review_ms_atomicity_single_purpose": "92bbd44dbd04342a9d883f1af4785b55d5d37d60cc7f1fc5f14db6254cf8c83d",
+    "impl_rvs__review_ms_declared_input_unused": "98bec27a20e90835e676dc06d187fc45cc5dd309cdd157cb5842f75a0e9063fa",
+    "impl_rvs__review_ms_description_trigger_quality": "4a416fd4090face9a42ed1cb99ebf043c3ba6dc13a5f625351a6b3a16c015072",
+    "impl_rvs__review_ms_failure_modes_coverage": "f00314b20a92b6ecb22f0fbe92dbea3f99f4e9fa79e2ed5a114265d3a1c3ee5a",
+    "impl_rvs__review_ms_inputs_contract_adequacy": "44511989242f62544e4be2a0635827de78b00348548b390cd4d1bbe8f9398f64",
+    "impl_rvs__review_ms_output_contract_appropriate": "e683a4c49c2df54f2ce6fdeee688e460f38a4e325d950da19b4ab861e5dca6a5",
+    "impl_rvs__review_ms_output_section_vs_schema_fields": "5fe151013b4a7fbea6dada90a958b2eb7ad64abcf9839e0968775160d5e30316",
+    "impl_rvs__review_ms_purpose_contract_fidelity": "f3c6a2fdcd8a1f44d6a67e987e9a80e3a9473a4cf5cb6be5f469bcf5ba4ad64a",
+    "impl_rvs__review_ms_single_linear_path_semantic": "9864970ade270d429303143dae5aa5ba32700aa1ffe757ef43dd758ae845db10",
+    "impl_rvs__review_ms_step_atomicity_linearity": "704bdea05ecd8eab2aafa80b7540adceeb4daa3c45021d384f16b5fc037c5234",
+    "impl_rvs__review_ms_step_input_reference_undeclared": "9cd1f1c7ac6dca3c6179d537235259c6112646d10407965993e73603089ff4a7",
+    "impl_rvs__synth": "d3e6d7ae8e2bf71c8ae779fe22cbc9da24420d9037272a6a3417ef5b25cc00f1",
+    "impl_rvs__verify": "a77c74e2f654936b336acf0764363813d3b61e1edeb5c8c27feefa4f8e983bbd",
+    "impl_rvs__xreview_duplicate_capability": "351038cf235e3f07a8b84bdf7e2dfbc0dab31964b682b9c621c179be54eaa2ea",
+    "impl_rvs__xreview_naming_collision": "832944624d7085219ddf134887e078583fc2b10e0b34976eb3de63cddb6d859f",
+    "impl_rvs__xreview_reverse_consumer": "011c5bcd2e12c9aed9cd5126ed9dc5805c5d7af7d7608c806be0acb5e7c0ebfd",
+    "plan_rvs__collect": "f9d5c2f3bcb7ef340a8ea16a236d03dd28a3dd1a837972ea26eb7bc2e880dcc2",
+    "plan_rvs__plan": "76622ec0845ff2b66616ac0fcf78b358753d599b464eea8884403edd4d2e8dc6",
+    "plan_rvs__review_plan_ms_completeness": "8c78b1144ebe6c2bd2437e6729b328a6b39c8c6f9c204a2b05735785c5543f4d",
+    "plan_rvs__review_plan_ms_failure_coverage": "721780d4ce60a8855cd8e1ce741465aff7f8c7ea888c1d9b4f22e4b6cc944a31",
+    "plan_rvs__review_plan_ms_input_contract": "0bac1a28a0236349358c29f8e0ef9c2cf5b61de947ecc7477b992f3fad1c41f7",
+    "plan_rvs__review_plan_ms_name_capability": "1678b4db5dcfdd661bca65263876f08f3be08da8cbacb1286e627988fddb2d9a",
+    "plan_rvs__review_plan_ms_output_contract": "7aeb7f6ff26c68e56cbdf1f93074eb9ebb44f812d9af9871767df8ef1cb666ff",
+    "plan_rvs__review_plan_ms_scope_fit": "baf5dd16b1fa16519a4b734dd4da93183c08e618bb5deab4fe9ef89ee8e11d5a",
+    "plan_rvs__synth": "b8fc1449b6db7e66a0f031ae5fefb0066b60eab724575908d449026c1e8ffb4d",
+    "plan_rvs__verify": "ab13fef286b44a90c7ff9332703c99193e55cb42af0fb319f246de61fe670aca"
   },
   "profile_used": "base",
   "segment_digests": {
-    "seg-1.js": "2f9fcfd3ec40f187bfb3d276eccd0b712d5c62fb824f09b325cf8450fd9c9d38",
-    "seg-2.js": "02077d50f6e52314f9bf5bcb9a0e2ac3f5bd9f8ba7a8262f5f3233aa127a6301"
+    "seg-1.js": "3442b22e44045c55ed9adde39d89d2146052ada453dd4ccf5faa0e5d1175b8c6",
+    "seg-2.js": "1a09c4fcd0623ea4cd29a402d50718af29784037cff5bf659ab8ad3b808b9379"
   }
 }

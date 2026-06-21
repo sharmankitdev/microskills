@@ -6,6 +6,7 @@ compiles the real microskill-create.
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -306,37 +307,24 @@ nodes:
 
 
 def test_real_workflow_create_compiles():
-    # The implement/evaluate loop moved out into build-workflow-from-plan, so
-    # workflow-create is now a single background segment (plan) followed by three
-    # checkpoints: `provision` (nested workflow: microskill-create, autonomous
-    # profile, for_each over missing microskills), `advise` (orchestrator node),
-    # and `build` (nested workflow: build-workflow-from-plan).
+    # 2026-06-21 refactor: the refine-requirements front-end was REMOVED. workflow-create's
+    # `plan_rvs` (plan-rvs) and `build` (implement-rvs) `workflow:` children INLINE FLAT
+    # (EXPLICIT inputs, no wire: auto); only `provision` (for_each microskill-create) stays
+    # a runtime nested_workflow checkpoint (depth-1). Base (interactive) shape:
+    #   plan_rvs seg (base loop-less) → Gate 1 (approve_plan, HARD) → advise (orch) →
+    #   provision (nested_workflow) → inlined build loop region → loop_exhaust_build gate →
+    #   finalize (orch).
     rc, data, out, err = run(REAL_DEFS, "workflow-create")
     assert rc == 0, err
-    assert data["segments"] == 1
-    assert data["sequence"] == [
-        "segment[plan]", "gate", "nested_workflow", "orchestrator_node",
-        "nested_workflow"]
-
-
-def test_real_build_workflow_from_plan_compiles():
-    # The shared build half extracted from workflow-create, rewired (§8 step 7) to
-    # the host-inline review→verify→synthesize loop: ONE background segment holding
-    # the whole RVS body (implement → floor → parallel review fan-out → collect →
-    # in-loop for_each verify → synth), its on_exhaust escalation gate (conditional —
-    # skipped when the loop converges), and the canonical finalize orchestrator node.
-    # No plan node and no authored gate (those live in the caller).
-    rc, data, out, err = run(REAL_DEFS, "build-workflow-from-plan")
-    assert rc == 0, err
-    assert data["segments"] == 1
-    assert data["sequence"][1:] == ["gate", "orchestrator_node"]
-    seg = data["sequence"][0]
-    assert seg.startswith("segment[implement,") and "verify,synth]" in seg
-    for nid in ("floor", "collect", "verify", "synth",
-                "review_wf_dag_decomposition_correctness", "xreview_duplicate_capability"):
-        assert nid in seg, f"{nid} missing from RVS loop segment: {seg}"
-    # the single-LLM evaluator is retired here (D3)
-    assert "evaluate" not in seg
+    assert data["segments"] == 2, data["sequence"]
+    seq = data["sequence"]
+    assert seq[0].startswith("segment[plan_rvs__plan"), seq[0]       # plan_rvs (base loop-less)
+    assert seq[1] == "gate"                       # Gate 1: approve_plan
+    assert seq[2] == "orchestrator_node"          # advise
+    assert seq[3] == "nested_workflow"            # provision (for_each, runtime depth-1)
+    assert seq[4].startswith("segment[build__implement"), seq[4]     # inlined build loop region
+    assert seq[5] == "gate"                       # loop_exhaust_build
+    assert seq[6] == "orchestrator_node"          # finalize
 
 
 # --- Nested-workflow profile passthrough -------------------------------------
@@ -415,31 +403,56 @@ def test_nested_workflow_omits_profile_when_no_customize(tmp_path):
 
 
 def test_real_flow_segments_and_advisory_branch():
-    # Retrofitted with a scope_advisory branch: an `advise` orchestrator node
-    # (when scope_advisory != null) before the loop, plus the loop's on_exhaust
-    # escalation gate (conditional) and the finalize node.
+    # 2026-06-21 refactor: the refine-requirements front-end was REMOVED (redundant with
+    # the adversarial plan phase + the approve_plan gate). microskill-create now compile-time
+    # INLINES two workflow children: plan-rvs (loop-less in base) → implement-rvs (one
+    # guarded loop region), keeping the `advise` advisory branch + the host `finalize`.
+    # Base: 2 segments / 4 checkpoints; fully flat (0 nested_workflow); approve_plan is
+    # the sole human-approval gate.
     rc, data, out, err = run(REAL_DEFS, "microskill-create")
     assert rc == 0, err
     assert data["segments"] == 2
     assert data["checkpoints"] == 4
-    assert data["sequence"] == [
-        "segment[plan]", "gate", "orchestrator_node",
-        "segment[implement,evaluate]", "gate", "orchestrator_node"]
+    man = json.loads(
+        (REAL_DEFS / "microskill-create" / ".compiled" / "manifest.json").read_text())
+    steps = man["steps"]
+    # Both children inline fully flat — no surviving nested_workflow checkpoint.
+    assert not any(s.get("checkpoint_type") == "nested_workflow" for s in steps)
+    # plan_rvs is a loop-less segment in base; impl_rvs is the one guarded loop region.
+    seg_plan = next(s for s in steps if s["kind"] == "segment"
+                    and all(n.startswith("plan_rvs__") for n in s["nodes"]))
+    assert seg_plan["is_loop"] is False
+    seg_impl = next(s for s in steps if s["kind"] == "segment"
+                    and all(n.startswith("impl_rvs__") for n in s["nodes"]))
+    assert seg_impl["is_loop"] is True
+    # No refine__ nodes survive — the front-end is gone.
+    assert not any(s["kind"] == "segment" and any(n.startswith("refine__") for n in s["nodes"])
+                   for s in steps)
+    assert any(s.get("node") == "advise" for s in steps)
+    assert any(s.get("node") == "finalize" for s in steps)
+    gate_ids = [s["gate"]["id"] for s in steps if s.get("checkpoint_type") == "gate"]
+    assert "approve_plan" in gate_ids
+    assert "refine__approve_requirements" not in gate_ids
 
 
 def test_real_flow_guarded_loop_breaks_when_skipped():
-    # The guarded loop body must emit the __ran flag + break so the advisory
-    # path doesn't read a skipped (null) node in the while condition.
+    # The guarded impl_rvs loop body must emit the __ran flag + break so the advisory
+    # path doesn't read a skipped (null) node in the while condition. (The impl_rvs region
+    # trails plan_rvs — locate it by its guard rather than a hardcoded segment number.)
     run(REAL_DEFS, "microskill-create")
-    seg2 = (REAL_DEFS / "microskill-create" / ".compiled" / "seg-2.js").read_text()
-    assert "let __ran = false" in seg2
-    assert "if (!__ran) break" in seg2
-    assert "scope_advisory == null" in seg2
+    compiled = REAL_DEFS / "microskill-create" / ".compiled"
+    guarded = [p for p in compiled.glob("seg-*.js")
+               if "scope_advisory == null" in p.read_text()]
+    assert len(guarded) == 1, [p.name for p in guarded]
+    seg = guarded[0].read_text()
+    assert "let __ran = false" in seg
+    assert "if (!__ran) break" in seg
 
 
 def test_autonomous_profile_softens_gate():
-    # The autonomous profile keeps 2 segments + the gate checkpoint (loop stays
-    # separated) but the gate is warn-severity (no human pause at runtime).
+    # The autonomous profile adds plan-rvs's convergence loop (2 loop regions total:
+    # plan_rvs + impl_rvs) and keeps the 2-segment partition + the gate checkpoints;
+    # under gate_mode: auto the dispatcher takes each gate's default (no human pause).
     rc, data, out, err = run(REAL_DEFS, "microskill-create", "--profile", "autonomous")
     assert rc == 0, err
     assert data["segments"] == 2
@@ -525,12 +538,19 @@ def test_real_autonomous_gate_patch_applies():
         assert rc == 0, err
         m = json.loads((REAL_DEFS / name / ".compiled" / "manifest.json").read_text())
         assert m["gate_mode"] == "auto"
-        gate = _gate_checkpoint(REAL_DEFS, name)
+        # Both pipelines now run an AUTONOMOUS plan-rvs whose convergence loop adds a
+        # loop_exhaust_plan_rvs gate BEFORE approve_plan — so select the approval gate
+        # by id (not "the first gate"). After-anchor: approve_plan sits after the inlined
+        # plan-rvs terminal (plan_rvs__synth) for BOTH (workflow-create's guts rewire
+        # landed in sub-PR 4 — symmetric with microskill-create).
+        gate = next(s["gate"] for s in m["steps"]
+                    if s.get("checkpoint_type") == "gate"
+                    and s.get("gate", {}).get("id") == "approve_plan")
         assert gate["id"] == "approve_plan"
         assert gate["severity"] == "hard"          # NOT flipped any more
         assert gate["default"] == "approve"        # the patch merged by id
         assert "(autonomous)" not in gate["prompt"]
-        assert gate["after"] == "plan"
+        assert gate["after"] == "plan_rvs__synth"
         assert gate["type"] == "human_approval"
         assert gate["options"] == ["approve", "revise", "abandon"]
 
@@ -1850,17 +1870,6 @@ def test_loop_body_siblings_parallelize(tmp_path):
     assert "const n_x" not in seg2                       # reassignment, pre-declared lets
 
 
-def test_review_changes_dimension_reviews_parallelize(tmp_path):
-    # ACCEPTANCE: review-changes' three dimension reviews all depend only on
-    # `summarize`, so they share a rank and compile into a single parallel([...]).
-    rc, data, out, err = run(REAL_DEFS, "review-changes")
-    assert rc == 0, err
-    seg = (REAL_DEFS / "review-changes" / ".compiled" / "seg-1.js").read_text()
-    assert ("const [n_review_correctness, n_review_security, n_review_performance] "
-            "= await parallel([") in seg
-    assert "const n_review_security = await" not in seg   # not a serial sibling
-
-
 # --- phase_group: cosmetic /workflows grouping (emit-only, manifest_hash-safe) ---
 SIBLINGS_PG = """\
 version: 1
@@ -1976,44 +1985,6 @@ def test_single_node_phase_group_marker(tmp_path):
     assert '"foo", "node:a")' in seg                  # per-call opt also carries the group
 
 
-# --- review-changes: pure-pipeline strip + lite / comprehensive profiles (real def) ---
-def test_review_changes_base_is_pure_pipeline(tmp_path):
-    # After the strip, base review-changes is ONE background segment with ZERO
-    # checkpoints (no gate, no post) — it ends at synthesize and composes clean when nested.
-    rc, data, out, err = run(REAL_DEFS, "review-changes")
-    assert rc == 0, err
-    assert data["segments"] == 1 and data["checkpoints"] == 0
-    assert data["sequence"] == [
-        "segment[summarize,review_correctness,review_security,"
-        "review_performance,collect,verify,synthesize]"]
-
-
-def test_review_changes_lite_profile_is_correctness_only(tmp_path):
-    # lite removes the security + performance dimension nodes and unwires collect.
-    rc, data, out, err = run(REAL_DEFS, "review-changes", "--profile", "lite")
-    assert rc == 0, err
-    assert data["segments"] == 1 and data["checkpoints"] == 0
-    seq = data["sequence"][0]
-    assert "review_correctness" in seq
-    assert "review_security" not in seq and "review_performance" not in seq
-
-
-def test_review_changes_comprehensive_profile_six_dimensions(tmp_path):
-    # comprehensive adds style/documentation/test_coverage — six dimensions under ONE
-    # "review" group — plus the configurable min_coverage input (default 80).
-    rc, data, out, err = run(REAL_DEFS, "review-changes", "--profile", "comprehensive", "--explain")
-    assert rc == 0, err
-    seg = (REAL_DEFS / "review-changes" / ".compiled" / "seg-1.js").read_text()
-    assert ("const [n_review_correctness, n_review_security, n_review_performance, "
-            "n_review_style, n_review_documentation, n_review_test_coverage] "
-            "= await parallel([") in seg
-    assert seg.count('{ title: "review" }') == 1          # all six collapse to one group
-    assert 'phase("review")' not in seg                    # per-call opt, no racey marker
-    assert '"threshold": _args.wf_min_coverage' in seg     # coverage threshold threaded in
-    man = json.loads((REAL_DEFS / "review-changes" / ".compiled" / "manifest.json").read_text())
-    assert man["input_defaults"].get("min_coverage") == 80
-
-
 # --- materialize: file — large/multi-shape input passed by reference ---
 MATERIALIZE = """\
 version: 1
@@ -2059,27 +2030,13 @@ def test_manifest_materialize_inputs_empty_when_none(tmp_path):
     assert man["materialize_inputs"] == []
 
 
-def test_review_changes_threads_diff_path_by_reference(tmp_path):
-    # After the diff_path migration, the compiled review-changes segment threads
-    # ONLY the short path (_args.wf_diff_path) into every diff consumer — never the
-    # inline _args.wf_diff — and the manifest marks diff_path materialize:file.
-    rc, data, out, err = run(REAL_DEFS, "review-changes", "--explain")
-    assert rc == 0, err
-    seg = (REAL_DEFS / "review-changes" / ".compiled" / "seg-1.js").read_text()
-    assert "_args.wf_diff_path" in seg
-    assert "_args.wf_diff" not in seg.replace("_args.wf_diff_path", "")  # no bare wf_diff
-    man = json.loads((REAL_DEFS / "review-changes" / ".compiled" / "manifest.json").read_text())
-    assert "diff_path" in man["required_inputs"]
-    assert "diff" not in man["required_inputs"]
-    assert man["materialize_inputs"] == ["diff_path"]
-
-
 # --- wave 2: requirement_path by reference across the create pipelines (real defs) ---
 def test_create_pipelines_requirement_by_reference(tmp_path):
-    # microskill-create / workflow-create / build-workflow-from-plan all carry the
-    # requirement BY REFERENCE: manifest required_inputs has requirement_path (not the
-    # old inline requirement) and materialize_inputs lists it.
-    for wf in ("microskill-create", "workflow-create", "build-workflow-from-plan"):
+    # microskill-create / workflow-create both carry the requirement BY REFERENCE:
+    # manifest required_inputs has requirement_path (not the old inline requirement)
+    # and materialize_inputs lists it. (build-workflow-from-plan retired by the
+    # 2026-06-21 production rewire.)
+    for wf in ("microskill-create", "workflow-create"):
         rc, data, out, err = run(REAL_DEFS, wf)
         assert rc == 0, f"{wf}: {err}"
         man = json.loads((REAL_DEFS / wf / ".compiled" / "manifest.json").read_text())
@@ -2088,18 +2045,9 @@ def test_create_pipelines_requirement_by_reference(tmp_path):
         assert "requirement_path" in man["materialize_inputs"], wf
 
 
-def test_decompose_analyze_writes_requirement_path_plan_reads_it(tmp_path):
-    # decompose's analyze→plan is one background segment (mechanism b): analyze must
-    # PRODUCE the requirement as a file path (decomposition_requirement_path) and plan
-    # must thread that path into task-plan's requirement_path — so only a short path
-    # rides inline, never the full requirement text.
-    rc, data, out, err = run(REAL_DEFS, "decompose-monolith-orchestrator")
-    assert rc == 0, err
-    assert data["sequence"][0] == "segment[analyze,plan]"
-    seg = (REAL_DEFS / "decompose-monolith-orchestrator" / ".compiled" / "seg-1.js").read_text()
-    assert "decomposition_requirement_path" in seg
-    assert '"requirement_path"' in seg            # plan node consumes the path
-    assert "decomposition_requirement" not in seg.replace("decomposition_requirement_path", "")
+# test_decompose_analyze_writes_requirement_path_plan_reads_it REMOVED — the
+# decompose-monolith-orchestrator def was retired by the 2026-06-21 production
+# rewire (out-of-scope nester importing the deleted build-workflow-from-plan).
 
 
 # --- FAIL-LOUD CLASSIFICATION (rank: fail-loud-classification) ---
@@ -3648,9 +3596,10 @@ def test_snippet_trailing_newline_stripped_once(tmp_path):
 
 
 def test_real_finalize_snippet_renders_in_both_creators():
-    # The shared finalize protocol (ONE snippet, ~6 vars) renders into BOTH
-    # microskill-create and build-workflow-from-plan with the domain literals
-    # substituted and no token residue.
+    # The shared finalize protocol (ONE snippet, ~7 vars incl. finalize_staging_ref)
+    # renders into BOTH microskill-create and workflow-create with the domain literals
+    # substituted and no token residue. (workflow-create now hosts the workflow-domain
+    # finalize directly — the 2026-06-21 rewire retired build-workflow-from-plan.)
     rc, data, out, err = run(REAL_DEFS, "microskill-create", "--plan")
     assert rc == 0, err
     fin = [s for s in data["manifest"]["steps"] if s.get("node") == "finalize"][0]
@@ -3658,7 +3607,7 @@ def test_real_finalize_snippet_renders_in_both_creators():
     assert "harness_root}/microskills/<name>" in fin["prompt"]
     assert "`microskills:` list" in fin["prompt"]
     assert "{{" not in fin["prompt"]
-    rc, data, out, err = run(REAL_DEFS, "build-workflow-from-plan", "--plan")
+    rc, data, out, err = run(REAL_DEFS, "workflow-create", "--plan")
     assert rc == 0, err
     fin = [s for s in data["manifest"]["steps"] if s.get("node") == "finalize"][0]
     assert "vendoring the approved workflow" in fin["prompt"]
@@ -3837,45 +3786,6 @@ def test_leftover_each_token_blocks(tmp_path):
     rc, data, out, err = run(tmp_path, "fan-flow")
     assert rc == 1
     assert any("each" in e for e in data.get("expand_errors", [])), data
-
-
-def test_real_review_changes_expand_matches_hand_cloned_shape():
-    # The flagship adoption: review-changes' ONE expand template generates the
-    # exact node ids + collect fan-in the hand-cloned siblings used to declare.
-    rc, data, out, err = run(REAL_DEFS, "review-changes", "--plan", "--explain")
-    assert rc == 0, err
-    seg = [s for s in data["manifest"]["steps"] if s["kind"] == "segment"][0]
-    assert seg["nodes"] == ["summarize", "review_correctness", "review_security",
-                            "review_performance", "collect", "verify", "synthesize"]
-    fp = {f["node"]: f["fingerprint"] for f in data["fingerprints"]}
-    assert fp["collect"]["inputs"] == {
-        "correctness": "${review_correctness.output}",
-        "security": "${review_security.output}",
-        "performance": "${review_performance.output}"}
-    assert fp["review_security"]["profile"] == "security"
-    assert fp["review_correctness"]["profile"] == "correctness"
-
-
-def test_real_review_changes_lite_is_one_over_patch():
-    rc, data, out, err = run(REAL_DEFS, "review-changes", "--plan", "--profile", "lite")
-    assert rc == 0, err
-    seg = [s for s in data["manifest"]["steps"] if s["kind"] == "segment"][0]
-    assert seg["nodes"] == ["summarize", "review_correctness", "collect", "verify",
-                            "synthesize"]
-
-
-def test_real_review_changes_comprehensive_adds_dimensions():
-    rc, data, out, err = run(REAL_DEFS, "review-changes", "--plan", "--profile",
-                             "comprehensive", "--explain")
-    assert rc == 0, err
-    seg = [s for s in data["manifest"]["steps"] if s["kind"] == "segment"][0]
-    assert seg["nodes"] == ["summarize", "review_correctness", "review_security",
-                            "review_performance", "review_style", "review_documentation",
-                            "review_test_coverage", "collect", "verify", "synthesize"]
-    fp = {f["node"]: f["fingerprint"] for f in data["fingerprints"]}
-    assert fp["review_test_coverage"]["inputs"]["threshold"] == "${workflow.inputs.min_coverage}"
-    assert fp["review_test_coverage"]["profile"] == "test-coverage"
-    assert "test_coverage" in fp["collect"]["inputs"]
 
 
 # =============================================================================
@@ -4140,33 +4050,6 @@ nodes:
     assert chk["io"]["build"] == {"schema": None, "guarded": True, "fan_out": True}
 
 
-def test_real_refine_requirements_orchestrator_contracts(tmp_path):
-    # The prose-only orchestrator return contracts ride as declared
-    # output_schema blocks. Post-augmentation (multiagentic pipeline), the
-    # gaps==0 `approve` twin is gone — clarify, present_refined, and the
-    # when-guarded triage_reopened carry the contracts into their checkpoint io.
-    rc, data, out, err = run(REAL_DEFS, "refine-requirements")
-    assert rc == 0, err
-    m = json.loads(
-        (REAL_DEFS / "refine-requirements" / ".compiled" / "manifest.json").read_text())
-    chks = {s["node"]: s for s in m["steps"]
-            if s.get("checkpoint_type") == "orchestrator_node"}
-    assert "approve" not in chks                 # removed by the augmentation
-    clarify = chks["clarify"]["io"]["clarify"]
-    assert clarify["guarded"] is True            # when: gaps_count > 0
-    assert set(clarify["schema"]["required"]) == {
-        "choice", "final_document_path", "rounds", "converged", "remaining_gaps"}
-    present = chks["present_refined"]["io"]["present_refined"]
-    assert present["guarded"] is False
-    assert set(present["schema"]["required"]) == {
-        "action", "document_path", "remediation_rounds"}
-    triage = chks["triage_reopened"]["io"]["triage_reopened"]
-    assert triage["guarded"] is True             # when: attention_count > 0
-    assert set(triage["schema"]["required"]) == {
-        "action", "remediated_count", "remaining_escalations",
-        "refreshed_report_path", "post_counts"}
-
-
 # ---------------------------------------------------------------------------
 # Declared gate policy + headless mode (gate default / on_headless / gate_mode)
 # ---------------------------------------------------------------------------
@@ -4311,7 +4194,11 @@ def test_real_microskill_create_autonomous_profile_is_headless(tmp_path):
     assert data["profile_used"] == "autonomous"
     m = data["manifest"]
     assert m["gate_mode"] == "auto"
-    gate = next(s for s in m["steps"] if s.get("checkpoint_type") == "gate")["gate"]
+    # The autonomous plan-rvs loop adds a loop_exhaust_plan_rvs gate ahead of
+    # approve_plan, so select the approval gate by id rather than "the first gate".
+    gate = next(s["gate"] for s in m["steps"]
+                if s.get("checkpoint_type") == "gate"
+                and s.get("gate", {}).get("id") == "approve_plan")
     assert gate["id"] == "approve_plan"
     assert gate["default"] == "approve"
     assert gate["severity"] == "hard"   # severity is NOT flipped any more
@@ -4951,23 +4838,23 @@ name: seg-shared-pg
 nodes:
   - id: summarize
     agent: ag
-    phase_group: review-changes
+    phase_group: review-pass
     prompt: do a
   - id: review_bugs
     agent: ag
-    phase_group: review-changes
+    phase_group: review-pass
     depends_on: [summarize]
     prompt: do b ${summarize.output.v}
   - id: collect
     agent: ag
-    phase_group: review-changes
+    phase_group: review-pass
     depends_on: [review_bugs]
     prompt: do c ${review_bugs.output.v}
 """
 
-SEG_NO_PG = SEG_SHARED_PG.replace("    phase_group: review-changes\n", "")
+SEG_NO_PG = SEG_SHARED_PG.replace("    phase_group: review-pass\n", "")
 SEG_MIXED_PG = SEG_SHARED_PG.replace(
-    "  - id: collect\n    agent: ag\n    phase_group: review-changes\n",
+    "  - id: collect\n    agent: ag\n    phase_group: review-pass\n",
     "  - id: collect\n    agent: ag\n    phase_group: other\n")
 
 
@@ -4980,7 +4867,7 @@ def test_segment_label_from_shared_phase_group(tmp_path):
     make_flow(tmp_path, "seg-shared-pg", SEG_SHARED_PG)
     rc, data, out, err = run(tmp_path, "seg-shared-pg")
     assert rc == 0, err
-    assert _seg(tmp_path, "seg-shared-pg")["label"] == "Review Changes"
+    assert _seg(tmp_path, "seg-shared-pg")["label"] == "Review Pass"
 
 
 def test_segment_label_concise_slug_when_no_phase_group(tmp_path):
@@ -6302,3 +6189,164 @@ def test_guarded_loop_body_independent_siblings_stay_serial(tmp_path):
     assert seg2.count("__ran = true") >= 3          # ga, gb, col each set it
     assert "let __ran = false" in seg2 and "if (!__ran) break" in seg2
     assert_seg_parses(seg2)
+
+
+# --- inline + expand-sibling ref namespacing (RUNTIME-gap regression) ---------
+# desugar_nested_workflows runs BEFORE expand_static_fanout, so a spliced child
+# node's explicit ${<template>_<item>.output} ref to a not-yet-generated expand
+# SIBLING must be namespaced like any child id (the projected-sibling-id fix). The
+# pre-fix bug left it BARE → it surfaced as a phantom external need.nodes entry,
+# and `run-step args` failed loud ("no recorded result for node '<bare-sibling>'")
+# even though compile / structure / node --check all passed (none resolve args).
+
+RUN_STEP = REPO / "catalog" / "scripts" / "run-step"
+
+XREF_CHILD = """\
+version: 1
+name: xref-child
+inputs:
+  src:
+    type: string
+    required: true
+nodes:
+  # The expand TEMPLATE — its generated siblings (xreview_duplicate_capability,
+  # xreview_naming_collision) only exist AFTER the later expand pass.
+  - id: xreview
+    agent: ag
+    expand:
+      over:
+        - duplicate-capability
+        - naming-collision
+    prompt: review ${workflow.inputs.src} for {{each.item}}
+  # The fan-in — mirrors implement-rvs's `collect`: it names the generated siblings
+  # by id in its EXPLICIT inputs (the path inputs_each does NOT cover).
+  - id: collect
+    agent: ag
+    depends_on: [xreview_duplicate_capability, xreview_naming_collision]
+    inputs:
+      duplicate_capability: ${xreview_duplicate_capability.output}
+      naming_collision: ${xreview_naming_collision.output}
+    prompt: combine the panel
+output:
+  from: collect
+"""
+
+XREF_HOST = """\
+version: 1
+name: xref-host
+imports:
+  - xref-child
+nodes:
+  - id: seed
+    agent: ag
+    prompt: seed
+  # Static (non-for_each) workflow node → INLINED under the impl_rvs__ namespace.
+  - id: impl_rvs
+    workflow: xref-child
+    depends_on: [seed]
+    inputs:
+      src: ${seed.output.x}
+  - id: done
+    agent: ag
+    depends_on: [impl_rvs]
+    prompt: use ${impl_rvs.output}
+output:
+  from: done
+"""
+
+
+def _run_step_args(manifest_path, step_index, results=None, wf_inputs=None):
+    """Build a run-state and shell `run-step args` for one segment step. Returns
+    (rc, parsed_json)."""
+    man = json.loads(Path(manifest_path).read_text())
+    rs = {
+        "manifest_hash": man["manifest_hash"],
+        "step_index": step_index,
+        "inputs": wf_inputs or {},
+        "results": results or {},
+    }
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        f.write(json.dumps(rs))
+        rs_path = f.name
+    try:
+        p = subprocess.run(
+            [sys.executable, str(RUN_STEP), "args", "--manifest", str(manifest_path),
+             "--run-state", rs_path, "--step", str(step_index)],
+            capture_output=True, text=True)
+    finally:
+        os.unlink(rs_path)
+    data = json.loads(p.stdout) if p.stdout.strip().startswith("{") else None
+    return p.returncode, data
+
+
+def test_inline_expand_sibling_refs_are_namespaced(tmp_path):
+    # PRIMARY regression: a spliced child's explicit ref to an expand-generated
+    # sibling must be namespaced <splice>__<sibling>, not left bare.
+    make_flow(tmp_path, "xref-child", XREF_CHILD)
+    d = make_flow(tmp_path, "xref-host", XREF_HOST)
+    rc, data, out, err = run(tmp_path, "xref-host")
+    assert rc == 0, err
+    man_path = d / ".compiled" / "manifest.json"
+    man = json.loads(man_path.read_text())
+    blob = json.dumps(man)
+
+    # (a) NO bare xreview-sibling ref survives anywhere in the manifest — every one
+    # must wear the impl_rvs__ splice namespace (matching the post-expand node id).
+    bare = re.compile(r"(?<![_A-Za-z0-9])xreview_duplicate_capability")
+    assert not bare.search(blob), (
+        "bare (un-namespaced) expand-sibling ref leaked into the compiled manifest: "
+        + blob)
+    assert "impl_rvs__xreview_duplicate_capability" in blob
+
+    # (b) the collect node's segment must NOT carry the phantom bare need.
+    seg = next(s for s in man["steps"] if s.get("kind") == "segment")
+    assert "xreview_duplicate_capability" not in seg["needs"]["nodes"]
+    assert "xreview_naming_collision" not in seg["needs"]["nodes"]
+
+    # (c) the post-expand sibling IS a produced node under the splice namespace.
+    assert "impl_rvs__xreview_duplicate_capability" in seg["produces"]
+
+    # (d) RUNTIME proof: `run-step args` resolves with no "no recorded result" error
+    # (the gap the compile-only suite missed). seed + siblings are all produced in
+    # this single segment, so its needs.nodes is empty → empty results suffices.
+    seg_idx = man["steps"].index(seg)
+    rc2, payload = _run_step_args(man_path, seg_idx)
+    assert rc2 == 0, payload
+    assert not payload.get("errors"), payload
+
+    # (e) the spliced segment still parses (the namespacing edits the baked refs).
+    assert_seg_parses((d / seg["script"]).read_text())
+
+
+def test_real_microskill_create_no_bare_xreview_refs():
+    # Real-flow guard: the production implement-rvs `collect` ↔ `xreview` shape (the
+    # bug's origin) must compile with every xreview-sibling ref namespaced under the
+    # impl_rvs__ splice, and `run-step args` for the impl_rvs loop step must resolve.
+    rc, data, out, err = run(REAL_DEFS, "microskill-create")
+    assert rc == 0, err
+    man_path = REAL_DEFS / "microskill-create" / ".compiled" / "manifest.json"
+    man = json.loads(man_path.read_text())
+    blob = json.dumps(man)
+    bare = re.compile(r"(?<![_A-Za-z0-9])xreview_")
+    assert not bare.search(blob), (
+        "bare xreview ref leaked into microskill-create manifest")
+    # RUNTIME proof: `run-step args` for the impl_rvs loop step must resolve every
+    # need from the recorded upstream results. We seed ONLY the legitimate external
+    # producers — deliberately NOT seeding anything that looks like a bare xreview
+    # sibling. Post-fix every xreview sibling is namespaced impl_rvs__xreview_* and
+    # produced INSIDE the splice (never a bare need), so the filter is a no-op and
+    # all real needs resolve. Pre-fix the bug leaks bare xreview_* into needs.nodes;
+    # the filter then leaves them UNSEEDED, so run-step args reports "no recorded
+    # result" for them — i.e. this block actually catches the regression instead of
+    # tautologically fabricating a result for the very phantom needs under test.
+    impl = next(s for s in man["steps"] if s.get("kind") == "segment"
+                and any(n.startswith("impl_rvs__") for n in s.get("nodes", []))
+                and s.get("is_loop"))
+    results = {nid: {} for nid in impl["needs"]["nodes"]
+               if not nid.startswith("xreview_")}
+    wf_inputs = {n: "x" for n in impl["needs"].get("wf_inputs", [])}
+    rc2, payload = _run_step_args(man_path, man["steps"].index(impl),
+                                  results=results, wf_inputs=wf_inputs)
+    no_result = [e for e in (payload.get("errors") or []) if "no recorded result" in e]
+    assert not no_result, payload
+    assert rc2 == 0, payload

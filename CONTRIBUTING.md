@@ -32,8 +32,9 @@ overwritten on the next reconcile.
 
 ## Adding a component
 
-Prefer the create flows — they plan, get your approval, implement/evaluate in a
-loop, then vendor into `harness/` (as `source: custom`) + sync:
+Prefer the create flows — they plan (with an adversarial review), get your
+approval, then implement in a self-correcting review loop, then vendor into
+`harness/` (as `source: custom`) + sync:
 
 - `/microskill-create "<requirement>"`
 - `/workflow-create "<requirement>"`

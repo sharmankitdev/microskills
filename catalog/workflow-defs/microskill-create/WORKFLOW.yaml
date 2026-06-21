@@ -1,7 +1,7 @@
 version: 1
 name: microskill-create
 base: true
-description: Create a microskill from a requirement — plan → human approval gate → implement/evaluate loop → finalize. The plan/implement/evaluate phases run the generic microskills (profile microskill).
+description: Create a microskill from a requirement — plan-rvs (planner-in-review) → human approval gate → implement-rvs (self-correcting implement→review→verify→synthesize loop) → finalize. Both RVS stages run as inlined first-class workflows (profile microskill-create).
 
 # Top-level workflow inputs (referenced as ${workflow.inputs.<name>}).
 inputs:
@@ -10,8 +10,9 @@ inputs:
     required: true
     materialize: file
     description: >-
-      Natural-language description of the microskill to create. task-plan /
-      task-evaluate Read the path.
+      Natural-language description of the microskill to create. plan-rvs's planner
+      Reads the path, and each RVS stage threads it as the review panel's semantic
+      ground truth — the raw requirement is the ground truth (no upstream refine).
   name:
     type: string
     required: false
@@ -33,118 +34,118 @@ inputs:
     description: Sandbox dir where the implementer writes the draft before finalize moves it.
 
 imports:
-  - microskills/task-plan
-  - microskills/task-implement
-  - microskills/task-evaluate
+  - plan-rvs
+  - implement-rvs
 
 # Parameters for the SHARED finalize protocol (_snippets/finalize-protocol.md,
 # included below via {{snippet:finalize-protocol}} — snippets resolve before vars,
-# so these {{...}} tokens parameterize the shared prose). build-workflow-from-plan
+# so these {{...}} tokens parameterize the shared prose). workflow-create
 # carries the workflow-domain twin of this block; the protocol text itself lives in
 # ONE place so the two finalizes cannot drift.
 vars:
   finalize_kind: microskill
-  finalize_plan_ref: ${plan.output.plan_path}
+  finalize_plan_ref: ${plan_rvs.output.plan_path}
   finalize_name_source: <name> from the plan
   finalize_dest_subdir: microskills
   finalize_staged_layout: MICROSKILL.md + profiles/*
   # The quality-node refs the shared finalize-protocol presents before vendoring.
-  # microskill-create keeps the single-LLM evaluator (its RVS rewire is sub-PR 5),
-  # so these resolve to the evaluate node — byte-identical to the pre-vars snippet.
-  finalize_verdict_ref: ${evaluate.output.pass}
-  finalize_issues_ref: ${evaluate.output.issues}
+  # The 2026-06-21 rewire (sub-PR 2) routes them through the implement-rvs loop's
+  # synth output (the verdict + surviving findings the RVS cycle converged on).
+  finalize_verdict_ref: ${impl_rvs.output.verdict}
+  finalize_issues_ref: ${impl_rvs.output.findings}
+  # The finalize-protocol snippet is parameterized on the staging-paths ref; the
+  # implement-rvs loop echoes the implementer's staging_paths out of synth.
+  finalize_staging_ref: ${impl_rvs.output.staging_paths}
   finalize_epilogue: >-
     done. Print a summary: the harness/ source path, the synced .claude/ paths +
     generated shim .claude/commands/<name>.md, and the manifest entry. Do not claim
     success on an unresolved sync conflict.
 
 nodes:
-  # Plan the microskill. The planner is autonomous — it returns a structured
-  # plan (or a scope_advisory); the HUMAN approves it at the gate below. Node
-  # output shape: the resolved task-plan (microskill profile) output_schema
-  # (inherited).
-  - id: plan
-    use: task-plan
-    customize: { profile: microskill }
+  # Plan the microskill from the RAW requirement via the reusable plan-stage RVS
+  # (planner-in-review: plan→review×N→verify→synth over the plan.yaml). The plan
+  # phase's adversarial review panel + the approve_plan human gate below own
+  # requirement quality (an ambiguous requirement surfaces as a plan the human
+  # revises → re-plans) — there is no upstream refine front-end. The base ships
+  # LOOP-LESS (a single pass; the approve_plan gate is the backstop); the autonomous
+  # pipeline profile swaps in plan-rvs[microskill-create-autonomous], which adds the
+  # bounded convergence loop. A STATIC `workflow:` node with EXPLICIT inputs (no
+  # `wire: auto`, which would suppress inlining), so the compiler INLINES it: the
+  # plan-rvs nodes splice into this host (the autonomous loop becomes one region).
+  # plan_rvs is the first node, so it has no depends_on. Output carries {plan_path,
+  # name, scope_advisory, verdict, findings}; the HUMAN approves it at the gate below.
+  - id: plan_rvs
+    workflow: plan-rvs
+    customize: { profile: microskill-create }
     inputs:
       requirement_path: ${workflow.inputs.requirement_path}
       name_override: ${workflow.inputs.name}
       staging_dir: ${workflow.inputs.staging_dir}
 
   # When the planner returns a scope_advisory instead of a plan, surface it and
-  # stop — no microskill gets built. Guarded by `when`; defined BEFORE the loop
-  # body so it doesn't split the implement/evaluate loop.
+  # stop — no microskill gets built. Guarded by `when`; the guard also if-wraps the
+  # impl_rvs region + finalize below so the advisory path skips the build entirely.
   - id: advise
     delegation: orchestrator
-    when: ${plan.output.scope_advisory != null}
+    when: ${plan_rvs.output.scope_advisory != null}
     prompt: >
       The planner returned a scope advisory instead of a plan:
-      ${plan.output.scope_advisory}. Present it to the user. For kind=split, list
+      ${plan_rvs.output.scope_advisory}. Present it to the user. For kind=split, list
       the candidate atomic microskills to create separately. For kind=promote,
       explain that the requirement needs a full skill (branches/gates), not a
       single atomic microskill. Do not implement anything — stop here.
 
-  # The implement ↔ evaluate loop. Fully autonomous — runs as a JS while inside
-  # ONE segment, no human interaction between rounds. Both body nodes are
-  # guarded so the advisory path skips the loop entirely.
-  - id: implement
-    use: task-implement
-    customize: { profile: microskill }
-    when: ${plan.output.scope_advisory == null}
+  # Build the approved plan into a microskill draft via the reusable implement-rvs
+  # loop (the self-correcting implement→review→verify→synthesize cycle). implement-rvs
+  # is the PURE loop — it has NO finalize; it returns {verdict, findings,
+  # staging_paths} and the HOST owns the single vendor→manifest→sync finalize (the
+  # `finalize` node below). A STATIC `workflow:` node with EXPLICIT inputs (no
+  # `wire: auto`), so the compiler INLINES it as ONE guarded do/while loop region
+  # (region-guarded on the same `when`), keeping the pipeline flat. The explicit
+  # depends_on: [plan_rvs] is LOAD-BEARING for contiguity — it anchors the inlined
+  # region's zero-dep internal node (implement-rvs's catalog_index, depends_on: [])
+  # after the plan_rvs region; the inputs refs (${plan_rvs.output.plan_path}) alone
+  # only order impl_rvs's implement, leaving catalog_index free to float across a
+  # region boundary (the "zero-dep node floats" lesson).
+  - id: impl_rvs
+    workflow: implement-rvs
+    customize: { profile: microskill-create }
+    when: ${plan_rvs.output.scope_advisory == null}
+    depends_on: [plan_rvs]
     inputs:
-      plan_path: ${plan.output.plan_path}
-      staging_dir: ${workflow.inputs.staging_dir}
-      last_findings: ${loop.carry.last_findings}
-
-  - id: evaluate
-    use: task-evaluate
-    customize: { profile: microskill }
-    when: ${plan.output.scope_advisory == null}
-    inputs:
-      staging_paths: ${implement.output.staging_paths}
+      plan_path: ${plan_rvs.output.plan_path}
+      name: ${plan_rvs.output.name}
       requirement_path: ${workflow.inputs.requirement_path}
-      plan_path: ${plan.output.plan_path}
+      staging_dir: ${workflow.inputs.staging_dir}
 
   # Vendor the approved microskill into harness/ (source of truth), upsert the
   # manifest, then let sync-harness generate the .claude/ runtime copy + slash
   # shim + ledger. No agent/use → an orchestrator-native step.
   # The prompt is the SHARED finalize protocol (one snippet, parameterized by the
   # vars: block above) — edit _snippets/finalize-protocol.md, not a per-def copy.
+  # The finalize_staging_ref ${impl_rvs.output.staging_paths} (rendered into the
+  # prompt) anchors finalize after the impl_rvs region — finalize is a single node,
+  # so the ref-implied edge suffices and an explicit depends_on: [impl_rvs] would be
+  # redundant noise (the ${plan_rvs...} when-ref also keeps it past plan_rvs).
   - id: finalize
     delegation: orchestrator
-    when: ${plan.output.scope_advisory == null}
+    when: ${plan_rvs.output.scope_advisory == null}
     prompt: "{{snippet:finalize-protocol}}"
 
-# Human-approval gate after `plan`.
+# Human-approval gate after `plan_rvs` (the sole gate — Gate 1). The plan-rvs
+# review evidence is the whole-branch-confirm material the human signs off on; it
+# also backstops requirement quality, since there is no upstream refine gate.
 gates:
   - id: approve_plan
     name: "Approve microskill plan"
-    after: plan
+    after: plan_rvs
     type: human_approval
     severity: hard
     prompt: Review the plan — including whether the name is a reusable capability (not coupled to a caller, step, or a domain a profile could carry). Approve to implement, revise to re-plan, or abandon.
     options: [approve, revise, abandon]
 
-# Guarded loop: repeat implement→evaluate until the evaluator passes or the cap.
-# max_iters is customizable via a profile overlay (deep-merged onto this def).
-loop:
-  while: ${!evaluate.output.pass}
-  max_iters: 3
-  body: [implement, evaluate]
-  carry:
-    last_findings: ${evaluate.output}
-  on_exhaust:
-    # Cap exhaustion is a verdict, not a budget overrun: delegate it to the
-    # orchestrator instead of letting a still-failing draft flow into finalize.
-    # extend re-runs the loop with the committed carry (guidance appended to the
-    # materialized requirement file); accept proceeds on an explicit human
-    # choice; headless runs PARK resumable here (on_headless: fail — the
-    # do-the-work-overnight, approve-in-the-morning pattern).
-    action: escalate
-    prompt: The implement-evaluate loop hit its round cap with the evaluator still failing - extend with another round budget (optionally with guidance), accept the draft as-is, or abandon?
-    options: [extend, accept, abandon]
-    notes_input: requirement_path
-    on_headless: fail
+# No top-level loop: the convergence loops now live INSIDE the inlined plan-rvs
+# (autonomous) and implement-rvs children, each spliced in as its own loop region.
 
 output:
   from: finalize

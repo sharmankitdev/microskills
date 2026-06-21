@@ -7,9 +7,10 @@ region if-wraps, the human approval gate is a real checkpoint, and every emitted
 parses. Hermetic: copies the catalog microskills/ + workflow-defs/ into a tmp world
 (microskills resolve from the defs-root's sibling microskills/), then writes the fixture.
 
-The real refine-requirements carries an orchestrator clarify node (its production binding
-is out of scope, §8); the stand-in supplies the third loop region without that coupling so
-the test exercises the ENGINE, not refine's host wiring. The host orders the three regions
+There is no real refine front-end in the shipped create pipelines (the refine-requirements
+def was retired in the 2026-06-21 rewire); this hand-authored refine-stub exists ONLY to
+supply a third loop region so the test exercises the ENGINE's multi-region inlining, not any
+host wiring. The host orders the three regions
 with explicit depends_on (a region's zero-dep node would otherwise float across a region
 boundary and break do/while contiguity — the multi-region separation contract).
 """

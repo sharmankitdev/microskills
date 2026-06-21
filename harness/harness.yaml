@@ -6,71 +6,24 @@
 # Schema: templates/references/harness-schema.json
 version: 2
 microskills:
+  # plan/build cores — the create pipelines run as these (domain via profile).
   - name: task-plan
     source: plugin
   - name: task-implement
     source: plugin
-  - name: task-evaluate
+  # create-pipeline RVS review/verify/synth + floor + grounding + bundling.
+  - name: review-dimension
     source: plugin
-  - name: validate-microskill
-    source: plugin
-  - name: analyze-monolith-orchestrator
-    source: plugin
-  # domain: software-engineering (code-review) — atomic microskills composed by the
-  # review-changes workflow. Forward-compat breadcrumb for a future tag/domain system
-  # (schemas are closed grammars today, so this grouping rides in a comment).
-  - name: summarize-diff
+  - name: collect-findings
     source: plugin
   - name: verify-finding
     source: plugin
   - name: synthesize-review
     source: plugin
-  - name: collect-findings
-    source: plugin
-  - name: review-dimension
-    source: plugin
-  # domain: software-engineering (requirements) — atomic assimilation microskill composed by
-  # the refine-requirements workflow.
-  - name: assimilate-requirements
-    source: plugin
-  # domain: product-development — atomic microskills for the develop-product-backlog
-  # pipeline (MULTIAGENTIC-DESIGN.md), provisioned via microskill-create.
-  - name: classify-product
-    source: plugin
-  - name: judge-artifacts
-    source: plugin
-  - name: synthesize-panel
-    source: plugin
-  - name: extract-closure-claims
-    source: plugin
-  - name: generate-backlog
-    source: plugin
-  - name: verify-traceability
-    source: plugin
-  - name: refute-story-quality
-    source: plugin
-  - name: collect-artifacts
-    source: plugin
-  - name: author-design-artifact
-    source: plugin
-  - name: tally-votes
-    source: plugin
-  - name: apply-findings-to-document
-    source: plugin
-  - name: publish-backlog
-    source: plugin
-  - name: assemble-evidence
-    source: plugin
-  - name: expand-assignments
-    source: plugin
-  # domain: create-pipeline floor + grounding (§8 step 5) — the deterministic-floor
-  # node and the cross-artifact catalog index source.
   - name: run-validators
     source: plugin
   - name: build-catalog-index
     source: plugin
-  # domain: create-pipeline RVS bundling (§8 step 7) — concatenates a staged draft's
-  # files into one review bundle for the host-inline review/verify panel.
   - name: bundle-draft
     source: plugin
 workflows:
@@ -78,26 +31,7 @@ workflows:
     source: plugin
   - name: workflow-create
     source: plugin
-  - name: build-workflow-from-plan
-    source: plugin
-  - name: decompose-monolith-orchestrator
-    source: plugin
-  # domain: software-engineering (code-review) — flagship pipeline over the review microskills.
-  - name: review-changes
-    source: plugin
-  # domain: software-engineering (requirements) — wraps assimilate-requirements with a
-  # when-split, bounded gap-refinement loop driven by AskUserQuestion.
-  - name: refine-requirements
-    source: plugin
-  # domain: product-development — develop-product-backlog pipeline (MULTIAGENTIC-DESIGN.md).
-  - name: ux-design
-    source: plugin
-  - name: technical-design
-    source: plugin
-  - name: backlog-publication
-    source: plugin
-  - name: develop-product-backlog
-    source: plugin
+  # reusable RVS stages the two create pipelines inline.
   - name: implement-rvs
     source: plugin
   - name: plan-rvs

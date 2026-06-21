@@ -1,26 +1,40 @@
 # Autonomous overlay for workflow-create — used when the flow runs as a sub-step
-# of another workflow (e.g. decompose-monolith-orchestrator's `provision` node
-# building a missing nested workflow), where no human is present to approve the plan.
+# of another workflow (a parent's `provision`-style node building a missing
+# nested workflow), where no human is present to approve the plan.
 #
-# Pure flip to the declared gate-policy mechanism: `gate_mode: auto` makes the
-# dispatcher take each gate's declared default and record it VERBATIM (never a
-# fabricated pick), and the `patch` declares that default on the approve_plan
-# gate by id — after/type/severity/options/prompt are inherited from the base
-# gate, not restated. The gate stays hard + human_approval, so the compiled
-# shape is unchanged (a human_approval gate ALWAYS flushes the segment; the
-# `build` orchestrator node stays after its own boundary); under gate_mode: auto
-# the dispatcher records {choice: approve} and continues WITHOUT pausing. Net
-# effect: same partition, no human pause, an author-declared recorded choice.
+# Two pure flips (symmetric with microskill-create's autonomous overlay):
+#  1. `nodes: patch` swaps the plan_rvs child onto the AUTONOMOUS plan-rvs profile
+#     (workflow-create-autonomous), which adds the bounded convergence loop + wires
+#     plan.last_findings = ${loop.carry.findings}. The interactive base runs plan-rvs
+#     LOOP-LESS (one pass) and leans on the human at approve_plan; the autonomous
+#     variant re-plans against surviving findings until it converges or hits the cap.
+#     (implement-rvs already carries its own loop in both modes.)
+#  2. `gate_mode: auto` makes the dispatcher take each gate's declared default and
+#     record it VERBATIM (never a fabricated pick); the `gates: patch` declares that
+#     default on approve_plan by id — after/type/severity/options/prompt are inherited
+#     from the base gate, not restated. The gate stays hard + human_approval, so the
+#     compiled partition is unchanged (a human_approval gate ALWAYS flushes the
+#     segment; the inlined plan_rvs / build loop regions stay after their own
+#     boundaries); under gate_mode: auto the dispatcher records {choice: approve} and
+#     continues WITHOUT pausing. Net effect: same partition, no human pause, an
+#     author-declared recorded choice.
 #
-# The doc-declared gate_mode also WINS over a parent's inherited `--gate-mode`
-# flag, so this profile is headless regardless of how the parent runs. The build
-# half (the implement ↔ evaluate loop + finalize) runs inside
-# build-workflow-from-plan, which `build` invokes; it stays non-interactive as
-# long as the caller supplies a fresh, collision-free workflow name (a collision
-# would escalate).
+# The doc-declared gate_mode also WINS over a parent's inherited `--gate-mode` flag,
+# so this profile is headless regardless of how the parent runs (approve_plan, now
+# the sole gate, is auto-taken). The build half (the
+# implement→review→verify→synthesize loop) lives in implement-rvs, which `build`
+# compile-time INLINES as a guarded do/while loop region (explicit inputs, no
+# wire: auto); the host's `finalize` node then vendors/syncs/compiles. It stays
+# non-interactive as long as the caller supplies a fresh, collision-free workflow
+# name (a collision would escalate).
 version: 1
 
 gate_mode: auto
+
+nodes:
+  patch:
+    - id: plan_rvs
+      customize: { profile: workflow-create-autonomous }
 
 gates:
   patch:

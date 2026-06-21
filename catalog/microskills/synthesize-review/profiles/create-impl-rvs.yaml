@@ -8,9 +8,12 @@ version: 1
 # whole {verdict, findings, staging_paths} contract rides one exit node.
 #
 # Identical to synthesize-review/profiles/create.yaml (the floor∪review fuse) EXCEPT for
-# the staging_paths input + output field + echo step. Kept a SEPARATE profile so
-# build-workflow-from-plan (which uses `create` and has finalize INSIDE, reading
-# implement.output.staging_paths directly) stays byte-identical — zero re-baseline.
+# the staging_paths input + output field + echo step. Kept a SEPARATE profile from
+# `create` because implement-rvs is the live consumer that needs it: its synth node is
+# the loop's single exit (output: { from: synth }), so synth must surface the staged
+# draft paths for the HOST create pipeline to finalize. A plain `create`-profile
+# review fuse has no staging_paths to echo, so folding this echo back into
+# `create` would break that contract.
 vars:
   verdict_mapping: >-
     a surviving blocker-severity finding (whether a deterministic-floor blocker or a review

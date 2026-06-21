@@ -102,41 +102,48 @@ Then build:
 
 ```bash
 /microskill-create "validate that a YAML file matches a JSON schema"
-/workflow-create   "plan a feature, implement it, then review the diff"
+/workflow-create   "ingest a dataset, validate each record against a schema, then write a summary report"
 ```
 
 ## How it works
 
-**Author + compose.** A workflow is just a DAG. Nodes `use:` a microskill (or run an `agent:`, or hand off to an `orchestrator` checkpoint); edges are `depends_on`; gates and loops are declared inline. To hand-write one, the full construct reference is **[DAG-RULES.md](./DAG-RULES.md)**. Here's the spine of the built-in `microskill-create` workflow:
+**Author + compose.** A workflow is just a DAG. Nodes `use:` a microskill (or run an `agent:`, inline a nested `workflow:`, or hand off to an `orchestrator` checkpoint); edges are `depends_on`; gates and loops are declared inline. To hand-write one, the full construct reference is **[DAG-RULES.md](./DAG-RULES.md)**. Here's the spine of the built-in `microskill-create` workflow — a `plan → build` pipeline whose two stages are each a nested workflow the compiler **inlines** (splices flat) into the host:
 
 ```yaml
+imports:
+  - plan-rvs                  # planner-in-review: plan → review → verify → synthesize
+  - implement-rvs             # self-correcting implement → review → verify → synthesize loop
+
 nodes:
-  - id: plan
-    use: task-plan
-    customize: { profile: microskill }
-    inputs: { requirement: ${workflow.inputs.requirement} }
+  - id: plan_rvs              # PLAN: draft a plan, then harden it with an adversarial review panel
+    workflow: plan-rvs
+    customize: { profile: microskill-create }
+    inputs: { requirement_path: ${workflow.inputs.requirement_path} }
 
-  - id: implement
-    use: task-implement
-    when: ${plan.output.scope_advisory == null}
-    depends_on: [plan]
+  - id: impl_rvs              # BUILD: build the approved plan, self-correcting to an `approve` verdict
+    workflow: implement-rvs
+    customize: { profile: microskill-create }
+    when: ${plan_rvs.output.scope_advisory == null}
+    depends_on: [plan_rvs]
+    inputs: { plan_path: ${plan_rvs.output.plan_path} }
 
-  - id: evaluate
-    use: task-evaluate
-    depends_on: [implement, plan]
+  - id: finalize             # orchestrator: vendor → upsert manifest → sync-harness
+    delegation: orchestrator
+    when: ${plan_rvs.output.scope_advisory == null}
+    prompt: "{{snippet:finalize-protocol}}"
 
 gates:
-  - id: approve_plan          # human checkpoint between segments
-    after: plan
+  - id: approve_plan          # the SOLE human checkpoint, between plan and build
+    after: plan_rvs
     type: human_approval
     severity: hard
     options: [approve, revise, abandon]
 
-loop:                         # retry implement→evaluate until it passes
-  while: ${!evaluate.output.pass}
-  max_iters: 3
-  body: [implement, evaluate]
+# No top-level loop: the convergence loops live INSIDE the inlined plan-rvs
+# (autonomous) and implement-rvs children — each splices in as its own loop region.
 ```
+
+The adversarial review-verify-synthesize panel inside each stage plus the single `approve_plan` human gate own quality, so there's no separate `check` phase — `plan → build` is the whole pipeline. `workflow-create` is the same spine with one extra stage: a `provision` checkpoint that re-enters `microskill-create` for each microskill the plan needs but the catalog lacks.
 
 **Customize without forking.** The same microskill serves two domains by overlaying a profile. `task-implement` ships a `microskill` profile (the default — it inherits `base` verbatim) and a `workflow` overlay. The entire delta is **two lines** — contract doc and executor agent; the model, inputs, and output schema are all inherited:
 

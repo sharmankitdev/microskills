@@ -73,9 +73,9 @@ The **dispatcher skills** are the conductors (`catalog/skills/microskill`, `cata
 
 Hand-authoring reference for `WORKFLOW.yaml` constructs: **DAG-RULES.md**.
 
-### The plan→build→check agentic model
+### The plan→build agentic model
 
-The create pipelines (`microskill-create`, `workflow-create`, `build-workflow-from-plan`) are built from three **generic** microskills — `task-plan`, `task-implement`, `task-evaluate` — whose domain is selected by profile (`microskill` = default/base vs `workflow` overlay). Each runs **as** the domain agent named in its `runtime.agent` (e.g. `microskill-planner` vs `workflow-planner`) on the pinned `runtime.model`, reading the phase contract named by the `contract_doc` var. There is no nested sub-agent dispatch — the executor *is* the planner/implementer/evaluator, because background segments can't nest. This is why the same microskill serves two domains with a ~2-line profile delta.
+The create pipelines (`microskill-create`, `workflow-create`) are built from the **generic** microskills `task-plan` and `task-implement` — whose domain is selected by profile (`microskill` = default/base vs `workflow` overlay). Each runs **as** the domain agent named in its `runtime.agent` (e.g. `microskill-planner` vs `workflow-planner`) on the pinned `runtime.model`, reading the phase contract named by the `contract_doc` var. There is no nested sub-agent dispatch — the executor *is* the planner/implementer, because background segments can't nest. This is why the same microskill serves two domains with a ~2-line profile delta. The plan and build phases are each wrapped by a reusable RVS loop — `plan-rvs` and `implement-rvs` (review→verify→synthesize over the staged artifact) — which the two pipelines compile-time inline; the host owns the single vendor→sync→compile `finalize`. (As of the 2026-06-21 refactor the `refine-requirements` front-end and the `task-evaluate` check phase were removed as redundant — the adversarial RVS review plus the `approve_plan` human gate own quality. The old `build-workflow-from-plan` workflow is also retired.)
 
 ## Conventions
 

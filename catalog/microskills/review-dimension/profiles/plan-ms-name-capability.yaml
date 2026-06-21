@@ -21,7 +21,7 @@ context:
         — a name coupled to one caller is a plan defect because the skill cannot be reused; a
         name that describes WHO calls it or WHEN it runs rather than what it does; a
         domain-coupled name that a profile COULD retarget to another domain (the capability is
-        generic, e.g. summarize-diff rather than summarize-diff-for-release-notes, or task-plan
+        generic, e.g. run-validators rather than run-validators-for-microskill-create, or task-plan
         with a profile selecting the domain rather than plan-for-microskill-create). A
         domain-locked name that no profile could ever retarget (a validator bound to the single
         artifact kind it can check) is correct and is NOT a defect, per the planner contract's

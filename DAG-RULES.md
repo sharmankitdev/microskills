@@ -139,7 +139,7 @@ A `{{snippet:NAME}}` token anywhere in the merged doc is replaced with the text 
 **`<defs-root>/_snippets/NAME.md`** (minus one trailing newline), by the same shared pre-pass —
 **before** ordinary `{{var}}` substitution, so a snippet body may itself carry `{{var}}` tokens and
 each def parameterizes the shared prose via its own `vars:` map (that is how `microskill-create` and
-`build-workflow-from-plan` share ONE finalize protocol without drifting). Rules:
+`workflow-create` share ONE finalize protocol without drifting). Rules:
 
 - **Unresolved snippet → hard block** (compile dies, validate blocks) — a missing include must never
   ship a literal token into a compiled prompt. (Contrast: an unresolved `{{var}}` only warns.)
@@ -155,7 +155,7 @@ each def parameterizes the shared prose via its own `vars:` map (that is how `mi
 ### `imports` — the child-workflow allowlist
 
 ```yaml
-imports: [build-workflow-from-plan]     # every `workflow:` node's target MUST be listed here
+imports: [implement-rvs]                # every `workflow:` node's target MUST be listed here
 ```
 
 `imports` is the **load-bearing allowlist** of child workflows a `workflow:` node (§5d) may invoke:
@@ -280,14 +280,14 @@ satisfied *there*). The stale-clean that precedes each compile globs `seg-*.js` 
 - id: analyze
   agent: workflow-planner              # an agent type
   inputs:
-    monolith_path: ${workflow.inputs.path}
+    requirement_path: ${workflow.inputs.path}
   prompt: >
-    Analyze the monolith at ${workflow.inputs.path} and produce a decomposition brief.
+    Read the requirement at ${workflow.inputs.path} and produce a build brief.
   output_schema:
     type: object
-    required: [decomposition_requirement]
+    required: [build_requirement]
     properties:
-      decomposition_requirement: { type: string }
+      build_requirement: { type: string }
 ```
 
 `agent:` nodes are **always background** (autonomous) unless a gate forces a checkpoint.
@@ -310,15 +310,15 @@ An orchestrator node whose output a downstream node consumes (or whose prompt pr
 `RETURN {...}`) should declare that contract as an `output_schema` — the compiler records it in the
 checkpoint's per-node `io` block and the dispatcher validates the stored result against it right
 after the step (`check-step-io`), so a prose-shaped summary or a fabricated `null` stops the run
-instead of riding forward (see refine-requirements' `clarify`/`approve` and decompose's `provision`).
+instead of riding forward (see microskill-create's `advise` and `finalize` orchestrator nodes).
 
 ### (d) `workflow:` — invoke a nested workflow (first-class)
 
 ```yaml
-imports: [build-workflow-from-plan]    # the child MUST be allowlisted here
+imports: [implement-rvs]               # the child MUST be allowlisted here
 nodes:
   - id: build
-    workflow: build-workflow-from-plan  # bare child-workflow name (kebab-case)
+    workflow: implement-rvs             # bare child-workflow name (kebab-case)
     depends_on: [provision]             # PURE ORDERING edge (no ref carries it)
     inputs:
       plan_path: ${plan.output.plan_path}   # raw refs — resolved by the dispatcher at run time
@@ -404,7 +404,7 @@ Most node wiring contains pure name-identical forwards (`harness_root: ${workflo
 
 ```yaml
 - id: build
-  workflow: build-workflow-from-plan
+  workflow: implement-rvs
   wire: auto                          # harness_root / harness_yaml forward themselves
   inputs:
     plan_path: ${plan.output.plan_path}   # explicit entries always win
@@ -663,11 +663,11 @@ Rules:
   ```
   Extras may not carry `id`/`expand`/`inputs_each`.
 - **Profile merge precedes expansion**, so an overlay customizes the fan-out by patching the
-  *template's* `over` list **only** (lists replace wholesale on merge): `review-changes`'
-  `comprehensive.yaml` is one six-entry `over` patch, `lite.yaml` is `over: [correctness]` — the
-  generated siblings *and* the `inputs_each` fan-in follow automatically, no collect rewiring.
-  Likewise `--node-override` addresses the **template** id (pre-expansion), applying to every
-  generated sibling.
+  *template's* `over` list **only** (lists replace wholesale on merge): `plan-rvs`'s
+  `microskill-create` profile patches the review template's `over` list from the six `plan-wf-*`
+  workflow critique dimensions to the `plan-ms-*` microskill set — and the generated siblings *and*
+  the `inputs_each` fan-in follow the patched list automatically. Likewise `--node-override`
+  addresses the **template** id (pre-expansion), applying to every generated sibling.
 - **`inputs_each: <template-id>`** must name an expand template; a desugared key colliding with an
   explicit `inputs` entry is a block. The expansion is a pure function of the merged doc — an
   expanded def compiles **byte-identical** to its hand-cloned twin.
@@ -829,9 +829,10 @@ Under auto mode:
   nonzero outcome naming the gate** — run-state stays resumable interactively (the "do the work
   overnight, approve in the morning" pattern).
 - An **orchestrator node whose prompt requires `AskUserQuestion`** stops the run naming the node —
-  the dispatcher never answers on the user's behalf. (`refine-requirements`' base `clarify` loop is
-  therefore **not headless-able**; its `autonomous` profile — which rewrites the prompt to an
-  unattended pass — is the supported unattended path.)
+  the dispatcher never answers on the user's behalf. (A `finalize` node whose prompt itself calls
+  `AskUserQuestion` to resolve a name conflict is therefore **not headless-able**; a profile that
+  rewrites that prompt to an unattended pass — e.g. auto-resolving the conflict — is the supported
+  unattended path.)
 - **Partition and segment bytes are provably unchanged**: auto gates remain orchestrator
   checkpoints. The manifest is stamped `gate_mode: "auto"` (inside `manifest_hash`) **only when the
   effective mode is auto**, so existing interactive defs compile byte-identically and interactive
@@ -1152,13 +1153,15 @@ Walk the topo order. Background nodes accumulate into the current segment. An or
 segment (`is_loop` segment). Result: an alternating sequence of `segment[...]` and checkpoint steps,
 written to `manifest.json`.
 
-Example compiled sequences (from the real workflows):
+Example compiled sequences for the built-in workflows (the create pipelines nest `plan-rvs` as their
+plan stage and `implement-rvs` as their build stage — each a `workflow:` checkpoint):
 
 ```
-microskill-create:        segment[plan]  gate  orchestrator_node(advise)
-                          segment[implement,evaluate]  orchestrator_node(finalize)
-build-workflow-from-plan: segment[implement,evaluate]  orchestrator_node(finalize)
-workflow-create:          segment[plan]  gate  nested_workflow(provision)  orchestrator_node(advise)  nested_workflow(build)
+microskill-create: nested_workflow(plan_rvs)  gate(approve_plan)  orchestrator_node(advise)
+                   nested_workflow(impl_rvs)  orchestrator_node(finalize)
+implement-rvs:     segment[implement…synth, loop]  gate(loop_exhaust)
+workflow-create:   nested_workflow(plan_rvs)  gate(approve_plan)  orchestrator_node(advise)
+                   nested_workflow(provision)  nested_workflow(build)  orchestrator_node(finalize)
 ```
 
 ### Intra-segment parallelism — independent-sibling ranks
@@ -1179,11 +1182,11 @@ const [n_review_correctness, n_review_security, n_review_performance] = await pa
 ])
 ```
 
-This is what makes the `review-changes` correctness/security/performance reviews — three sibling
-`use:` nodes that all depend only on `summarize` (via their `${summarize.output}` ref) — run **at the
+This is what makes `implement-rvs`'s per-dimension `review-dimension` reviews — the `expand:`-generated
+`review_*` siblings that all depend only on `bundle` (via their `${bundle.output...}` ref) — run **at the
 same time** even though each carries a
 different `customize.profile` (a static literal that `for_each` can't vary per item, which is exactly
-why they're siblings and not a fan-out). Rules and guarantees:
+why an `expand:` fan-out of siblings, not a `for_each`, is the right shape). Rules and guarantees:
 
 - A **single-node rank** is emitted exactly as before — `phase(<id>)` + an awaited assignment — so a
   pure dependency chain (every node depends on the previous) is **byte-identical** to the pre-feature
@@ -1213,7 +1216,8 @@ Each node renders under a `/workflows` progress group named by its **id** by def
 field **`phase_group: <label>`** overrides that: every node sharing a `phase_group` renders under one group
 box. The label is the per-call `phase` opt baked into the node's `runMicroskill`/`runAgent` call, and
 `meta.phases` de-dupes to one entry per distinct group. For an independent-sibling rank whose members all
-share a `phase_group` (e.g. `review-changes`'s three dimension reviews carry `phase_group: review`), that
+share a `phase_group` (e.g. `implement-rvs`'s `review_*`/`xreview_*` dimension reviews carry
+`phase_group: review`), that
 per-call opt is what groups them — the compiler emits **no** inline `phase()` marker for a multi-node rank
 (the global `phase()` marker races inside a `parallel([...])` batch); a single-node rank keeps its
 `phase(<group>)` marker.
@@ -1743,7 +1747,7 @@ gates:
 output: { from: build }
 ```
 
-**Retry loop with advisory fork — the built-in `microskill-create` shape →
+**Retry loop with advisory fork — a plan→build→check retry-loop shape →
 `segment[plan]` · gate · orchestrator(advise) · `segment[implement,evaluate]` · orchestrator(finalize):**
 ```yaml
 version: 1
@@ -1801,14 +1805,16 @@ output: { from: finalize }
 ```
 
 > The `agent:` nodes above keep the skeleton self-contained. To compose registered microskills
-> instead, swap `agent: planner` → `use: task-plan` + `customize: { profile: microskill }` (and the
-> matching `task-implement` / `task-evaluate`), exactly as the real `microskill-create` does.
+> instead, swap `agent: planner` → `use: task-plan` and `agent: builder` → `use: task-implement`
+> (each under `customize: { profile: microskill }`). The real `microskill-create` goes further still:
+> its plan and build halves are the `plan-rvs` and `implement-rvs` review-loops, and the lone
+> `evaluate` checker here stands in for that adversarial review→verify→synthesize panel.
 
 **Nested workflow + fan-out — plan, then build each item via a child workflow →
 `segment[plan]` · gate · nested_workflow(build):**
 ```yaml
 name: orchestrate                  # version omitted → defaults to 1
-imports: [build-workflow-from-plan]   # the child MUST be allowlisted
+imports: [implement-rvs]           # the child MUST be allowlisted
 inputs:
   requirement: { type: string, required: true }
 nodes:
@@ -1822,13 +1828,13 @@ nodes:
       properties:
         units: { type: array, items: { type: object } }
   - id: build                       # first-class nested-workflow node → always a checkpoint
-    workflow: build-workflow-from-plan
+    workflow: implement-rvs
     for_each: ${plan.output.units}  # one child run per unit; the ref implies plan -> build
     as: unit
     inputs:                         # ALL of the child's required inputs must be present, or
-      plan_path: ${unit}            #   validate-workflow --defs-root BLOCKS. build-workflow-from-plan
-      name: ${unit}                 #   requires plan_path/name/requirement/staging_dir (all required).
-      requirement: ${workflow.inputs.requirement}
+      plan_path: ${unit}            #   validate-workflow --defs-root BLOCKS. implement-rvs
+      name: ${unit}                 #   requires plan_path/name/requirement_path/staging_dir (all required).
+      requirement_path: ${workflow.inputs.requirement}
       staging_dir: ${unit}          # raw refs — the dispatcher resolves them at run time
 gates:
   - id: approve_plan
@@ -1842,41 +1848,41 @@ output: { from: build }
 > required inputs are checked against this node's `inputs`, and depth>1 / import cycles are blocked.
 
 **Caller owns the terminal decision — nest a pure review component, then branch on its verdict →
-`nested_workflow(review)` · orchestrator(review_decision) · orchestrator(post):** a reusable review
-component (e.g. `review-changes`) deliberately **ends at its synthesis node** — it *produces* the review and
-never asks a human or posts. A caller that wants to *act* on the result owns that policy: nest the review,
-then an orchestrator node renders the report and asks the human **verdict-appropriate** options, and a
-declarative `post` node fires on the recorded choice.
+`nested_workflow(review)` · orchestrator(review_decision) · orchestrator(build):** a reusable review
+component (e.g. `plan-rvs`) deliberately **ends at its synthesis node** — it *produces* the review and
+never asks a human or acts. A caller that wants to *act* on the result owns that policy: nest the review,
+then an orchestrator node renders the verdict and asks the human **verdict-appropriate** options, and a
+declarative `build` node fires on the recorded choice.
 ```yaml
-name: pr-review
-imports: [review-changes]
+name: plan-then-decide
+imports: [plan-rvs]
 inputs:
-  diff: { type: string, required: true }
-  post_target: { type: string, required: false }
+  requirement_path: { type: string, required: true }
+  staging_dir: { type: string, required: true }
 nodes:
   - id: review                          # nested pure-pipeline review — a checkpoint, ends at synthesize
-    workflow: review-changes
+    workflow: plan-rvs
     inputs:
-      diff: ${workflow.inputs.diff}     # block style — ${...} can't sit in a { } flow map
+      requirement_path: ${workflow.inputs.requirement_path}   # block style — ${...} can't sit in a { } flow map
+      staging_dir: ${workflow.inputs.staging_dir}
   - id: review_decision                 # orchestrator: prompt IS ${...}-resolved + can AskUserQuestion
     delegation: orchestrator
     prompt: >
-      Render the review report (${review.output.report_markdown}); verdict
-      ${review.output.verdict}, ${review.output.blocker_count} blocker(s). Then AskUserQuestion with
-      options that fit the verdict — request_changes -> "Show blockers to fix" / "Post anyway" /
-      "Don't post"; approve|comment -> "Post to PR" / "Don't post". For "Show blockers to fix", list
-      the blocker findings from ${review.output.findings} and stop. Return ONLY
+      Render the plan-review verdict (${review.output.verdict}) and its surviving findings
+      (${review.output.findings}). Then AskUserQuestion with options that fit the verdict —
+      request_changes -> "Show must-fix" / "Build anyway" / "Abandon"; approve -> "Build the plan"
+      / "Abandon". For "Show must-fix", list the blocker findings and stop. Return ONLY
       {"choice":"<the selected label, verbatim>"}.
     output_schema:                      # declared return contract — validated post-step (check-step-io)
       type: object
       required: [choice]
       properties:
         choice: { type: string }
-  - id: post                            # declarative side-effect, guarded on the recorded choice
+  - id: build                           # declarative side-effect, guarded on the recorded choice
     delegation: orchestrator
-    when: ${review_decision.output.choice == 'Post to PR' || review_decision.output.choice == 'Post anyway'}
+    when: ${review_decision.output.choice == 'Build the plan' || review_decision.output.choice == 'Build anyway'}
     prompt: >
-      Post ${review.output.report_markdown} to ${workflow.inputs.post_target} via the gh CLI.
+      Hand the approved plan ${review.output.plan_path} to the build stage.
 output: { from: review }
 ```
 > **Why an orchestrator node, not a gate:** a gate can't vary its prompt/options by an upstream verdict —
@@ -1888,7 +1894,7 @@ output: { from: review }
 > the AskUserQuestion labels and the `when` strings a single hand-maintained set (a typo silently
 > dead-ends a branch). **Caveat:** a `workflow:` node is *always* a checkpoint, so a declarative `loop:` can't wrap the
 > nested review (loop-contiguity, §9) — a fix→re-run cycle is orchestrator/human-driven (re-invoke on a
-> fresh diff), not an engine loop.
+> fresh requirement), not an engine loop.
 
 ---
 

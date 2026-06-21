@@ -36,3 +36,8 @@ output_schema:
     plan_path: { type: ["string", "null"], description: Path to the written plan YAML file under staging_dir, or null when a scope advisory applies. }
     name: { type: ["string", "null"], description: Proposed kebab-case name for the artifact (echoes name_override when supplied). }
     scope_advisory: { type: ["object", "null"] }
+    # Microskill domain has no missing-microskill concept; declared null-safe (NOT required)
+    # so that plan-rvs's domain-neutral synth can reference ${plan.output.missing_microskills}
+    # under the ms profiles too — the ms planner emits null/absent. The workflow profile
+    # overrides output_schema wholesale and re-declares this field as a populated array.
+    missing_microskills: { type: ["array", "null"], description: Always null/absent in the microskill domain (no nested-component provisioning); present only as a null-safe echo target for the shared plan-rvs synth. }

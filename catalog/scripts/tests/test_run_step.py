@@ -280,14 +280,14 @@ def test_eval_resolves_prompt_refs_against_inputs_and_results(tmp_path):
         tmp_path,
         [orch_step("Finalize ${plan.output.name} into ${workflow.inputs.out_dir}.")],
         inputs={"out_dir": "/staging"},
-        results={"plan": {"name": "review-changes"}})
+        results={"plan": {"name": "slugify-title"}})
     rc, data, out, err = run("eval", "--manifest", str(man),
                              "--run-state", str(st), "--step", "0")
     assert rc == 0, out + err
     assert data["errors"] == []
     assert data["skipped"] is False
     assert data["when"] is None and data["for_each"] is None
-    assert data["prompt"] == "Finalize review-changes into /staging."
+    assert data["prompt"] == "Finalize slugify-title into /staging."
 
 
 @needs_node

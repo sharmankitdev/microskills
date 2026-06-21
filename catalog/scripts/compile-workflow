@@ -289,6 +289,44 @@ def _expand_suffix(item):
     return item.replace("-", "_")
 
 
+def _projected_expand_sibling_ids(nodes):
+    """Project the sibling node ids the LATER expand_static_fanout pass will mint from
+    every `expand:` template node here — the SAME `<template-id>_<suffix>` id-synthesis
+    expand_static_fanout's Pass 2 uses (`f"{nid}_{_expand_suffix(item)}"`).
+
+    desugar_nested_workflows runs BEFORE expand, so at inline time a generated sibling
+    is NOT yet a node: a spliced child node's explicit ref to one (e.g. implement-rvs's
+    collect inputs ${xreview_duplicate_capability.output}, where xreview is the template)
+    would miss the ref-rewriter's known-child-id map and ship BARE — surfacing later as a
+    phantom external need.nodes entry the segment never produces. Feeding these projected
+    ids into the inline id-namespacing map fixes that: the ref is namespaced
+    <splice>__<sibling>, matching the post-expand node id (the template's own id is
+    namespaced at inline, so expand then mints <splice>__<template>_<suffix>).
+
+    Best-effort + pure: a malformed expand block is skipped here (expand_static_fanout
+    owns the hard validation and will fail loud on the flat graph)."""
+    out = set()
+    for n in nodes:
+        if not (isinstance(n, dict) and "expand" in n):
+            continue
+        nid = n.get("id")
+        exp = n.get("expand")
+        if not (isinstance(nid, str) and isinstance(exp, dict)):
+            continue
+        over = exp.get("over")
+        if not isinstance(over, list):
+            continue
+        for ent in over:
+            if isinstance(ent, str):
+                item = ent
+            elif isinstance(ent, dict) and isinstance(ent.get("item"), str):
+                item = ent["item"]
+            else:
+                continue
+            out.add(f"{nid}_{_expand_suffix(item)}")
+    return out
+
+
 def humanize_id(s):
     """Deterministic id -> human-readable display label fallback.
 
@@ -1358,6 +1396,13 @@ def desugar_nested_workflows(wf, defs_root, _stack=None):
         inner_nodes = child.get("nodes") or []
         inner_ids = {cn["id"] for cn in inner_nodes
                      if isinstance(cn, dict) and isinstance(cn.get("id"), str)}
+        # Expand runs AFTER this inline pass, so a child node's ref to a not-yet-minted
+        # expand SIBLING (${<template>_<item>.output}, e.g. collect's ${xreview_*.output})
+        # would miss the ref-rewriter's known-id map and ship bare. Project those sibling
+        # ids now (the same id-synthesis expand_static_fanout uses) so the rewriter
+        # namespaces such a ref like any child id — matching the eventual post-expand
+        # node id <splice>__<template>_<item>.
+        inner_ids |= _projected_expand_sibling_ids(inner_nodes)
 
         # Bindings: each child-declared input -> the host node's inputs binding, else
         # the input's own default, else (optional + unbound) a null literal. An

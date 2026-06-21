@@ -552,9 +552,9 @@ evaluate an expression or substitute a ref in your head).
 that REQUIRES asking the user (it instructs an interactive loop, or a decision only a human can make)
 → dispatch `{op:"fail", name, run_dir, step:<i>, label:'<node> needs a human'}` and STOP with a
 nonzero outcome, naming the node; never answer on the user's behalf (a fabricated answer is worse than
-a stop). A prompt that needs no human input executes normally. (Example: `refine-requirements`' base
-`clarify` node is NOT headless-able — its `autonomous` profile, which rewrites the prompt to an
-unattended single pass, is the supported unattended path.)
+a stop). A prompt that needs no human input executes normally. (Example: a node whose prompt
+instructs an interactive clarify loop is NOT headless-able; the supported unattended path is a
+profile that rewrites the prompt to a single unattended pass, or a `gate_mode: auto` gate.)
 
 The main loop is also the only place a node may invoke a **nested workflow** (e.g. a `provision`
 node running `microskill-create` with the autonomous profile, once per missing microskill via

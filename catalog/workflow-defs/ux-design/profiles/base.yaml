@@ -1,5 +1,0 @@
-version: 1
-
-# Interactive default — every gate default and the full rigor graph already live in
-# WORKFLOW.yaml (rigor is profile-invariant; overlays may change only pauses).
-profile: { default: base }

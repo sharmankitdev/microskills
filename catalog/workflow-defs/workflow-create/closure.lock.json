@@ -1,14 +1,42 @@
 {
-  "manifest_hash": "c0de98f6abbfd7631e99c50409d124bef67c1c101f47c74eebec2c2857ad1cb0",
+  "manifest_hash": "0ebe1ba70d51cd1bd0e5bed6894ac0e75b72eda65d7b021825766f5bc1ca1a67",
   "name": "workflow-create",
   "node_fingerprints": {
-    "advise": "cfb1393008cb82f3bfdaca49314b4be2cdd5df6101a23672b3ba7e0a2a26f982",
-    "build": "277f4a1b94ab531530fc05adde2f2b6e8d1cfc3b052b31135c3ba6a81dc5639c",
-    "plan": "c72a28e2f844631d0197c98d21356c49640eba0bc2b42c94c7cc8dd5d5953f77",
-    "provision": "1af50352a7a13433d8dd330ebab36fa1c4766e970d14be9d915a59e1df6d0f76"
+    "advise": "e1b2198f1227f3bf3ed34822bb17c35ece8196cf38afa75060560f836b07ca60",
+    "build__bundle": "369d509b2430e238276517a57ef529b27fb47a4689702dcaf5b4cc2d77b0d0be",
+    "build__bundle_xref": "576f7299867f2230ed5c6f3326f18965dcd3582c05b986ea57713b3f75ceb4f0",
+    "build__catalog_index": "9ca4a8de8c6bd7f0a836d37936a91778e263a936b533c7c236619a0a34e6ea6d",
+    "build__collect": "2374f9f674e4ea9eba3c19e1e908778fa9d7eb5e2369b5c2de035024dcd95f84",
+    "build__floor": "feb4f8c1999e73d1ca90aa7660cecc9ab08f12d0d36887a05d748563a970e326",
+    "build__implement": "68b4ded9d49b5e6b03731dad80e7fb0cfa3fd992519ad14e18d2831104441a59",
+    "build__review_wf_dag_decomposition_correctness": "1d3996197a35bd8e02cee422ab87acf8096602e486a09f39bb1adbbe3d2082f3",
+    "build__review_wf_gate_prompt_options_quality": "5d8c4aaf59946ad7ddcc26d01e57e67b0548aa75f0b3a74742759713618ce298",
+    "build__review_wf_guard_logic_intent": "941da2001b98241cf53611527bdad2d8cdb321667b708ce62cd7586289956682",
+    "build__review_wf_output_schema_downstream_fit": "ae25068058a747184edf9d22585de1e2fae1907de3a9993782c94471b3abc5b1",
+    "build__review_wf_profile_overlay_coherence": "0db1d2151e8269a0175173bc709d953c730730244ec1de06103802138c0735a1",
+    "build__review_wf_prompt_task_fidelity": "2ee108022b532703b6f04829c1b4cf385e02bd225a5f092baf0228467b2e8a05",
+    "build__review_wf_spill_materialize_judgment": "ce307adb636ba49e5f6b07f1d2fe06a987587cd2e1eb5c4ecea716e59f346a8a",
+    "build__synth": "d4ee93baa4f8001ad40ca5fa12928c8cecb2f5ef6430bb5f92c163d99f170158",
+    "build__verify": "5d6c123b3b27e572956b67cd650ac9a800b45da8d0b3a77a4adb36c81659e465",
+    "build__xreview_duplicate_capability": "df3d598aa4b839da4ab118ea501fea6df54607448b193d1525e0f82932b87935",
+    "build__xreview_naming_collision": "774dc0bedc63121196c6caf871d29e43e18a1ac48c54d16196370a5339327952",
+    "build__xreview_reverse_consumer": "cd6d3298436a7aeefa4d95aeb18c62e83c93ca36dbc374af73d9e11dcca11055",
+    "finalize": "25d3a0b4c3ade28bbc5410c4202c2225a85a64c84e699875d5950fc957e782f3",
+    "plan_rvs__collect": "bd6372d4df7b8d5f6a8ebd7d36d5a25e1c33b0a95907fbe6d28e5d1f7011a27f",
+    "plan_rvs__plan": "c72a28e2f844631d0197c98d21356c49640eba0bc2b42c94c7cc8dd5d5953f77",
+    "plan_rvs__review_plan_wf_completeness": "d97547fc8a3fe83e6f15f10a6c03f71f8bff408abe3591aa584216ef22e5333a",
+    "plan_rvs__review_plan_wf_control_flow": "80474ee493c74ab2c46b4bb850093948a99140a7f05746844e78f2ad141ee2b8",
+    "plan_rvs__review_plan_wf_graph_correctness": "7c2f6ac9f9a1edde0635f3dd6fff79ff7ae2f9ce8b41f253e66d59f0f4302756",
+    "plan_rvs__review_plan_wf_name_capability": "12507f7d239b69ef3e022e4c30bdea1e34fb127433c241a6845f36927e1f475d",
+    "plan_rvs__review_plan_wf_reuse_survey": "a23c0ce2a0eedcc8d6b9869283d34d3d95d5c0b75bdbc8a2869eedbe5731a3ab",
+    "plan_rvs__review_plan_wf_scope_fit": "82af3ad6cb81a04509db877696c899481b2eb5caeed6884f1916b7390f652e05",
+    "plan_rvs__synth": "b8fc1449b6db7e66a0f031ae5fefb0066b60eab724575908d449026c1e8ffb4d",
+    "plan_rvs__verify": "340e5124d8a5da59781231a00b24686363e3efcb9370ffb40c3888977ebd1025",
+    "provision": "c22a3dd31650505c1e06d78f228e7d11316746c477493f10e4f81bd35b657b0c"
   },
   "profile_used": "base",
   "segment_digests": {
-    "seg-1.js": "269cb6e7f3db4ef4c54e3b1252971faef1946dfdad036e541d545683a0128e86"
+    "seg-1.js": "b662391f5eed6317a9d9a2a4dea425f951508d187901f92e7faa793073077098",
+    "seg-2.js": "e18a1d4b315f91b76d3dd9e8accbd0def1682a36b9e4497591a752c8852289da"
   }
 }
