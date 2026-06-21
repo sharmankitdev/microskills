@@ -1,3 +1,9 @@
+## [0.33.0](https://github.com/sharmankitdev/microskills/compare/v0.32.0...v0.33.0) (2026-06-21)
+
+### Features
+
+* **scripts:** compile-time workflow inlining + region guards + first-class RVS workflows ([#37](https://github.com/sharmankitdev/microskills/issues/37)) ([084d37a](https://github.com/sharmankitdev/microskills/commit/084d37ac8423da2f578c66944a2dc0a21743e566))
+
 ## [0.32.0](https://github.com/sharmankitdev/microskills/compare/v0.31.0...v0.32.0) (2026-06-20)
 
 ### Features
