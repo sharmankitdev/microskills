@@ -32,8 +32,6 @@ import yaml
 REPO = Path(__file__).resolve().parents[3]
 COMPILE = REPO / "catalog" / "scripts" / "compile-workflow"
 VALIDATE = REPO / "catalog" / "scripts" / "validate-workflow"
-REAL_CATALOG_DEFS = REPO / "catalog" / "workflow-defs"
-REAL_CATALOG_MS = REPO / "catalog" / "microskills"
 # Pin the in-repo source schema so tests exercise the committed templates/.
 _ENV = {**os.environ, "MICROSKILLS_TEMPLATES_ROOT": str(REPO / "templates")}
 
@@ -530,71 +528,3 @@ def test_validate_wire_auto_materializes_like_compile(tmp_path):
         d / "WORKFLOW.yaml", "--defs-root", str(defs_root))
     assert data["pass"] is True, data
     assert data["issues"] == []
-
-
-# --- adoption pin: the real catalog defs ------------------------------------
-# THE feature's correctness proof on the shipped defs: each adopted def's
-# wire: auto output must be byte-identical (segments AND manifest, incl.
-# manifest_hash) to the hand-desugared rewrite of the same def. Intentionally
-# points at the real catalog/.
-
-# 2026-06-21 production rewire: NO shipped def currently adopts `wire: auto`.
-# workflow-create's `build` (workflow: implement-rvs) now binds its inputs
-# EXPLICITLY and is compile-time INLINED as a guarded loop region — keeping
-# wire: auto would SUPPRESS that inlining (the node would stay a nested_workflow
-# checkpoint). decompose-monolith-orchestrator (the other former adopter) was
-# retired. The hermetic test_wire_auto_emits_handwritten_bytes remains the
-# byte-identity correctness proof for the feature; the real-catalog adoption pin
-# below is skipped until a shipped def adopts wire: auto again.
-ADOPTED = {}
-
-
-def copy_catalog_world(tmp_path):
-    defs_root = tmp_path / "workflow-defs"
-    shutil.copytree(REAL_CATALOG_DEFS, defs_root,
-                    ignore=shutil.ignore_patterns(".compiled"))
-    shutil.copytree(REAL_CATALOG_MS, tmp_path / "microskills")
-    return defs_root
-
-
-@pytest.mark.parametrize("name", [
-    pytest.param("workflow-create", marks=pytest.mark.skip(
-        reason="post-2026-06-21 rewire: no shipped def adopts wire: auto "
-               "(workflow-create's build is inlined with explicit inputs); "
-               "hermetic test_wire_auto_emits_handwritten_bytes covers byte-identity")),
-])
-def test_real_adopted_def_wire_auto_equals_handwritten(tmp_path, name):
-    defs_root = copy_catalog_world(tmp_path)
-    d = defs_root / name
-
-    rc, data, out, err = compile_wf(defs_root, name, "--explain")
-    assert rc == 0, err
-    assert data["auto_wired"] == ADOPTED[name]
-    assert "REQUIRED target input" not in err  # adoption wires optional inputs only
-    sugar_segs = {p.name: p.read_text() for p in (d / ".compiled").glob("seg-*.js")}
-    sugar_manifest = (d / ".compiled" / "manifest.json").read_text()
-    assert sugar_segs, "expected at least one compiled segment"
-
-    # Hand-desugar: drop wire: auto, restate the wired forwards explicitly (at
-    # the end, in sorted order — the documented materialization rule).
-    doc = yaml.safe_load((d / "WORKFLOW.yaml").read_text())
-    desugared = set()
-    for node in doc["nodes"]:
-        if node.pop("wire", None) != "auto":
-            continue
-        wired = ADOPTED[name].get(node["id"])
-        assert wired, f"unexpected wire: auto on node '{node['id']}'"
-        for w in wired:
-            assert w not in (node.get("inputs") or {})
-            node.setdefault("inputs", {})[w] = "${workflow.inputs." + w + "}"
-        desugared.add(node["id"])
-    assert desugared == set(ADOPTED[name])
-    (d / "WORKFLOW.yaml").write_text(yaml.safe_dump(doc, sort_keys=False))
-
-    rc, data, out, err = compile_wf(defs_root, name)
-    assert rc == 0, err
-    hand_segs = {p.name: p.read_text() for p in (d / ".compiled").glob("seg-*.js")}
-    hand_manifest = (d / ".compiled" / "manifest.json").read_text()
-
-    assert sugar_segs == hand_segs          # segments byte-identical
-    assert sugar_manifest == hand_manifest  # manifest (incl. manifest_hash) too
