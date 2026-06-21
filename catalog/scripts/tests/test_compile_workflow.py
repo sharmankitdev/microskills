@@ -403,16 +403,31 @@ def test_nested_workflow_omits_profile_when_no_customize(tmp_path):
 
 
 def test_real_flow_segments_and_advisory_branch():
-    # Retrofitted with a scope_advisory branch: an `advise` orchestrator node
-    # (when scope_advisory != null) before the loop, plus the loop's on_exhaust
-    # escalation gate (conditional) and the finalize node.
+    # 2026-06-21 production rewire (sub-PR 2): the old plan/implement/evaluate guts
+    # are gone — microskill-create now compile-time INLINES plan-rvs (loop-less in
+    # base) + implement-rvs (one guarded loop region), keeping the `advise` advisory
+    # branch + the host `finalize`. Base shape: plan_rvs segment → approve_plan gate
+    # → advise orchestrator → impl_rvs loop segment (guarded) → loop_exhaust_impl_rvs
+    # gate → finalize orchestrator. Same 2-segment / 4-checkpoint topology, but the
+    # segment node lists are now the inlined child nodes.
     rc, data, out, err = run(REAL_DEFS, "microskill-create")
     assert rc == 0, err
     assert data["segments"] == 2
     assert data["checkpoints"] == 4
-    assert data["sequence"] == [
-        "segment[plan]", "gate", "orchestrator_node",
-        "segment[implement,evaluate]", "gate", "orchestrator_node"]
+    man = json.loads(
+        (REAL_DEFS / "microskill-create" / ".compiled" / "manifest.json").read_text())
+    steps = man["steps"]
+    kinds = [s["kind"] if s["kind"] == "segment" else s.get("checkpoint_type")
+             for s in steps]
+    assert kinds == ["segment", "gate", "orchestrator_node",
+                     "segment", "gate", "orchestrator_node"], kinds
+    seg_plan, seg_impl = [s for s in steps if s["kind"] == "segment"]
+    assert seg_plan["is_loop"] is False
+    assert all(n.startswith("plan_rvs__") for n in seg_plan["nodes"]), seg_plan["nodes"]
+    assert seg_impl["is_loop"] is True
+    assert all(n.startswith("impl_rvs__") for n in seg_impl["nodes"]), seg_impl["nodes"]
+    assert any(s.get("node") == "advise" for s in steps)
+    assert any(s.get("node") == "finalize" for s in steps)
 
 
 def test_real_flow_guarded_loop_breaks_when_skipped():
@@ -513,12 +528,20 @@ def test_real_autonomous_gate_patch_applies():
         assert rc == 0, err
         m = json.loads((REAL_DEFS / name / ".compiled" / "manifest.json").read_text())
         assert m["gate_mode"] == "auto"
-        gate = _gate_checkpoint(REAL_DEFS, name)
+        # microskill-create now runs an AUTONOMOUS plan-rvs whose convergence loop adds
+        # a loop_exhaust_plan_rvs gate BEFORE approve_plan — so select the approval gate
+        # by id (not "the first gate"). After-anchor: microskill-create's approve_plan
+        # sits after the inlined plan-rvs terminal (plan_rvs__synth); workflow-create
+        # still carries a top-level `plan` node (its guts rewire is sub-PR 4).
+        gate = next(s["gate"] for s in m["steps"]
+                    if s.get("checkpoint_type") == "gate"
+                    and s.get("gate", {}).get("id") == "approve_plan")
         assert gate["id"] == "approve_plan"
         assert gate["severity"] == "hard"          # NOT flipped any more
         assert gate["default"] == "approve"        # the patch merged by id
         assert "(autonomous)" not in gate["prompt"]
-        assert gate["after"] == "plan"
+        assert gate["after"] == (
+            "plan_rvs__synth" if name == "microskill-create" else "plan")
         assert gate["type"] == "human_approval"
         assert gate["options"] == ["approve", "revise", "abandon"]
 
@@ -4292,7 +4315,11 @@ def test_real_microskill_create_autonomous_profile_is_headless(tmp_path):
     assert data["profile_used"] == "autonomous"
     m = data["manifest"]
     assert m["gate_mode"] == "auto"
-    gate = next(s for s in m["steps"] if s.get("checkpoint_type") == "gate")["gate"]
+    # The autonomous plan-rvs loop adds a loop_exhaust_plan_rvs gate ahead of
+    # approve_plan, so select the approval gate by id rather than "the first gate".
+    gate = next(s["gate"] for s in m["steps"]
+                if s.get("checkpoint_type") == "gate"
+                and s.get("gate", {}).get("id") == "approve_plan")
     assert gate["id"] == "approve_plan"
     assert gate["default"] == "approve"
     assert gate["severity"] == "hard"   # severity is NOT flipped any more

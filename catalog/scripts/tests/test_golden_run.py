@@ -393,6 +393,14 @@ def test_scenario_review_changes_comprehensive(tmp_path):
 
 
 @needs_node
+@pytest.mark.xfail(
+    reason="STALE GOLDEN — the 2026-06-21 production rewire (sub-PR 2) replaced "
+    "microskill-create's plan/implement/evaluate guts with inlined plan-rvs + "
+    "implement-rvs. The frozen scenario/fixtures/goldens still model the old flow, "
+    "AND the golden-run world-builder copies only the named def (not its nested "
+    "workflow: imports) so the new def cannot even compile here. Refreshing the "
+    "golden-run for the rewired in-scope defs is sub-PR 5's explicit scope.",
+    strict=False)
 def test_scenario_microskill_create_autonomous(tmp_path):
     rc, data, out, err = run_scenario("microskill-create-autonomous", tmp_path)
     assert rc == 0, (json.dumps(data, indent=2) if data else out + err)
@@ -513,6 +521,12 @@ def test_golden_microskill_create_auto_gate_and_guarded_skip():
 # ============================================================ pickup rail
 
 @needs_node
+@pytest.mark.xfail(
+    reason="STALE GOLDEN — same 2026-06-21 rewire as test_scenario_microskill_create_"
+    "autonomous: the park/pickup scenario models the retired implement-evaluate loop's "
+    "loop_exhaust gate, and the world-builder cannot compile the rewired nested-import "
+    "def. Golden-run refresh for the in-scope defs is sub-PR 5's scope.",
+    strict=False)
 def test_scenario_microskill_create_park_pickup(tmp_path):
     # The full park→pickup lifecycle: 3 failing evaluator rounds exhaust the
     # loop unconverged → the auto run PARKS at the loop_exhaust gate

@@ -447,6 +447,14 @@ def main():
         nid = n.get("id")
         if not nid:
             continue
+        # A `workflow:` node is EXEMPT: it compile-time inlines a child region whose
+        # internal nodes include zero-dep ones (e.g. implement-rvs's catalog_index,
+        # depends_on: []). An output ref (${child.output...}) only orders the child's
+        # producing node, leaving those zero-dep nodes free to float across the
+        # region boundary — so depends_on on a workflow: node ANCHORS the whole
+        # spliced region and is load-bearing for contiguity, never redundant noise.
+        if n.get("workflow"):
+            continue
         implied = {r for r in scoped_ref_ids(n) if r in pre_ids and r != nid}
         for d in (n.get("depends_on") or []):
             if d in implied:

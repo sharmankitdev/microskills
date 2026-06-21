@@ -2,15 +2,19 @@
 # sub-step of another workflow (e.g. workflow-create's `provision` node), where
 # no human is present to approve the plan.
 #
-# Pure flip to the declared gate-policy mechanism: `gate_mode: auto` makes the
-# dispatcher take each gate's declared default and record it VERBATIM (never a
-# fabricated pick), and the `patch` declares that default on the approve_plan
-# gate by id — after/type/severity/options/prompt are inherited from the base
-# gate, not restated. The gate stays hard + human_approval, so the compiled
-# shape is unchanged (a human_approval gate ALWAYS flushes the segment and the
-# implement/evaluate loop stays in its own segment); under gate_mode: auto the
-# dispatcher records {choice: approve} and continues WITHOUT pausing. Net
-# effect: same partition, no human pause, an author-declared recorded choice.
+# Two pure flips:
+#  1. `nodes: patch` swaps the plan_rvs child onto the AUTONOMOUS plan-rvs profile
+#     (microskill-create-autonomous), which adds the bounded convergence loop +
+#     wires plan.last_findings = ${loop.carry.findings}. The interactive base runs
+#     plan-rvs LOOP-LESS (one pass) and leans on the human at approve_plan; the
+#     autonomous variant re-plans against surviving findings until it converges or
+#     hits the cap. (implement-rvs already carries its own loop in both modes.)
+#  2. `gate_mode: auto` makes the dispatcher take each gate's declared default and
+#     record it VERBATIM (never a fabricated pick); the `gates: patch` declares that
+#     default on approve_plan by id — after/type/severity/options/prompt are
+#     inherited from the base gate, not restated. The gate stays hard +
+#     human_approval, so the compiled partition is unchanged; under gate_mode: auto
+#     the dispatcher records {choice: approve} and continues WITHOUT pausing.
 #
 # The doc-declared gate_mode also WINS over a parent's inherited `--gate-mode`
 # flag, so this profile is headless regardless of how the parent runs. finalize
@@ -19,6 +23,11 @@
 version: 1
 
 gate_mode: auto
+
+nodes:
+  patch:
+    - id: plan_rvs
+      customize: { profile: microskill-create-autonomous }
 
 gates:
   patch:
