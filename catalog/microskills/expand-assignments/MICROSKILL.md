@@ -1,5 +1,6 @@
 ---
 name: expand-assignments
+base: true
 description: >-
   Use when you have an item set and need every review or verification
   assignment enumerated. Deterministically crosses the union of an optional

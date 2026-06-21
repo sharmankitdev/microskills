@@ -1,5 +1,6 @@
 ---
 name: assimilate-requirements
+base: true
 description: >
   Use when you have raw software requirements from one source — an inline
   brain-dump, a single file, or a directory of notes — and need them assimilated

@@ -1,5 +1,6 @@
 ---
 name: tally-votes
+base: true
 description: >-
   Use after a panel of adversarial verdicts has scored each assigned seat, when you have
   the per-seat verdicts plus the original assignment object and need them tallied. Joins

@@ -116,12 +116,21 @@ workflows:
 # + bundling microskills, so the flagship base set a fresh consumer seeds includes
 # them. The workflow-inlining engine added the two first-class RVS workflows
 # implement-rvs + plan-rvs. The 2026-06-21 production rewire RETIRED
-# build-workflow-from-plan + decompose-monolith-orchestrator (no longer base).
+# build-workflow-from-plan + decompose-monolith-orchestrator (no longer base) and
+# (sub-PR 3) bound refine-requirements into microskill-create as its front-end — so
+# refine-requirements + its transitive microskill closure (assimilate-requirements,
+# apply-findings-to-document, extract-closure-claims, expand-assignments, tally-votes,
+# assemble-evidence) are now base-tagged: an in-scope create pipeline must seed its
+# whole import closure.
 MISSING_BASE = {"analyze-monolith-orchestrator",
                 "run-validators", "build-catalog-index",
                 "review-dimension", "collect-findings", "verify-finding",
                 "synthesize-review", "bundle-draft",
-                "implement-rvs", "plan-rvs"}
+                "implement-rvs", "plan-rvs",
+                "refine-requirements",
+                "assimilate-requirements", "apply-findings-to-document",
+                "extract-closure-claims", "expand-assignments", "tally-votes",
+                "assemble-evidence"}
 
 
 def write_manifest(tmp, text):

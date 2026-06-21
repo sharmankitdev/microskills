@@ -1,5 +1,6 @@
 ---
 name: extract-closure-claims
+base: true
 description: Use when a requirements-refinement loop holds the round-1 gaps array, the accumulated answers ledger, and the current document, and needs to determine which gaps the document has since closed. Reads the document and answers, and for each gap the document no longer leaves open emits one closure claim {id, gap_id, section, question, closure_excerpt} — id pinned as claim-<gap_id> so a downstream verifier echoes it as finding_id — alongside the still-open remainder. Produces a JSON object carrying claims, claim_count, still_open, and still_open_count.
 ---
 

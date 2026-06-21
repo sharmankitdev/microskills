@@ -225,27 +225,25 @@ def test_each_create_spec_profile_compiles_with_expected_structure():
         # asserted precisely in test_gate_collapse_makes_approve_non_pausing.
 
 
-def test_gate_collapse_makes_approve_non_pausing():
-    # D3: severity:warn keeps default:approve and never pauses, so the parent
-    # approve_plan becomes the only human gate. The compiled manifest still RENDERS
-    # the approve_requirements checkpoint (a human_approval gate is always emitted),
-    # but its severity flips hard -> warn; compile-workflow's gate_pauses() treats a
-    # warn human_approval gate as render-without-pause. So assert the gate step is
-    # present but no longer hard.
+def test_create_spec_microskill_keeps_gate_hard():
+    # 2026-06-21 production rewire (sub-PR 3): create-spec-microskill is inlined as
+    # microskill-create's refine front-end, where approve_requirements becomes Gate 1 — a
+    # HARD parent-level checkpoint. The create pipeline runs TWO hard gates (requirements +
+    # plan), so the §8 step-6 warn-collapse is REVERSED for the microskill variant. (The
+    # workflow variant flips to hard later, in sub-PR 4.) The compiled manifest renders the
+    # approve_requirements checkpoint with severity hard.
     rc, _, err = _compile("refine-requirements", "create-spec-microskill")
     assert rc == 0, err
     m = _manifest("refine-requirements")
     gsteps = _gate_steps(m, "approve_requirements")
-    assert gsteps, "approve_requirements should still render as a (non-pausing) checkpoint"
+    assert gsteps, "approve_requirements should render as a checkpoint"
     severities = {(s.get("gate") or {}).get("severity") for s in gsteps}
-    assert severities == {"warn"}, severities
-    hard_gates = [s for s in gsteps if (s.get("gate") or {}).get("severity") == "hard"]
-    assert hard_gates == [], "approve_requirements must not be a hard pause under create-spec"
+    assert severities == {"hard"}, severities
 
 
 def test_gate_stays_hard_in_base():
-    # Sanity twin: under base, approve_requirements IS a hard pausing gate — proves
-    # the collapse assertion above is meaningful (not vacuously true from a wrong key).
+    # Sanity twin: under base, approve_requirements IS a hard pausing gate — proves the
+    # severity assertion above reads the right key (not vacuously true from a wrong key).
     rc, _, err = _compile("refine-requirements", None)
     assert rc == 0, err
     m = _manifest("refine-requirements")

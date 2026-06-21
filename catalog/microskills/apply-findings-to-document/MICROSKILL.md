@@ -1,5 +1,6 @@
 ---
 name: apply-findings-to-document
+base: true
 description: Use when you hold a structured markdown document and a set of structured findings each citing a section, and need the document revised to address them in one pass. Rewrites the document in place — applying every addressable finding in its cited section, folding in any freeform revision notes, and recording each unresolvable finding as an explicit "Open question for human review" line. Null or empty findings and notes make it a no-op that returns the document unchanged. Produces the document path plus addressed and deferred counts and a summary.
 ---
 

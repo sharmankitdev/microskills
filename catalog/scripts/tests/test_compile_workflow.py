@@ -403,49 +403,62 @@ def test_nested_workflow_omits_profile_when_no_customize(tmp_path):
 
 
 def test_real_flow_segments_and_advisory_branch():
-    # 2026-06-21 production rewire (sub-PR 2): the old plan/implement/evaluate guts
-    # are gone — microskill-create now compile-time INLINES plan-rvs (loop-less in
-    # base) + implement-rvs (one guarded loop region), keeping the `advise` advisory
-    # branch + the host `finalize`. Base shape: plan_rvs segment → approve_plan gate
-    # → advise orchestrator → impl_rvs loop segment (guarded) → loop_exhaust_impl_rvs
-    # gate → finalize orchestrator. Same 2-segment / 4-checkpoint topology, but the
-    # segment node lists are now the inlined child nodes.
+    # 2026-06-21 production rewire (sub-PRs 2-3): the old plan/implement/evaluate guts
+    # are gone — microskill-create now compile-time INLINES three workflow children:
+    # refine-requirements (create-spec-microskill — its critique loop region + the
+    # clarify/present_refined/triage_reopened orchestrator checkpoints + Gate 1
+    # refine__approve_requirements) → plan-rvs (loop-less in base) → implement-rvs (one
+    # guarded loop region), keeping the `advise` advisory branch + the host `finalize`.
+    # Base: 6 segments / 9 checkpoints; refine inlines fully flat (0 nested_workflow);
+    # Gate 1 (refine__approve_requirements) precedes Gate 2 (approve_plan).
     rc, data, out, err = run(REAL_DEFS, "microskill-create")
     assert rc == 0, err
-    assert data["segments"] == 2
-    assert data["checkpoints"] == 4
+    assert data["segments"] == 6
+    assert data["checkpoints"] == 9
     man = json.loads(
         (REAL_DEFS / "microskill-create" / ".compiled" / "manifest.json").read_text())
     steps = man["steps"]
-    kinds = [s["kind"] if s["kind"] == "segment" else s.get("checkpoint_type")
-             for s in steps]
-    assert kinds == ["segment", "gate", "orchestrator_node",
-                     "segment", "gate", "orchestrator_node"], kinds
-    seg_plan, seg_impl = [s for s in steps if s["kind"] == "segment"]
+    # Refine inlines fully flat — no surviving nested_workflow checkpoint.
+    assert not any(s.get("checkpoint_type") == "nested_workflow" for s in steps)
+    # plan_rvs is a loop-less segment in base; impl_rvs is the one guarded loop region.
+    seg_plan = next(s for s in steps if s["kind"] == "segment"
+                    and all(n.startswith("plan_rvs__") for n in s["nodes"]))
     assert seg_plan["is_loop"] is False
-    assert all(n.startswith("plan_rvs__") for n in seg_plan["nodes"]), seg_plan["nodes"]
+    seg_impl = next(s for s in steps if s["kind"] == "segment"
+                    and all(n.startswith("impl_rvs__") for n in s["nodes"]))
     assert seg_impl["is_loop"] is True
-    assert all(n.startswith("impl_rvs__") for n in seg_impl["nodes"]), seg_impl["nodes"]
+    # refine's nodes inline under the refine__ namespace (assemble + critique loop +
+    # refute + evidence segments).
+    assert any(s["kind"] == "segment" and all(n.startswith("refine__") for n in s["nodes"])
+               for s in steps)
     assert any(s.get("node") == "advise" for s in steps)
     assert any(s.get("node") == "finalize" for s in steps)
+    gate_ids = [s["gate"]["id"] for s in steps if s.get("checkpoint_type") == "gate"]
+    assert gate_ids.index("refine__approve_requirements") < gate_ids.index("approve_plan")
 
 
 def test_real_flow_guarded_loop_breaks_when_skipped():
-    # The guarded loop body must emit the __ran flag + break so the advisory
-    # path doesn't read a skipped (null) node in the while condition.
+    # The guarded impl_rvs loop body must emit the __ran flag + break so the advisory
+    # path doesn't read a skipped (null) node in the while condition. (Post sub-PR 3 the
+    # impl_rvs region trails refine's segments + plan_rvs — locate it by its guard rather
+    # than a hardcoded segment number.)
     run(REAL_DEFS, "microskill-create")
-    seg2 = (REAL_DEFS / "microskill-create" / ".compiled" / "seg-2.js").read_text()
-    assert "let __ran = false" in seg2
-    assert "if (!__ran) break" in seg2
-    assert "scope_advisory == null" in seg2
+    compiled = REAL_DEFS / "microskill-create" / ".compiled"
+    guarded = [p for p in compiled.glob("seg-*.js")
+               if "scope_advisory == null" in p.read_text()]
+    assert len(guarded) == 1, [p.name for p in guarded]
+    seg = guarded[0].read_text()
+    assert "let __ran = false" in seg
+    assert "if (!__ran) break" in seg
 
 
 def test_autonomous_profile_softens_gate():
-    # The autonomous profile keeps 2 segments + the gate checkpoint (loop stays
-    # separated) but the gate is warn-severity (no human pause at runtime).
+    # The autonomous profile adds plan-rvs's convergence loop (3 loop regions total) but
+    # keeps the 6-segment partition + the gate checkpoints; under gate_mode: auto the
+    # dispatcher takes each gate's default (no human pause at runtime).
     rc, data, out, err = run(REAL_DEFS, "microskill-create", "--profile", "autonomous")
     assert rc == 0, err
-    assert data["segments"] == 2
+    assert data["segments"] == 6
     assert "gate" in data["sequence"]
 
 

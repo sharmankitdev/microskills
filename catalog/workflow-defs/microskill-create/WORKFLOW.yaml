@@ -34,6 +34,7 @@ inputs:
     description: Sandbox dir where the implementer writes the draft before finalize moves it.
 
 imports:
+  - refine-requirements
   - plan-rvs
   - implement-rvs
 
@@ -62,6 +63,24 @@ vars:
     success on an unresolved sync conflict.
 
 nodes:
+  # Refine the raw requirement into a structured, critic-proven microskill spec via the
+  # reusable refine-requirements front-end (create-spec-microskill profile: spec lenses +
+  # the 7-section microskill template + tightened budgets). A STATIC `workflow:` node with
+  # EXPLICIT inputs (no `wire: auto`), so the compiler INLINES it: refine's nodes splice
+  # into this host — its critique loop becomes a loop region, its clarify / present_refined /
+  # triage_reopened orchestrators become checkpoints, and its terminal approve_requirements
+  # gate becomes Gate 1 (refine__approve_requirements, HARD; flipped warn→hard in the
+  # create-spec-microskill profile). The refined document at ${refine.output.document_path}
+  # (refine's output: from assemble_req_evidence) is the semantic ground truth plan_rvs and
+  # impl_rvs review against — replacing the raw requirement_path.
+  - id: refine
+    workflow: refine-requirements
+    customize: { profile: create-spec-microskill }
+    inputs:
+      sources_path: ${workflow.inputs.requirement_path}
+      output_dir: ${workflow.inputs.staging_dir}
+      staging_dir: ${workflow.inputs.staging_dir}
+
   # Plan the microskill via the reusable plan-stage RVS (planner-in-review:
   # plan→review×N→verify→synth over the plan.yaml). The base ships LOOP-LESS (a
   # single pass; the approve_plan gate below is the backstop); the autonomous
@@ -74,8 +93,9 @@ nodes:
   - id: plan_rvs
     workflow: plan-rvs
     customize: { profile: microskill-create }
+    depends_on: [refine]
     inputs:
-      requirement_path: ${workflow.inputs.requirement_path}
+      requirement_path: ${refine.output.document_path}
       name_override: ${workflow.inputs.name}
       staging_dir: ${workflow.inputs.staging_dir}
 
@@ -99,20 +119,21 @@ nodes:
   # `finalize` node below). A STATIC `workflow:` node with EXPLICIT inputs (no
   # `wire: auto`), so the compiler INLINES it as ONE guarded do/while loop region
   # (region-guarded on the same `when`), keeping the pipeline flat. The explicit
-  # depends_on: [plan_rvs] is LOAD-BEARING for contiguity — it anchors the inlined
-  # region's zero-dep internal node (implement-rvs's catalog_index, depends_on: [])
-  # after the whole plan_rvs region; the inputs ref ${plan_rvs.output.plan_path}
-  # alone only orders impl_rvs's implement, leaving catalog_index free to float
-  # across the region boundary (the "zero-dep node floats" lesson).
+  # depends_on: [refine, plan_rvs] is LOAD-BEARING for contiguity — it anchors the
+  # inlined region's zero-dep internal node (implement-rvs's catalog_index,
+  # depends_on: []) after BOTH the refine and the plan_rvs regions; the inputs refs
+  # (${plan_rvs.output.plan_path}, ${refine.output.document_path}) alone only order
+  # impl_rvs's implement, leaving catalog_index free to float across a region boundary
+  # (the "zero-dep node floats" lesson).
   - id: impl_rvs
     workflow: implement-rvs
     customize: { profile: microskill-create }
     when: ${plan_rvs.output.scope_advisory == null}
-    depends_on: [plan_rvs]
+    depends_on: [refine, plan_rvs]
     inputs:
       plan_path: ${plan_rvs.output.plan_path}
       name: ${plan_rvs.output.name}
-      requirement_path: ${workflow.inputs.requirement_path}
+      requirement_path: ${refine.output.document_path}
       staging_dir: ${workflow.inputs.staging_dir}
 
   # Vendor the approved microskill into harness/ (source of truth), upsert the

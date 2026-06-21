@@ -1,5 +1,6 @@
 version: 1
 name: refine-requirements
+base: true
 description: >-
   Assemble requirements from one source into a structured SE requirements document, refine it
   with the user (or unattended from sources), then prove completeness mechanically: a

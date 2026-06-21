@@ -4,11 +4,13 @@ version: 1
 # (§8 step 6 / D3). Retargets refine-requirements' completeness critique panel from the
 # generic SE-requirements lenses (req-*) to the 2 microskill-spec lenses, threads the
 # 7-section microskill spec template, tightens the loop/clarify/refute budgets to the
-# tighter microskill scope, and COLLAPSES the approval gate (severity:warn, keep
-# default:approve) so the parent create pipeline's approve_plan is the only human gate.
-# clarify + present_refined stay INTERACTIVE here (intent capture is the whole point of
-# the front-end). NO output_schema / parent-input changes → develop-product-backlog's
-# external contract is untouched.
+# tighter microskill scope, and KEEPS the approval gate HARD (severity:hard) — when this
+# profile is inlined as microskill-create's refine front-end (2026-06-21 rewire, sub-PR 3),
+# approve_requirements becomes Gate 1, a HARD parent-level checkpoint. The create pipeline
+# therefore runs TWO hard human gates: requirements (Gate 1, this gate) + plan (Gate 2,
+# the host's approve_plan). clarify + present_refined stay INTERACTIVE here (intent capture
+# is the whole point of the front-end). NO output_schema / parent-input changes →
+# develop-product-backlog's external contract is untouched.
 inputs:
   template_path:
     default: .claude/workflow-defs/refine-requirements/references/microskill-spec-template.md
@@ -38,8 +40,10 @@ loop:
   body: [revise_req, critique_spec_ms_completeness, critique_spec_ms_atomicity,
          collect_req, synth_req]
 
-# Gate collapse: the final approval no longer pauses — the parent owns the one human gate.
+# Gate 1 kept HARD: inlined into microskill-create, approve_requirements is the
+# requirements checkpoint the human signs off (with critic evidence) before any planning —
+# the first of the create pipeline's two hard gates (requirements + plan).
 gates:
   patch:
     - id: approve_requirements
-      severity: warn
+      severity: hard

@@ -1,16 +1,22 @@
-"""microskill-create rewired onto plan-rvs + implement-rvs (2026-06-21, sub-PR 2).
+"""microskill-create rewired onto refine-requirements + plan-rvs + implement-rvs
+(2026-06-21, sub-PRs 2-3).
 
 The old guts (plan/implement/evaluate task-* nodes + the top-level implement-evaluate
-loop) are replaced by inlined `workflow: plan-rvs` (loop-less base; autonomous adds a
-convergence loop region) + `workflow: implement-rvs` (one guarded loop region), with the
-host keeping `finalize`. No refine yet (sub-PR 3) — plan_rvs reads requirement_path
-directly. Points --defs-root at the REAL catalog so the imported workflow + microskill
-registry resolves.
+loop) are replaced by three inlined `workflow:` children: `refine-requirements`
+(create-spec-microskill — its critique loop becomes a loop region, its clarify /
+present_refined / triage_reopened orchestrators become checkpoints, and its terminal
+approve_requirements becomes Gate 1, HARD) → `plan-rvs` (loop-less base; autonomous adds a
+convergence loop region) → `implement-rvs` (one guarded loop region), with the host keeping
+`finalize` (Gate 2 = approve_plan). plan_rvs + impl_rvs review against the REFINED document
+(${refine.output.document_path}), not the raw requirement_path. Points --defs-root at the
+REAL catalog so the imported workflows + microskill registry resolve.
 
 manifest shape (confirmed): `compile --plan` prints JSON to stdout (no --json flag);
 `data["manifest"]["steps"]` carries kind / is_loop / region_guard / checkpoint_type /
 gate.id / nodes. A loop region = a segment step with is_loop True. The impl_rvs region
-carries a region_guard containing scope_advisory.
+carries a region_guard containing scope_advisory. Region count: base = 2 (refine critique +
+impl_rvs; plan-rvs base loop-less); autonomous = 3 (refine critique + plan_rvs + impl_rvs).
+Refine inlines fully flat: 0 nested_workflow checkpoints (sub-PR 0 spike-confirmed, §6 GO).
 """
 import json
 import subprocess
@@ -68,19 +74,47 @@ def test_autonomous_compiles():
     assert r.returncode == 0, r.stderr or r.stdout
 
 
-def test_base_one_loop_region():
-    # plan-rvs base is loop-less; impl_rvs contributes the single loop region.
+def test_base_two_loop_regions():
+    # plan-rvs base is loop-less; refine's critique loop + impl_rvs are the two regions on
+    # the base (interactive) profile (sub-PR 3: refine front-end bound in).
     m = _manifest("base")
     loops = _loops(m)
-    assert len(loops) == 1, [s["nodes"] for s in loops]
-    assert any("impl_rvs" in n for n in loops[0]["nodes"]), loops[0]["nodes"]
+    assert len(loops) == 2, [s["nodes"] for s in loops]
+    assert any(any("impl_rvs" in n for n in s["nodes"]) for s in loops), [s["nodes"] for s in loops]
+    assert any(any("refine" in n for n in s["nodes"]) for s in loops), [s["nodes"] for s in loops]
 
 
-def test_autonomous_two_loop_regions():
-    # autonomous adds plan-rvs's convergence loop → two regions (plan_rvs + impl_rvs).
+def test_autonomous_three_loop_regions():
+    # autonomous adds plan-rvs's convergence loop → three regions: refine critique +
+    # plan_rvs + impl_rvs (sub-PR 0 spike-confirmed, §6).
     m = _manifest("autonomous")
     loops = _loops(m)
-    assert len(loops) >= 2, [s["nodes"] for s in loops]
+    assert len(loops) == 3, [s["nodes"] for s in loops]
+    assert any(any("refine" in n for n in s["nodes"]) for s in loops), [s["nodes"] for s in loops]
+    assert any(any("plan_rvs" in n for n in s["nodes"]) for s in loops), [s["nodes"] for s in loops]
+    assert any(any("impl_rvs" in n for n in s["nodes"]) for s in loops), [s["nodes"] for s in loops]
+
+
+def test_refine_inlined_no_nested_workflow():
+    # Refine inlines fully FLAT — no surviving nested_workflow checkpoint, on either
+    # profile. This is the central risk the sub-PR 0 spike retired (§6 GO): real refine
+    # (3 orchestrators + for_each + critique loop + gate) partitions cleanly.
+    for profile in ("base", "autonomous"):
+        m = _manifest(profile)
+        offenders = [s for s in m["steps"] if s.get("checkpoint_type") == "nested_workflow"]
+        assert not offenders, offenders
+
+
+def test_two_hard_gates_requirements_then_plan():
+    # Gate 1 = refine's inlined approve_requirements (namespaced refine__…, flipped
+    # warn→hard in create-spec-microskill); Gate 2 = the host approve_plan. Both present
+    # on both profiles, and Gate 1 precedes Gate 2 in step order.
+    for profile in ("base", "autonomous"):
+        m = _manifest(profile)
+        gate_ids = _gate_ids(m)
+        assert "refine__approve_requirements" in gate_ids, gate_ids
+        assert "approve_plan" in gate_ids, gate_ids
+        assert gate_ids.index("refine__approve_requirements") < gate_ids.index("approve_plan"), gate_ids
 
 
 def test_impl_region_guarded():

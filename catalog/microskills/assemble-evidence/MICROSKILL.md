@@ -1,5 +1,6 @@
 ---
 name: assemble-evidence
+base: true
 description: >-
   Use after a pipeline's stages emit their per-stage record outputs and you need
   them consolidated into one evidence ledger. Reads every supplied record input
