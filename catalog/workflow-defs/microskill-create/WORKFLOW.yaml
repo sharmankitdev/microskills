@@ -76,6 +76,7 @@ nodes:
   # name, scope_advisory, verdict, findings}; the HUMAN approves it at the gate below.
   - id: plan_rvs
     workflow: plan-rvs
+    name: Plan
     customize: { profile: microskill-create }
     inputs:
       requirement_path: ${workflow.inputs.requirement_path}
@@ -109,6 +110,7 @@ nodes:
   # region boundary (the "zero-dep node floats" lesson).
   - id: impl_rvs
     workflow: implement-rvs
+    name: Build
     customize: { profile: microskill-create }
     when: ${plan_rvs.output.scope_advisory == null}
     depends_on: [plan_rvs]

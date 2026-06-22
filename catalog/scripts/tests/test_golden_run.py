@@ -40,7 +40,7 @@ needs_node = pytest.mark.skipif(NODE is None, reason="node not installed")
 
 MINI_META = """\
 export const meta = {
-  name: "mini__seg1",
+  name: "mini",
   description: "Compiled segment 1 of mini",
   phases: [{ title: "a" }],
 }
