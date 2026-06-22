@@ -1,3 +1,9 @@
+## [0.35.0](https://github.com/sharmankitdev/microskills/compare/v0.34.0...v0.35.0) (2026-06-22)
+
+### Features
+
+* **workflow:** clean /workflows display-name layers (phase groups, segment title, step labels, exhaust gate) ([#39](https://github.com/sharmankitdev/microskills/issues/39)) ([4a5354b](https://github.com/sharmankitdev/microskills/commit/4a5354b8060a7d3b0f36027758859f1a73c06af1))
+
 ## [0.34.0](https://github.com/sharmankitdev/microskills/compare/v0.33.0...v0.34.0) (2026-06-21)
 
 ### ⚠ BREAKING CHANGES
