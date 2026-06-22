@@ -80,6 +80,7 @@ nodes:
   # synth's aggregate exit so provision can fan out.
   - id: plan_rvs
     workflow: plan-rvs
+    name: Plan
     customize: { profile: workflow-create }
     inputs:
       requirement_path: ${workflow.inputs.requirement_path}
@@ -143,6 +144,7 @@ nodes:
   # one optional child input the host carries).
   - id: build
     workflow: implement-rvs
+    name: Build
     customize: { profile: workflow-create }
     when: ${plan_rvs.output.scope_advisory == null}
     depends_on: [provision]

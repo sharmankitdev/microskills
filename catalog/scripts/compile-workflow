@@ -3070,7 +3070,13 @@ def emit_segment_js(seg_nodes, wf, loop_regions, seg_index, converge_groups=None
             _seen_ph.add(_p)
             _phase_titles.append(_p)
     phases = ", ".join(f'{{ title: {json.dumps(t)} }}' for t in _phase_titles)
-    name = f'{wf["name"]}__seg{seg_index}'
+    # The native Workflow title shown under the command line. Kept to the bare
+    # workflow name (kebab, matching Claude's dynamic-workflow naming) — the
+    # segment index lives in the description, and segments run as separate
+    # sequential invocations (split by checkpoints) so the shared name never
+    # collides on screen. Manifest steps key on the seg FILE + index, not this
+    # name, so dropping the __segN suffix is purely cosmetic.
+    name = wf["name"]
     head = (f"export const meta = {{\n"
             f"  name: {json.dumps(name)},\n"
             f"  description: {json.dumps('Compiled segment ' + str(seg_index) + ' of ' + wf['name'])},\n"
@@ -3441,6 +3447,16 @@ def main():
     # are a HARD block (an inline must never half-resolve). Because this pass
     # guarded the author '__' ids at every level, the subgraph splice below is
     # called with check_reserved=False (its surviving '__' ids are this pass's).
+    # Authored display name of each STATIC nested-workflow host node, captured
+    # BEFORE inlining consumes the node. Keyed by node id — which IS the inline
+    # splice prefix and the loop-region `origin` — so an inlined-region segment's
+    # manifest label can take the host node's curated name (Tier 0 below) instead
+    # of humanizing a prefixed inner id. Cosmetic; popped from manifest_hash with
+    # the rest of the label.
+    _nw_host_names = {
+        n["id"]: n["name"] for n in (wf.get("nodes") or [])
+        if isinstance(n, dict) and "workflow" in n and n.get("name")
+    }
     wf, nw_inline_errors, nw_did_inline, nw_loop_regions = desugar_nested_workflows(
         wf, defs_root)
     if nw_inline_errors:
@@ -3706,6 +3722,12 @@ def main():
         _vars = _loop_vars(_r["origin"])
         _sg = synth_loop_exhaust_gate(_roe)
         _sg["id"] = _vars["exhaust_gate"]
+        # Clean, pipeline-consistent label for the synthetic escalation gate: prefer
+        # the inlined region host node's authored name over humanizing the namespaced
+        # gate id ('loop_exhaust_impl_rvs' -> 'Loop Exhaust Impl Rvs'). Gate name is
+        # popped from manifest_hash (see hashed_manifest below), so it is resume-safe.
+        if _nw_host_names.get(_r["origin"]):
+            _sg["name"] = f"{_nw_host_names[_r['origin']]} loop exhausted"
         _sg["after"] = _rlast
         _sg_pol = gate_policy_errors([_sg])
         if _sg_pol:
@@ -4281,17 +4303,32 @@ def main():
             _seg_labels = {nid: (node_by_id[nid].get("name") or humanize_id(nid))
                            for nid in step["nodes"]}
             # Segment display label (cosmetic — popped from manifest_hash below, so
-            # it never perturbs byte-identical output / resume). Tier 1: when every
-            # node in the segment shares ONE phase_group, that authored group name
-            # IS the segment's name (humanized) — the author-curated label (note
-            # phase_group is ALSO the /workflows progress group, so this fires only
-            # for a genuinely single-phase segment; mixed grouping deliberately
-            # falls through). Tier 2 fallback: a short segment keeps the readable
-            # " & " join (1-2 nodes), but a 3+-node segment collapses to a CONCISE
-            # "<first> … +N more" slug instead of a run-on of every node name.
+            # it never perturbs byte-identical output / resume).
+            # Tier 0: a segment that IS an inlined nested-workflow region takes the
+            # host node's authored `name` as one clean phrase (no "+N more" slug) —
+            # independent of how many phase_groups the segment spans, so it survives
+            # multi-phase live-view grouping where Tier 1 deliberately can't fire.
+            # Tier 1: when every node in the segment shares ONE phase_group, that
+            # authored group name IS the segment's name (humanized) — the author-
+            # curated label (note phase_group is ALSO the /workflows progress group,
+            # so this fires only for a genuinely single-phase segment; mixed grouping
+            # deliberately falls through). Tier 2 fallback: a short segment keeps the
+            # readable " & " join (1-2 nodes), but a 3+-node segment collapses to a
+            # CONCISE "<first> … +N more" slug instead of a run-on of every node name.
             _ids = step["nodes"]
             _pgs = {node_by_id[nid].get("phase_group") for nid in _ids}
-            if len(_pgs) == 1 and None not in _pgs:
+            # Tier 0 origin = the single '<host>__...' inline namespace prefix shared
+            # by EVERY node in the segment. The author '__' separator is reserved for
+            # inline namespacing, so a node id contains it iff it was spliced from a
+            # nested workflow, and the prefix IS that host node's id. Works for looped
+            # AND loop-less inlined segments alike (no dependency on a loop region).
+            _inl = {nid.split("__", 1)[0] for nid in _ids if "__" in nid}
+            _origin = (next(iter(_inl))
+                       if len(_inl) == 1 and all("__" in nid for nid in _ids)
+                       else None)
+            if _origin and _nw_host_names.get(_origin):
+                manifest_step["label"] = _nw_host_names[_origin]
+            elif len(_pgs) == 1 and None not in _pgs:
                 manifest_step["label"] = humanize_id(next(iter(_pgs)))
             elif len(_ids) <= 2:
                 manifest_step["label"] = " & ".join(_seg_labels[nid] for nid in _ids)

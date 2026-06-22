@@ -39,7 +39,7 @@
   },
   "profile_used": "base",
   "segment_digests": {
-    "seg-1.js": "3442b22e44045c55ed9adde39d89d2146052ada453dd4ccf5faa0e5d1175b8c6",
-    "seg-2.js": "1a09c4fcd0623ea4cd29a402d50718af29784037cff5bf659ab8ad3b808b9379"
+    "seg-1.js": "a2ffe6dfbe29b4408a4cc408b9ee41a106761a85e02bff5b9e6f45d377adfe20",
+    "seg-2.js": "614a0cc0963499d53baa7915d0b0e937a99b0a2a6312f4cd0d3f1506f30053dc"
   }
 }

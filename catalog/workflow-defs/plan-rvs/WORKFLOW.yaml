@@ -46,6 +46,7 @@ nodes:
   - id: plan
     use: task-plan
     customize: { profile: workflow }
+    phase_group: plan
     inputs:
       requirement_path: ${workflow.inputs.requirement_path}
       name_override: ${workflow.inputs.name_override}
@@ -76,6 +77,7 @@ nodes:
   - id: collect
     use: collect-findings
     customize: { profile: plan-wf-create }
+    phase_group: collect
     inputs_each: review
 
   # Adversarially verify each collected finding against the SAME plan.yaml the panel saw. for_each
@@ -83,6 +85,7 @@ nodes:
   - id: verify
     use: verify-finding
     customize: { profile: plan-workflow }
+    phase_group: verify
     for_each: ${collect.output.findings}
     as: finding
     max_parallel: 4
@@ -101,6 +104,7 @@ nodes:
   - id: synth
     use: synthesize-review
     customize: { profile: create-plan-rvs }
+    phase_group: synthesize
     inputs:
       findings: ${collect.output.findings}
       verifications: ${verify.items}
