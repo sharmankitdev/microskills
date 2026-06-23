@@ -405,6 +405,22 @@ Non-zero exit → `{"ok": false, "error": "..."}`.
 
 Return `{"ok": true}`.
 
+## op: abandon
+
+Inputs: `{name, run_dir, step, label}`
+
+A TERMINAL gate abandon — the human chose `abandon` at a gate. Stamp the still-committed
+run-state terminal so no later resume / rerun / pickup scan ever re-offers this run (the run
+is given up, not paused); `step_index` is left untouched as the provenance of where they
+stopped. Unlike `fail`, this does not mark a re-runnable failed step — an abandoned run is dead.
+
+Run via Bash:
+`.claude/scripts/run-journal append --run-dir '<run_dir>' --event run_abandoned --step-index <step> --label '<label>' --mark-abandoned`
+
+Non-zero exit → `{"ok": false, "error": "..."}`.
+
+Return `{"ok": true}`.
+
 ## op: preflight
 
 Inputs: `{name, profile?, overrides?, headless_from_args}`

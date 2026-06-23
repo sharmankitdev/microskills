@@ -362,6 +362,69 @@ def test_latest_skips_pre_shape_state_without_inputs(tmp_path):
     assert data["run_id"] == "20260610T100000Z-aaaaaa"
 
 
+# ------------------------------------------------------- latest (abandoned)
+
+def abandon_run(run_dir):
+    rc, data, out, err = run("append", "--run-dir", str(run_dir),
+                             "--event", "run_abandoned", "--mark-abandoned",
+                             "--step-index", "1", "--label", "approve_plan abandoned")
+    assert rc == 0, out + err
+    return data
+
+
+def test_mark_abandoned_sets_flag_and_journals(tmp_path):
+    run_dir = seed_run(tmp_path, "20260610T100000Z-aaaaaa", "sha256:h1", 1)
+    abandon_run(run_dir)
+    state = json.loads((run_dir / "run-state.json").read_text())
+    assert state["abandoned"] is True
+    # step_index is provenance of where it stopped — abandon advances nothing
+    assert state["step_index"] == 1
+    assert "run_abandoned" in [l["event"] for l in journal_lines(run_dir)]
+
+
+def test_latest_resume_scan_skips_abandoned(tmp_path):
+    # an abandoned run is terminal — never re-offered for resume, though its
+    # step_index is mid-run (< steps). The scan falls back to the live run.
+    seed_run(tmp_path, "20260610T100000Z-aaaaaa", "sha256:h1", 1)
+    gone = seed_run(tmp_path, "20260610T110000Z-bbbbbb", "sha256:h1", 1)
+    rc, data, *_ = run("latest", "--runs-dir", str(tmp_path / "runs"),
+                       "--manifest-hash", "sha256:h1", "--steps", "6")
+    assert data["found"] is True and data["run_id"] == "20260610T110000Z-bbbbbb"
+    abandon_run(gone)
+    rc, data, *_ = run("latest", "--runs-dir", str(tmp_path / "runs"),
+                       "--manifest-hash", "sha256:h1", "--steps", "6")
+    assert rc == 0 and data["found"] is True
+    assert data["run_id"] == "20260610T100000Z-aaaaaa"
+
+
+def test_latest_rerun_scan_also_skips_abandoned(tmp_path):
+    # the rerun/pickup source scan (no --manifest-hash) also skips abandoned runs
+    seed_run(tmp_path, "20260610T100000Z-aaaaaa", "sha256:h1", 2)
+    gone = seed_run(tmp_path, "20260610T110000Z-bbbbbb", "sha256:h2", 3)
+    abandon_run(gone)
+    rc, data, *_ = run("latest", "--runs-dir", str(tmp_path / "runs"))
+    assert rc == 0 and data["found"] is True
+    assert data["run_id"] == "20260610T100000Z-aaaaaa"
+
+
+def test_mark_abandoned_rejects_commit_state(tmp_path):
+    run_dir = seed_run(tmp_path, "20260610T100000Z-aaaaaa", "sha256:h1", 1)
+    state = {"manifest_hash": "sha256:h1", "step_index": 2,
+             "inputs": {}, "results": {}}
+    (run_dir / "s2.tmp").write_text(json.dumps(state))
+    rc, data, out, err = run("append", "--run-dir", str(run_dir),
+                             "--event", "run_abandoned", "--mark-abandoned",
+                             "--commit-state", "s2.tmp")
+    assert rc != 0 and "abandon" in (out + err).lower()
+
+
+def test_mark_abandoned_requires_committed_state(tmp_path):
+    run_dir, _ = init_run(tmp_path, "20260610T100000Z-aaaaaa", "sha256:h1")
+    rc, data, out, err = run("append", "--run-dir", str(run_dir),
+                             "--event", "run_abandoned", "--mark-abandoned")
+    assert rc != 0
+
+
 # ------------------------------------------------- latest (rerun source scan)
 
 def test_latest_without_hash_filter_returns_newest_committed_any_hash(tmp_path):

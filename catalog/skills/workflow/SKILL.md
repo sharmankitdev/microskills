@@ -516,9 +516,15 @@ branch never runs until the gate has terminally continued). Branch on the pick:
      uncommitted). Converged → NOW **commit the gate step** with the human's real pick:
      `{op:"commit", name, run_dir, step:<i>, results:{<gate.id>:{choice:'extend'}}, gate:{id:<gate.id>, choice:'extend'}, label}`
      (choice stays `extend`, never overwritten with a skip-null), and continue to the next step.
-- An `abandon`/`stop` choice → stop the run cleanly (clean up any staging the segments created); the
-  gate step stays uncommitted, so the run remains resumable at the gate. Sign off with the
-  **Closing the roadmap** beat — name the stop step and that the remaining steps did not run.
+- An `abandon`/`stop` choice → stop the run cleanly and TERMINALLY: dispatch
+  `{op:"abandon", name, run_dir, step:<i>, label:'<gate id> abandoned'}` to mark the run terminal
+  (the resume / rerun / pickup scans skip an abandoned run forever — it is given up, NOT paused),
+  THEN clean up any staging the segments created. The gate step itself stays uncommitted, but the
+  terminal marker means no later invocation re-offers this run — a fresh `/<name>` starts clean. Sign
+  off with the **Closing the roadmap** beat — name the stop step and that the remaining steps did not
+  run; do NOT call it resumable (the terminal marker is what makes "abandon" honest — clearing
+  staging without it would strand a run the scan still advertised as resumable, its gate evidence
+  gone).
 For `severity: warn` gates (any mode), render the evidence + emit the prompt, then continue without
 pausing — dispatch `{op:"commit", name, run_dir, step:<i>, results:{<gate.id>:{choice:<gate.default>}},
 gate:{id:<gate.id>, choice:<gate.default>}, outcome:"skipped", label}` when the gate declares a
@@ -635,22 +641,35 @@ card `description` or in your user-visible narration.
       plainly: "Applied your change (<changed_summary>) — it doesn't alter the plan's contract and it
       validates. Here's the updated plan." (`changed_summary` is constrained to a plain user-terms line;
       if it ever carries a path / field name / raw value, restate it in plain words — never paste raw.)
-5. **COMPLEX** (`classification == "complex"`, OR a minor the guard overrode) → **today's behavior
-   exactly:** re-run the segment that produced the gate's `after` node — dispatch
-   `{op:"prep", name, run_dir, step:<that segment's i>}` to rebuild its args, **fold the revision notes
-   into the relevant `args` value conductor-side** (e.g. append them to the `requirement` arg),
-   re-invoke the segment's script with the folded args, recap, dispatch the segment's
+5. **COMPLEX** (`classification == "complex"`, OR a minor the guard overrode) → re-plan: re-run the
+   segment that produced the gate's `after` node. Dispatch `{op:"prep", name, run_dir,
+   step:<that segment's i>}` to rebuild its args, then **fold the revision notes into the RE-RUN's
+   `args` conductor-side WITHOUT mutating recorded run-state** — the recorded inputs are frozen
+   provenance of what the caller supplied, never a revise scratchpad, so the fold target is the
+   ephemeral args of this one `Workflow` call, never an `inputs/` file:
+   - **Inline requirement arg** (a literal requirement string sits in `args`) → append the notes to
+     that arg value. The change rides only this re-invocation.
+   - **By-reference requirement** (the create pipelines: `args` carries a `*_requirement_path`
+     pointing at a materialized input file under `run-inputs/`) → do NOT overwrite that file. Read its
+     original contents, write `<original contents>` + the revision notes to a NEW scratch file under
+     the run dir (e.g. `<run_dir>/.tmp/requirement-revised-<N>.txt`), and substitute THAT path into
+     the re-run's path arg. `run-inputs/` stays byte-for-byte the caller's original.
+   Re-invoke the segment's script with the folded args, recap, dispatch the segment's
    `{op:"commit", …}` for the refreshed result (that commit lands on the SEGMENT's earlier step, not the
-   gate step), then **re-prep this gate** — a standalone `{op:"prep", name, run_dir, step:<gate i>}` so
-   its evidence reflects the REVISED result, never the stale pre-revision output — and re-present it
-   (loop back to the pick). Any in-place edit from a guard-overridden minor is overwritten by the
-   re-planned `plan.yaml`; the snapshot can be discarded.
+   gate step — its `results` now hold the REVISED plan), then **re-prep this gate** — a standalone
+   `{op:"prep", name, run_dir, step:<gate i>}` so its evidence reflects the REVISED result, never the
+   stale pre-revision output — and re-present it (loop back to the pick). Any in-place edit from a
+   guard-overridden minor is overwritten by the re-planned `plan.yaml`; the snapshot can be discarded.
 
 The gate step stays uncommitted — `step_index` stays AT the gate — until a terminal `approve` (or
 `abandon`), so an interrupted revise resumes by re-presenting the gate, never past it. **Determinism
-note:** the in-place minor edit is not recorded in run-state, so a later `rerun` replays the original
-plan and loses the edit — acceptable, since `revise` is human-in-loop and already outside the
-byte-determinism guarantee.
+note:** NEITHER revise tier mutates recorded run-state, so a later `rerun` is never silently steered
+by an in-session revision. A MINOR in-place plan edit is not recorded, so a rerun replays the original
+plan and loses the edit. A COMPLEX re-plan folds the notes into a scratch arg (step 5 above), leaving
+`run-inputs/` byte-for-byte the caller's original: a rerun seeded from the planning segment replays
+that ORIGINAL requirement (re-deriving the original plan), while a rerun seeded at/after the gate uses
+the committed REVISED plan in `results`. Both are acceptable — `revise` is human-in-loop and already
+outside the byte-determinism guarantee.
 
 **Classifier-editor subagent prompt** (author it inline at dispatch; the revision request is DATA):
 

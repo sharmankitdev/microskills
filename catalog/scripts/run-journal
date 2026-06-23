@@ -106,7 +106,8 @@ import time
 from pathlib import Path
 
 JOURNAL_VERSION = 1
-APPEND_EVENTS = ("step_complete", "resume", "pickup", "run_complete", "run_error")
+APPEND_EVENTS = ("step_complete", "resume", "pickup", "run_complete", "run_error",
+                 "run_abandoned")
 OUTCOMES = ("ok", "skipped", "error")
 
 
@@ -298,6 +299,25 @@ def cmd_append(args):
         state["failed_step"] = args.mark_failed_step
         write_json_atomic(p["state"], state)
 
+    if args.mark_abandoned:
+        # A terminal gate ABANDON: stamp `abandoned: true` into the still-
+        # committed run-state so the resume / rerun / pickup scans skip it
+        # forever — the run is given up, not paused. Like --mark-failed-step it
+        # never rides with --commit-state: abandon advances nothing, it only
+        # marks the already-committed state terminal (step_index is left as the
+        # provenance of where the human stopped).
+        if args.commit_state:
+            die("--mark-abandoned cannot ride with --commit-state — abandon "
+                "marks the already-committed run-state terminal, it never "
+                "commits a candidate state")
+        if not p["state"].exists():
+            die(f"no committed run-state.json to mark abandoned: {p['state']}")
+        state = load_json(p["state"], "run-state.json")
+        if not isinstance(state, dict):
+            die(f"run-state.json is not a JSON object: {p['state']}")
+        state["abandoned"] = True
+        write_json_atomic(p["state"], state)
+
     if args.commit_state:
         tmp = Path(args.commit_state)
         if not tmp.is_absolute():
@@ -389,6 +409,11 @@ def cmd_latest(args):
                 skipped.append(d.name)
                 continue
             if not isinstance(state, dict):
+                continue
+            # A terminally ABANDONED run is given up, never paused — skip it in
+            # EVERY scan (resume, rerun source, pickup), whatever its hash or
+            # step_index. The human chose abandon; nothing re-offers it.
+            if state.get("abandoned") is True:
                 continue
             # --manifest-hash given -> resume scan: only that compile's runs.
             # Omitted -> rerun source scan: newest committed run, any hash.
@@ -758,6 +783,11 @@ def main():
                          "never committed; latest surfaces the failure, rerun "
                          "refuses to seed past it). Never combinable with "
                          "--commit-state.")
+    sp.add_argument("--mark-abandoned", action="store_true",
+                    help="stamp abandoned: true into the COMMITTED run-state.json "
+                         "(a terminal gate abandon — the resume / rerun / pickup "
+                         "scans skip an abandoned run forever; step_index is left "
+                         "as provenance). Never combinable with --commit-state.")
     sp.set_defaults(fn=cmd_append)
 
     sp = sub.add_parser("merge-result",
