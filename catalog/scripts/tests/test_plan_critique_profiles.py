@@ -1,11 +1,11 @@
 """Plan-critique content tests (§8 step 7, sub-PR 3).
 
 The plan-stage RVS reviews the planner's plan.yaml object. These tests pin the
-four-way naming invariant across all 12 plan-critique review-dimension profiles
-(filename == vars.dimension == snippet-prefix `<dim>-rubric` == collect-key with
-hyphen->underscore), assert NO floor carve-out leaks into a plan rubric body (the
-plan stage has no validator), pin the review severity vocabulary, and check the
-collect/verify registration profiles.
+three-way naming invariant across all 12 plan-critique review-dimension profiles
+(filename == vars.dimension == snippet-prefix `<dim>-rubric`), assert NO floor
+carve-out leaks into a plan rubric body (the plan stage has no validator), pin the
+review severity vocabulary, and check the verify registration profiles. (The
+collect-findings fan-in was removed — verify reads the panel via ${review[].findings}.)
 """
 import json
 import subprocess
@@ -85,12 +85,10 @@ def test_wf_plan_dims_resolve_and_obey_naming_invariant():
         _assert_plan_dim_invariant(dim)
 
 
-def test_plan_collect_keys_match_dims_and_verify_kinds():
-    ms_collect = _resolve("collect-findings", "plan-ms-create")["config"]["inputs"]
-    # collect key == dimension with hyphen->underscore
-    assert set(ms_collect) >= {d.replace("-", "_") for d in MS_DIMS}
-    wf_collect = _resolve("collect-findings", "plan-wf-create")["config"]["inputs"]
-    assert set(wf_collect) >= {d.replace("-", "_") for d in WF_DIMS}
+def test_plan_verify_kinds():
+    # The collect-findings fan-in node was removed — verify now fans out directly over
+    # the review panel via ${review[].findings}, so there is no per-dimension collect
+    # registration profile to check. The plan-stage verify-finding seats stay.
     for prof in ("plan-microskill", "plan-workflow"):
         vf = _resolve("verify-finding", prof)["config"]["vars"]
         assert "plan" in vf["artifact_kind"].lower()

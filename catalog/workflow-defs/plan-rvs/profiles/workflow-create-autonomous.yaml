@@ -19,7 +19,7 @@ loop:
          review_plan_wf_completeness, review_plan_wf_graph_correctness,
          review_plan_wf_control_flow, review_plan_wf_reuse_survey,
          review_plan_wf_scope_fit, review_plan_wf_name_capability,
-         collect, verify, synth]
+         verify, synth]
   carry:
     findings: ${synth.output.findings}
   on_exhaust:

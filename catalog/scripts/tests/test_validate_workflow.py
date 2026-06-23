@@ -435,6 +435,193 @@ def test_nested_field_path_checks_first_segment_only(tmp_path):
                for i in data2["issues"])
 
 
+# --- PANEL-AGGREGATE ref: ${<panel>[].<field>} dep-inference + field-check ---
+
+PANEL_FLOW = """\
+version: 1
+name: panel-flow
+nodes:
+  - id: review
+    agent: rev
+    expand:
+      over: [a, b, c]
+    prompt: review {{each.item}}
+    output_schema:
+      type: object
+      required: [findings]
+      properties:
+        findings: { type: array }
+  - id: verify
+    agent: ver
+    for_each: ${review[].findings}
+    as: f
+    prompt: verify ${f}
+    output_schema:
+      type: object
+      properties:
+        ok: { type: boolean }
+  - id: synth
+    agent: syn
+    prompt: synth
+    inputs:
+      findings: ${review[].findings}
+    output_schema:
+      type: object
+      properties:
+        verdict: { type: string }
+output:
+  from: synth
+"""
+
+
+def test_panel_ref_infers_edges_on_all_siblings_and_passes(tmp_path):
+    # S-INFER: ${review[].findings} expands to refs on every generated sibling, so
+    # the edges are inferred (no explicit depends_on) and validation passes with no
+    # spurious block/warn — and S-FIELD is satisfied (findings is declared).
+    rc, data, _ = run(write_wf(tmp_path, PANEL_FLOW))
+    assert rc == 0, data
+    assert data["pass"] is True
+    assert all(i["severity"] != "block" for i in data["issues"])
+
+
+def test_panel_ref_field_check_per_sibling_blocks(tmp_path):
+    # S-FIELD: a panel ref to a field NOT declared by the siblings' schema blocks —
+    # once per sibling (the field-check runs over each enumerated sibling ref).
+    body = PANEL_FLOW.replace("${review[].findings}", "${review[].nofield}")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    msgs = [i["message"] for i in data["issues"] if i["severity"] == "block"]
+    assert any("review_a" in m and "does not declare" in m for m in msgs)
+    assert any("review_b" in m and "nofield" in m for m in msgs)
+
+
+def test_panel_ref_unknown_panel_id_blocks(tmp_path):
+    body = PANEL_FLOW.replace("${review[].findings}", "${ghost[].findings}", 1)
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    assert any("unknown expand template id 'ghost'" in i["message"]
+               for i in data["issues"])
+
+
+def test_panel_ref_malformed_blocks(tmp_path):
+    body = PANEL_FLOW.replace("for_each: ${review[].findings}",
+                              "for_each: ${review[]}")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    assert any("malformed panel ref" in i["message"] for i in data["issues"])
+
+
+def test_panel_ref_two_panels_compose_passes(tmp_path):
+    body = """\
+version: 1
+name: panel-two
+nodes:
+  - id: review
+    agent: rev
+    expand:
+      over: [a, b]
+    prompt: r {{each.item}}
+    output_schema:
+      type: object
+      properties:
+        findings: { type: array }
+  - id: xreview
+    agent: rev
+    expand:
+      over: [c]
+    prompt: x {{each.item}}
+    output_schema:
+      type: object
+      properties:
+        findings: { type: array }
+  - id: verify
+    agent: ver
+    for_each: ${[review[].findings, xreview[].findings].flat()}
+    as: f
+    prompt: verify ${f}
+    output_schema:
+      type: object
+      properties:
+        ok: { type: boolean }
+output:
+  from: verify
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 0, data
+    assert data["pass"] is True
+    assert all(i["severity"] != "block" for i in data["issues"])
+
+
+def test_panel_ref_in_gate_outside_node_blocks(tmp_path):
+    # FIX #1: compile's Pass-4 panel expansion sweeps wf["nodes"] ONLY, so a panel
+    # token in a gate (here a gate `prompt`) is never expanded — it would leak
+    # verbatim. validate HARD-BLOCKS a panel token found OUTSIDE a node.
+    body = PANEL_FLOW + """\
+gates:
+  - id: g
+    after: synth
+    type: human_approval
+    prompt: review ${review[].findings} before approving?
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    assert any(i["severity"] == "block" and "OUTSIDE a node" in i["message"]
+               for i in data["issues"]), data
+
+
+def test_panel_ref_in_loop_carry_outside_node_blocks(tmp_path):
+    # FIX #1: a panel token in loop.carry (also outside `nodes`) is never expanded
+    # by Pass 4 — validate must block it loud, not let it leak into the loop scaffold.
+    body = """\
+version: 1
+name: panel-loop
+nodes:
+  - id: review
+    agent: rev
+    expand:
+      over: [a, b]
+    prompt: r {{each.item}}
+    output_schema:
+      type: object
+      required: [findings]
+      properties: { findings: { type: array } }
+  - id: step
+    agent: ag
+    depends_on: [review_a, review_b]
+    prompt: s
+    output_schema:
+      type: object
+      required: [done]
+      properties: { done: { type: boolean } }
+loop:
+  while: ${!step.output.done}
+  max_iters: 2
+  body: [step]
+  carry:
+    findings: ${review[].findings}
+output:
+  from: step
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    assert any(i["severity"] == "block" and "OUTSIDE a node" in i["message"]
+               for i in data["issues"]), data
+
+
+def test_panel_ref_composed_malformed_and_unknown_both_block(tmp_path):
+    # FIX #7: a composed multi-panel ref carrying BOTH a malformed-bare token
+    # (review[], no .field) AND an unknown-panel token (ghost[].findings) reports
+    # BOTH the malformed-ref and unknown-template blocks.
+    body = PANEL_FLOW.replace(
+        "for_each: ${review[].findings}",
+        "for_each: ${[review[], ghost[].findings].flat()}")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    msgs = " ".join(i["message"] for i in data["issues"])
+    assert "malformed panel ref" in msgs
+    assert "unknown expand template id 'ghost'" in msgs
+
+
 # --- S-LOOP: loop-body contiguity ---
 
 def test_loop_body_split_by_orchestrator_blocks(tmp_path):

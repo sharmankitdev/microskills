@@ -32,7 +32,6 @@ inputs:
 imports:
   - microskills/task-plan
   - microskills/review-dimension
-  - microskills/collect-findings
   - microskills/verify-finding
   - microskills/synthesize-review
 
@@ -72,21 +71,16 @@ nodes:
       artifact_path: ${plan.output.plan_path}
       context_path: ${workflow.inputs.requirement_path}
 
-  # Fan the critique panel into one combined, dimension-stamped, deduplicated list. The plan-wf-create
-  # profile registers the 6 plan-wf-* input names (microskill-create swaps it to plan-ms-create).
-  - id: collect
-    use: collect-findings
-    customize: { profile: plan-wf-create }
-    phase_group: collect
-    inputs_each: review
-
-  # Adversarially verify each collected finding against the SAME plan.yaml the panel saw. for_each
-  # fan-out — its own await parallel(map(...)) rank; run every round so false positives drop.
+  # Adversarially verify each panel finding against the SAME plan.yaml the panel saw. The verify
+  # fan-out reads the review panel DIRECTLY via the panel-aggregate ref ${review[].findings} (the
+  # native flatMap-between-review-and-verify pattern) — no collect fan-in node. for_each is its own
+  # await parallel(map(...)) rank; run every round so false positives drop. Each panel finding now
+  # carries its own `dimension` field (stamped upstream by review-dimension).
   - id: verify
     use: verify-finding
     customize: { profile: plan-workflow }
     phase_group: verify
-    for_each: ${collect.output.findings}
+    for_each: ${review[].findings}
     as: finding
     max_parallel: 4
     inputs:
@@ -106,7 +100,7 @@ nodes:
     customize: { profile: create-plan-rvs }
     phase_group: synthesize
     inputs:
-      findings: ${collect.output.findings}
+      findings: ${review[].findings}
       verifications: ${verify.items}
       plan_path: ${plan.output.plan_path}
       name: ${plan.output.name}

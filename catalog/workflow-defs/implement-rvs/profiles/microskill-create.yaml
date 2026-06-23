@@ -1,8 +1,9 @@
 version: 1
 # implement-rvs / microskill-create — retarget the workflow-domain RVS (baked in WORKFLOW.yaml)
 # to the MICROSKILL domain: the implementer + floor switch to the ms validators, the review panel
-# swaps the 7 wf dimensions for the 11 ms dimensions, and the fan-in / verify switch to the ms
-# combined profiles. The xreview cross panel + synth (create-impl-rvs) are domain-neutral and
+# swaps the 7 wf dimensions for the 11 ms dimensions, and verify switches to the ms combined
+# adversarial seat (it fans out over both panels via ${[review[].findings, xreview[].findings].flat()}
+# — no collect fan-in node). The xreview cross panel + synth (create-impl-rvs) are domain-neutral and
 # stay. A profile that swaps review.expand.over MUST co-patch loop.body to the new generated
 # review_ms_* ids (the resolver list-replaces both).
 nodes:
@@ -27,15 +28,13 @@ nodes:
           - ms-declared-input-unused
           - ms-purpose-contract-fidelity
           - ms-description-trigger-quality
-    # Fan-in → the ms combined collect (11 ms names + 3 cross names).
-    - id: collect
-      customize: { profile: ms-create-all }
     # Verify → the ms combined adversarial seat (microskill draft bundle + catalog index).
     - id: verify
       customize: { profile: microskill-draft-xref }
 
 # Co-patch loop.body to the GENERATED review_ms_* ids (replaces the wf body wholesale). The cross
-# xreview ids + the fixed pipeline ids are unchanged.
+# xreview ids + the fixed pipeline ids are unchanged. No collect node — verify reads both panels
+# via ${[review[].findings, xreview[].findings].flat()}.
 loop:
   body: [implement, catalog_index, bundle, bundle_xref, floor,
          review_ms_atomicity_single_purpose, review_ms_single_linear_path_semantic,
@@ -45,4 +44,4 @@ loop:
          review_ms_declared_input_unused, review_ms_purpose_contract_fidelity,
          review_ms_description_trigger_quality,
          xreview_duplicate_capability, xreview_naming_collision, xreview_reverse_consumer,
-         collect, verify, synth]
+         verify, synth]

@@ -1,10 +1,11 @@
 """
 Tests for the cross-artifact review CONTENT (§8 step 5 / spec §11 D2): the 3
 review-dimension cross-artifact rubric overlays (duplicate-capability,
-naming-collision, reverse-consumer), the verify-finding cross-artifact profile,
-and the collect-findings cross-create fan-in profile. These re-aim the generics at
-a component-draft-vs-catalog comparison grounded by catalog-index.json. Pure
-additive YAML overlays — no body / schema / script change.
+naming-collision, reverse-consumer) and the verify-finding cross-artifact profile.
+These re-aim the generics at a component-draft-vs-catalog comparison grounded by
+catalog-index.json. Pure additive YAML overlays — no body / schema / script change.
+(The collect-findings cross-create fan-in profile it formerly also covered was
+deleted — verify reads the review panel directly via the panel-aggregate ref.)
 
 Run: python3 -m pytest catalog/scripts/tests/test_cross_artifact_review_profiles.py -v
 """
@@ -19,7 +20,6 @@ import yaml
 REPO = Path(__file__).resolve().parents[3]
 MS_ROOT = REPO / "catalog" / "microskills"
 RD = MS_ROOT / "review-dimension"
-CF = MS_ROOT / "collect-findings"
 VF = MS_ROOT / "verify-finding"
 RESOLVE = REPO / "catalog" / "scripts" / "resolve-microskill"
 VALIDATE_WF = REPO / "catalog" / "scripts" / "validate-workflow"
@@ -75,14 +75,6 @@ def test_cross_dims_naming_invariant_and_no_forbidden_keys():
         assert not (set(doc.keys()) & FORBIDDEN_KEYS), (name, doc.keys())
 
 
-def test_collect_cross_create_keys():
-    doc = _raw(CF / "profiles" / "cross-create.yaml")
-    assert set(doc["inputs"]) == _us(CROSS_DIMS)
-    assert "output_schema" not in doc and "runtime" not in doc
-    rc, _, err = _resolve("collect-findings", "cross-create")
-    assert rc == 0, err
-
-
 def test_verify_cross_artifact_profile():
     doc = _raw(VF / "profiles" / "cross-artifact.yaml")
     assert set(doc.keys()) <= {"version", "vars"}, doc.keys()
@@ -98,7 +90,7 @@ def test_verify_cross_artifact_profile():
 # --- Integration: a dedicated cross-artifact panel validates + compiles against
 #     the REAL catalog (the four-way naming invariant's live guard). ---
 
-def _panel_yaml(dims, collect_profile, verify_profile):
+def _panel_yaml(dims, verify_profile):
     lines = [
         "version: 1",
         "name: cross-panel",
@@ -125,14 +117,12 @@ def _panel_yaml(dims, collect_profile, verify_profile):
         "    inputs:",
         "      artifact_path: ${producer.output.bundle_path}",
         "      context_path: ${producer.output.index_path}",
-        "  - id: collect",
-        "    use: collect-findings",
-        f"    customize: {{ profile: {collect_profile} }}",
-        "    inputs_each: review",
+        # verify fans out over the review panel directly via the panel-aggregate
+        # ref — no collect fan-in node.
         "  - id: verify",
         "    use: verify-finding",
         f"    customize: {{ profile: {verify_profile} }}",
-        "    for_each: ${collect.output.findings}",
+        "    for_each: ${review[].findings}",
         "    as: finding",
         "    max_parallel: 4",
         "    inputs:",
@@ -153,7 +143,7 @@ def _build_world(tmp_path, panel_yaml):
 
 
 def test_cross_panel_wires_endtoend(tmp_path):
-    panel = _panel_yaml(CROSS_DIMS, "cross-create", "cross-artifact")
+    panel = _panel_yaml(CROSS_DIMS, "cross-artifact")
     defs_root, d = _build_world(tmp_path, panel)
     proc = subprocess.run(
         [sys.executable, str(VALIDATE_WF), str(d / "WORKFLOW.yaml"), "--defs-root", str(MS_ROOT)],

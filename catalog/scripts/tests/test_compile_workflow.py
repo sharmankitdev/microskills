@@ -899,6 +899,230 @@ nodes:
     assert data is not None and "reserved 'wf_' prefix" in data["error"]
 
 
+# --- PANEL-AGGREGATE ref: ${<panel>[].<field>} fan-out over an expand panel ---
+
+PANEL_SINGLE = """\
+version: 1
+name: panel-single
+nodes:
+  - id: review
+    agent: rev
+    expand:
+      over: [correctness, security, performance]
+    prompt: review {{each.item}}
+    output_schema:
+      type: object
+      required: [findings]
+      properties:
+        findings: { type: array }
+  - id: verify
+    agent: ver
+    for_each: ${review[].findings}
+    as: finding
+    prompt: verify ${finding}
+    output_schema:
+      type: object
+      required: [ok]
+      properties:
+        ok: { type: boolean }
+  - id: synth
+    agent: syn
+    prompt: synthesize
+    inputs:
+      findings: ${review[].findings}
+    output_schema:
+      type: object
+      required: [verdict]
+      properties:
+        verdict: { type: string }
+output:
+  from: synth
+"""
+
+
+def test_panel_ref_single_expands_to_flat_over_siblings(tmp_path):
+    # ${review[].findings} expands to a .flat() over the three generated siblings,
+    # in over order, in BOTH a for_each source and an inputs value — and the whole
+    # segment is valid JS (the engine handle that replaces the collect node).
+    d = make_flow(tmp_path, "panel-single", PANEL_SINGLE)
+    rc, data, out, err = run(tmp_path, "panel-single")
+    assert rc == 0, err
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    # for_each fan-out source: flat over siblings, in over order.
+    assert ("[n_review_correctness.findings, n_review_security.findings, "
+            "n_review_performance.findings].flat()") in seg
+    # The inferred edges put all three siblings + verify + synth in ONE segment.
+    assert data["sequence"] == ["segment[review_correctness,review_security,"
+                                "review_performance,verify,synth]"]
+    assert_seg_parses(seg)
+
+
+PANEL_COMPOSE = """\
+version: 1
+name: panel-compose
+nodes:
+  - id: review
+    agent: rev
+    expand:
+      over: [a, b]
+    prompt: r {{each.item}}
+    output_schema:
+      type: object
+      required: [findings]
+      properties:
+        findings: { type: array }
+  - id: xreview
+    agent: rev
+    expand:
+      over: [c]
+    prompt: x {{each.item}}
+    output_schema:
+      type: object
+      required: [findings]
+      properties:
+        findings: { type: array }
+  - id: verify
+    agent: ver
+    for_each: ${[review[].findings, xreview[].findings].flat()}
+    as: finding
+    prompt: verify ${finding}
+    output_schema:
+      type: object
+      required: [ok]
+      properties:
+        ok: { type: boolean }
+output:
+  from: verify
+"""
+
+
+def test_panel_ref_two_panels_compose_under_flat(tmp_path):
+    # Two panels compose under an outer .flat(): each panel token expands to its own
+    # bracketed .flat(), nested inside the authored outer [..].flat().
+    d = make_flow(tmp_path, "panel-compose", PANEL_COMPOSE)
+    rc, data, out, err = run(tmp_path, "panel-compose")
+    assert rc == 0, err
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert ("[[n_review_a.findings, n_review_b.findings].flat(), "
+            "[n_xreview_c.findings].flat()].flat()") in seg
+    assert_seg_parses(seg)
+
+
+PANEL_FIELD = PANEL_SINGLE.replace(
+    "for_each: ${review[].findings}", "for_each: ${review[].id}").replace(
+    "findings: ${review[].findings}", "ids: ${review[].id}").replace(
+    "required: [findings]", "required: [findings, id]").replace(
+    "        findings: { type: array }",
+    "        findings: { type: array }\n        id: { type: string }")
+
+
+def test_panel_ref_field_selection(tmp_path):
+    # The field after []. selects which sibling output field is aggregated.
+    d = make_flow(tmp_path, "panel-field", PANEL_FIELD.replace(
+        "name: panel-single", "name: panel-field"))
+    rc, data, out, err = run(tmp_path, "panel-field")
+    assert rc == 0, err
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    assert ("[n_review_correctness.id, n_review_security.id, "
+            "n_review_performance.id].flat()") in seg
+
+
+PANEL_UNKNOWN = PANEL_SINGLE.replace("${review[].findings}", "${nope[].findings}")
+
+
+def test_panel_ref_unknown_panel_id_dies_in_compile(tmp_path):
+    make_flow(tmp_path, "panel-unknown",
+              PANEL_UNKNOWN.replace("name: panel-single", "name: panel-unknown"))
+    rc, data, out, err = run(tmp_path, "panel-unknown")
+    assert rc == 1
+    assert data is not None
+    blob = json.dumps(data)
+    assert "unknown expand template id 'nope'" in blob
+
+
+PANEL_MALFORMED = PANEL_SINGLE.replace(
+    "for_each: ${review[].findings}", "for_each: ${review[]}")
+
+
+def test_panel_ref_malformed_dies_in_compile(tmp_path):
+    make_flow(tmp_path, "panel-malformed",
+              PANEL_MALFORMED.replace("name: panel-single", "name: panel-malformed"))
+    rc, data, out, err = run(tmp_path, "panel-malformed")
+    assert rc == 1
+    assert data is not None
+    assert "malformed panel ref" in json.dumps(data)
+
+
+# FIX #5: exotic malformed panel forms (capital lead / embedded space / dotted
+# prefix) bypass the lowercase-anchored PANEL_REF_RE/PANEL_BARE_RE, but the
+# broadened residual `[]` sweep still flags them — same 'malformed panel ref' die,
+# no silent verbatim leak into emitted JS.
+@pytest.mark.parametrize("bad", ["${Review[].findings}", "${a [].findings}",
+                                 "${a.x[].findings}"])
+def test_panel_ref_exotic_malformed_dies_in_compile(tmp_path, bad):
+    body = PANEL_SINGLE.replace(
+        "for_each: ${review[].findings}", f"for_each: {bad}").replace(
+        "name: panel-single", "name: panel-exotic")
+    make_flow(tmp_path, "panel-exotic", body)
+    rc, data, out, err = run(tmp_path, "panel-exotic")
+    assert rc == 1
+    assert data is not None
+    assert "malformed panel ref" in json.dumps(data)
+
+
+# FIX #7: a COMPOSED multi-panel ref carrying BOTH a malformed-bare token
+# (review[], no .field tail) AND an unknown-panel token (ghost[].findings) reports
+# BOTH blocks — the malformed-ref sweep and the unknown-template check — in one die.
+PANEL_COMPOSED_BAD = PANEL_SINGLE.replace(
+    "for_each: ${review[].findings}",
+    "for_each: ${[review[], ghost[].findings].flat()}").replace(
+    "name: panel-single", "name: panel-composed-bad")
+
+
+def test_panel_ref_composed_malformed_and_unknown_both_die(tmp_path):
+    make_flow(tmp_path, "panel-composed-bad", PANEL_COMPOSED_BAD)
+    rc, data, out, err = run(tmp_path, "panel-composed-bad")
+    assert rc == 1
+    assert data is not None
+    blob = json.dumps(data)
+    assert "malformed panel ref" in blob
+    assert "unknown expand template id 'ghost'" in blob
+
+
+def test_panel_ref_no_token_is_byte_identical(tmp_path):
+    # A def with expand templates but NO panel token compiles exactly as before
+    # (the Pass-4 sweep is a no-op when no `[]` token is present).
+    body = """\
+version: 1
+name: panel-none
+nodes:
+  - id: review
+    agent: rev
+    expand:
+      over: [a, b]
+    prompt: r {{each.item}}
+    output_schema:
+      type: object
+      required: [findings]
+      properties:
+        findings: { type: array }
+  - id: collect
+    agent: agg
+    depends_on: [review_a, review_b]
+    prompt: collect ${review_a.output.findings} ${review_b.output.findings}
+output:
+  from: collect
+"""
+    d = make_flow(tmp_path, "panel-none", body)
+    rc, data, out, err = run(tmp_path, "panel-none")
+    assert rc == 0, err
+    seg = (d / ".compiled" / "seg-1.js").read_text()
+    # No panel token → no .flat() artifact; the hand-enumerated sibling refs
+    # translate through the ordinary ${<id>.output.<field>} machinery.
+    assert ".flat()" not in seg
+    assert "n_review_a.findings" in seg and "n_review_b.findings" in seg
+
+
 # --- S-INFER: union-edge cycle + ref-implied ordering in compile ---
 
 REF_CYCLE = """\

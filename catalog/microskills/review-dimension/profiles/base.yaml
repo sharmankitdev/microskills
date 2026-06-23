@@ -61,8 +61,13 @@ output_schema:
       type: array
       items:
         type: object
-        required: [id, severity, file, title, explanation, confidence]
+        # `dimension` is stamped per finding (= the active {{dimension}}) so a
+        # downstream consumer reading the panel directly via a panel-aggregate ref
+        # (${review[].findings}) — no fan-in node — still knows each finding's source
+        # dimension. (Formerly collect-findings stamped this; it now lives upstream.)
+        required: [dimension, id, severity, file, title, explanation, confidence]
         properties:
+          dimension: { type: string }
           id: { type: string }
           severity: { type: string, enum: [blocker, major, minor, nit] }
           file: { type: string }

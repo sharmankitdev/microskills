@@ -480,3 +480,66 @@ output: { from: nest }
            if s.get("checkpoint_type") == "nested_workflow"]
     assert len(chk) == 1
     assert chk[0].get("when") == "${seed.output.go == true}"
+
+
+# ------------------- panel-aggregate ref across the inline seam (FIX #3) -----
+
+
+def test_panel_ref_namespaced_through_static_inline(tmp_path):
+    # The _nested_rewrite_ref panel_repl branch: a child's `${panel[].findings}`
+    # consumer of its OWN expand panel must, when the child is statically inlined,
+    # be NAMESPACED to the spliced template id (nest__panel) so the later expand
+    # Pass 4 fans it out over the NAMESPACED siblings. Assert the host segment
+    # carries the namespaced `[n_nest__panel_a.findings, ...].flat()` aggregate —
+    # NOT the bare child-local `n_panel_*` form (which would dangle post-splice).
+    _write(tmp_path / "kidp" / "WORKFLOW.yaml", """
+version: 1
+name: kidp
+inputs: { req: { required: true } }
+nodes:
+  - id: panel
+    agent: rev
+    expand:
+      over: [a, b]
+    prompt: "p {{each.item}} ${workflow.inputs.req}"
+    output_schema:
+      type: object
+      required: [findings]
+      properties: { findings: { type: array } }
+  - id: consume
+    agent: ag
+    for_each: ${panel[].findings}
+    as: f
+    prompt: "c ${f}"
+    output_schema:
+      type: object
+      properties: { ok: { type: boolean } }
+output: { from: consume }
+""")
+    _write(tmp_path / "hostp" / "WORKFLOW.yaml", """
+version: 1
+name: hostp
+imports: [kidp]
+inputs: { top: { required: true } }
+nodes:
+  - id: seed
+    agent: scratch
+    prompt: "seed ${workflow.inputs.top}"
+  - id: nest
+    workflow: kidp
+    inputs:
+      req: ${seed.output}
+  - id: tail
+    agent: scratch
+    prompt: "tail ${nest.output}"
+output: { from: tail }
+""")
+    r = _compile(tmp_path, "hostp")
+    assert r.returncode == 0, r.stderr
+    js = _all_segment_js(tmp_path, "hostp")
+    # The panel-aggregate ref fanned out over the NAMESPACED spliced siblings.
+    assert ("[n_nest__panel_a.findings, n_nest__panel_b.findings].flat()") in js
+    # The namespaced siblings themselves exist; the bare child-local ids do not.
+    assert "n_nest__panel_a" in js and "n_nest__panel_b" in js
+    assert "n_panel_a." not in js and "n_panel_b." not in js
+    _node_check(tmp_path, "hostp")

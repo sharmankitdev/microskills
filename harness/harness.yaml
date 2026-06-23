@@ -14,8 +14,6 @@ microskills:
   # create-pipeline RVS review/verify/synth + floor + grounding + bundling.
   - name: review-dimension
     source: plugin
-  - name: collect-findings
-    source: plugin
   - name: verify-finding
     source: plugin
   - name: synthesize-review

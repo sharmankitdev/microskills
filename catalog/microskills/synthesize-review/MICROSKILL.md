@@ -22,7 +22,7 @@ Given a change summary, dimension-tagged findings, and per-finding verifications
 | Name | Required | Type | Description | Default |
 |---|---|---|---|---|
 | change_summary | yes | object | The diff summary of the change under review; sources the report's change overview. | — |
-| findings | yes | array | The collected dimension-tagged findings produced by collect-findings. | — |
+| findings | yes | array | The dimension-tagged review findings produced upstream (the flattened review panel — each finding carries its own dimension field). | — |
 | verifications | yes | array | The per-finding verdicts produced by verify-finding, each carrying a finding_id (the matching finding's id), verdict, and false_positive flag. | — |
 
 ## Steps

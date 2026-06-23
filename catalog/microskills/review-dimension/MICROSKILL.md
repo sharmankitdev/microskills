@@ -23,12 +23,12 @@ Given an artifact of the configured kind and a configured quality dimension with
 
 1. **Read artifact** — Read the {{artifact_kind}} from the file at `artifact_path`.
 2. **Scan artifact** — Scan the {{artifact_kind}} read from `artifact_path` (grounded by the optional `change_summary`, the optional grounding material Read from `context_path`, and any rubric parameter such as the optional `threshold`) against the `{{dimension}}` rubric to detect issues matching only that rubric's concerns.
-3. **Build findings** — Build one finding object per detected issue, assigning a `{{dimension}}`-prefixed id, a severity (blocker, major, minor, nit), the file path, an optional line number, a short title, a rubric-tied explanation, an optional fix suggestion, and a confidence (high, medium, low).
+3. **Build findings** — Build one finding object per detected issue, setting its `dimension` field to `{{dimension}}` and assigning a `{{dimension}}`-prefixed id, a severity (blocker, major, minor, nit), the file path, an optional line number, a short title, a rubric-tied explanation, an optional fix suggestion, and a confidence (high, medium, low).
 4. **Return result** — Return the JSON object pairing `{{dimension}}` with the array of findings.
 
 ## Output
 
-A single JSON object `{dimension, findings}` returned as the structured result (and, when composed in a workflow, as the node output). The `dimension` field holds the active dimension name `{{dimension}}`; `findings` is an array of finding objects, each carrying a `{{dimension}}`-prefixed id, severity, file path, optional line, title, rubric-tied explanation, optional fix suggestion, and confidence.
+A single JSON object `{dimension, findings}` returned as the structured result (and, when composed in a workflow, as the node output). The `dimension` field holds the active dimension name `{{dimension}}`; `findings` is an array of finding objects, each carrying its own `dimension` field (= `{{dimension}}`, so a consumer reading the panel directly knows each finding's source dimension), a `{{dimension}}`-prefixed id, severity, file path, optional line, title, rubric-tied explanation, optional fix suggestion, and confidence.
 
 ## Failure modes
 

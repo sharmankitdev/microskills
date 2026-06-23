@@ -176,6 +176,21 @@ EACH_ANY_RE = re.compile(r"\{\{each\.[^}]*\}\}")
 # Legal expand.over item name: lowercase identifier; '-' is normalized to '_' when the
 # item is used as a generated-node-id suffix / fan-in input key.
 EXPAND_ITEM_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
+# PANEL-AGGREGATE ref: `${<panel>[].<field>}` (e.g. ${review[].findings}). A
+# compile-time handle that fans a consumer out over an `expand:` panel's generated
+# siblings — at expand-desugar time it rewrites to
+# `[<sib1>.output.<field>, <sib2>.output.<field>, ...].flat()` (sibling order =
+# over order), the native flatMap-between-review-and-verify pattern made first-class.
+# Composes under .flat() for multiple panels:
+# ${[review[].findings, xreview[].findings].flat()}. Resolved by
+# expand_static_fanout's Pass 4 (AFTER the expand siblings are minted, so the
+# template id maps to its sibling ids) and BEFORE ref translation, so the ordinary
+# ${<id>.output.<field>} machinery (edge inference, field-check, segment emission)
+# then handles each enumerated sibling ref uniformly. The (?<!...) lookbehind keeps
+# the panel id from mid-matching a longer token. PANEL_BARE_RE catches a malformed
+# `<id>[]` with no `.<field>` tail (a leftover after well-formed substitution).
+PANEL_REF_RE = re.compile(r"(?<![A-Za-z0-9_.-])([a-z][a-z0-9_-]*)\[\]\.([a-zA-Z0-9_]+)")
+PANEL_BARE_RE = re.compile(r"(?<![A-Za-z0-9_.-])[a-z][a-z0-9_-]*\[\](?!\.[a-zA-Z0-9_])")
 # {{param}} token inside a SUBGRAPH.yaml inner node — substituted from the host
 # `with:` map by desugar_subgraphs (whole-value aware). Same shape as
 # resolve-microskill's PLACEHOLDER_RE; a DISTINCT namespace from {{snippet:...}}
@@ -465,7 +480,87 @@ def expand_static_fanout(wf):
                 break
 
     wf["nodes"] = new_nodes
+
+    # Pass 4: PANEL-AGGREGATE ref expansion (`${<panel>[].<field>}`). The template
+    # ids are now known (Pass 1), so each template maps to its generated sibling ids
+    # in over order — exactly the ids Pass 2 minted. A `<panel>[].<field>` token
+    # inside any ${...} ref rewrites to `[<sib>.output.<field>, ...].flat()`, so a
+    # consumer (verify's for_each, synth's findings input) fans out over the whole
+    # panel with no fan-in node — and composes under .flat() for multiple panels.
+    # Runs AFTER expansion + inputs_each so the ordinary ${<id>.output.<field>}
+    # machinery (edge inference, field-check, segment emission) handles the
+    # enumerated sibling refs uniformly. An unknown panel id or a malformed
+    # `<id>[]` (no `.<field>`) is a HARD block in both tools.
+    panel_siblings = {
+        tid: [f"{tid}_{_expand_suffix(item)}" for item, _ in items]
+        for tid, items in templates.items()
+    }
+    # Always sweep — an unknown panel id (`${nope[].x}`) must fail loud even when
+    # no panel resolves; a doc with no `[]` token is byte-identically unchanged.
+    panel_errors = []
+    wf["nodes"] = _expand_panel_refs_deep(new_nodes, panel_siblings, panel_errors)
+    errors.extend(panel_errors)
+
     return wf, errors
+
+
+def _expand_panel_ref_str(s, panel_siblings, errors):
+    """Rewrite every `${...}` ref in one string, expanding each `<panel>[].<field>`
+    panel-aggregate token to `[<sib>.output.<field>, ...].flat()` over the panel
+    template's generated sibling ids (in over order). An unknown panel id, or a
+    malformed `<id>[]` with no `.<field>` tail, appends a message to `errors` (the
+    caller turns a non-empty list into a HARD block). Confined to ${...} inners via
+    REF_RE so prose like 'a[].b' outside a ref is never touched."""
+    if not isinstance(s, str) or "[]" not in s:
+        return s
+
+    def repl(m):
+        inner = m.group(1)
+
+        def prepl(pm):
+            panel, field = pm.group(1), pm.group(2)
+            sibs = panel_siblings.get(panel)
+            if sibs is None:
+                errors.append(
+                    f"panel ref '{panel}[].{field}' references unknown expand "
+                    f"template id '{panel}'")
+                return pm.group(0)
+            arr = ", ".join(f"{sib}.output.{field}" for sib in sibs)
+            return f"[{arr}].flat()"
+
+        inner2 = PANEL_REF_RE.sub(prepl, inner)
+        # Residual-malformed sweep: strip the well-formed `<panel>[].<field>` tokens
+        # (prepl already resolved the KNOWN ones to `[…].flat()` and flagged the
+        # UNKNOWN ones), then ANY `[]` still present is a genuinely MALFORMED panel
+        # ref. This broadens beyond PANEL_BARE_RE (which only spots a bare lowercase
+        # `<id>[]`) to the exotic forms the lowercase-anchored regex skips — a capital
+        # lead (`Review[].x`), a space (`a [].x`), a dotted prefix (`a.x[]`). A fully
+        # valid ref leaves no `[]` (a resolved panel becomes `[…].flat()`), so this
+        # never false-flags; and an unknown-but-well-formed token is stripped here, so
+        # it reports ONLY as 'unknown expand template id', never double.
+        if "[]" in PANEL_REF_RE.sub("", inner2):
+            mm = PANEL_BARE_RE.search(inner2)
+            near = mm.group(0) if mm else "[]"
+            errors.append(
+                f"malformed panel ref near '{near}' in '${{{inner}}}' "
+                f"(expected ${{<panel>[].<field>}})")
+        return "${" + inner2 + "}"
+
+    return REF_RE.sub(repl, s)
+
+
+def _expand_panel_refs_deep(obj, panel_siblings, errors):
+    """Recursively apply _expand_panel_ref_str to every string in a nested structure
+    (dict keys walked too, mirroring substitute_vars_deep). Pure textual transform."""
+    if isinstance(obj, str):
+        return _expand_panel_ref_str(obj, panel_siblings, errors)
+    if isinstance(obj, dict):
+        return {_expand_panel_refs_deep(k, panel_siblings, errors):
+                _expand_panel_refs_deep(v, panel_siblings, errors)
+                for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_expand_panel_refs_deep(v, panel_siblings, errors) for v in obj]
+    return obj
 
 
 def _subgraph_static_orchestrator(node):
@@ -1163,6 +1258,16 @@ def _nested_rewrite_ref(s, bindings, inner_ids, splice_id, result_rekey=None):
             return mm.group(0)
         inner = NODE_ITEMS_RE.sub(items_repl, inner)
         inner = NODE_OUTPUT_RE.sub(out_repl, inner)
+        # PANEL-AGGREGATE ref: namespace the panel TEMPLATE id (a child node id at
+        # inline time — expand runs AFTER this pass) so ${<panel>[].<field>} ->
+        # ${<splice>__<panel>[].<field>}, matching the eventual namespaced template
+        # that expand_static_fanout's Pass 4 then fans out. Has no `.output`/`.items`
+        # tail, so the rewrites above never touch it.
+        def panel_repl(mm):
+            nid = mm.group(1)
+            return (f"{splice_id}__{nid}[].{mm.group(2)}"
+                    if nid in inner_ids else mm.group(0))
+        inner = PANEL_REF_RE.sub(panel_repl, inner)
         return "${" + inner + "}"
     return REF_RE.sub(repl, s)
 

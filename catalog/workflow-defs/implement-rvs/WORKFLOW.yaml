@@ -54,7 +54,6 @@ imports:
   - microskills/build-catalog-index
   - microskills/run-validators
   - microskills/review-dimension
-  - microskills/collect-findings
   - microskills/verify-finding
   - microskills/synthesize-review
 
@@ -155,29 +154,18 @@ nodes:
       artifact_path: ${bundle.output.bundle_path}
       context_path: ${catalog_index.output.index_path}
 
-  # Fan the WHOLE review panel into one combined, dimension-stamped, globally-identified,
-  # deduplicated list. The review siblings ride via inputs_each: review; the 3 cross siblings
-  # are wired explicitly. The wf-create-all profile registers all 10 input names (microskill-create
-  # swaps it to ms-create-all). ONE collect → one findings array → one verify.
-  - id: collect
-    use: collect-findings
-    customize: { profile: wf-create-all }
-    phase_group: collect
-    inputs_each: review
-    inputs:
-      duplicate_capability: ${xreview_duplicate_capability.output}
-      naming_collision: ${xreview_naming_collision.output}
-      reverse_consumer: ${xreview_reverse_consumer.output}
-
-  # Adversarially verify each collected REVIEW finding (floor findings bypass verify). for_each
-  # fan-out — legal inside an UNGUARDED loop body: it composes as its own await parallel(map(...))
-  # rank inside the do/while, run EVERY round so false positives are dropped before the next fix.
-  # artifact_path = the draft bundle WITH the catalog index appended.
+  # Adversarially verify each REVIEW finding (floor findings bypass verify). The verify fan-out
+  # reads BOTH review panels DIRECTLY via the composed panel-aggregate ref
+  # ${[review[].findings, xreview[].findings].flat()} (the native flatMap pattern) — no collect
+  # fan-in node. Each panel finding now carries its own `dimension` field (stamped upstream by
+  # review-dimension). for_each is legal inside an UNGUARDED loop body: it composes as its own
+  # await parallel(map(...)) rank inside the do/while, run EVERY round so false positives are
+  # dropped before the next fix. artifact_path = the draft bundle WITH the catalog index appended.
   - id: verify
     use: verify-finding
     customize: { profile: workflow-draft-xref }
     phase_group: verify
-    for_each: ${collect.output.findings}
+    for_each: ${[review[].findings, xreview[].findings].flat()}
     as: finding
     max_parallel: 4
     inputs:
@@ -193,7 +181,7 @@ nodes:
     customize: { profile: create-impl-rvs }
     phase_group: synthesize
     inputs:
-      findings: ${collect.output.findings}
+      findings: ${[review[].findings, xreview[].findings].flat()}
       verifications: ${verify.items}
       floor_findings: ${floor.output.findings}
       staging_paths: ${implement.output.staging_paths}
@@ -212,7 +200,7 @@ loop:
          review_wf_profile_overlay_coherence, review_wf_spill_materialize_judgment,
          review_wf_output_schema_downstream_fit,
          xreview_duplicate_capability, xreview_naming_collision, xreview_reverse_consumer,
-         collect, verify, synth]
+         verify, synth]
   carry:
     findings: ${synth.output.findings}           # surviving findings seed the next implement pass
   on_exhaust:
