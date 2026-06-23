@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""plan-signature-diff — deterministic, agent-independent guard for tiered revise.
+
+STRIP-COSMETIC-THEN-DEEP-COMPARE. Normalize a plan YAML by removing the small,
+explicit COSMETIC set (descriptions everywhere; input DEFAULT VALUES), then deep-
+compare the remainder. ANY non-cosmetic difference => load-bearing (changed: true),
+BY CONSTRUCTION — there is no enumerated allowlist to leave a gap, so a load-bearing
+edit cannot slip through as "unchanged" (the dangerous direction). The only residual
+risk is a false POSITIVE (a non-stripped cosmetic edit routes to the safe full
+re-plan), never a false negative.
+
+The conductor's tiered-revise flow uses this to OVERRIDE a classifier subagent's
+"minor" verdict when an in-place plan edit actually changed anything beyond the
+cosmetic set — the agent's classification is never trusted for the safety-critical
+decision.
+
+COSMETIC SET (stripped):
+  - every `description` key, anywhere (never a contract);
+  - the `default` VALUE of an input spec — microskill: items of the top-level
+    `inputs` LIST; workflow: values of the inner `inputs` MAP. (`default` is NOT
+    stripped anywhere else — e.g. a gate's `default` choice is behavior-bearing and
+    stays compared.)
+Everything else is compared: name; input names/required/type/materialize; steps;
+output_schema/output; failure_modes; config (microskill); and the full nested
+workflow design — nodes (use/agent/workflow/prompt/delegation/customize/grant_tools/
+when/for_each/depends_on/…), gates (incl. default/on_headless/options), loop
+(body/while/carry), output.from — plus the OUTER name/missing_microskills/
+scope_advisory (workflow).
+
+PLAN SHAPES:
+  microskill — a FLAT mapping (name / inputs[] / steps / output_schema / …).
+  workflow   — an OUTER mapping (name / missing_microskills / scope_advisory) with
+    the design nested in a `plan_yaml: |` BLOCK SCALAR; the block is unwrapped and
+    compared as STRUCTURE (a pure re-indent / reflow of the block does not register).
+Microskill `inputs` are sorted by name before compare (a reorder is cosmetic); list
+order is otherwise preserved (steps / nodes order can be semantic).
+
+Usage:
+  plan-signature-diff --before <path> --after <path> --domain <microskill|workflow>
+Output (stdout): JSON {"changed": bool, "changed_fields": [str]}, exit 0.
+Exit codes: 0 ok; 2 environment error (missing dep / unreadable or malformed YAML /
+a plan that is not a mapping / a malformed plan_yaml block) — emitted as a JSON
+{error} on stderr, never a raw traceback (matches the sibling scripts).
+"""
+import argparse
+import json
+import sys
+
+try:
+    import yaml
+except ImportError:
+    print(json.dumps({"error": "PyYAML not installed. pip3 install pyyaml"}), file=sys.stderr)
+    sys.exit(2)
+
+
+class DiffError(Exception):
+    """An unreadable / malformed / non-mapping plan YAML (or a malformed nested
+    plan_yaml block) — surfaced as a JSON {error} + exit 2, never a raw traceback."""
+
+
+def _load(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            doc = yaml.safe_load(f)
+    except FileNotFoundError:
+        raise DiffError(f"file not found: {path}")
+    except (OSError, UnicodeDecodeError) as e:
+        raise DiffError(f"cannot read {path}: {e}")
+    except yaml.YAMLError as e:
+        raise DiffError(f"invalid YAML in {path}: {e}")
+    if not isinstance(doc, dict):
+        raise DiffError(f"plan YAML is not a mapping: {path}")
+    return doc
+
+
+def _strip_descriptions(obj):
+    """Recursively drop every `description` key (cosmetic, never a contract)."""
+    if isinstance(obj, dict):
+        return {k: _strip_descriptions(v) for k, v in obj.items() if k != "description"}
+    if isinstance(obj, list):
+        return [_strip_descriptions(v) for v in obj]
+    return obj
+
+
+def _strip_input_defaults(inputs):
+    """Drop the `default` VALUE from each input spec — a changed default is cosmetic.
+    Handles the microskill list form and the workflow map form; leaves `default`
+    everywhere else (e.g. gate defaults) untouched."""
+    if isinstance(inputs, list):
+        return [{k: v for k, v in i.items() if k != "default"} if isinstance(i, dict) else i
+                for i in inputs]
+    if isinstance(inputs, dict):
+        return {n: ({k: v for k, v in (s or {}).items() if k != "default"}
+                    if isinstance(s, dict) else s)
+                for n, s in inputs.items()}
+    return inputs
+
+
+def _unwrap_inner(doc):
+    """A workflow plan nests the WORKFLOW design in a `plan_yaml: |` block scalar.
+    Parse it to a mapping so we compare STRUCTURE (a reflow of the block does not
+    register). Returns None when there is no nested design. A malformed block or a
+    non-mapping parse raises DiffError (-> exit 2)."""
+    raw = doc.get("plan_yaml")
+    if isinstance(raw, str):
+        try:
+            inner = yaml.safe_load(raw)
+        except yaml.YAMLError as e:
+            raise DiffError(f"invalid YAML in plan_yaml block: {e}")
+        if inner is None:
+            return {}
+        if not isinstance(inner, dict):
+            raise DiffError("plan_yaml block did not parse to a mapping")
+        return inner
+    if isinstance(raw, dict):
+        return raw
+    return None
+
+
+def _normalize(doc, domain):
+    """Return the plan with the cosmetic set stripped, ready for deep-compare."""
+    if domain == "microskill":
+        d = dict(doc)
+        if "inputs" in d:
+            inp = _strip_input_defaults(d.get("inputs"))
+            if isinstance(inp, list):
+                inp = sorted(inp, key=lambda i: (i.get("name") or "") if isinstance(i, dict) else "")
+            d["inputs"] = inp
+        return _strip_descriptions(d)
+    # workflow: unwrap the nested design, strip its input defaults, compare as structure.
+    outer = dict(doc)
+    inner = _unwrap_inner(doc)
+    if inner is not None:
+        inner = dict(inner)
+        if "inputs" in inner:
+            inner["inputs"] = _strip_input_defaults(inner.get("inputs"))
+        outer["plan_yaml"] = inner
+    return _strip_descriptions(outer)
+
+
+def _changed_fields(before, after):
+    """Top-level keys that differ. When the nested workflow design (`plan_yaml`)
+    differs, expand to `plan_yaml.<innerkey>` for nicer narration."""
+    fields = []
+    for k in sorted(set(before) | set(after)):
+        if before.get(k) == after.get(k):
+            continue
+        b, a = before.get(k), after.get(k)
+        if k == "plan_yaml" and isinstance(b, dict) and isinstance(a, dict):
+            for ik in sorted(set(b) | set(a)):
+                if b.get(ik) != a.get(ik):
+                    fields.append(f"plan_yaml.{ik}")
+        else:
+            fields.append(k)
+    return fields
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--before", required=True)
+    ap.add_argument("--after", required=True)
+    ap.add_argument("--domain", required=True, choices=["microskill", "workflow"])
+    args = ap.parse_args()
+    try:
+        before = _normalize(_load(args.before), args.domain)
+        after = _normalize(_load(args.after), args.domain)
+    except DiffError as e:
+        print(json.dumps({"error": str(e)}), file=sys.stderr)
+        sys.exit(2)
+    fields = _changed_fields(before, after)
+    print(json.dumps({"changed": bool(fields), "changed_fields": fields}, indent=2))
+
+
+if __name__ == "__main__":
+    main()
