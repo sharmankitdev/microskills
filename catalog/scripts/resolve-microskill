@@ -90,10 +90,12 @@ def _templates_root(script):
 
 SCHEMA_PATH = _templates_root(SCRIPT) / "references" / "config-schema.json"
 
-# Shared linear-path vocabulary (STEP_RE / BRANCH_RE / STEP_CAP). The SAME module
-# backs validate-microskill's author-time lint, so a profile that adds/patches a
-# step cannot smuggle branching language past a check the validator would catch.
-# Loaded via SourceFileLoader to match the engine's extension-less-script pattern.
+# Shared numbered-step vocabulary + atomicity cap (STEP_RE / STEP_CAP). The SAME
+# module backs validate-microskill's author-time lint, so the advisory step cap
+# applied to a profile's merged Steps cannot drift from the validator's. Internal
+# control flow is not linted — the body is a black box and the compiler owns
+# orchestration placement. Loaded via SourceFileLoader to match the engine's
+# extension-less-script pattern.
 _STEPS_MOD_PATH = SCRIPT.parent / "microskill_steps.py"
 _steps_loader = importlib.machinery.SourceFileLoader(
     "microskill_steps", str(_STEPS_MOD_PATH)
@@ -956,25 +958,12 @@ def main():
         emit_and_exit({"error": f"step directive error: {e}"}, 1)
 
     # Atomicity re-check on the MERGED Steps (LOCKED decision: inline, shared
-    # module). A profile add/patch could introduce branching language the
-    # author-time validator never saw; reject it with the SAME BRANCH_RE the
-    # validator uses. The >STEP_CAP cap stays an advisory WARN (not a block),
-    # consistent with validate-microskill's documented advisory cap.
+    # module). Internal control flow is no longer linted — a microskill body is a
+    # black box and the compiler owns orchestration placement — so this re-check
+    # only enforces the advisory step cap. The >STEP_CAP cap stays an advisory
+    # WARN (not a block), consistent with validate-microskill's documented cap.
     _, merged_steps_block, _ = parse_steps_section(rendered)
     if merged_steps_block:
-        branch_hits = microskill_steps.find_branch_language(merged_steps_block)
-        if branch_hits:
-            snippet, _span = branch_hits[0]
-            sys.stderr.write(
-                f"merged steps introduce branching language: \"…{snippet}…\"\n"
-            )
-            emit_and_exit({
-                "error": (
-                    f"profile step directive introduced branching language into the "
-                    f"merged Steps — microskills must form a single linear path "
-                    f"(no branches, conditionals, loops): \"…{snippet}…\""
-                )
-            }, 1)
         merged_count = microskill_steps.count_steps(merged_steps_block)
         if merged_count > microskill_steps.STEP_CAP:
             warnings.append(

@@ -207,41 +207,16 @@ def test_setup_section_rejected(tmp_path):
     assert any("## Setup section found" in i["message"] for i in data["issues"])
 
 
-def test_branching_language_blocks(tmp_path):
+def test_branching_language_passes(tmp_path):
+    # A microskill body may branch/loop internally — internals are a black box.
     body = MINIMAL_BODY.format(name="branchy").replace(
         "1. **First** — do thing one.",
-        "1. **First** — if the file exists then read it.",
+        "1. **First** — if the file exists then read it, otherwise for each default value emit it.",
     )
     skill = write_skill(tmp_path, "branchy", body)
     code, data, _, err = run(str(skill))
-    assert code == 1, err
-    branch_blocks = [
-        i for i in data["issues"]
-        if i["severity"] == "block" and "branching language" in i["message"]
-    ]
-    assert branch_blocks, data
-
-
-def test_naked_if_in_step_blocks(tmp_path):
-    body = MINIMAL_BODY.format(name="naked-if").replace(
-        "1. **First** — do thing one.",
-        "1. **First** — stop if file missing.",
-    )
-    skill = write_skill(tmp_path, "naked-if", body)
-    code, data, _, err = run(str(skill))
-    assert code == 1, err
-    assert any("branching language" in i["message"] for i in data["issues"])
-
-
-def test_for_each_in_step_blocks(tmp_path):
-    body = MINIMAL_BODY.format(name="loopy").replace(
-        "1. **First** — do thing one.",
-        "1. **First** — for each commit, process it.",
-    )
-    skill = write_skill(tmp_path, "loopy", body)
-    code, data, _, err = run(str(skill))
-    assert code == 1, err
-    assert any("branching language" in i["message"] for i in data["issues"])
+    assert code == 0, data
+    assert not any("branch" in i["message"].lower() for i in data["issues"]), data
 
 
 def test_section_heading_casing_diagnostic(tmp_path):
@@ -485,24 +460,14 @@ def test_steps_add_after_unknown_blocks(tmp_path):
                for i in data["issues"]), data
 
 
-def test_profile_step_add_branching_blocks(tmp_path):
-    skill = write_skill(tmp_path, "psb", MINIMAL_BODY.format(name="psb"))
-    cfg = write_cfg(tmp_path, "strict.yaml",
-                    "version: 1\nsteps:\n  add:\n    - after: 1\n      text: if the file exists then read it\n")
+def test_profile_step_add_branching_passes(tmp_path):
+    skill = write_skill(tmp_path, "padd", MINIMAL_BODY.format(name="padd"))
+    cfg = tmp_path / "base.yaml"
+    cfg.write_text(
+        "version: 1\nsteps:\n  add:\n    - after: 1\n      text: for each commit, process it\n")
     code, data, _, err = run(str(skill), str(cfg))
-    assert code == 1, err
-    assert any(i["severity"] == "block" and "branching language" in i["message"] and ".text" in i["message"]
-               for i in data["issues"]), data
-
-
-def test_profile_step_patch_branching_blocks(tmp_path):
-    skill = write_skill(tmp_path, "psp", MINIMAL_BODY.format(name="psp"))
-    cfg = write_cfg(tmp_path, "strict.yaml",
-                    "version: 1\nsteps:\n  patch:\n    \"1\":\n      text: for each commit, process it\n")
-    code, data, _, err = run(str(skill), str(cfg))
-    assert code == 1, err
-    assert any(i["severity"] == "block" and "branching language" in i["message"]
-               for i in data["issues"]), data
+    assert code == 0, data
+    assert not any("branch" in i["message"].lower() for i in data["issues"]), data
 
 
 # ---------------------------------------------------------------------------

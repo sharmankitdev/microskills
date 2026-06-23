@@ -53,7 +53,7 @@ PLACEHOLDER_RE = re.compile(r"\{\{([\w-]+)\}\}")
 
 SCRIPT = Path(__file__).resolve()
 
-# Shared linear-path vocabulary (STEP_RE / BRANCH_RE / STEP_CAP) lives in
+# Shared numbered-step vocabulary + atomicity cap (STEP_RE / STEP_CAP) lives in
 # microskill_steps.py so resolve-microskill's profile add/patch re-check cannot
 # drift from this author-time lint. Loaded via SourceFileLoader to match the
 # extension-less-script pattern used across the engine.
@@ -65,7 +65,6 @@ _steps_spec = importlib.util.spec_from_loader("microskill_steps", _steps_loader)
 _steps_mod = importlib.util.module_from_spec(_steps_spec)
 _steps_loader.exec_module(_steps_mod)
 STEP_RE = _steps_mod.STEP_RE
-BRANCH_RE = _steps_mod.BRANCH_RE
 STEP_CAP = _steps_mod.STEP_CAP
 
 
@@ -173,10 +172,6 @@ def check_skill(path, issues):
         elif count > STEP_CAP:
             add(issues, "warn", "steps",
                 f"{count} numbered steps; consider whether this is still one atomic task")
-        for match in BRANCH_RE.finditer(steps_body):
-            snippet = match.string[max(0, match.start()-20):match.end()+20].replace("\n", " ")
-            add(issues, "block", "steps",
-                f"branching language detected: \"…{snippet.strip()}…\" — steps must form a single linear path (no branches, conditionals, loops, or parallel tracks)")
 
     m_inputs = re.search(r"^## Inputs\s*$([\s\S]*?)(?=^## |\Z)", body, re.MULTILINE)
     if m_inputs:
@@ -264,23 +259,6 @@ def check_config(path, issues):
                     add(issues, "warn", "config",
                         f"{p.name}: output_schema.required lists '{req}' which is not in properties — "
                         f"a dead field that dead-ends downstream .output.{req} refs.")
-
-    steps_block = doc.get("steps") if isinstance(doc, dict) else None
-    if isinstance(steps_block, dict):
-        frags = []
-        patch = steps_block.get("patch")
-        if isinstance(patch, dict):
-            for k, v in patch.items():
-                if isinstance(v, dict) and isinstance(v.get("text"), str):
-                    frags.append((f"steps.patch.{k}", v["text"]))
-        for i, entry in enumerate(steps_block.get("add") or []):
-            if isinstance(entry, dict) and isinstance(entry.get("text"), str):
-                frags.append((f"steps.add[{i}]", entry["text"]))
-        for loc, text in frags:
-            for snippet, _span in _steps_mod.find_branch_language(text):
-                add(issues, "block", "config",
-                    f"{p.name}: {loc}.text contains branching language: \"…{snippet}…\" — "
-                    f"profile-supplied steps must form a single linear path (same rule as the body Steps).")
 
     if p.name != "base.yaml" and isinstance(doc, dict) and "profile" in doc:
         add(issues, "block", "config",

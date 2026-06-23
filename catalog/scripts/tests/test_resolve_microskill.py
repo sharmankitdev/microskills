@@ -1633,7 +1633,7 @@ def test_steps_gate_anchored_after_removed_step_falls_back(tmp_path):
     )
 
 
-def test_steps_add_branching_language_blocks(tmp_path):
+def test_steps_add_branching_language_passes(tmp_path):
     body = MINIMAL_SKILL.format(name="branch-add-fixture")
     cfg = textwrap.dedent("""\
         version: 1
@@ -1644,12 +1644,11 @@ def test_steps_add_branching_language_blocks(tmp_path):
         """)
     make_skill(tmp_path, "branch-add-fixture", body, default_cfg=cfg)
     code, data, _, err = run("branch-add-fixture", skill_root=tmp_path)
-    assert code == 1, err
-    assert "error" in data
-    assert "branch" in data["error"].lower()
+    assert code == 0, err
+    assert "error" not in data, data
 
 
-def test_steps_patch_branching_language_blocks(tmp_path):
+def test_steps_patch_branching_language_passes(tmp_path):
     body = MINIMAL_SKILL.format(name="branch-patch-fixture")
     cfg = textwrap.dedent("""\
         version: 1
@@ -1660,9 +1659,8 @@ def test_steps_patch_branching_language_blocks(tmp_path):
         """)
     make_skill(tmp_path, "branch-patch-fixture", body, default_cfg=cfg)
     code, data, _, err = run("branch-patch-fixture", skill_root=tmp_path)
-    assert code == 1, err
-    assert "error" in data
-    assert "branch" in data["error"].lower()
+    assert code == 0, err
+    assert "error" not in data, data
 
 
 def test_steps_over_ten_merged_warns_not_blocks(tmp_path):
@@ -1759,8 +1757,10 @@ def test_steps_directives_preserve_optional_mandate_skip(tmp_path):
 
 
 def test_shared_atomicity_module_vocabulary_matches_validate(tmp_path):
-    # The branching-language vocabulary must be the SAME object used by
-    # validate-microskill — loaded from the shared module, not duplicated.
+    # The shared module carries only the numbered-step vocabulary + advisory cap
+    # used by BOTH validate-microskill and resolve-microskill. Internal control
+    # flow is no longer linted — a microskill body is a black box and the compiler
+    # owns orchestration placement — so the branch vocabulary is gone entirely.
     import importlib.machinery as _m
     import importlib.util as _u
 
@@ -1769,11 +1769,13 @@ def test_shared_atomicity_module_vocabulary_matches_validate(tmp_path):
     spec = _u.spec_from_loader("microskill_steps", loader)
     mod = _u.module_from_spec(spec)
     loader.exec_module(mod)
-    # branching language is detected; plain linear prose is not
-    assert mod.BRANCH_RE.search("if the file exists then read it")
-    assert not mod.BRANCH_RE.search("read the supplied text and write the document")
     # step-line counter matches a simple numbered block
     assert mod.STEP_RE.search("1. do thing")
+    assert mod.count_steps("1. do thing\n2. do other") == 2
+    assert isinstance(mod.STEP_CAP, int)
+    # the branch vocabulary no longer exists — internals are a black box
+    assert not hasattr(mod, "BRANCH_RE")
+    assert not hasattr(mod, "find_branch_language")
 
 
 # --- materialize: file — large/multi-shape input passed by reference ---
