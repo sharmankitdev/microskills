@@ -1,3 +1,9 @@
+## [0.37.0](https://github.com/sharmankitdev/microskills/compare/v0.36.0...v0.37.0) (2026-06-23)
+
+### Features
+
+* **workflow:** tiered plan-gate revise — classifier-editor subagent routes trivial edits past full re-plan ([#41](https://github.com/sharmankitdev/microskills/issues/41)) ([74390e0](https://github.com/sharmankitdev/microskills/commit/74390e08757f024e64a643775856a9701c3757a6))
+
 ## [0.36.0](https://github.com/sharmankitdev/microskills/compare/v0.35.0...v0.36.0) (2026-06-23)
 
 ### ⚠ BREAKING CHANGES
