@@ -1,3 +1,13 @@
+## [0.36.0](https://github.com/sharmankitdev/microskills/compare/v0.35.0...v0.36.0) (2026-06-23)
+
+### ⚠ BREAKING CHANGES
+
+* **workflow:** verify fans out over the review panel via a panel-aggregate ref; remove collect node (#40)
+
+### Features
+
+* **workflow:** verify fans out over the review panel via a panel-aggregate ref; remove collect node ([#40](https://github.com/sharmankitdev/microskills/issues/40)) ([23a9c3c](https://github.com/sharmankitdev/microskills/commit/23a9c3c41a6094dde2f1bd33d2d9b1c3c3a378ab))
+
 ## [0.35.0](https://github.com/sharmankitdev/microskills/compare/v0.34.0...v0.35.0) (2026-06-22)
 
 ### Features
