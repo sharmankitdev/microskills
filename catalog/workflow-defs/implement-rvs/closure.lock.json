@@ -1,28 +1,27 @@
 {
-  "manifest_hash": "af93895ef140f1da6978551b8af8f474feddde648df4a5738899dfd6528dd0bd",
+  "manifest_hash": "4c24577a8cc09ed7f5c31d85e75861435794cf535fc12cd59514387b0e665b01",
   "name": "implement-rvs",
   "node_fingerprints": {
     "bundle": "53d0b6604573ab4dcb26ca05d347c69fc25439a7198e4d545282b7446e7335cb",
     "bundle_xref": "947103d4264ddceb7aa7dcacdb57703b29c241767e98df3fa860b218d2894cde",
     "catalog_index": "3e234471762e344bc8a423be55034caabd39fb3f54fbfaa28444d21b2acc6a3e",
-    "collect": "2e37c81224a3d46199248f7e172776b73ec71bd8a622c78061b505edc036b362",
     "floor": "5c4750caf8b9713c101a0ad7de2fdb19d6995e08b7f2ca2778e0b9a6f1c71f0a",
     "implement": "346809a67a3092ab7606e86031ef1ac0900868b518ea023da711c4716f2dfe98",
-    "review_wf_dag_decomposition_correctness": "111cdc2314d94f011f2115a62418d1b49c3c4b99b9c448ab4e35e3ddc51ece79",
-    "review_wf_gate_prompt_options_quality": "e4a772435d815f0f3032c7617fe0cf8aee395f22dae32371bd84dbaf6b24e39c",
-    "review_wf_guard_logic_intent": "229d096fc17f48d2b9de7922bcaac3b658b69c6ba0f125019fa9ff4db18e71a2",
-    "review_wf_output_schema_downstream_fit": "472406267e9c10ea09a42e8847b7e4127f61369d28893f1147de3833abe105b8",
-    "review_wf_profile_overlay_coherence": "71c0ad2d2c98c18834e50f013418d5626d97b0bc62166385d28cc02ff69e0b08",
-    "review_wf_prompt_task_fidelity": "eb58423b91d2c50a62035d517bb7e024b21b34bd12efa2a259537fd68473e5a6",
-    "review_wf_spill_materialize_judgment": "15b7358f66b82cd9392ef2356e0264a05ffc406b03ef849811e75470c3b283ee",
-    "synth": "227fbd6ada2c9afcc5c3583dc33cf4c318dbe9f83a24bdf007d2c6501e29dee6",
-    "verify": "32ea8257d33a610613626c6f269c1d1bdcdb9552c9cd7c9b7bf4b695e0896911",
-    "xreview_duplicate_capability": "be6515e7dd08b63b6b57076e29310cc38ace1bbd413c8afdc8bcaa3759a68a2c",
-    "xreview_naming_collision": "90408ca4d7d2f58e50e7efe7424665d4b238371db64850814bc96b69a737a411",
-    "xreview_reverse_consumer": "75b4a0553d3de71942df2e68619662b572cb371657428ceb5e1cfaacd85f4bd4"
+    "review_wf_dag_decomposition_correctness": "bc0cefa1b30bfc33d6f88293c31b48e742458c39e03af9d9572c34c3d5c5d0c5",
+    "review_wf_gate_prompt_options_quality": "cfe0366cbc7b428af84ba055eaf7b7ccf90170a959e5f49878f461c30ae18761",
+    "review_wf_guard_logic_intent": "92c2b446f6b6d60b123500c3e7cc675a94ef8261ca81836c6e0957733a1e2d77",
+    "review_wf_output_schema_downstream_fit": "1d30ab5c6a9aa674e32f1dc31ec438bd4c59f480c7645267f2aeb5d120956662",
+    "review_wf_profile_overlay_coherence": "89bdf6b09322ebfbcf53c35dafff8440433e3204f3e29c70509f1dfafa3da6dc",
+    "review_wf_prompt_task_fidelity": "c79a4b8af574848490c6b7eef0c7969f2536f67be422f4220ff4b0a27979b482",
+    "review_wf_spill_materialize_judgment": "13627edf56c4ff55df76cd17f89b9df58c013f411458bcd18e7833610c98ea2b",
+    "synth": "5860c8fa6914e2b9799525737ad0149d0bb8c8d690e714138fb27608327dd716",
+    "verify": "7a2ce07851a9c5fe39c6d2b8da11efe9a94c76712f43cdc882d4a4de10a0680b",
+    "xreview_duplicate_capability": "01ebfa3b2e0d8104a805f31a70765338c3f85ea26bbca4db27d9ad78b3ee905f",
+    "xreview_naming_collision": "ad3098f8c3057cdc021611a1a84cdebf081406dc77c4653debcd9559b0035ac7",
+    "xreview_reverse_consumer": "84f480229c41019d11e06d704c38331cbc3b66480dd450612896b0983e489c55"
   },
   "profile_used": "base",
   "segment_digests": {
-    "seg-1.js": "c27989b0b3bd2cb1c4c2ac2e625e62cfa9ebb910b6cdec098a472af3ada2812c"
+    "seg-1.js": "19667655f6d9120c567c70e87823d1031d08b411e0d4c9e208870e316a515fdb"
   }
 }

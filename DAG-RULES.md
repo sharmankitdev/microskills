@@ -195,8 +195,26 @@ can embed references. There are these forms:
 | `${workflow.inputs.<x>}` | A workflow-level input | `_args.wf_<x>` |
 | `${<node-id>.output.<field>...}` | An upstream node's output field | `n_<id>.<field>` if same segment, else `_args["<id>"].<field>` |
 | `${<node-id>.items}` | The **whole per-item-results array** of a `for_each` node | the producer's bare array handle: `n_<id>` if same segment, else `_args["<id>"]` |
+| `${<panel>[].<field>}` | The **flattened `<field>` across an `expand:` panel's siblings** (§6) | `[<sib1>.output.<field>, <sib2>.output.<field>, …].flat()` (each sibling ref then translates as a `.output` ref) |
 | `${loop.carry.<v>}` | A loop carry variable (loop body only) | `carry_<v>` |
 | `${<as>}` | The current `for_each` item (the `as` binding) | the bare loop variable |
+
+**`${<panel>[].<field>}`** is the **panel-aggregate ref** — a compile-time handle that fans a
+consumer out over an [`expand:` panel](#expand--inputs_each--compile-time-static-fan-out) without a
+fan-in node. `<panel>` must be an `expand:` **template id**; at expand-desugar time (after the panel's
+siblings are minted, before ref translation) the token rewrites to
+`[<sib1>.output.<field>, <sib2>.output.<field>, …].flat()` over the generated siblings **in `over`
+order**. This is the native *flatMap-between-review-and-verify* pattern made first-class: the same
+token works **both** as a `for_each` source (`for_each: ${review[].findings}` → fan out one verify per
+finding across the whole panel) **and** as an `inputs` value (`findings: ${review[].findings}` → hand
+the whole flattened list to a synth node). Because it expands to ordinary `${<sib>.output.<field>}`
+refs, it **implies a dependency edge on every sibling** (S-INFER, §7) and each sibling's `<field>` is
+field-checked against that sibling's effective `output_schema` (S-FIELD, §7) — auto-correcting when a
+profile swaps the panel's `over` set. **Multi-panel compose:** wrap two panel tokens in an outer
+`.flat()` — `${[review[].findings, xreview[].findings].flat()}` → each panel expands to its own
+bracketed `.flat()`, nested inside the authored outer flatten. **Hard blocks** (both tools): a
+`<panel>` that is not an `expand:` template id (`references unknown expand template id`), and a
+malformed `<id>[]` with no `.<field>` tail (`malformed panel ref`).
 
 **`${<id>.items}`** consumes the *entire* fan-out result array of `for_each` node `<id>` — there is
 **no `.field` tail**, the node's result *is* the array. It implies a dependency edge into the
@@ -673,7 +691,19 @@ Rules:
   expanded def compiles **byte-identical** to its hand-cloned twin.
 - A leftover reference to the template id itself (`${review.output}`, `depends_on: [review]`, a gate
   `after: review`) is **not** rewritten — after expansion the template id no longer exists, so the
-  ordinary unknown-node checks block it. Consume the fan-out via `inputs_each` or the generated ids.
+  ordinary unknown-node checks block it. Consume the fan-out via `inputs_each`, the
+  **panel-aggregate ref** `${review[].<field>}` (below), or the generated ids.
+
+> **Consuming a panel as one array — `${<panel>[].<field>}`.** `inputs_each` aggregates a panel into a
+> *map* (one input key per sibling) — handy for a fan-in microskill, but it cannot feed a `for_each`
+> and it gives the consumer N keys, not one list. The **panel-aggregate ref** `${<panel>[].<field>}`
+> (§4) is the array counterpart: it flattens one output `<field>` across the panel's siblings into a
+> single `[…].flat()` list, usable **both** as a `for_each` source and as an `inputs` value, composing
+> under `.flat()` for multiple panels (`${[review[].findings, xreview[].findings].flat()}`). This is
+> what lets a `verify` node fan out per-finding directly over a `review` panel — and a `synth` node
+> take the same flattened list — with **no** intermediate fan-in node. Prefer it over a fan-in
+> microskill when the consumer only needs the concatenated array (the create-pipeline RVS chain uses
+> exactly this: `verify for_each: ${review[].findings}` + `synth findings: ${review[].findings}`).
 
 ---
 

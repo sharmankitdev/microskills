@@ -116,7 +116,7 @@ workflows:
 # production rewire UNWIRED refine-requirements from the create pipelines, so it is no
 # longer pulled into the base set.
 MISSING_BASE = {"run-validators", "build-catalog-index",
-                "review-dimension", "collect-findings", "verify-finding",
+                "review-dimension", "verify-finding",
                 "synthesize-review", "bundle-draft",
                 "implement-rvs", "plan-rvs"}
 

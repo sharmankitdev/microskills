@@ -37,10 +37,12 @@ def test_plan_rvs_workflow_create_is_loopless():
     # A loop-less single pass — one segment, NO checkpoint (no loop, no on_exhaust gate).
     s = _summary("workflow-create")
     assert s["checkpoints"] == 0, s["sequence"]
+    # No collect node — verify fans out directly over the review panel via
+    # ${review[].findings} (the panel-aggregate ref).
     assert s["sequence"] == ["segment[plan,review_plan_wf_completeness,"
                              "review_plan_wf_graph_correctness,review_plan_wf_control_flow,"
                              "review_plan_wf_reuse_survey,review_plan_wf_scope_fit,"
-                             "review_plan_wf_name_capability,collect,verify,synth]"], s["sequence"]
+                             "review_plan_wf_name_capability,verify,synth]"], s["sequence"]
 
 
 def test_plan_rvs_microskill_create_is_loopless():

@@ -1,7 +1,8 @@
 version: 1
 # plan-rvs / microskill-create — retarget the plan critique to the MICROSKILL domain, LOOP-LESS
-# (single pass; the host's approve_plan gate is the backstop). The planner + critique panel +
-# fan-in + verify switch to the ms plan-stage profiles; synth (create-plan-rvs) is domain-neutral.
+# (single pass; the host's approve_plan gate is the backstop). The planner + critique panel + verify
+# switch to the ms plan-stage profiles; synth (create-plan-rvs) is domain-neutral. verify fans out
+# directly over the panel via ${review[].findings} (no collect fan-in node).
 # Swapping review.expand.over MUST co-patch loop.body — but the base is loop-less, so there is no
 # loop to co-patch here (the *-autonomous variant carries the ms loop body).
 nodes:
@@ -17,7 +18,5 @@ nodes:
           - plan-ms-output-contract
           - plan-ms-name-capability
           - plan-ms-failure-coverage
-    - id: collect
-      customize: { profile: plan-ms-create }
     - id: verify
       customize: { profile: plan-microskill }

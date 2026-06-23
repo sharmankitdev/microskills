@@ -1,7 +1,8 @@
 """
-Coverage for the bundle-draft script + microskill and the two combined RVS
-profiles it wires (`collect-findings/wf-create-all`,
-`verify-finding/workflow-draft-xref`).
+Coverage for the bundle-draft script + microskill and the combined RVS verify
+profile it wires (`verify-finding/workflow-draft-xref`). (The collect-findings
+fan-in microskill it formerly also covered was deleted — verify reads the review
+panels directly via the panel-aggregate ref.)
 
 These tests were split out of the retired test_rewire_build_workflow_from_plan.py
 (2026-06-21 production rewire). The BWFP-specific group (test_bwfp_*) was retired
@@ -14,10 +15,8 @@ in-scope for the create pipelines:
     and is base-tagged. bundle-draft is consumed by implement-rvs
     (catalog/workflow-defs/implement-rvs/WORKFLOW.yaml: the `bundle`/`bundle_xref`
     nodes);
-  * the combined profiles — `wf-create-all` registers exactly the 7 wf + 3 cross
-    fan-in keys (the union of the shipped wf-create + cross-create profiles), and
-    `workflow-draft-xref` swaps only artifact_kind to the bundle+index phrasing,
-    no forbidden overlay keys.
+  * the combined verify profile — `workflow-draft-xref` swaps only artifact_kind to
+    the bundle+index phrasing, no forbidden overlay keys.
 
 Hermetic where it can be; the resolve/validate tests intentionally point at the
 real catalog.
@@ -184,23 +183,10 @@ def _raw(path):
     return yaml.safe_load(path.read_text())
 
 
-def test_wf_create_all_is_the_union_of_wf_and_cross_keys():
-    allk = set(_raw(MS_ROOT / "collect-findings" / "profiles" / "wf-create-all.yaml")["inputs"])
-    wf = set(_raw(MS_ROOT / "collect-findings" / "profiles" / "wf-create.yaml")["inputs"])
-    cross = set(_raw(MS_ROOT / "collect-findings" / "profiles" / "cross-create.yaml")["inputs"])
-    # exactly the union of the shipped wf-create + cross-create key sets — 10 keys,
-    # = the fan-out item names with '-' -> '_' (the inputs_each desugar contract)
-    assert allk == wf | cross
-    assert allk == {d.replace("-", "_") for d in WF_DIMS + CROSS_DIMS}
-    assert len(allk) == 10
-
-
-def test_wf_create_all_resolves():
-    rc, data, err = _resolve("collect-findings", "wf-create-all")
-    assert rc == 0 and data, err
-    # collect-findings overlays only register input names; the {findings,count}
-    # schema must stay inherited from base (a replaced schema would break the join)
-    assert set(data["output_schema"]["required"]) == {"findings", "count"}
+# NOTE: the collect-findings fan-in microskill (and its wf-create-all / wf-create /
+# cross-create registration profiles) was DELETED — verify now fans out directly over
+# the review panels via ${[review[].findings, xreview[].findings].flat()} (the
+# panel-aggregate ref), so there are no per-dimension collect input keys to pin here.
 
 
 def test_workflow_draft_xref_profile():

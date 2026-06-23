@@ -1,32 +1,33 @@
 """
 Tests for the create-domain review CONTENT (§8 step 4): the 14 microskill + 7
-workflow `review-dimension` rubric overlays, the 2 `collect-findings` fan-in
-registration profiles (ms-create / wf-create), and the 2 `verify-finding`
-adversarial-verify profiles (microskill-draft / workflow-draft).
+workflow `review-dimension` rubric overlays, and the 2 `verify-finding`
+adversarial-verify profiles (microskill-draft / workflow-draft). (The 2
+`collect-findings` fan-in registration profiles it formerly also covered were
+deleted — verify reads the review panel directly via the panel-aggregate ref.)
 
-These profiles re-aim the existing review-dimension / collect-findings /
-verify-finding generics at a microskill draft bundle and a workflow draft bundle
-instead of a code diff. They are pure additive YAML overlays — no body, schema,
-or script change.
+These profiles re-aim the existing review-dimension / verify-finding generics at a
+microskill draft bundle and a workflow draft bundle instead of a code diff. They
+are pure additive YAML overlays — no body, schema, or script change.
 
 The unit tests:
   * resolve each review-dimension / verify-finding profile through the same
     resolve-microskill subprocess the dispatcher uses, asserting a clean resolve
     and FULL {{dimension}}/{{artifact_kind}} substitution (no leftover tokens);
-  * assert the four-way naming invariant on the raw profile bytes — the profile
+  * assert the three-way naming invariant on the raw profile bytes — the profile
     FILENAME == vars.dimension == the single context.snippets entry named
-    <dimension>-rubric, and the collect-findings input key is that same name with
-    '-' -> '_' (the inputs_each desugar contract);
+    <dimension>-rubric (which is also the generated expand fan-out node suffix with
+    '-' -> '_', so the panel-aggregate ref ${review[].findings} resolves);
   * assert NO forbidden inputs / runtime / output_schema key in any overlay (they
     all inherit from base; redeclaring output_schema would silently drop the
     {dimension, findings} contract the collect/verify/synthesize chain joins on);
   * assert the load-bearing artifact_kind strings are exact AND consistent across
     the review-dimension panel and its paired verify-finding profile.
 
-The integration tests build a hermetic fan-out -> inputs_each collect -> for_each
-verify WORKFLOW.yaml in tmp_path (the same wiring §8 step 7 splices) and assert it
-validates + compiles against the REAL catalog microskills — proving every named
-profile resolves and the panel is joinable end to end.
+The integration tests build a hermetic fan-out -> for_each verify WORKFLOW.yaml in
+tmp_path (the same wiring §8 step 7 splices: verify fans out over the review panel
+via ${review[].findings}, no collect node) and assert it validates + compiles
+against the REAL catalog microskills — proving every named profile resolves and the
+panel is joinable end to end.
 
 Run: python3 -m pytest catalog/scripts/tests/test_create_domain_review_profiles.py -v
 """
@@ -41,7 +42,6 @@ import yaml
 REPO = Path(__file__).resolve().parents[3]
 MS_ROOT = REPO / "catalog" / "microskills"
 RD = MS_ROOT / "review-dimension"
-CF = MS_ROOT / "collect-findings"
 VF = MS_ROOT / "verify-finding"
 RESOLVE = REPO / "catalog" / "scripts" / "resolve-microskill"
 VALIDATE_WF = REPO / "catalog" / "scripts" / "validate-workflow"
@@ -174,29 +174,10 @@ def test_wf_profiles_no_forbidden_keys_and_naming():
 
 
 # ---------------------------------------------------------------------------
-# Task 3 unit tests: collect-findings registration profiles (the inputs_each
-# fan-in keys) + verify-finding create profiles (artifact_kind swap only).
+# Task 3 unit tests: verify-finding create profiles (artifact_kind swap only).
+# (The collect-findings registration profiles were deleted — verify reads the
+# review panel directly via the panel-aggregate ref ${review[].findings}.)
 # ---------------------------------------------------------------------------
-
-
-def test_collect_ms_create_keys_match_dimensions():
-    doc = _raw(CF / "profiles" / "ms-create.yaml")
-    assert set(doc["inputs"]) == _us(MS_DIMS)
-    assert "output_schema" not in doc
-    # The fan-in profile only DECLARES input names; it must not redeclare the
-    # {findings, count} contract or carry a runtime block.
-    assert "runtime" not in doc
-    rc, _, err = _resolve("collect-findings", "ms-create")
-    assert rc == 0, err
-
-
-def test_collect_wf_create_keys_match_dimensions():
-    doc = _raw(CF / "profiles" / "wf-create.yaml")
-    assert set(doc["inputs"]) == _us(WF_DIMS)
-    assert "output_schema" not in doc
-    assert "runtime" not in doc
-    rc, _, err = _resolve("collect-findings", "wf-create")
-    assert rc == 0, err
 
 
 def _assert_verify_profile(profile, artifact_kind):
@@ -223,25 +204,26 @@ def test_verify_workflow_draft_profile():
 
 
 # ---------------------------------------------------------------------------
-# Task 4 integration: a hermetic fan-out -> collect -> verify panel validates +
-# compiles against the REAL catalog microskills. This is the four-way naming
-# invariant's live guard — the per-item customize.profile "{{each.item}}" forces
-# every review-dimension profile named in expand.over to resolve, inputs_each
-# desugars the fan-in keys against collect-findings' declared inputs, and the
-# collect/verify create profiles must exist and resolve.
+# Task 4 integration: a hermetic fan-out -> verify panel validates + compiles
+# against the REAL catalog microskills. This is the three-way naming invariant's
+# live guard — the per-item customize.profile "{{each.item}}" forces every
+# review-dimension profile named in expand.over to resolve, and the panel-aggregate
+# ref ${review[].findings} fans verify out over the generated siblings directly
+# (no collect node), so the verify create profiles must exist and resolve.
 # ---------------------------------------------------------------------------
 
 
-def _panel_yaml(dims, collect_profile, verify_profile, artifact_label):
-    """A 4-node panel: a stub agent producer emitting a bundle_path; a
+def _panel_yaml(dims, verify_profile, artifact_label):
+    """A 3-node panel: a stub agent producer emitting a bundle_path; a
     review-dimension expand TEMPLATE fanned over `dims` with a per-item
-    customize.profile; a collect-findings fan-in via inputs_each; a verify-finding
-    for_each over the collected findings. Built as explicit lines (no f-string
-    brace escaping of the YAML inline maps / ${refs} / {{each.item}} token)."""
+    customize.profile; a verify-finding for_each over the review panel via the
+    panel-aggregate ref ${review[].findings} (no collect fan-in node). Built as
+    explicit lines (no f-string brace escaping of the YAML inline maps / ${refs} /
+    {{each.item}} token)."""
     lines = [
         "version: 1",
         "name: panel-flow",
-        "description: hermetic create-domain review panel (fan-out -> collect -> verify)",
+        "description: hermetic create-domain review panel (fan-out -> verify over panel)",
         "nodes:",
         "  - id: producer",
         "    agent: stub-producer",
@@ -262,14 +244,10 @@ def _panel_yaml(dims, collect_profile, verify_profile, artifact_label):
     lines += [
         "    inputs:",
         "      artifact_path: ${producer.output.bundle_path}",
-        "  - id: collect",
-        "    use: collect-findings",
-        f"    customize: {{ profile: {collect_profile} }}",
-        "    inputs_each: review",
         "  - id: verify",
         "    use: verify-finding",
         f"    customize: {{ profile: {verify_profile} }}",
-        "    for_each: ${collect.output.findings}",
+        "    for_each: ${review[].findings}",
         "    as: finding",
         "    max_parallel: 4",
         "    inputs:",
@@ -312,8 +290,8 @@ def _compile_wf(defs_root, name):
     return proc.returncode, data, proc.stdout, proc.stderr
 
 
-def _assert_panel_wires(tmp_path, dims, collect_profile, verify_profile, label):
-    panel = _panel_yaml(dims, collect_profile, verify_profile, label)
+def _assert_panel_wires(tmp_path, dims, verify_profile, label):
+    panel = _panel_yaml(dims, verify_profile, label)
     defs_root, d = _build_world(tmp_path, panel)
     wf_path = d / "WORKFLOW.yaml"
 
@@ -326,10 +304,8 @@ def _assert_panel_wires(tmp_path, dims, collect_profile, verify_profile, label):
 
 
 def test_ms_panel_wires_endtoend(tmp_path):
-    _assert_panel_wires(tmp_path, MS_DIMS, "ms-create", "microskill-draft",
-                        "microskill draft")
+    _assert_panel_wires(tmp_path, MS_DIMS, "microskill-draft", "microskill draft")
 
 
 def test_wf_panel_wires_endtoend(tmp_path):
-    _assert_panel_wires(tmp_path, WF_DIMS, "wf-create", "workflow-draft",
-                        "workflow draft")
+    _assert_panel_wires(tmp_path, WF_DIMS, "workflow-draft", "workflow draft")

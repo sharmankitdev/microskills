@@ -435,6 +435,123 @@ def test_nested_field_path_checks_first_segment_only(tmp_path):
                for i in data2["issues"])
 
 
+# --- PANEL-AGGREGATE ref: ${<panel>[].<field>} dep-inference + field-check ---
+
+PANEL_FLOW = """\
+version: 1
+name: panel-flow
+nodes:
+  - id: review
+    agent: rev
+    expand:
+      over: [a, b, c]
+    prompt: review {{each.item}}
+    output_schema:
+      type: object
+      required: [findings]
+      properties:
+        findings: { type: array }
+  - id: verify
+    agent: ver
+    for_each: ${review[].findings}
+    as: f
+    prompt: verify ${f}
+    output_schema:
+      type: object
+      properties:
+        ok: { type: boolean }
+  - id: synth
+    agent: syn
+    prompt: synth
+    inputs:
+      findings: ${review[].findings}
+    output_schema:
+      type: object
+      properties:
+        verdict: { type: string }
+output:
+  from: synth
+"""
+
+
+def test_panel_ref_infers_edges_on_all_siblings_and_passes(tmp_path):
+    # S-INFER: ${review[].findings} expands to refs on every generated sibling, so
+    # the edges are inferred (no explicit depends_on) and validation passes with no
+    # spurious block/warn — and S-FIELD is satisfied (findings is declared).
+    rc, data, _ = run(write_wf(tmp_path, PANEL_FLOW))
+    assert rc == 0, data
+    assert data["pass"] is True
+    assert all(i["severity"] != "block" for i in data["issues"])
+
+
+def test_panel_ref_field_check_per_sibling_blocks(tmp_path):
+    # S-FIELD: a panel ref to a field NOT declared by the siblings' schema blocks —
+    # once per sibling (the field-check runs over each enumerated sibling ref).
+    body = PANEL_FLOW.replace("${review[].findings}", "${review[].nofield}")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    msgs = [i["message"] for i in data["issues"] if i["severity"] == "block"]
+    assert any("review_a" in m and "does not declare" in m for m in msgs)
+    assert any("review_b" in m and "nofield" in m for m in msgs)
+
+
+def test_panel_ref_unknown_panel_id_blocks(tmp_path):
+    body = PANEL_FLOW.replace("${review[].findings}", "${ghost[].findings}", 1)
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    assert any("unknown expand template id 'ghost'" in i["message"]
+               for i in data["issues"])
+
+
+def test_panel_ref_malformed_blocks(tmp_path):
+    body = PANEL_FLOW.replace("for_each: ${review[].findings}",
+                              "for_each: ${review[]}")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    assert any("malformed panel ref" in i["message"] for i in data["issues"])
+
+
+def test_panel_ref_two_panels_compose_passes(tmp_path):
+    body = """\
+version: 1
+name: panel-two
+nodes:
+  - id: review
+    agent: rev
+    expand:
+      over: [a, b]
+    prompt: r {{each.item}}
+    output_schema:
+      type: object
+      properties:
+        findings: { type: array }
+  - id: xreview
+    agent: rev
+    expand:
+      over: [c]
+    prompt: x {{each.item}}
+    output_schema:
+      type: object
+      properties:
+        findings: { type: array }
+  - id: verify
+    agent: ver
+    for_each: ${[review[].findings, xreview[].findings].flat()}
+    as: f
+    prompt: verify ${f}
+    output_schema:
+      type: object
+      properties:
+        ok: { type: boolean }
+output:
+  from: verify
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 0, data
+    assert data["pass"] is True
+    assert all(i["severity"] != "block" for i in data["issues"])
+
+
 # --- S-LOOP: loop-body contiguity ---
 
 def test_loop_body_split_by_orchestrator_blocks(tmp_path):
