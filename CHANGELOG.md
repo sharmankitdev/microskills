@@ -1,3 +1,13 @@
+## [0.39.0](https://github.com/sharmankitdev/microskills/compare/v0.38.0...v0.39.0) (2026-06-23)
+
+### ⚠ BREAKING CHANGES
+
+* **microskill:** relax linearity — single-purpose black-box microskills (#43)
+
+### Features
+
+* **microskill:** relax linearity — single-purpose black-box microskills ([#43](https://github.com/sharmankitdev/microskills/issues/43)) ([a617f2f](https://github.com/sharmankitdev/microskills/commit/a617f2fd879c2ad7492207729098ccf30ed07fb5))
+
 ## [0.38.0](https://github.com/sharmankitdev/microskills/compare/v0.37.0...v0.38.0) (2026-06-23)
 
 ### Features
