@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""
+plan-signature-diff — deterministic, agent-independent load-bearing-signature diff
+between a before-snapshot and an edited plan YAML.
+
+Usage:
+  plan-signature-diff --before <path> --after <path> --domain <microskill|workflow>
+
+The conductor's tiered-revise flow uses this to OVERRIDE a classifier subagent's
+"minor" verdict when an in-place plan edit actually changed identity / contract /
+dependencies — the agent's classification is never trusted for the safety-critical
+decision. A changed SIGNATURE means downstream consumers (recorded metadata, the
+provision/missing-microskills set, what gets built) would read something stale, so
+the edit is load-bearing and must take the full re-plan path.
+
+LOAD-BEARING SIGNATURE — the fields that change identity / contract / dependencies:
+  microskill:
+    - name                  (component name — recorded metadata + filename)
+    - inputs (the contract) = sorted [{name, required, type}] over inputs
+                              (DEFAULT VALUES and descriptions EXCLUDED)
+    - output_schema         (the output contract object)
+  workflow:
+    - name
+    - referenced_components = sorted set of every use:/agent:/workflow: target
+                              across the planned nodes (drives missing_microskills)
+    - node_ids              = sorted node-id set
+    - inputs                = sorted [{name, required}] over declared workflow inputs
+    - output_from           = output.from
+  Excluded everywhere (cosmetic / non-load-bearing): descriptions, prose, step
+  wording, input DEFAULT values, comments.
+
+Output (stdout): JSON {"changed": bool, "changed_fields": [str]}, exit 0.
+Exit codes: 0 ok; 2 environment error (missing dep / unreadable or malformed YAML /
+a plan that is not a mapping — emitted as a JSON {error} on stderr, never a raw
+traceback, matching the sibling scripts).
+"""
+import argparse
+import json
+import sys
+
+try:
+    import yaml
+except ImportError:
+    print(json.dumps({"error": "PyYAML not installed. pip3 install pyyaml"}), file=sys.stderr)
+    sys.exit(2)
+
+
+class DiffError(Exception):
+    """An unreadable / malformed / non-mapping plan YAML — surfaced as a JSON
+    {error} + exit 2, never a raw traceback (matches the sibling scripts)."""
+
+
+def _load(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            doc = yaml.safe_load(f)
+    except FileNotFoundError:
+        raise DiffError(f"file not found: {path}")
+    except (OSError, UnicodeDecodeError) as e:
+        raise DiffError(f"cannot read {path}: {e}")
+    except yaml.YAMLError as e:
+        raise DiffError(f"invalid YAML in {path}: {e}")
+    if not isinstance(doc, dict):
+        raise DiffError(f"plan YAML is not a mapping: {path}")
+    return doc
+
+
+def _ms_signature(doc):
+    inputs = []
+    for i in (doc.get("inputs") or []):
+        if isinstance(i, dict):
+            inputs.append({"name": i.get("name"),
+                           "required": bool(i.get("required", False)),
+                           "type": i.get("type")})
+    inputs.sort(key=lambda d: (d["name"] or ""))
+    return {
+        "name": doc.get("name"),
+        "inputs": inputs,
+        "output_schema": doc.get("output_schema"),
+    }
+
+
+def _wf_signature(doc):
+    nodes = doc.get("nodes")
+    if not isinstance(nodes, list):
+        nodes = []
+    refs, ids = set(), []
+    for n in nodes:
+        if not isinstance(n, dict):
+            continue
+        if n.get("id"):
+            ids.append(n["id"])
+        for k in ("use", "agent", "workflow"):
+            if isinstance(n.get(k), str):
+                refs.add(n[k])
+    wf_inputs = []
+    raw_inputs = doc.get("inputs")
+    if isinstance(raw_inputs, dict):
+        for name, spec in raw_inputs.items():
+            wf_inputs.append({"name": name,
+                              "required": bool((spec or {}).get("required", False))})
+    wf_inputs.sort(key=lambda d: (d["name"] or ""))
+    output = doc.get("output")
+    output_from = output.get("from") if isinstance(output, dict) else None
+    return {
+        "name": doc.get("name"),
+        "referenced_components": sorted(refs),
+        "node_ids": sorted(ids),
+        "inputs": wf_inputs,
+        "output_from": output_from,
+    }
+
+
+def _signature(doc, domain):
+    return _ms_signature(doc) if domain == "microskill" else _wf_signature(doc)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--before", required=True)
+    ap.add_argument("--after", required=True)
+    ap.add_argument("--domain", required=True, choices=["microskill", "workflow"])
+    args = ap.parse_args()
+    try:
+        before = _signature(_load(args.before), args.domain)
+        after = _signature(_load(args.after), args.domain)
+    except DiffError as e:
+        print(json.dumps({"error": str(e)}), file=sys.stderr)
+        sys.exit(2)
+    changed_fields = [k for k in before if before.get(k) != after.get(k)]
+    print(json.dumps({"changed": bool(changed_fields),
+                      "changed_fields": changed_fields}, indent=2))
+
+
+if __name__ == "__main__":
+    main()
