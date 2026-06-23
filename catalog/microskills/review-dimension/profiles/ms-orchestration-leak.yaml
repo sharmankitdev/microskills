@@ -1,0 +1,36 @@
+version: 1
+
+# ms-orchestration-leak lens overlay for review-dimension (create pipeline). A microskill is a
+# single black-box unit: it may branch, loop, use tools, and even pause for a human (declare
+# AskUserQuestion in runtime.allowed_tools and the compiler runs it at an orchestrator
+# checkpoint — that is LEGITIMATE, never a leak). The two things a body genuinely cannot express
+# are spawning a sub-agent and calling another registered component — those compose in the
+# workflow DAG, not a body. This lens flags ONLY those two. A plain list REPLACES base's snippet.
+vars:
+  dimension: ms-orchestration-leak
+  artifact_kind: microskill draft bundle (MICROSKILL.md + profiles/base.yaml, concatenated)
+
+context:
+  snippets:
+    - name: ms-orchestration-leak-rubric
+      text: >-
+        Orchestration-leak rubric for a microskill draft bundle — answer "does this body try to
+        spawn a sub-agent or call another registered component?". A microskill is one unit: it
+        may branch, loop, use tools, and pause for a human — an AskUserQuestion in
+        runtime.allowed_tools (or a human-approval / confirmation step) is LEGITIMATE, because the
+        compiler runs such a microskill at an orchestrator checkpoint; NEVER flag a human gate,
+        a confirmation, or AskUserQuestion as a leak. The only true leaks are the two things a
+        body cannot do, which belong in the DAG: dispatching / spawning / delegating to a
+        sub-agent, and invoking another registered microskill / agent / workflow by name. Flag
+        only those: a step that hands work to another agent ("dispatch a worker to finish the
+        rest", "have a subagent classify each item"); a step that drives another registered
+        component ("run the task-plan microskill over the result", "call review-dimension for
+        each file"). Internal branches, loops, and tool calls are NOT leaks — the body is a black
+        box. Severity mapping: a genuine sub-agent spawn or cross-component call a single
+        microskill cannot perform = blocker (the unit must become a workflow); an ambiguous
+        passage that probably delegates to an agent or another component = major; prose that
+        merely mentions another component as context without instructing a call = minor. Set each
+        finding's file to the real source file per the bundle's provenance markers (MICROSKILL.md)
+        and line to that file's real line number — the refute pass and fix step read the real
+        source. Do not raise ms-atomicity-single-purpose (whole-skill single purpose) concerns
+        under this rubric — that sibling lens owns them.

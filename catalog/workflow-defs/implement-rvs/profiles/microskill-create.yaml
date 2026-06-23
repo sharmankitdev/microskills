@@ -1,7 +1,7 @@
 version: 1
 # implement-rvs / microskill-create — retarget the workflow-domain RVS (baked in WORKFLOW.yaml)
 # to the MICROSKILL domain: the implementer + floor switch to the ms validators, the review panel
-# swaps the 7 wf dimensions for the 11 ms dimensions, and verify switches to the ms combined
+# swaps the 7 wf dimensions for the 10 ms dimensions, and verify switches to the ms combined
 # adversarial seat (it fans out over both panels via ${[review[].findings, xreview[].findings].flat()}
 # — no collect fan-in node). The xreview cross panel + synth (create-impl-rvs) are domain-neutral and
 # stay. A profile that swaps review.expand.over MUST co-patch loop.body to the new generated
@@ -13,13 +13,12 @@ nodes:
       customize: { profile: microskill }
     - id: floor
       customize: { profile: microskill }
-    # Review panel → the 11 artifact-stage microskill dimensions (expand.over REPLACES wholesale).
+    # Review panel → the 10 artifact-stage microskill dimensions (expand.over REPLACES wholesale).
     - id: review
       expand:
         over:
           - ms-atomicity-single-purpose
-          - ms-single-linear-path-semantic
-          - ms-step-atomicity-linearity
+          - ms-orchestration-leak
           - ms-inputs-contract-adequacy
           - ms-output-contract-appropriate
           - ms-failure-modes-coverage
@@ -37,8 +36,8 @@ nodes:
 # via ${[review[].findings, xreview[].findings].flat()}.
 loop:
   body: [implement, catalog_index, bundle, bundle_xref, floor,
-         review_ms_atomicity_single_purpose, review_ms_single_linear_path_semantic,
-         review_ms_step_atomicity_linearity, review_ms_inputs_contract_adequacy,
+         review_ms_atomicity_single_purpose, review_ms_orchestration_leak,
+         review_ms_inputs_contract_adequacy,
          review_ms_output_contract_appropriate, review_ms_failure_modes_coverage,
          review_ms_output_section_vs_schema_fields, review_ms_step_input_reference_undeclared,
          review_ms_declared_input_unused, review_ms_purpose_contract_fidelity,

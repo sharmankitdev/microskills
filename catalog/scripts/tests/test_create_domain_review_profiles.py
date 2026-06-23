@@ -57,8 +57,7 @@ _ENV = {**os.environ, "MICROSKILLS_TEMPLATES_ROOT": str(REPO / "templates")}
 # the collect-findings input key + the generated expand fan-out node suffix.
 MS_DIMS = [
     "ms-atomicity-single-purpose",
-    "ms-single-linear-path-semantic",
-    "ms-step-atomicity-linearity",
+    "ms-orchestration-leak",
     "ms-inputs-contract-adequacy",
     "ms-output-contract-appropriate",
     "ms-failure-modes-coverage",
@@ -69,7 +68,6 @@ MS_DIMS = [
     "ms-description-trigger-quality",
     "shape-not-faithfulness-fabrication-passes",
     "additionalprops-and-empty-content-permissive",
-    "unanalyzable-fork-guard-no-signal",
 ]
 WF_DIMS = [
     "wf-dag-decomposition-correctness",
@@ -119,7 +117,7 @@ def _raw(path):
 
 
 def test_inventory_sizes():
-    assert len(MS_DIMS) == 14 and len(set(MS_DIMS)) == 14
+    assert len(MS_DIMS) == 12 and len(set(MS_DIMS)) == 12
     assert len(WF_DIMS) == 7 and len(set(WF_DIMS)) == 7
 
 

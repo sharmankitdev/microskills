@@ -1,5 +1,5 @@
 {
-  "manifest_hash": "28913c0e72cb889a9ca2c4cbe05d4d6b8bf2b490550d2ed92d8eac58f74f91fd",
+  "manifest_hash": "7e94657135747d70f59ab8beaa63dcdfe9a9479c849b7107b92b4e51e0a9f3a7",
   "name": "microskill-create",
   "node_fingerprints": {
     "advise": "01820cd75c406b7bcac77fd2cee4a4957d145097c1518277338b7e8747d04640",
@@ -9,19 +9,18 @@
     "impl_rvs__catalog_index": "1ed7c7d4b5545bf7c491cd231745060166d157584d77785147e96e4a68f3c33d",
     "impl_rvs__floor": "6d8c5e88e9f5e678552d4452fc4510efdda57f1e1bd3266ee0ec8601da3efd4d",
     "impl_rvs__implement": "8b892233d2d32bfeb3373c80080a5fadb2219c726d24afbb1e796655dd22f277",
-    "impl_rvs__review_ms_atomicity_single_purpose": "1e932c2fedd445611037d794f622a693e475ec369d4559cec1ae632dcc7d04bf",
+    "impl_rvs__review_ms_atomicity_single_purpose": "e75fe9884eee6796278a71090376f31c994734f2c25002f82872740acb1cbc72",
     "impl_rvs__review_ms_declared_input_unused": "0ecc2f4b8c688ab5d32837ca232d6a8be010fa42ed16392b5437f3aa3f11f7ff",
     "impl_rvs__review_ms_description_trigger_quality": "6bd5e954204df44a3826877d374628d902c4482aaa1ba66df3a5d23e2363a327",
     "impl_rvs__review_ms_failure_modes_coverage": "d1faedeb12f8470327f2ff80d959b52a88e8ab3598aa18f80977bca48530acaa",
     "impl_rvs__review_ms_inputs_contract_adequacy": "e86ddab6083602315ccfaee4d35242188fbc936bc42154f9a719a7eda6762c4d",
+    "impl_rvs__review_ms_orchestration_leak": "13b427dbe1cc9f3bcf19d884aed25364e9fecdb3b5e50d5de9923b54d9f3a4d6",
     "impl_rvs__review_ms_output_contract_appropriate": "afecdc6cef067521cf1149ffb960f7320256183a6c78cf86801861e1b57e28f1",
     "impl_rvs__review_ms_output_section_vs_schema_fields": "e83f57dd2b2d2f2ea6f0054cc9b662474c84a9d85cb1f125f093deabab3f3812",
     "impl_rvs__review_ms_purpose_contract_fidelity": "974006ea492aae6e5e02494525947a6e66846b62e822aa4562ab6607b57877cf",
-    "impl_rvs__review_ms_single_linear_path_semantic": "fa778f7442f42bcf0e918b0c80a604fa0bf07929fe77a71cafc9e71c0aa7e6bf",
-    "impl_rvs__review_ms_step_atomicity_linearity": "65fef1fe6b393f48845b84ec2e90c3b3b02783034821a04c3642147d5eadef18",
     "impl_rvs__review_ms_step_input_reference_undeclared": "ef1400c6fa9d884fb45db0a7b9995a2904da201afc4b9454e2ceaec6ace61210",
-    "impl_rvs__synth": "72bea5ddcc4a10221ea42fa1a3c8f42778df0d8bde8452aabf19c4414c80bb18",
-    "impl_rvs__verify": "fd81b4a143cbcb3440924de77b64eb69745ff33a30d90622f762817583ceb25a",
+    "impl_rvs__synth": "5d83e74189490390ed9cf9aa4cb3e31a370eac1506ec0f1a1e8b8034a6ab24b4",
+    "impl_rvs__verify": "539605f9d55827d33ceebb93418d27195a6f9cddd77c41f523bcffac3b4e71a6",
     "impl_rvs__xreview_duplicate_capability": "abb9da9bf11c128fa418f915a8adb4f499fd10e98922993a379ec091564557cf",
     "impl_rvs__xreview_naming_collision": "265e125bef3ca1dfbe0d043c42760593de0e3866080d2fd2c1cd1730c99d6522",
     "impl_rvs__xreview_reverse_consumer": "2b2d4d526dc5803385e3745b53412ca86e7ea6ca5f2415b23d0f7dcadd739fd9",
@@ -38,6 +37,6 @@
   "profile_used": "base",
   "segment_digests": {
     "seg-1.js": "a16716725be13e2eca783af3d074c8afe1b4fcd9e8d2e805f6c171b39b99a3a7",
-    "seg-2.js": "63a1b22631a618b20da6485dc2c872a6618bc0d68548b1fdff5ed15924417ba3"
+    "seg-2.js": "6df2040f9800b4d3065e77d9ed004796269a0d36846b974338953f1c899ad6c1"
   }
 }
