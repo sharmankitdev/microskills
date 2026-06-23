@@ -35,7 +35,7 @@ microskills is a lightweight set of **building blocks** you piece together to co
 flowchart TB
     subgraph compose["Author + compose — declarative"]
         direction LR
-        MS["<b>Microskill</b><br/>atomic · linear · single-purpose"]
+        MS["<b>Microskill</b><br/>single-purpose · black-box · reusable"]
         WF["<b>Workflow</b><br/>DAG of microskills + agents + nested workflows"]
         MS --> WF
     end
@@ -75,8 +75,8 @@ flowchart TB
 
 ## The four pillars
 
-### 1. Microskills — atomic, single-purpose, reusable
-One unit of work with a declared **input contract**, bounded customization knobs (**profiles**), and an explicit **output schema**. No branching, no hidden state — `validate-microskill` regex-rejects control-flow keywords (`if` / `else` / `for each` / `retry` / `when…then` / …) and caps steps to a single linear path (≤10). The payoff: a microskill does *exactly one thing*, so it plugs into any workflow that needs that thing.
+### 1. Microskills — single-purpose, reusable black boxes
+One unit of work with a declared **input contract**, bounded customization knobs (**profiles**), and an explicit **output schema**. Its internals are a black box — it may branch, loop, classify, or even pause for a human (declare `AskUserQuestion` and the compiler runs it at an orchestrator checkpoint); `validate-microskill` enforces only structure, never internal control flow. The payoff: a microskill does *exactly one job*, so it plugs into any workflow that needs that job. It graduates to a **workflow** when it must compose *other* components or orchestrate a multi-node graph.
 
 ### 2. Workflows — compiled, deterministic orchestrators
 A declarative `WORKFLOW.yaml` DAG that composes microskills, agents, and even nested workflows. All control flow — gates, loops, conditionals (`when`), fan-out (`for_each`) — lives in the YAML. `compile-workflow` then partitions it into **autonomous background segments** (run on Claude Code's native Workflow engine) separated by **human checkpoints** — and it's deterministic: *same inputs → byte-identical output*. Determinism comes from the compile step, not from hoping the model behaves.
