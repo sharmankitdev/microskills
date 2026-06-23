@@ -8,52 +8,85 @@ Usage:
 
 The conductor's tiered-revise flow uses this to OVERRIDE a classifier subagent's
 "minor" verdict when an in-place plan edit actually changed identity / contract /
-dependencies — the agent's classification is never trusted for the safety-critical
-decision. A changed SIGNATURE means downstream consumers (recorded metadata, the
-provision/missing-microskills set, the profiles/components that get built) would
-read something stale, so the edit is load-bearing and must take the full re-plan
-path.
+dependencies / control flow — the agent's classification is never trusted for the
+safety-critical decision. A changed SIGNATURE means downstream consumers (recorded
+metadata, the provision/missing-microskills set, the profiles/components that get
+built, the engine's control flow) would read something stale, so the edit is
+load-bearing and must take the full re-plan path. The guard errs TOWARD "changed":
+when in doubt it flags, because a false "changed" only costs a (correct) full
+re-plan, whereas a false "unchanged" would silently accept a contract-breaking edit.
 
 PLAN SHAPES (the two domains differ):
   microskill — a FLAT document (per microskill-create/references/planner.md):
     top-level name / description / inputs[] / steps / output_schema / ...
   workflow   — an OUTER doc (per workflow-create/references/planner.md):
     name / missing_microskills / scope_advisory, with the WORKFLOW design nested
-    in a `plan_yaml: |` BLOCK SCALAR. name + missing_microskills are read from the
-    OUTER doc; the design fields (nodes / inputs / gates / output / _new_profiles)
-    are read from the UNWRAPPED inner document.
+    in a `plan_yaml: |` BLOCK SCALAR. name / missing_microskills / scope_advisory
+    are read from the OUTER doc; the design fields (name / nodes / inputs / gates /
+    loop / output / _new_profiles) are read from the UNWRAPPED inner document.
 
-LOAD-BEARING SIGNATURE — the fields that change identity / contract / dependencies:
+LOAD-BEARING SIGNATURE — the fields that change identity / contract / dependencies /
+control flow:
   microskill:
     - name                  (component name — recorded metadata + filename)
     - inputs (the contract) = sorted [{name, required, type}] over inputs
                               (DEFAULT VALUES and descriptions EXCLUDED)
     - output_schema         (the output contract object)
+    - step_count            (number of steps — add/remove of a step registers;
+                              pure step WORDING / reorder stays non-load-bearing,
+                              by design — see the exclusions note below)
   workflow:
     - name                  (OUTER doc — recorded metadata + filename)
+    - design_name           (the INNER plan_yaml name — the value actually deployed
+                              as the WORKFLOW.yaml `name`; a divergent inner edit
+                              must register even if the outer name is untouched)
+    - scope_advisory        (OUTER doc — a downstream node branches on this recorded
+                              value; a file-edited advisory must register)
     - referenced_components = sorted set of every use:/agent:/workflow: target,
                               keyed by (kind, name) so a same-name dispatch-kind
                               swap also registers (drives missing_microskills)
     - node_ids              = sorted node-id set (the inner design)
     - node_profiles         = sorted [<id>:<customize.profile>] (what gets built)
+    - node_output_schemas   = sorted [{id, schema}] for every node carrying an
+                              output_schema (a narrowed/changed per-node output
+                              contract — what downstream refs read)
     - inputs                = sorted [{name, required, type, materialize}] over the
                               declared workflow inputs (DEFAULT VALUES EXCLUDED)
     - output_from           = output.from (the inner design)
     - gates                 = sorted [{id, after, type}] (gate topology)
+    - loop                  = {body: sorted ids, while, max_iters, carry: sorted
+                              keys} or null — captures a linear->loop conversion,
+                              a changed loop condition / bound, or a re-membered body
+    - node_control          = sorted [{id, when, for_each, depends_on}] over nodes
+                              carrying ANY control construct — captures a node
+                              gaining/losing a when guard, a for_each fan-out, or a
+                              pure-ordering depends_on edge
+    - edges                 = sorted [{node, refs}] — each node's ${...} ref targets
+                              (leading id) across its inputs / when / for_each, i.e.
+                              the data-flow edge set; captures a rewired edge
     - new_profiles          = sorted [{microskill, profile}] from _new_profiles
     - missing_microskills   = sorted [{name, requirement}] from the OUTER doc
                               (the provision set)
-  Excluded everywhere (cosmetic / non-load-bearing): descriptions, prose, step
-  wording, input DEFAULT values, comments.
+  Excluded everywhere (cosmetic / non-load-bearing): descriptions, prose, comments,
+  step WORDING and step REORDER (only step COUNT is tracked — wording is owned by
+  the floor validator + the human re-approval at the gate), input DEFAULT values.
+  INTENTIONALLY DEFERRED in the workflow signature (documented, not a gap): a pure
+  operator-only edit to a when/loop `while` expression that keeps the SAME referenced
+  ids (e.g. `== null` -> `!= null`) is not captured by node_control (presence-only) or
+  edges (ref-targets-only); the loop `while` raw value IS captured, so a loop-condition
+  edit registers, but a node-level `when` operator flip without a ref change does not —
+  accepted as a rare, low-risk corner the human re-approval backstops. `as:` on a
+  for_each is not separately fingerprinted (presence is).
 
 Output (stdout): JSON {"changed": bool, "changed_fields": [str]}, exit 0.
 Exit codes: 0 ok; 2 environment error (missing dep / unreadable or malformed YAML /
 a plan that is not a mapping / a malformed plan_yaml block / a non-mapping workflow
-input spec — emitted as a JSON {error} on stderr, never a raw traceback, matching
-the sibling scripts).
+input spec / an unorderable signature component — emitted as a JSON {error} on
+stderr, never a raw traceback, matching the sibling scripts).
 """
 import argparse
 import json
+import re
 import sys
 
 try:
@@ -63,10 +96,17 @@ except ImportError:
     sys.exit(2)
 
 
+# Leading identifier of a ${<id>...} reference (a data-flow edge target). Captures
+# `${collect.output.x}` -> "collect", `${workflow.inputs.y}` -> "workflow",
+# `${loop.output.z}` -> "loop". Whitespace after `${` is tolerated.
+REF_RE = re.compile(r"\$\{\s*([A-Za-z_][A-Za-z0-9_.-]*)")
+
+
 class DiffError(Exception):
     """An unreadable / malformed / non-mapping plan YAML (or a malformed nested
-    plan_yaml block / non-mapping workflow input spec) — surfaced as a JSON
-    {error} + exit 2, never a raw traceback (matches the sibling scripts)."""
+    plan_yaml block / non-mapping workflow input spec / an unorderable signature
+    component) — surfaced as a JSON {error} + exit 2, never a raw traceback
+    (matches the sibling scripts)."""
 
 
 def _load(path):
@@ -92,10 +132,14 @@ def _ms_signature(doc):
                            "required": bool(i.get("required", False)),
                            "type": i.get("type")})
     inputs.sort(key=lambda d: (d["name"] or ""))
+    steps = doc.get("steps")
     return {
         "name": doc.get("name"),
         "inputs": inputs,
         "output_schema": doc.get("output_schema"),
+        # step COUNT only — pure wording/reorder is non-load-bearing (the floor
+        # validator + the human gate re-approval own step quality).
+        "step_count": len(steps) if isinstance(steps, list) else 0,
     }
 
 
@@ -138,6 +182,38 @@ def _wf_inputs(inner):
     return out
 
 
+def _ref_targets(value, out):
+    """Collect the leading ${<id>...} identifiers reachable in a nested
+    str/list/dict value (the data-flow edge targets)."""
+    if isinstance(value, str):
+        for m in REF_RE.finditer(value):
+            out.add(m.group(1).split(".")[0])
+    elif isinstance(value, list):
+        for v in value:
+            _ref_targets(v, out)
+    elif isinstance(value, dict):
+        for v in value.values():
+            _ref_targets(v, out)
+
+
+def _loop_signature(inner):
+    loop = inner.get("loop")
+    if not isinstance(loop, dict):
+        return None
+    body = loop.get("body")
+    body_ids = sorted(
+        b.get("id") for b in body
+        if isinstance(b, dict) and b.get("id")) if isinstance(body, list) else []
+    carry = loop.get("carry")
+    carry_keys = sorted(carry.keys()) if isinstance(carry, dict) else []
+    return {
+        "body": body_ids,
+        "while": loop.get("while"),
+        "max_iters": loop.get("max_iters"),
+        "carry": carry_keys,
+    }
+
+
 def _wf_signature(doc):
     inner = _unwrap_inner(doc)
 
@@ -145,6 +221,7 @@ def _wf_signature(doc):
     if not isinstance(nodes, list):
         nodes = []
     refs, ids, profiles = set(), [], []
+    node_output_schemas, node_control, edges = [], [], []
     for n in nodes:
         if not isinstance(n, dict):
             continue
@@ -157,6 +234,27 @@ def _wf_signature(doc):
         cust = n.get("customize")
         if isinstance(cust, dict) and cust.get("profile") and nid:
             profiles.append(f"{nid}:{cust['profile']}")
+        if n.get("output_schema") is not None:
+            node_output_schemas.append({"id": nid, "schema": n.get("output_schema")})
+
+        # Control-flow fingerprint: capture a node only when it carries a control
+        # construct (a when guard, a for_each fan-out, or a pure-ordering edge).
+        has_when = n.get("when") is not None
+        has_for_each = n.get("for_each") is not None
+        deps = n.get("depends_on")
+        deps = sorted(str(d) for d in deps) if isinstance(deps, list) else []
+        if has_when or has_for_each or deps:
+            node_control.append({"id": nid, "when": has_when,
+                                 "for_each": has_for_each, "depends_on": deps})
+
+        # Data-flow edge set: the leading ids of every ${...} ref in this node's
+        # inputs / when / for_each (a ${id.output...} ref implies a dependency edge).
+        ref_set = set()
+        _ref_targets(n.get("inputs"), ref_set)
+        _ref_targets(n.get("when"), ref_set)
+        _ref_targets(n.get("for_each"), ref_set)
+        if ref_set:
+            edges.append({"node": nid, "refs": sorted(ref_set)})
 
     output = inner.get("output")
     output_from = output.get("from") if isinstance(output, dict) else None
@@ -167,9 +265,13 @@ def _wf_signature(doc):
             gates.append({"id": g.get("id"), "after": g.get("after"), "type": g.get("type")})
     gates.sort(key=lambda d: (d["id"] or "", d["after"] or ""))
 
+    # None-coerce the sort key (a half-written entry missing a microskill/profile
+    # must not raise an unorderable TypeError — that would break the {error}+exit-2
+    # contract; the wrapper in main() catches any residual case all the same).
     new_profiles = sorted(
         {(p.get("microskill"), p.get("profile"))
-         for p in (inner.get("_new_profiles") or []) if isinstance(p, dict)})
+         for p in (inner.get("_new_profiles") or []) if isinstance(p, dict)},
+        key=lambda t: (t[0] or "", t[1] or ""))
     new_profiles = [{"microskill": m, "profile": pr} for (m, pr) in new_profiles]
 
     # missing_microskills is read from the OUTER doc (the provision set) —
@@ -179,21 +281,38 @@ def _wf_signature(doc):
          for m in (doc.get("missing_microskills") or []) if isinstance(m, dict)),
         key=lambda d: (d["name"] or ""))
 
+    node_output_schemas.sort(key=lambda d: (d["id"] or ""))
+    node_control.sort(key=lambda d: (d["id"] or ""))
+    edges.sort(key=lambda d: (d["node"] or ""))
+
     return {
         "name": doc.get("name"),
+        "design_name": inner.get("name"),
+        "scope_advisory": doc.get("scope_advisory"),
         "referenced_components": sorted(refs),
         "node_ids": sorted(ids),
         "node_profiles": sorted(profiles),
+        "node_output_schemas": node_output_schemas,
         "inputs": _wf_inputs(inner),
         "output_from": output_from,
         "gates": gates,
+        "loop": _loop_signature(inner),
+        "node_control": node_control,
+        "edges": edges,
         "new_profiles": new_profiles,
         "missing_microskills": missing,
     }
 
 
 def _signature(doc, domain):
-    return _ms_signature(doc) if domain == "microskill" else _wf_signature(doc)
+    try:
+        return _ms_signature(doc) if domain == "microskill" else _wf_signature(doc)
+    except DiffError:
+        raise
+    except TypeError as e:
+        # Any residual unorderable comparison (a malformed plan with mixed types in
+        # a sort key) is surfaced as a clean {error}+exit 2, never a raw traceback.
+        raise DiffError(f"unorderable signature component: {e}")
 
 
 def main():

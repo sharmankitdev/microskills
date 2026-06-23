@@ -116,14 +116,28 @@ def test_description_change_is_unchanged(tmp_path):
                    MS_BASE.replace("Original description.", "Totally reworded description."))
     out = json.loads(_run(before, after).stdout)
     assert out["changed"] is False
+    assert out["changed_fields"] == []
 
 
 def test_step_wording_change_is_unchanged(tmp_path):
+    # Pure step WORDING (count unchanged) is non-load-bearing — step_count is the
+    # only step fingerprint, so a reword stays unchanged.
     before = _write(tmp_path, "before.yaml", MS_BASE)
     after = _write(tmp_path, "after.yaml",
                    MS_BASE.replace("Write the document.", "Write the requirements document to disk."))
     out = json.loads(_run(before, after).stdout)
     assert out["changed"] is False
+    assert out["changed_fields"] == []
+
+
+def test_step_add_is_load_bearing(tmp_path):
+    # Adding a step changes step_count even though wording/reorder do not.
+    before = _write(tmp_path, "before.yaml", MS_BASE)
+    after = _write(tmp_path, "after.yaml",
+                   MS_BASE.replace("  - Write the document.",
+                                   "  - Write the document.\n  - Validate the output."))
+    out = json.loads(_run(before, after).stdout)
+    assert out["changed"] is True and "step_count" in out["changed_fields"]
 
 
 def test_new_input_is_load_bearing(tmp_path):
@@ -221,6 +235,7 @@ def test_wf_default_value_change_is_unchanged(tmp_path):
     after = _write(tmp_path, "after.yaml", WF_BASE.replace("default: ./out", "default: ./dist"))
     out = json.loads(_run(before, after, domain="workflow").stdout)
     assert out["changed"] is False
+    assert out["changed_fields"] == []
 
 
 def test_wf_referenced_component_add_is_load_bearing(tmp_path):
@@ -229,6 +244,19 @@ def test_wf_referenced_component_add_is_load_bearing(tmp_path):
         "    - id: write\n      agent: prose-writer\n      prompt: Write the notes.",
         "    - id: enrich\n      use: summarize-diff\n      inputs:\n        x: 1\n"
         "    - id: write\n      agent: prose-writer\n      prompt: Write the notes."))
+    out = json.loads(_run(before, after, domain="workflow").stdout)
+    assert out["changed"] is True
+    assert "referenced_components" in out["changed_fields"]
+    assert "node_ids" in out["changed_fields"]
+
+
+def test_wf_referenced_component_remove_is_load_bearing(tmp_path):
+    # Removing the collect/extract-pr-links node drops a referenced component (and
+    # a node id) — both must register (mirror of the add case).
+    before = _write(tmp_path, "before.yaml", WF_BASE)
+    after = _write(tmp_path, "after.yaml", WF_BASE.replace(
+        "    - id: collect\n      use: extract-pr-links\n      inputs:\n"
+        "        changelog: ${workflow.inputs.changelog_path}\n", ""))
     out = json.loads(_run(before, after, domain="workflow").stdout)
     assert out["changed"] is True
     assert "referenced_components" in out["changed_fields"]
@@ -346,6 +374,117 @@ def test_wf_gate_add_is_load_bearing(tmp_path):
         "  output:\n    from: write"))
     out = json.loads(_run(before, after, domain="workflow").stdout)
     assert out["changed"] is True and "gates" in out["changed_fields"]
+
+
+def test_wf_node_output_schema_change_is_load_bearing(tmp_path):
+    # A per-node output_schema (the node's narrowed output contract — what
+    # downstream refs read) must register, not just output.from.
+    before = _write(tmp_path, "before.yaml", WF_BASE)
+    after = _write(tmp_path, "after.yaml", WF_BASE.replace(
+        "    - id: write\n      agent: prose-writer\n      prompt: Write the notes.",
+        "    - id: write\n      agent: prose-writer\n      prompt: Write the notes.\n"
+        "      output_schema:\n        type: object\n        properties:\n"
+        "          notes: { type: string }"))
+    out = json.loads(_run(before, after, domain="workflow").stdout)
+    assert out["changed"] is True and "node_output_schemas" in out["changed_fields"]
+
+
+def test_wf_scope_advisory_change_is_load_bearing(tmp_path):
+    # The OUTER-doc scope_advisory is a value a downstream node branches on — a
+    # file-edited advisory must register.
+    before = _write(tmp_path, "before.yaml", WF_BASE)
+    after = _write(tmp_path, "after.yaml", WF_BASE.replace(
+        "scope_advisory: null",
+        "scope_advisory:\n  kind: split\n  reason: too big\n  recommendation: split it"))
+    out = json.loads(_run(before, after, domain="workflow").stdout)
+    assert out["changed"] is True and "scope_advisory" in out["changed_fields"]
+
+
+def test_wf_inner_design_name_change_is_load_bearing(tmp_path):
+    # The INNER plan_yaml name is the value deployed as the WORKFLOW.yaml name —
+    # an inner-only edit (outer name untouched) must register via design_name.
+    before = _write(tmp_path, "before.yaml", WF_BASE)
+    # The inner name lives in the `plan_yaml` block, indented two spaces; the outer
+    # name has no leading space. Replacing the INDENTED form touches only the inner
+    # design name, leaving the outer name untouched.
+    after = _write(tmp_path, "after.yaml", WF_BASE.replace(
+        "  name: release-notes-pipeline", "  name: release-notes-builder"))
+    out = json.loads(_run(before, after, domain="workflow").stdout)
+    assert out["changed"] is True
+    assert "design_name" in out["changed_fields"]
+    # The OUTER name is unchanged by the indented-inner-only edit.
+    assert "name" not in out["changed_fields"]
+
+
+def test_wf_linear_to_loop_is_load_bearing(tmp_path):
+    # Wrapping nodes in a loop block (linear -> loop) must register via `loop`.
+    before = _write(tmp_path, "before.yaml", WF_BASE)
+    after = _write(tmp_path, "after.yaml", WF_BASE.replace(
+        "  output:\n    from: write",
+        "  loop:\n    while: ${write.output.again}\n    max_iters: 3\n"
+        "    body: [write]\n    carry:\n      acc: ${write.output.acc}\n"
+        "  output:\n    from: write"))
+    out = json.loads(_run(before, after, domain="workflow").stdout)
+    assert out["changed"] is True and "loop" in out["changed_fields"]
+
+
+def test_wf_node_when_guard_add_is_load_bearing(tmp_path):
+    # Adding a when guard to a node must register via node_control.
+    before = _write(tmp_path, "before.yaml", WF_BASE)
+    after = _write(tmp_path, "after.yaml", WF_BASE.replace(
+        "    - id: write\n      agent: prose-writer",
+        "    - id: write\n      when: ${collect.output.ok}\n      agent: prose-writer"))
+    out = json.loads(_run(before, after, domain="workflow").stdout)
+    assert out["changed"] is True and "node_control" in out["changed_fields"]
+
+
+def test_wf_depends_on_add_is_load_bearing(tmp_path):
+    # A pure-ordering depends_on edge (no ref) must register via node_control.
+    before = _write(tmp_path, "before.yaml", WF_BASE)
+    after = _write(tmp_path, "after.yaml", WF_BASE.replace(
+        "    - id: write\n      agent: prose-writer",
+        "    - id: write\n      depends_on: [collect]\n      agent: prose-writer"))
+    out = json.loads(_run(before, after, domain="workflow").stdout)
+    assert out["changed"] is True and "node_control" in out["changed_fields"]
+
+
+def test_wf_edge_rewire_is_load_bearing(tmp_path):
+    # Rewiring a node's ${...} input ref to a different upstream id must register
+    # via edges (the data-flow edge set), even with node ids unchanged.
+    before = _write(tmp_path, "before.yaml", WF_BASE)
+    after = _write(tmp_path, "after.yaml", WF_BASE.replace(
+        "changelog: ${workflow.inputs.changelog_path}",
+        "changelog: ${write.output.changelog}"))
+    out = json.loads(_run(before, after, domain="workflow").stdout)
+    assert out["changed"] is True and "edges" in out["changed_fields"]
+
+
+def test_wf_new_profiles_add_is_load_bearing(tmp_path):
+    # A _new_profiles entry in the inner plan_yaml drives what gets minted — an
+    # add must register via new_profiles.
+    before = _write(tmp_path, "before.yaml", WF_BASE)
+    after = _write(tmp_path, "after.yaml", WF_BASE.replace(
+        "  output:\n    from: write",
+        "  _new_profiles:\n    - {microskill: extract-pr-links, profile: lite}\n"
+        "  output:\n    from: write"))
+    out = json.loads(_run(before, after, domain="workflow").stdout)
+    assert out["changed"] is True and "new_profiles" in out["changed_fields"]
+
+
+def test_wf_new_profiles_same_both_sides_is_unchanged(tmp_path):
+    # The SAME _new_profiles set on both sides is non-load-bearing (pins the
+    # unchanged case for the new_profiles field).
+    with_np = WF_BASE.replace(
+        "  output:\n    from: write",
+        "  _new_profiles:\n    - {microskill: extract-pr-links, profile: lite}\n"
+        "  output:\n    from: write")
+    before = _write(tmp_path, "before.yaml", with_np)
+    # Reword the description only — new_profiles identical on both sides.
+    after = _write(tmp_path, "after.yaml",
+                   with_np.replace("Original workflow description.", "Reworded."))
+    out = json.loads(_run(before, after, domain="workflow").stdout)
+    assert out["changed"] is False
+    assert "new_profiles" not in out["changed_fields"]
 
 
 def test_wf_identical_is_unchanged(tmp_path):
