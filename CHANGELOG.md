@@ -1,3 +1,9 @@
+## [0.38.0](https://github.com/sharmankitdev/microskills/compare/v0.37.0...v0.38.0) (2026-06-23)
+
+### Features
+
+* **workflow:** agent-row profile labels, terminal abandon, and revise scratch-fold ([#42](https://github.com/sharmankitdev/microskills/issues/42)) ([f0eb93b](https://github.com/sharmankitdev/microskills/commit/f0eb93b0a5646456f569fd753beb1ce062016781))
+
 ## [0.37.0](https://github.com/sharmankitdev/microskills/compare/v0.36.0...v0.37.0) (2026-06-23)
 
 ### Features
