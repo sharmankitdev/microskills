@@ -34,7 +34,7 @@
   },
   "profile_used": "base",
   "segment_digests": {
-    "seg-1.js": "9d4b9edd1745a8dc1f5c3103285fb7e827178e41115dd3d970248b8de9fb9241",
-    "seg-2.js": "5a42f4278ba751f2064b71ef01270d93fd64204316d690c5cd5bfbb9255acaa1"
+    "seg-1.js": "251f37a97f957e0b18bd3766088ad510bc824b2bbff57dffb17f284d27aac146",
+    "seg-2.js": "de50add2d8b535ef28fa0e87c53499fbc69e5821e05ac9e481776728b11ee1d5"
   }
 }

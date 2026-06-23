@@ -2981,7 +2981,7 @@ async function runMicroskill(name, { profile = 'base', inputs = {}, schema, phas
 3. Caller inputs:\n${lines}
 4. If a required input or decision is missing, FAIL with an error — do NOT invent an answer.
 5. Return ONLY the structured object matching the required schema. No prose.`,
-    { label: `ms:${name}`, phase, schema, agentType, model }
+    { label: profile && profile !== 'base' ? `ms:${name} · ${profile}` : `ms:${name}`, phase, schema, agentType, model }
   )
 }
 async function runAgent(agentType, prompt, schema, phase, label) {
