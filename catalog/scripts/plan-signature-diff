@@ -10,8 +10,18 @@ The conductor's tiered-revise flow uses this to OVERRIDE a classifier subagent's
 "minor" verdict when an in-place plan edit actually changed identity / contract /
 dependencies — the agent's classification is never trusted for the safety-critical
 decision. A changed SIGNATURE means downstream consumers (recorded metadata, the
-provision/missing-microskills set, what gets built) would read something stale, so
-the edit is load-bearing and must take the full re-plan path.
+provision/missing-microskills set, the profiles/components that get built) would
+read something stale, so the edit is load-bearing and must take the full re-plan
+path.
+
+PLAN SHAPES (the two domains differ):
+  microskill — a FLAT document (per microskill-create/references/planner.md):
+    top-level name / description / inputs[] / steps / output_schema / ...
+  workflow   — an OUTER doc (per workflow-create/references/planner.md):
+    name / missing_microskills / scope_advisory, with the WORKFLOW design nested
+    in a `plan_yaml: |` BLOCK SCALAR. name + missing_microskills are read from the
+    OUTER doc; the design fields (nodes / inputs / gates / output / _new_profiles)
+    are read from the UNWRAPPED inner document.
 
 LOAD-BEARING SIGNATURE — the fields that change identity / contract / dependencies:
   microskill:
@@ -20,19 +30,27 @@ LOAD-BEARING SIGNATURE — the fields that change identity / contract / dependen
                               (DEFAULT VALUES and descriptions EXCLUDED)
     - output_schema         (the output contract object)
   workflow:
-    - name
-    - referenced_components = sorted set of every use:/agent:/workflow: target
-                              across the planned nodes (drives missing_microskills)
-    - node_ids              = sorted node-id set
-    - inputs                = sorted [{name, required}] over declared workflow inputs
-    - output_from           = output.from
+    - name                  (OUTER doc — recorded metadata + filename)
+    - referenced_components = sorted set of every use:/agent:/workflow: target,
+                              keyed by (kind, name) so a same-name dispatch-kind
+                              swap also registers (drives missing_microskills)
+    - node_ids              = sorted node-id set (the inner design)
+    - node_profiles         = sorted [<id>:<customize.profile>] (what gets built)
+    - inputs                = sorted [{name, required, type, materialize}] over the
+                              declared workflow inputs (DEFAULT VALUES EXCLUDED)
+    - output_from           = output.from (the inner design)
+    - gates                 = sorted [{id, after, type}] (gate topology)
+    - new_profiles          = sorted [{microskill, profile}] from _new_profiles
+    - missing_microskills   = sorted [{name, requirement}] from the OUTER doc
+                              (the provision set)
   Excluded everywhere (cosmetic / non-load-bearing): descriptions, prose, step
   wording, input DEFAULT values, comments.
 
 Output (stdout): JSON {"changed": bool, "changed_fields": [str]}, exit 0.
 Exit codes: 0 ok; 2 environment error (missing dep / unreadable or malformed YAML /
-a plan that is not a mapping — emitted as a JSON {error} on stderr, never a raw
-traceback, matching the sibling scripts).
+a plan that is not a mapping / a malformed plan_yaml block / a non-mapping workflow
+input spec — emitted as a JSON {error} on stderr, never a raw traceback, matching
+the sibling scripts).
 """
 import argparse
 import json
@@ -46,7 +64,8 @@ except ImportError:
 
 
 class DiffError(Exception):
-    """An unreadable / malformed / non-mapping plan YAML — surfaced as a JSON
+    """An unreadable / malformed / non-mapping plan YAML (or a malformed nested
+    plan_yaml block / non-mapping workflow input spec) — surfaced as a JSON
     {error} + exit 2, never a raw traceback (matches the sibling scripts)."""
 
 
@@ -80,34 +99,96 @@ def _ms_signature(doc):
     }
 
 
+def _unwrap_inner(doc):
+    """A workflow plan nests the WORKFLOW design in a `plan_yaml: |` block scalar.
+    Unwrap it; tolerate a flat/unwrapped doc by treating the doc itself as the
+    design source. A malformed block raises DiffError (-> exit 2)."""
+    raw = doc.get("plan_yaml")
+    if isinstance(raw, str):
+        try:
+            inner = yaml.safe_load(raw)
+        except yaml.YAMLError as e:
+            raise DiffError(f"invalid YAML in plan_yaml block: {e}")
+        if inner is None:
+            return {}
+        if not isinstance(inner, dict):
+            raise DiffError("plan_yaml block did not parse to a mapping")
+        return inner
+    if isinstance(raw, dict):
+        return raw
+    # No plan_yaml block (or a non-string/non-mapping value) — treat the OUTER
+    # doc as the design source (tolerates a flat/unwrapped plan).
+    return doc
+
+
+def _wf_inputs(inner):
+    out = []
+    raw = inner.get("inputs")
+    if isinstance(raw, dict):
+        for name, spec in raw.items():
+            if spec is None:
+                spec = {}
+            if not isinstance(spec, dict):
+                raise DiffError(f"workflow input '{name}' spec is not a mapping")
+            out.append({"name": name,
+                        "required": bool(spec.get("required", False)),
+                        "type": spec.get("type"),
+                        "materialize": spec.get("materialize")})
+    out.sort(key=lambda d: (d["name"] or ""))
+    return out
+
+
 def _wf_signature(doc):
-    nodes = doc.get("nodes")
+    inner = _unwrap_inner(doc)
+
+    nodes = inner.get("nodes")
     if not isinstance(nodes, list):
         nodes = []
-    refs, ids = set(), []
+    refs, ids, profiles = set(), [], []
     for n in nodes:
         if not isinstance(n, dict):
             continue
-        if n.get("id"):
-            ids.append(n["id"])
+        nid = n.get("id")
+        if nid:
+            ids.append(nid)
         for k in ("use", "agent", "workflow"):
             if isinstance(n.get(k), str):
-                refs.add(n[k])
-    wf_inputs = []
-    raw_inputs = doc.get("inputs")
-    if isinstance(raw_inputs, dict):
-        for name, spec in raw_inputs.items():
-            wf_inputs.append({"name": name,
-                              "required": bool((spec or {}).get("required", False))})
-    wf_inputs.sort(key=lambda d: (d["name"] or ""))
-    output = doc.get("output")
+                refs.add(f"{k}:{n[k]}")          # key by (kind, name)
+        cust = n.get("customize")
+        if isinstance(cust, dict) and cust.get("profile") and nid:
+            profiles.append(f"{nid}:{cust['profile']}")
+
+    output = inner.get("output")
     output_from = output.get("from") if isinstance(output, dict) else None
+
+    gates = []
+    for g in (inner.get("gates") or []):
+        if isinstance(g, dict):
+            gates.append({"id": g.get("id"), "after": g.get("after"), "type": g.get("type")})
+    gates.sort(key=lambda d: (d["id"] or "", d["after"] or ""))
+
+    new_profiles = sorted(
+        {(p.get("microskill"), p.get("profile"))
+         for p in (inner.get("_new_profiles") or []) if isinstance(p, dict)})
+    new_profiles = [{"microskill": m, "profile": pr} for (m, pr) in new_profiles]
+
+    # missing_microskills is read from the OUTER doc (the provision set) —
+    # a changed set OR a changed requirement line surfaces as changed.
+    missing = sorted(
+        ({"name": m.get("name"), "requirement": m.get("requirement")}
+         for m in (doc.get("missing_microskills") or []) if isinstance(m, dict)),
+        key=lambda d: (d["name"] or ""))
+
     return {
         "name": doc.get("name"),
         "referenced_components": sorted(refs),
         "node_ids": sorted(ids),
-        "inputs": wf_inputs,
+        "node_profiles": sorted(profiles),
+        "inputs": _wf_inputs(inner),
         "output_from": output_from,
+        "gates": gates,
+        "new_profiles": new_profiles,
+        "missing_microskills": missing,
     }
 
 
