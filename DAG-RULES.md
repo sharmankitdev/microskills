@@ -641,10 +641,17 @@ replacing the hand-cloned-siblings pattern (N near-identical nodes differing onl
     artifact_path: ${workflow.inputs.diff_path}
     change_summary: ${summarize.output}        # the ref implies summarize -> each generated sibling
 
-- id: collect                                  # the paired FAN-IN
-  use: collect-findings
+- id: collect                                  # the paired FAN-IN (any fan-in microskill)
+  use: <some-fan-in-microskill>
   inputs_each: review                          # ← desugars the input map + depends_on below
 ```
+
+> **Note.** The catalog's old `collect-findings` fan-in microskill was **removed** in favor of the
+> [panel-aggregate ref](#expand--inputs_each--compile-time-static-fan-out) `${<panel>[].<field>}` (the
+> create-pipeline RVS chain now has `verify`/`synth` read the review panel directly, no fan-in node).
+> `inputs_each` is retained only as a hand-authoring fan-in option — reach for it (with any fan-in
+> microskill of your own) when a consumer genuinely needs N per-sibling input *keys* (a map) rather
+> than one flattened array; for the array, prefer the panel-aggregate ref.
 
 Both keys are **sugar consumed pre-validation** by the shared desugar in compile *and* validate —
 immediately after the `vars` pre-pass, before schema validation — so the closed node schema never

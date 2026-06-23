@@ -132,6 +132,12 @@ workflow_node_targets = _cw.workflow_node_targets
 nested_workflow_depth_cycle_errors = _cw.nested_workflow_depth_cycle_errors
 NODE_OUTPUT_FIELD_RE = _cw.NODE_OUTPUT_FIELD_RE
 NODE_ITEMS_RE = _cw.NODE_ITEMS_RE
+# Panel-aggregate ref tokens. compile-workflow's Pass-4 expansion sweeps wf["nodes"]
+# ONLY, so a `${<panel>[].<field>}` (or bare `<id>[]`) token placed in a gate / loop /
+# output field is never expanded — it would leak verbatim into emitted JS or pass
+# silently. Reused here to fail loud on a misplaced panel token (see the guard below).
+PANEL_REF_RE = _cw.PANEL_REF_RE
+PANEL_BARE_RE = _cw.PANEL_BARE_RE
 
 REF_RE = re.compile(r"\$\{([^}]*)\}")
 NODE_OUTPUT_RE = re.compile(r"\b([a-z][a-z0-9_-]*)\.output\b")
@@ -355,6 +361,30 @@ def main():
         for se in subgraph_errors:
             add(issues, "block", "subgraph", se)
         if subgraph_errors:
+            print(json.dumps({"pass": False, "issues": issues}, indent=2))
+            sys.exit(1)
+
+    # --- PANEL-REF PLACEMENT GUARD: a panel-aggregate ref outside a node ---
+    # compile-workflow's expand Pass 4 rewrites `${<panel>[].<field>}` tokens ONLY
+    # inside wf["nodes"] (and blocks unknown/malformed ones there — already handled
+    # by the expand_errors exit above). A panel token placed ANYWHERE ELSE a ${...}
+    # ref can ride — a gate `present`/`prompt`, loop `while`/`carry`/`on_exhaust`, or
+    # `output` — is therefore neither expanded nor rejected: it would emit invalid JS
+    # or leak verbatim. Fail loud here. Sweep every ${...} ref OUTSIDE `nodes`
+    # (already expanded) and HARD-BLOCK any surviving panel token (`<id>[].<field>`
+    # or a bare `<id>[]`), mirroring the unknown/malformed expand blocks.
+    if isinstance(merged, dict):
+        outside_nodes = {k: v for k, v in merged.items() if k != "nodes"}
+        panel_misplaced = []
+        for inner in refs_in(outside_nodes):
+            if PANEL_REF_RE.search(inner) or PANEL_BARE_RE.search(inner):
+                panel_misplaced.append(inner)
+        for inner in panel_misplaced:
+            add(issues, "block", "panel-ref",
+                f"panel-aggregate ref token in '${{{inner}}}' appears OUTSIDE a node "
+                f"(gate/loop/output) — `${{<panel>[].<field>}}` refs are only expanded "
+                f"inside nodes; move it into a node's inputs/for_each/prompt")
+        if panel_misplaced:
             print(json.dumps({"pass": False, "issues": issues}, indent=2))
             sys.exit(1)
 

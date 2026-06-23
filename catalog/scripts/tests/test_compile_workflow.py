@@ -1053,6 +1053,42 @@ def test_panel_ref_malformed_dies_in_compile(tmp_path):
     assert "malformed panel ref" in json.dumps(data)
 
 
+# FIX #5: exotic malformed panel forms (capital lead / embedded space / dotted
+# prefix) bypass the lowercase-anchored PANEL_REF_RE/PANEL_BARE_RE, but the
+# broadened residual `[]` sweep still flags them — same 'malformed panel ref' die,
+# no silent verbatim leak into emitted JS.
+@pytest.mark.parametrize("bad", ["${Review[].findings}", "${a [].findings}",
+                                 "${a.x[].findings}"])
+def test_panel_ref_exotic_malformed_dies_in_compile(tmp_path, bad):
+    body = PANEL_SINGLE.replace(
+        "for_each: ${review[].findings}", f"for_each: {bad}").replace(
+        "name: panel-single", "name: panel-exotic")
+    make_flow(tmp_path, "panel-exotic", body)
+    rc, data, out, err = run(tmp_path, "panel-exotic")
+    assert rc == 1
+    assert data is not None
+    assert "malformed panel ref" in json.dumps(data)
+
+
+# FIX #7: a COMPOSED multi-panel ref carrying BOTH a malformed-bare token
+# (review[], no .field tail) AND an unknown-panel token (ghost[].findings) reports
+# BOTH blocks — the malformed-ref sweep and the unknown-template check — in one die.
+PANEL_COMPOSED_BAD = PANEL_SINGLE.replace(
+    "for_each: ${review[].findings}",
+    "for_each: ${[review[], ghost[].findings].flat()}").replace(
+    "name: panel-single", "name: panel-composed-bad")
+
+
+def test_panel_ref_composed_malformed_and_unknown_both_die(tmp_path):
+    make_flow(tmp_path, "panel-composed-bad", PANEL_COMPOSED_BAD)
+    rc, data, out, err = run(tmp_path, "panel-composed-bad")
+    assert rc == 1
+    assert data is not None
+    blob = json.dumps(data)
+    assert "malformed panel ref" in blob
+    assert "unknown expand template id 'ghost'" in blob
+
+
 def test_panel_ref_no_token_is_byte_identical(tmp_path):
     # A def with expand templates but NO panel token compiles exactly as before
     # (the Pass-4 sweep is a no-op when no `[]` token is present).

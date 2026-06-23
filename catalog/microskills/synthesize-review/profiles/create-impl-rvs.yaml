@@ -28,7 +28,7 @@ vars:
 
 inputs:
   findings:
-    required: true             # the collected, dimension-tagged REVIEW findings
+    required: true             # the dimension-tagged REVIEW findings from the flattened review panel (dimension stamped upstream by review-dimension)
   verifications:
     required: false            # the per-review-finding verdicts; null = keep all, join nothing
   change_summary:

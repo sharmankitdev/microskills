@@ -2,8 +2,10 @@ version: 1
 
 # The create-pipeline RVS synthesis profile. Fuses the deterministic-floor findings
 # (run-validators: severity blocker|warn, shape {location, message, source}) with the
-# adversarially-verified review findings (review-dimension: blocker|major|minor|nit) into
-# ONE whole-branch verdict + ranked must-fix. PURE OVERLAY: it ADDS the floor-fold via
+# adversarially-verified review findings (review-dimension: blocker|major|minor|nit) — arriving
+# as the flattened review panel via the panel-aggregate ref, each finding's dimension stamped
+# upstream by review-dimension (no fan-in node) — into ONE whole-branch verdict + ranked
+# must-fix. PURE OVERLAY: it ADDS the floor-fold via
 # steps.add and an optional floor_findings input — the shared body is untouched, so every
 # other synthesize-review consumer stays byte-identical (zero re-baseline).
 #
@@ -27,7 +29,7 @@ vars:
 
 inputs:
   findings:
-    required: true             # the collected, dimension-tagged REVIEW findings
+    required: true             # the dimension-tagged REVIEW findings from the flattened review panel (dimension stamped upstream by review-dimension)
   verifications:
     required: false            # the per-review-finding verdicts; null = keep all, join nothing
   change_summary:

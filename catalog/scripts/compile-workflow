@@ -529,10 +529,20 @@ def _expand_panel_ref_str(s, panel_siblings, errors):
             return f"[{arr}].flat()"
 
         inner2 = PANEL_REF_RE.sub(prepl, inner)
-        mm = PANEL_BARE_RE.search(inner2)
-        if mm:
+        # Residual-malformed sweep: strip the well-formed `<panel>[].<field>` tokens
+        # (prepl already resolved the KNOWN ones to `[…].flat()` and flagged the
+        # UNKNOWN ones), then ANY `[]` still present is a genuinely MALFORMED panel
+        # ref. This broadens beyond PANEL_BARE_RE (which only spots a bare lowercase
+        # `<id>[]`) to the exotic forms the lowercase-anchored regex skips — a capital
+        # lead (`Review[].x`), a space (`a [].x`), a dotted prefix (`a.x[]`). A fully
+        # valid ref leaves no `[]` (a resolved panel becomes `[…].flat()`), so this
+        # never false-flags; and an unknown-but-well-formed token is stripped here, so
+        # it reports ONLY as 'unknown expand template id', never double.
+        if "[]" in PANEL_REF_RE.sub("", inner2):
+            mm = PANEL_BARE_RE.search(inner2)
+            near = mm.group(0) if mm else "[]"
             errors.append(
-                f"malformed panel ref near '{mm.group(0)}' in '${{{inner}}}' "
+                f"malformed panel ref near '{near}' in '${{{inner}}}' "
                 f"(expected ${{<panel>[].<field>}})")
         return "${" + inner2 + "}"
 

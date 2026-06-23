@@ -123,6 +123,18 @@ def test_inventory_sizes():
     assert len(WF_DIMS) == 7 and len(set(WF_DIMS)) == 7
 
 
+def test_review_dimension_stamps_dimension_per_finding():
+    # FIX #4: the per-finding `dimension` field is the LOAD-BEARING substitute for the
+    # deleted collect-findings stamp — a consumer reading the panel directly via the
+    # panel-aggregate ref (${review[].findings}) relies on each finding carrying its
+    # own source dimension. Pin it in review-dimension's base output_schema so a future
+    # drop of the upstream stamp fails loudly (the downstream synth/report would
+    # otherwise silently lose the dimension grouping).
+    items = _raw(RD / "profiles" / "base.yaml")["output_schema"]["properties"]["findings"]["items"]
+    assert "dimension" in items["required"], items["required"]
+    assert items["properties"]["dimension"] == {"type": "string"}, items["properties"].get("dimension")
+
+
 # ---------------------------------------------------------------------------
 # Task 1 / 2 unit tests: review-dimension rubric overlays resolve + substitute,
 # and the naming invariant + no-forbidden-keys hold on the raw bytes.

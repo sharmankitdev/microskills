@@ -552,6 +552,76 @@ output:
     assert all(i["severity"] != "block" for i in data["issues"])
 
 
+def test_panel_ref_in_gate_outside_node_blocks(tmp_path):
+    # FIX #1: compile's Pass-4 panel expansion sweeps wf["nodes"] ONLY, so a panel
+    # token in a gate (here a gate `prompt`) is never expanded — it would leak
+    # verbatim. validate HARD-BLOCKS a panel token found OUTSIDE a node.
+    body = PANEL_FLOW + """\
+gates:
+  - id: g
+    after: synth
+    type: human_approval
+    prompt: review ${review[].findings} before approving?
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    assert any(i["severity"] == "block" and "OUTSIDE a node" in i["message"]
+               for i in data["issues"]), data
+
+
+def test_panel_ref_in_loop_carry_outside_node_blocks(tmp_path):
+    # FIX #1: a panel token in loop.carry (also outside `nodes`) is never expanded
+    # by Pass 4 — validate must block it loud, not let it leak into the loop scaffold.
+    body = """\
+version: 1
+name: panel-loop
+nodes:
+  - id: review
+    agent: rev
+    expand:
+      over: [a, b]
+    prompt: r {{each.item}}
+    output_schema:
+      type: object
+      required: [findings]
+      properties: { findings: { type: array } }
+  - id: step
+    agent: ag
+    depends_on: [review_a, review_b]
+    prompt: s
+    output_schema:
+      type: object
+      required: [done]
+      properties: { done: { type: boolean } }
+loop:
+  while: ${!step.output.done}
+  max_iters: 2
+  body: [step]
+  carry:
+    findings: ${review[].findings}
+output:
+  from: step
+"""
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    assert any(i["severity"] == "block" and "OUTSIDE a node" in i["message"]
+               for i in data["issues"]), data
+
+
+def test_panel_ref_composed_malformed_and_unknown_both_block(tmp_path):
+    # FIX #7: a composed multi-panel ref carrying BOTH a malformed-bare token
+    # (review[], no .field) AND an unknown-panel token (ghost[].findings) reports
+    # BOTH the malformed-ref and unknown-template blocks.
+    body = PANEL_FLOW.replace(
+        "for_each: ${review[].findings}",
+        "for_each: ${[review[], ghost[].findings].flat()}")
+    rc, data, _ = run(write_wf(tmp_path, body))
+    assert rc == 1 and data["pass"] is False
+    msgs = " ".join(i["message"] for i in data["issues"])
+    assert "malformed panel ref" in msgs
+    assert "unknown expand template id 'ghost'" in msgs
+
+
 # --- S-LOOP: loop-body contiguity ---
 
 def test_loop_body_split_by_orchestrator_blocks(tmp_path):
