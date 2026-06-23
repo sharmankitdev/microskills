@@ -1,92 +1,49 @@
 #!/usr/bin/env python3
-"""
-plan-signature-diff — deterministic, agent-independent load-bearing-signature diff
-between a before-snapshot and an edited plan YAML.
+"""plan-signature-diff — deterministic, agent-independent guard for tiered revise.
+
+STRIP-COSMETIC-THEN-DEEP-COMPARE. Normalize a plan YAML by removing the small,
+explicit COSMETIC set (descriptions everywhere; input DEFAULT VALUES), then deep-
+compare the remainder. ANY non-cosmetic difference => load-bearing (changed: true),
+BY CONSTRUCTION — there is no enumerated allowlist to leave a gap, so a load-bearing
+edit cannot slip through as "unchanged" (the dangerous direction). The only residual
+risk is a false POSITIVE (a non-stripped cosmetic edit routes to the safe full
+re-plan), never a false negative.
+
+The conductor's tiered-revise flow uses this to OVERRIDE a classifier subagent's
+"minor" verdict when an in-place plan edit actually changed anything beyond the
+cosmetic set — the agent's classification is never trusted for the safety-critical
+decision.
+
+COSMETIC SET (stripped):
+  - every `description` key, anywhere (never a contract);
+  - the `default` VALUE of an input spec — microskill: items of the top-level
+    `inputs` LIST; workflow: values of the inner `inputs` MAP. (`default` is NOT
+    stripped anywhere else — e.g. a gate's `default` choice is behavior-bearing and
+    stays compared.)
+Everything else is compared: name; input names/required/type/materialize; steps;
+output_schema/output; failure_modes; config (microskill); and the full nested
+workflow design — nodes (use/agent/workflow/prompt/delegation/customize/grant_tools/
+when/for_each/depends_on/…), gates (incl. default/on_headless/options), loop
+(body/while/carry), output.from — plus the OUTER name/missing_microskills/
+scope_advisory (workflow).
+
+PLAN SHAPES:
+  microskill — a FLAT mapping (name / inputs[] / steps / output_schema / …).
+  workflow   — an OUTER mapping (name / missing_microskills / scope_advisory) with
+    the design nested in a `plan_yaml: |` BLOCK SCALAR; the block is unwrapped and
+    compared as STRUCTURE (a pure re-indent / reflow of the block does not register).
+Microskill `inputs` are sorted by name before compare (a reorder is cosmetic); list
+order is otherwise preserved (steps / nodes order can be semantic).
 
 Usage:
   plan-signature-diff --before <path> --after <path> --domain <microskill|workflow>
-
-The conductor's tiered-revise flow uses this to OVERRIDE a classifier subagent's
-"minor" verdict when an in-place plan edit actually changed identity / contract /
-dependencies / control flow — the agent's classification is never trusted for the
-safety-critical decision. A changed SIGNATURE means downstream consumers (recorded
-metadata, the provision/missing-microskills set, the profiles/components that get
-built, the engine's control flow) would read something stale, so the edit is
-load-bearing and must take the full re-plan path. The guard errs TOWARD "changed":
-when in doubt it flags, because a false "changed" only costs a (correct) full
-re-plan, whereas a false "unchanged" would silently accept a contract-breaking edit.
-
-PLAN SHAPES (the two domains differ):
-  microskill — a FLAT document (per microskill-create/references/planner.md):
-    top-level name / description / inputs[] / steps / output_schema / ...
-  workflow   — an OUTER doc (per workflow-create/references/planner.md):
-    name / missing_microskills / scope_advisory, with the WORKFLOW design nested
-    in a `plan_yaml: |` BLOCK SCALAR. name / missing_microskills / scope_advisory
-    are read from the OUTER doc; the design fields (name / nodes / inputs / gates /
-    loop / output / _new_profiles) are read from the UNWRAPPED inner document.
-
-LOAD-BEARING SIGNATURE — the fields that change identity / contract / dependencies /
-control flow:
-  microskill:
-    - name                  (component name — recorded metadata + filename)
-    - inputs (the contract) = sorted [{name, required, type}] over inputs
-                              (DEFAULT VALUES and descriptions EXCLUDED)
-    - output_schema         (the output contract object)
-    - step_count            (number of steps — add/remove of a step registers;
-                              pure step WORDING / reorder stays non-load-bearing,
-                              by design — see the exclusions note below)
-  workflow:
-    - name                  (OUTER doc — recorded metadata + filename)
-    - design_name           (the INNER plan_yaml name — the value actually deployed
-                              as the WORKFLOW.yaml `name`; a divergent inner edit
-                              must register even if the outer name is untouched)
-    - scope_advisory        (OUTER doc — a downstream node branches on this recorded
-                              value; a file-edited advisory must register)
-    - referenced_components = sorted set of every use:/agent:/workflow: target,
-                              keyed by (kind, name) so a same-name dispatch-kind
-                              swap also registers (drives missing_microskills)
-    - node_ids              = sorted node-id set (the inner design)
-    - node_profiles         = sorted [<id>:<customize.profile>] (what gets built)
-    - node_output_schemas   = sorted [{id, schema}] for every node carrying an
-                              output_schema (a narrowed/changed per-node output
-                              contract — what downstream refs read)
-    - inputs                = sorted [{name, required, type, materialize}] over the
-                              declared workflow inputs (DEFAULT VALUES EXCLUDED)
-    - output_from           = output.from (the inner design)
-    - gates                 = sorted [{id, after, type}] (gate topology)
-    - loop                  = {body: sorted ids, while, max_iters, carry: sorted
-                              keys} or null — captures a linear->loop conversion,
-                              a changed loop condition / bound, or a re-membered body
-    - node_control          = sorted [{id, when, for_each, depends_on}] over nodes
-                              carrying ANY control construct — captures a node
-                              gaining/losing a when guard, a for_each fan-out, or a
-                              pure-ordering depends_on edge
-    - edges                 = sorted [{node, refs}] — each node's ${...} ref targets
-                              (leading id) across its inputs / when / for_each, i.e.
-                              the data-flow edge set; captures a rewired edge
-    - new_profiles          = sorted [{microskill, profile}] from _new_profiles
-    - missing_microskills   = sorted [{name, requirement}] from the OUTER doc
-                              (the provision set)
-  Excluded everywhere (cosmetic / non-load-bearing): descriptions, prose, comments,
-  step WORDING and step REORDER (only step COUNT is tracked — wording is owned by
-  the floor validator + the human re-approval at the gate), input DEFAULT values.
-  INTENTIONALLY DEFERRED in the workflow signature (documented, not a gap): a pure
-  operator-only edit to a when/loop `while` expression that keeps the SAME referenced
-  ids (e.g. `== null` -> `!= null`) is not captured by node_control (presence-only) or
-  edges (ref-targets-only); the loop `while` raw value IS captured, so a loop-condition
-  edit registers, but a node-level `when` operator flip without a ref change does not —
-  accepted as a rare, low-risk corner the human re-approval backstops. `as:` on a
-  for_each is not separately fingerprinted (presence is).
-
 Output (stdout): JSON {"changed": bool, "changed_fields": [str]}, exit 0.
 Exit codes: 0 ok; 2 environment error (missing dep / unreadable or malformed YAML /
-a plan that is not a mapping / a malformed plan_yaml block / a non-mapping workflow
-input spec / an unorderable signature component — emitted as a JSON {error} on
-stderr, never a raw traceback, matching the sibling scripts).
+a plan that is not a mapping / a malformed plan_yaml block) — emitted as a JSON
+{error} on stderr, never a raw traceback (matches the sibling scripts).
 """
 import argparse
 import json
-import re
 import sys
 
 try:
@@ -96,17 +53,9 @@ except ImportError:
     sys.exit(2)
 
 
-# Leading identifier of a ${<id>...} reference (a data-flow edge target). Captures
-# `${collect.output.x}` -> "collect", `${workflow.inputs.y}` -> "workflow",
-# `${loop.output.z}` -> "loop". Whitespace after `${` is tolerated.
-REF_RE = re.compile(r"\$\{\s*([A-Za-z_][A-Za-z0-9_.-]*)")
-
-
 class DiffError(Exception):
     """An unreadable / malformed / non-mapping plan YAML (or a malformed nested
-    plan_yaml block / non-mapping workflow input spec / an unorderable signature
-    component) — surfaced as a JSON {error} + exit 2, never a raw traceback
-    (matches the sibling scripts)."""
+    plan_yaml block) — surfaced as a JSON {error} + exit 2, never a raw traceback."""
 
 
 def _load(path):
@@ -124,29 +73,34 @@ def _load(path):
     return doc
 
 
-def _ms_signature(doc):
-    inputs = []
-    for i in (doc.get("inputs") or []):
-        if isinstance(i, dict):
-            inputs.append({"name": i.get("name"),
-                           "required": bool(i.get("required", False)),
-                           "type": i.get("type")})
-    inputs.sort(key=lambda d: (d["name"] or ""))
-    steps = doc.get("steps")
-    return {
-        "name": doc.get("name"),
-        "inputs": inputs,
-        "output_schema": doc.get("output_schema"),
-        # step COUNT only — pure wording/reorder is non-load-bearing (the floor
-        # validator + the human gate re-approval own step quality).
-        "step_count": len(steps) if isinstance(steps, list) else 0,
-    }
+def _strip_descriptions(obj):
+    """Recursively drop every `description` key (cosmetic, never a contract)."""
+    if isinstance(obj, dict):
+        return {k: _strip_descriptions(v) for k, v in obj.items() if k != "description"}
+    if isinstance(obj, list):
+        return [_strip_descriptions(v) for v in obj]
+    return obj
+
+
+def _strip_input_defaults(inputs):
+    """Drop the `default` VALUE from each input spec — a changed default is cosmetic.
+    Handles the microskill list form and the workflow map form; leaves `default`
+    everywhere else (e.g. gate defaults) untouched."""
+    if isinstance(inputs, list):
+        return [{k: v for k, v in i.items() if k != "default"} if isinstance(i, dict) else i
+                for i in inputs]
+    if isinstance(inputs, dict):
+        return {n: ({k: v for k, v in (s or {}).items() if k != "default"}
+                    if isinstance(s, dict) else s)
+                for n, s in inputs.items()}
+    return inputs
 
 
 def _unwrap_inner(doc):
     """A workflow plan nests the WORKFLOW design in a `plan_yaml: |` block scalar.
-    Unwrap it; tolerate a flat/unwrapped doc by treating the doc itself as the
-    design source. A malformed block raises DiffError (-> exit 2)."""
+    Parse it to a mapping so we compare STRUCTURE (a reflow of the block does not
+    register). Returns None when there is no nested design. A malformed block or a
+    non-mapping parse raises DiffError (-> exit 2)."""
     raw = doc.get("plan_yaml")
     if isinstance(raw, str):
         try:
@@ -160,159 +114,45 @@ def _unwrap_inner(doc):
         return inner
     if isinstance(raw, dict):
         return raw
-    # No plan_yaml block (or a non-string/non-mapping value) — treat the OUTER
-    # doc as the design source (tolerates a flat/unwrapped plan).
-    return doc
+    return None
 
 
-def _wf_inputs(inner):
-    out = []
-    raw = inner.get("inputs")
-    if isinstance(raw, dict):
-        for name, spec in raw.items():
-            if spec is None:
-                spec = {}
-            if not isinstance(spec, dict):
-                raise DiffError(f"workflow input '{name}' spec is not a mapping")
-            out.append({"name": name,
-                        "required": bool(spec.get("required", False)),
-                        "type": spec.get("type"),
-                        "materialize": spec.get("materialize")})
-    out.sort(key=lambda d: (d["name"] or ""))
-    return out
-
-
-def _ref_targets(value, out):
-    """Collect the leading ${<id>...} identifiers reachable in a nested
-    str/list/dict value (the data-flow edge targets)."""
-    if isinstance(value, str):
-        for m in REF_RE.finditer(value):
-            out.add(m.group(1).split(".")[0])
-    elif isinstance(value, list):
-        for v in value:
-            _ref_targets(v, out)
-    elif isinstance(value, dict):
-        for v in value.values():
-            _ref_targets(v, out)
-
-
-def _loop_signature(inner):
-    loop = inner.get("loop")
-    if not isinstance(loop, dict):
-        return None
-    body = loop.get("body")
-    body_ids = sorted(
-        b.get("id") for b in body
-        if isinstance(b, dict) and b.get("id")) if isinstance(body, list) else []
-    carry = loop.get("carry")
-    carry_keys = sorted(carry.keys()) if isinstance(carry, dict) else []
-    return {
-        "body": body_ids,
-        "while": loop.get("while"),
-        "max_iters": loop.get("max_iters"),
-        "carry": carry_keys,
-    }
-
-
-def _wf_signature(doc):
+def _normalize(doc, domain):
+    """Return the plan with the cosmetic set stripped, ready for deep-compare."""
+    if domain == "microskill":
+        d = dict(doc)
+        if "inputs" in d:
+            inp = _strip_input_defaults(d.get("inputs"))
+            if isinstance(inp, list):
+                inp = sorted(inp, key=lambda i: (i.get("name") or "") if isinstance(i, dict) else "")
+            d["inputs"] = inp
+        return _strip_descriptions(d)
+    # workflow: unwrap the nested design, strip its input defaults, compare as structure.
+    outer = dict(doc)
     inner = _unwrap_inner(doc)
+    if inner is not None:
+        inner = dict(inner)
+        if "inputs" in inner:
+            inner["inputs"] = _strip_input_defaults(inner.get("inputs"))
+        outer["plan_yaml"] = inner
+    return _strip_descriptions(outer)
 
-    nodes = inner.get("nodes")
-    if not isinstance(nodes, list):
-        nodes = []
-    refs, ids, profiles = set(), [], []
-    node_output_schemas, node_control, edges = [], [], []
-    for n in nodes:
-        if not isinstance(n, dict):
+
+def _changed_fields(before, after):
+    """Top-level keys that differ. When the nested workflow design (`plan_yaml`)
+    differs, expand to `plan_yaml.<innerkey>` for nicer narration."""
+    fields = []
+    for k in sorted(set(before) | set(after)):
+        if before.get(k) == after.get(k):
             continue
-        nid = n.get("id")
-        if nid:
-            ids.append(nid)
-        for k in ("use", "agent", "workflow"):
-            if isinstance(n.get(k), str):
-                refs.add(f"{k}:{n[k]}")          # key by (kind, name)
-        cust = n.get("customize")
-        if isinstance(cust, dict) and cust.get("profile") and nid:
-            profiles.append(f"{nid}:{cust['profile']}")
-        if n.get("output_schema") is not None:
-            node_output_schemas.append({"id": nid, "schema": n.get("output_schema")})
-
-        # Control-flow fingerprint: capture a node only when it carries a control
-        # construct (a when guard, a for_each fan-out, or a pure-ordering edge).
-        has_when = n.get("when") is not None
-        has_for_each = n.get("for_each") is not None
-        deps = n.get("depends_on")
-        deps = sorted(str(d) for d in deps) if isinstance(deps, list) else []
-        if has_when or has_for_each or deps:
-            node_control.append({"id": nid, "when": has_when,
-                                 "for_each": has_for_each, "depends_on": deps})
-
-        # Data-flow edge set: the leading ids of every ${...} ref in this node's
-        # inputs / when / for_each (a ${id.output...} ref implies a dependency edge).
-        ref_set = set()
-        _ref_targets(n.get("inputs"), ref_set)
-        _ref_targets(n.get("when"), ref_set)
-        _ref_targets(n.get("for_each"), ref_set)
-        if ref_set:
-            edges.append({"node": nid, "refs": sorted(ref_set)})
-
-    output = inner.get("output")
-    output_from = output.get("from") if isinstance(output, dict) else None
-
-    gates = []
-    for g in (inner.get("gates") or []):
-        if isinstance(g, dict):
-            gates.append({"id": g.get("id"), "after": g.get("after"), "type": g.get("type")})
-    gates.sort(key=lambda d: (d["id"] or "", d["after"] or ""))
-
-    # None-coerce the sort key (a half-written entry missing a microskill/profile
-    # must not raise an unorderable TypeError — that would break the {error}+exit-2
-    # contract; the wrapper in main() catches any residual case all the same).
-    new_profiles = sorted(
-        {(p.get("microskill"), p.get("profile"))
-         for p in (inner.get("_new_profiles") or []) if isinstance(p, dict)},
-        key=lambda t: (t[0] or "", t[1] or ""))
-    new_profiles = [{"microskill": m, "profile": pr} for (m, pr) in new_profiles]
-
-    # missing_microskills is read from the OUTER doc (the provision set) —
-    # a changed set OR a changed requirement line surfaces as changed.
-    missing = sorted(
-        ({"name": m.get("name"), "requirement": m.get("requirement")}
-         for m in (doc.get("missing_microskills") or []) if isinstance(m, dict)),
-        key=lambda d: (d["name"] or ""))
-
-    node_output_schemas.sort(key=lambda d: (d["id"] or ""))
-    node_control.sort(key=lambda d: (d["id"] or ""))
-    edges.sort(key=lambda d: (d["node"] or ""))
-
-    return {
-        "name": doc.get("name"),
-        "design_name": inner.get("name"),
-        "scope_advisory": doc.get("scope_advisory"),
-        "referenced_components": sorted(refs),
-        "node_ids": sorted(ids),
-        "node_profiles": sorted(profiles),
-        "node_output_schemas": node_output_schemas,
-        "inputs": _wf_inputs(inner),
-        "output_from": output_from,
-        "gates": gates,
-        "loop": _loop_signature(inner),
-        "node_control": node_control,
-        "edges": edges,
-        "new_profiles": new_profiles,
-        "missing_microskills": missing,
-    }
-
-
-def _signature(doc, domain):
-    try:
-        return _ms_signature(doc) if domain == "microskill" else _wf_signature(doc)
-    except DiffError:
-        raise
-    except TypeError as e:
-        # Any residual unorderable comparison (a malformed plan with mixed types in
-        # a sort key) is surfaced as a clean {error}+exit 2, never a raw traceback.
-        raise DiffError(f"unorderable signature component: {e}")
+        b, a = before.get(k), after.get(k)
+        if k == "plan_yaml" and isinstance(b, dict) and isinstance(a, dict):
+            for ik in sorted(set(b) | set(a)):
+                if b.get(ik) != a.get(ik):
+                    fields.append(f"plan_yaml.{ik}")
+        else:
+            fields.append(k)
+    return fields
 
 
 def main():
@@ -322,14 +162,13 @@ def main():
     ap.add_argument("--domain", required=True, choices=["microskill", "workflow"])
     args = ap.parse_args()
     try:
-        before = _signature(_load(args.before), args.domain)
-        after = _signature(_load(args.after), args.domain)
+        before = _normalize(_load(args.before), args.domain)
+        after = _normalize(_load(args.after), args.domain)
     except DiffError as e:
         print(json.dumps({"error": str(e)}), file=sys.stderr)
         sys.exit(2)
-    changed_fields = [k for k in before if before.get(k) != after.get(k)]
-    print(json.dumps({"changed": bool(changed_fields),
-                      "changed_fields": changed_fields}, indent=2))
+    fields = _changed_fields(before, after)
+    print(json.dumps({"changed": bool(fields), "changed_fields": fields}, indent=2))
 
 
 if __name__ == "__main__":
