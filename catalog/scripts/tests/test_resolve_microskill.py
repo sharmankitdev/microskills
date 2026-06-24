@@ -2031,3 +2031,21 @@ def test_task_plan_declares_last_findings_replan_input():
     assert "last_findings" in body
     # The re-plan instruction folds it into the draft step (no branching vocabulary).
     assert "re-plan pass" in body
+
+
+# --- task-plan workflow-decompose domain (decompose profile family) ------------------------
+
+def test_task_plan_workflow_decompose_profile():
+    # The decompose domain: same workflow-planner agent + workflow output_schema as the
+    # `workflow` profile, but pointed at the decompose contract doc.
+    rc, data, out, err = run("task-plan", "--profile", "workflow-decompose",
+                             skill_root=REAL_MICROSKILLS_ROOT)
+    assert rc == 0, err
+    assert data["profile_used"] == "workflow-decompose"  # not a base fallback
+    cfg = data["config"]
+    assert cfg["vars"]["contract_doc"].endswith(
+        "workflow-defs/workflow-create/references/decompose-planner.md")
+    assert cfg["runtime"]["agent"] == "workflow-planner"
+    # inherits the workflow plan shape (NOT the base microskill shape)
+    assert set(data["output_schema"]["required"]) == {
+        "plan_path", "name", "scope_advisory", "missing_microskills"}

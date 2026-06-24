@@ -1,0 +1,30 @@
+version: 1
+
+# Workflow-DECOMPOSE domain: run the workflow planner against the decompose contract, which
+# transcribes an orchestrator SKILL (the requirement_path bundle) into a WORKFLOW.yaml plan.
+# Same agent + output_schema as the `workflow` profile; only the contract doc differs. Selected
+# by plan-rvs[workflow-create-decompose].
+vars:
+  contract_doc: .claude/workflow-defs/workflow-create/references/decompose-planner.md
+
+runtime:
+  agent: workflow-planner
+  # model inherited from base (opus).
+
+# Workflow plan shape — overrides the base (microskill) output_schema wholesale (replace, not
+# merge). Copied verbatim from profiles/workflow.yaml so a use: node inherits the full contract.
+output_schema:
+  type: object
+  required: [plan_path, name, scope_advisory, missing_microskills]
+  properties:
+    plan_path: { type: ["string", "null"], description: Path to the written WORKFLOW.yaml-design plan file under staging_dir, or null when a scope advisory applies. }
+    name: { type: ["string", "null"] }
+    scope_advisory: { type: ["object", "null"], description: "{kind: split|promote|adapt, reason, recommendation} or null." }
+    missing_microskills:
+      type: array
+      description: Microskills the planned workflow needs that do not yet exist; each is created via microskill-create before implement.
+      items:
+        type: object
+        properties:
+          name: { type: string }
+          requirement: { type: string }
