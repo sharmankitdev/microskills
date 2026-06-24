@@ -640,3 +640,30 @@ def test_materialize_engine_prunes_removed_subgraph_dir(tmp_path):
     assert not dep.exists(), "deployed SUBGRAPH.yaml not pruned"
     assert not dep.parent.exists(), "empty _subgraphs/demo/ not pruned"
     assert not (deploy / "workflow-defs" / "_subgraphs").exists(), "empty _subgraphs/ not pruned"
+
+
+# --- dependency closure: schema (Task 1) ----------------------------------------------------
+
+def test_schema_accepts_derived_from(tmp_path):
+    mod = load_init_module()
+    manifest = {
+        "version": 2,
+        "microskills": [
+            {"name": "task-plan", "source": "plugin", "derived_from": "microskill-create"},
+        ],
+        "workflows": [{"name": "microskill-create", "source": "plugin"}],
+    }
+    # validate_manifest die()s (SystemExit) on failure; no exception == valid
+    mod.validate_manifest(manifest)
+
+
+def test_schema_rejects_unknown_field(tmp_path):
+    mod = load_init_module()
+    manifest = {
+        "version": 2,
+        "microskills": [{"name": "task-plan", "source": "plugin", "bogus": "x"}],
+        "workflows": [],
+    }
+    import pytest
+    with pytest.raises(SystemExit):
+        mod.validate_manifest(manifest)
