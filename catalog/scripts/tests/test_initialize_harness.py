@@ -773,3 +773,105 @@ def test_render_manifest_emits_derived_from(tmp_path):
     # round-trips through the schema
     import yaml as _y
     mod.validate_manifest(_y.safe_load(text))
+
+
+# --- dependency closure: drift / orphans / add+remove surgery (Task 4) ----------------------
+
+def _manifest_with_roots_only(catalog_root_names):
+    return {
+        "version": 2,
+        "microskills": [],
+        "workflows": [{"name": n, "source": "plugin"} for n in catalog_root_names],
+    }
+
+
+def test_closure_drift_lists_missing_deps(tmp_path):
+    mod = load_init_module()
+    cat = make_closure_catalog(tmp_path)
+    manifest = _manifest_with_roots_only(["wf-root"])  # roots only, no deps yet
+    drift = mod.closure_drift(manifest, cat)
+    by = {d["name"]: d for d in drift}
+    assert set(by) == {"wf-mid", "ms-a", "ms-b"}
+    assert by["ms-b"]["kind"] == "microskill" and by["ms-b"]["derived_from"] == "wf-root"
+    assert by["wf-mid"]["kind"] == "workflow"
+
+
+def test_closure_orphans_finds_unreachable_derived(tmp_path):
+    mod = load_init_module()
+    cat = make_closure_catalog(tmp_path)
+    manifest = {
+        "version": 2,
+        "microskills": [
+            {"name": "ms-a", "source": "plugin", "derived_from": "wf-root"},
+            {"name": "stale", "source": "plugin", "derived_from": "wf-gone"},  # no such root
+        ],
+        "workflows": [{"name": "wf-root", "source": "plugin"}],
+    }
+    orphans = mod.closure_orphans(manifest, cat)
+    names = {o["name"] for o in orphans}
+    assert names == {"stale"}            # ms-a still reachable from wf-root → kept
+
+
+def test_closure_orphans_keeps_shared_dep(tmp_path):
+    # ms-a reachable from wf-root; it stays even though it carries derived_from.
+    mod = load_init_module()
+    cat = make_closure_catalog(tmp_path)
+    manifest = {
+        "version": 2,
+        "microskills": [{"name": "ms-a", "source": "plugin", "derived_from": "wf-root"}],
+        "workflows": [{"name": "wf-root", "source": "plugin"}],
+    }
+    assert mod.closure_orphans(manifest, cat) == []
+
+
+def test_append_plugin_entries_emits_derived_from():
+    mod = load_init_module()
+    text = "version: 2\nworkflows:\n  - name: wf-root\n    source: plugin\nmicroskills: []\n"
+    out = mod.append_plugin_entries(text, {"microskills": [{"name": "ms-a", "derived_from": "wf-root"}]})
+    assert "  - name: ms-a" in out
+    assert "    source: plugin" in out
+    assert "    derived_from: wf-root" in out
+
+
+def test_append_plugin_entries_plain_name_back_compat():
+    mod = load_init_module()
+    text = "version: 2\nmicroskills: []\nworkflows: []\n"
+    out = mod.append_plugin_entries(text, {"workflows": ["wf-root"]})  # bare str still works
+    assert "  - name: wf-root" in out and "    source: plugin" in out
+    assert "derived_from" not in out
+
+
+REMOVE_MANIFEST = """\
+# header comment
+version: 2
+microskills:
+  - name: keep-root
+    source: plugin
+  - name: keep-custom
+    source: custom
+  - name: drop-me
+    source: plugin
+    derived_from: keep-root
+workflows:
+  - name: keep-root
+    source: plugin
+"""
+
+
+def test_remove_plugin_entries_drops_block_preserves_rest():
+    mod = load_init_module()
+    out = mod.remove_plugin_entries(REMOVE_MANIFEST, {"microskills": ["drop-me"]})
+    assert out.startswith("# header comment")        # header survives
+    assert "name: drop-me" not in out                # block gone
+    assert "derived_from: keep-root" not in out      # its field gone too
+    assert "name: keep-custom" in out and "source: custom" in out  # siblings survive
+    wf = out.split("workflows:")[1]
+    assert "name: keep-root" in wf                   # same-name in other list untouched
+    import yaml as _y
+    mod.validate_manifest(_y.safe_load(out))
+
+
+def test_remove_plugin_entries_noop_when_absent():
+    mod = load_init_module()
+    out = mod.remove_plugin_entries(REMOVE_MANIFEST, {"microskills": ["ghost"]})
+    assert out == REMOVE_MANIFEST

@@ -223,6 +223,106 @@ def seed_manifest(catalog):
     return m
 
 
+def manifest_roots(manifest):
+    """[(kind, name)] for manifest entries WITHOUT derived_from (base-seeded or hand-added).
+    These are the roots the closure is computed from; they are never auto-pruned."""
+    out = []
+    for lk, kind in _hs.LIST_KIND.items():
+        for c in (manifest.get(lk) or []):
+            if not c.get("derived_from"):
+                out.append((kind, c["name"]))
+    return out
+
+
+def manifest_names(manifest):
+    return {c["name"] for lk in _hs.LIST_KIND for c in (manifest.get(lk) or [])}
+
+
+def closure_drift(manifest, catalog):
+    """Mandatory transitive deps in closure(manifest roots) MISSING from the manifest →
+    [{name, kind, derived_from}], sorted. Unlike base_drift (new ROOTS, gated by --adopt-base),
+    these are auto-added on --apply: a missing dep breaks compile."""
+    derived, _u = walk_closure(manifest_roots(manifest), catalog)
+    listed = manifest_names(manifest)
+    out = [{"name": n, "kind": k, "derived_from": root}
+           for (k, n), root in derived.items() if n not in listed]
+    return sorted(out, key=lambda d: (d["kind"], d["name"]))
+
+
+def closure_orphans(manifest, catalog):
+    """derived_from entries NO LONGER reachable from any root → [{name, kind}], sorted.
+    Only derived_from entries are ever returned — roots (no derived_from) are sacrosanct."""
+    derived, _u = walk_closure(manifest_roots(manifest), catalog)
+    reachable = {n for (_, n) in derived} | {n for _, n in manifest_roots(manifest)}
+    out = []
+    for lk, kind in _hs.LIST_KIND.items():
+        for c in (manifest.get(lk) or []):
+            if c.get("derived_from") and c["name"] not in reachable:
+                out.append({"name": c["name"], "kind": kind})
+    return sorted(out, key=lambda d: (d["kind"], d["name"]))
+
+
+def closure_unresolved(manifest, catalog):
+    """Import strings reachable from roots that resolve to no catalog component (broken imports)."""
+    _d, unresolved = walk_closure(manifest_roots(manifest), catalog)
+    return unresolved
+
+
+def _list_item_blocks(lines, list_key):
+    """[(start, end)] half-open line ranges of items under top-level list_key. Mirrors
+    flip_entry_source's scanner: interstitial comments are absorbed into the preceding item."""
+    cur_key, item_start, blocks = None, None, []
+    for i, ln in enumerate(lines):
+        stripped = ln.strip()
+        if ln and not ln.startswith(" ") and not stripped.startswith("#"):
+            if cur_key == list_key and item_start is not None:
+                blocks.append((item_start, i)); item_start = None
+            cur_key = ln.split(":", 1)[0].strip(); continue
+        if cur_key != list_key or not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("- "):
+            if item_start is not None:
+                blocks.append((item_start, i))
+            item_start = i
+    if cur_key == list_key and item_start is not None:
+        blocks.append((item_start, len(lines)))
+    return blocks
+
+
+def _block_name(lines, block):
+    """The `name:` value within an item block (dash line included), or None."""
+    for j in range(*block):
+        t = lines[j].strip()
+        if t.startswith("- "):
+            t = t[2:].strip()
+        if t.startswith("name:"):
+            return t[len("name:"):].split("#", 1)[0].strip().strip("'\"")
+    return None
+
+
+def remove_plugin_entries(text, removals):
+    """Delete whole item blocks (removals: list_key -> iterable of names) from harness.yaml
+    text, preserving the header, sibling entries, and comments. Returns the new text. Used to
+    prune orphaned derived_from deps; derived entries are appended plain at EOF so no
+    interstitial comments are lost in practice."""
+    if not any(removals.get(k) for k in ("microskills", "workflows")):
+        return text
+    had_trailing_nl = text.endswith("\n")
+    lines = text.split("\n")
+    if had_trailing_nl and lines and lines[-1] == "":
+        lines.pop()
+    drop = set()
+    for key in ("microskills", "workflows"):
+        names = set(removals.get(key) or [])
+        if not names:
+            continue
+        for block in _list_item_blocks(lines, key):
+            if _block_name(lines, block) in names:
+                drop.update(range(*block))
+    out = "\n".join(ln for i, ln in enumerate(lines) if i not in drop)
+    return out + "\n" if (had_trailing_nl and out) else out
+
+
 def base_drift(manifest, catalog):
     """Base-tagged catalog components absent from the manifest (by name) → [{name, kind}].
     These are base components a fresh seed would include but an existing harness.yaml predates
@@ -240,8 +340,9 @@ def base_drift(manifest, catalog):
 
 def append_plugin_entries(text, additions):
     """Append source:plugin entries to existing harness.yaml text, preserving the header comment
-    and every existing entry. `additions` maps list_key -> [name, ...]. A `key: []` empty list is
-    converted to block form; a missing list key gets a fresh section appended at EOF."""
+    and every existing entry. `additions` maps list_key -> [entry, ...] where entry is a name str
+    OR a {'name', 'derived_from'} dict (derived_from emits the provenance line). A `key: []` empty
+    list is converted to block form; a missing list key gets a fresh section appended at EOF."""
     had_trailing_nl = text.endswith("\n")
     lines = text.split("\n")
     if had_trailing_nl and lines and lines[-1] == "":
@@ -274,8 +375,11 @@ def append_plugin_entries(text, additions):
         if not names:
             continue
         new = []
-        for n in names:
-            new += [f"  - name: {n}", "    source: plugin"]
+        for it in names:
+            nm = it["name"] if isinstance(it, dict) else it
+            new += [f"  - name: {nm}", "    source: plugin"]
+            if isinstance(it, dict) and it.get("derived_from"):
+                new.append(f"    derived_from: {it['derived_from']}")
         i = header_idx(key)
         if i is None:
             lines += [f"{key}:"] + new
