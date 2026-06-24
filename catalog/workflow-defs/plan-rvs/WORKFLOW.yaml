@@ -1,6 +1,5 @@
 version: 1
 name: plan-rvs
-base: true
 description: >
   The reusable plan-stage RVS — a planner-in-review cycle: plan→review→verify→synthesize over
   the PLAN object (the planner's plan.yaml), producing {plan_path, scope_advisory, name} plus the

@@ -107,18 +107,14 @@ workflows:
     source: plugin
 """
 
-# Base-tagged catalog components absent from PARTIAL_MANIFEST. The §8-step-7 RVS
-# rewire base-tagged (for import-closure) the review/verify/synth + floor + grounding
-# + bundling microskills, so the flagship base set a fresh consumer seeds includes
-# them. The workflow-inlining engine added the two first-class RVS workflows
-# implement-rvs + plan-rvs. The base set is now exactly the create-pipeline closure
-# (plan-rvs/implement-rvs + their review/floor/grounding microskills); the 2026-06-21
-# production rewire UNWIRED refine-requirements from the create pipelines, so it is no
-# longer pulled into the base set.
-MISSING_BASE = {"run-validators", "build-catalog-index",
-                "review-dimension", "verify-finding",
-                "synthesize-review", "bundle-draft",
-                "implement-rvs", "plan-rvs"}
+# After the base→roots redefinition, base: true lives ONLY on the two create pipelines
+# (workflow-create, microskill-create). Their imports-closure pulls in these 10 deps as
+# derived_from entries — they are no longer base-tagged, so they surface as available_CLOSURE
+# (mandatory, auto-added on --apply), not available_BASE. PARTIAL_MANIFEST lists the two
+# pipeline roots + task-plan/task-implement, so the closure deps still missing from it are
+# the review/verify/synth + floor + grounding + bundling microskills plus plan-rvs/implement-rvs.
+CLOSURE_DEPS = {"run-validators", "build-catalog-index", "review-dimension", "verify-finding",
+                "synthesize-review", "bundle-draft", "implement-rvs", "plan-rvs"}
 
 
 def write_manifest(tmp, text):
@@ -138,43 +134,45 @@ def run_init(tmp, *flags):
     return json.loads(proc.stdout)
 
 
-def test_available_base_detects_missing(tmp_path):
-    write_manifest(tmp_path, PARTIAL_MANIFEST)
+def test_available_closure_detects_missing_deps(tmp_path):
+    write_manifest(tmp_path, PARTIAL_MANIFEST)  # has both pipeline roots, not their full closure
     plan = run_init(tmp_path, "--plan")
-    names = {b["name"] for b in plan["available_base"]}
-    assert MISSING_BASE <= names, plan["available_base"]
-    assert plan["adopted_base"] == []
-    # informational only — not materialized without adopt
-    assert {a["name"] for a in plan["actions"] if a["action"] == "add"}.isdisjoint(MISSING_BASE)
+    closure_names = {d["name"] for d in plan["available_closure"]}
+    assert CLOSURE_DEPS <= closure_names, plan["available_closure"]
+    assert plan["available_base"] == []          # the two roots are already listed
+    # --plan writes nothing to harness.yaml (the file still lacks the deps)
+    assert "review-dimension" not in (tmp_path / "harness" / "harness.yaml").read_text()
 
 
-def test_available_base_empty_when_all_listed(tmp_path):
-    init_project(tmp_path)  # seeds the FULL base set
+def test_no_drift_when_closure_complete(tmp_path):
+    init_project(tmp_path)  # seeds roots + full closure
     plan = run_init(tmp_path, "--plan")
     assert plan["available_base"] == []
+    assert plan["available_closure"] == []
+    assert plan["orphaned_closure"] == []
 
 
-def test_adopt_base_appends_and_materializes(tmp_path):
+def test_closure_auto_adds_and_materializes(tmp_path):
     hy = write_manifest(tmp_path, PARTIAL_MANIFEST)
-    res = run_init(tmp_path, "--apply", "--adopt-base")
-    assert {b["name"] for b in res["adopted_base"]} == MISSING_BASE
-    assert res["available_base"] == []
-    # harness.yaml now lists both, tagged source: plugin
+    res = run_init(tmp_path, "--apply")           # NO --adopt-base: closure deps are mandatory
+    added = {d["name"] for d in res["available_closure"]}
+    assert CLOSURE_DEPS <= added
     text = hy.read_text()
-    for name in MISSING_BASE:
-        assert name in text
+    for name in CLOSURE_DEPS:
+        assert name in text                        # written to harness.yaml
+    assert "derived_from:" in text                 # marked as derived
     # materialized into .claude/
     assert (tmp_path / ".claude" / "microskills" / "review-dimension").is_dir()
     assert (tmp_path / ".claude" / "workflow-defs" / "implement-rvs").is_dir()
-    # idempotent: re-run sees no drift and nothing new to add
+    # idempotent: second run sees no further drift
     second = run_init(tmp_path, "--plan")
-    assert second["available_base"] == []
-    assert {a["name"] for a in second["actions"] if a["action"] == "add"}.isdisjoint(MISSING_BASE)
+    assert second["available_closure"] == []
+    assert second["orphaned_closure"] == []
 
 
-def test_adopt_base_preserves_header_and_custom_entry(tmp_path):
+def test_closure_add_preserves_header_and_custom_entry(tmp_path):
     hy = write_manifest(tmp_path, PARTIAL_MANIFEST)
-    run_init(tmp_path, "--apply", "--adopt-base")
+    run_init(tmp_path, "--apply")
     text = hy.read_text()
     assert text.startswith("# Harness manifest (v2)")  # header comment survived
     assert "name: greet-user" in text and "source: custom" in text  # custom entry survived

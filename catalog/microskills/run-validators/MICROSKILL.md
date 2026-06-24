@@ -1,6 +1,5 @@
 ---
 name: run-validators
-base: true
 description: Use as the deterministic-floor node of a create pipeline — run the programmatic validators named by the active floor contract over a staged artifact (validate-microskill for a microskill draft, or validate-workflow plus compile-workflow for a workflow draft) and map their results to floor findings. Produces a JSON object with dimension deterministic-floor and a findings array, with no pass verdict.
 ---
 

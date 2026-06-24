@@ -1,6 +1,5 @@
 ---
 name: review-dimension
-base: true
 description: Use when reviewing one artifact — the active profile's artifact kind, e.g. a unified git diff (base) or a design/requirements document — along one configured quality dimension within a fan-out review workflow. Scans the artifact against the active dimension's rubric (supplied as reference context), grounded by an optional summary and optional grounding file, flagging only issues matching that rubric. Dimension and artifact kind are configuration variables, so one body serves code and document review. Produces a JSON object pairing the dimension with structured findings (id, severity, file, line, title, explanation, fix, confidence).
 ---
 

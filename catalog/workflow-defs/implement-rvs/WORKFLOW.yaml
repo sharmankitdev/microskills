@@ -1,6 +1,5 @@
 version: 1
 name: implement-rvs
-base: true
 description: >
   The reusable implement-stage RVS loop — a self-correcting implement→review→verify→synthesize
   cycle. implement-rvs is the PURE loop (the host create pipeline owns finalize): it starts

@@ -1,6 +1,5 @@
 ---
 name: bundle-draft
-base: true
 description: Use when a create-pipeline review or verify stage needs a SINGLE artifact_path but the implementer staged a LIST of files — concatenate the staged draft files (and an optional grounding file) into one review bundle with per-file provenance markers, by running the bundle-draft script. Produces the bundle path plus the staged-file count.
 ---
 

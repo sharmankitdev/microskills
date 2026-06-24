@@ -1,6 +1,5 @@
 ---
 name: task-implement
-base: true
 description: >
   Build a domain artifact from an approved plan, running as the domain implementer
   agent against its phase contract, writing the files into a staging directory and
