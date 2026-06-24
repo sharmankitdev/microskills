@@ -875,3 +875,96 @@ def test_remove_plugin_entries_noop_when_absent():
     mod = load_init_module()
     out = mod.remove_plugin_entries(REMOVE_MANIFEST, {"microskills": ["ghost"]})
     assert out == REMOVE_MANIFEST
+
+
+# --- dependency closure: main() integration (Task 5) ----------------------------------------
+
+def make_closure_world(tmp):
+    """A plugin world (catalog + plugin.json) shaped for closure tests:
+    base root 'wf-root' -> imports nested 'wf-mid' + leaf 'ms-a'; 'wf-mid' -> 'ms-b'."""
+    plugin_root = tmp / "plugin"
+    make_closure_catalog(plugin_root)  # writes plugin_root/catalog/...
+    set_plugin_version(plugin_root, "1.0.0")
+    proj = tmp / "proj"; proj.mkdir()
+    return plugin_root, proj
+
+
+def test_apply_seeds_and_materializes_closure(tmp_path):
+    plugin_root, proj = make_closure_world(tmp_path)
+    rc, res = run_world(proj, plugin_root, "--apply")  # no manifest → seed closure
+    assert rc == 0, res
+    # all four materialized
+    assert (proj / ".claude" / "workflow-defs" / "wf-root").is_dir()
+    assert (proj / ".claude" / "workflow-defs" / "wf-mid").is_dir()
+    assert (proj / ".claude" / "microskills" / "ms-a").is_dir()
+    assert (proj / ".claude" / "microskills" / "ms-b").is_dir()
+    # harness.yaml: root plain, deps derived_from
+    text = (proj / "harness" / "harness.yaml").read_text()
+    assert "derived_from: wf-root" in text
+    # re-run is a clean noop
+    rc, second = run_world(proj, plugin_root, "--plan")
+    assert second["available_closure"] == [] and second["orphaned_closure"] == []
+    assert second["summary"]["add"] == 0
+
+
+def test_add_import_propagates_to_manifest(tmp_path):
+    plugin_root, proj = make_closure_world(tmp_path)
+    run_world(proj, plugin_root, "--apply")
+    # author a NEW microskill + add it to wf-mid's imports
+    cat = plugin_root / "catalog"
+    d = cat / "microskills" / "ms-new"; (d / "profiles").mkdir(parents=True)
+    (d / "MICROSKILL.md").write_text("---\nname: ms-new\ndescription: d\n---\n\n# ms-new\n")
+    (d / "profiles" / "base.yaml").write_text("version: 1\n")
+    wf_mid = cat / "workflow-defs" / "wf-mid" / "WORKFLOW.yaml"
+    wf_mid.write_text(wf_mid.read_text().replace(
+        "  - microskills/ms-b", "  - microskills/ms-b\n  - microskills/ms-new"))
+    # plan reports the new dep; apply materializes it
+    rc, plan = run_world(proj, plugin_root, "--plan")
+    assert "ms-new" in {dd["name"] for dd in plan["available_closure"]}
+    rc, res = run_world(proj, plugin_root, "--apply")
+    assert (proj / ".claude" / "microskills" / "ms-new").is_dir()
+    text = (proj / "harness" / "harness.yaml").read_text()
+    assert "name: ms-new" in text and "derived_from: wf-root" in text
+
+
+def test_orphaned_dep_is_pruned(tmp_path):
+    plugin_root, proj = make_closure_world(tmp_path)
+    run_world(proj, plugin_root, "--apply")
+    # remove ms-b from wf-mid's imports → ms-b becomes orphaned
+    wf_mid = plugin_root / "catalog" / "workflow-defs" / "wf-mid" / "WORKFLOW.yaml"
+    wf_mid.write_text(wf_mid.read_text().replace("\n  - microskills/ms-b", ""))
+    rc, plan = run_world(proj, plugin_root, "--plan")
+    assert "ms-b" in {o["name"] for o in plan["orphaned_closure"]}
+    rc, res = run_world(proj, plugin_root, "--apply")
+    assert not (proj / ".claude" / "microskills" / "ms-b").exists()
+    assert "name: ms-b" not in (proj / "harness" / "harness.yaml").read_text()
+
+
+def test_hand_added_root_is_never_pruned(tmp_path):
+    plugin_root, proj = make_closure_world(tmp_path)
+    run_world(proj, plugin_root, "--apply")
+    # add a standalone workflow as a ROOT (no derived_from, not imported by anyone). A workflow
+    # because render emits the workflows: list LAST, so an EOF text-append lands under it.
+    cat = plugin_root / "catalog"
+    d = cat / "workflow-defs" / "lonely"; (d / "profiles").mkdir(parents=True)
+    (d / "WORKFLOW.yaml").write_text(
+        "version: 1\nname: lonely\nimports: []\n"
+        "nodes:\n  - id: x\n    delegation: orchestrator\n    prompt: p\noutput:\n  from: x\n")
+    (d / "profiles" / "base.yaml").write_text("version: 1\n")
+    hy = proj / "harness" / "harness.yaml"
+    hy.write_text(hy.read_text() + "  - name: lonely\n    source: plugin\n")
+    run_world(proj, plugin_root, "--apply")
+    assert (proj / ".claude" / "workflow-defs" / "lonely").is_dir()
+    # re-runs never prune it (no derived_from)
+    rc, plan = run_world(proj, plugin_root, "--plan")
+    assert "lonely" not in {o["name"] for o in plan["orphaned_closure"]}
+    assert "name: lonely" in hy.read_text()
+
+
+def test_unresolved_import_is_an_error(tmp_path):
+    plugin_root, proj = make_closure_world(tmp_path)
+    wf_mid = plugin_root / "catalog" / "workflow-defs" / "wf-mid" / "WORKFLOW.yaml"
+    wf_mid.write_text(wf_mid.read_text().replace("microskills/ms-b", "microskills/ghost"))
+    rc, plan = run_world(proj, plugin_root, "--plan")
+    assert rc == 1
+    assert "microskills/ghost" in plan["unresolved_imports"]

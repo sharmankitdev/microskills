@@ -755,8 +755,40 @@ def main():
         if apply and harness_yaml.exists():
             harness_yaml.write_text(append_plugin_entries(harness_yaml.read_text(), additions))
 
+    # Closure reconcile: the manifest's ROOTS (entries without derived_from) imply a transitive
+    # imports-closure of mandatory deps. Prune derived entries no longer reachable from any root,
+    # then auto-add missing closure deps (marked derived_from). MANDATORY, so — unlike base_drift,
+    # which OFFERS new roots behind --adopt-base — these flow automatically on --apply. --plan
+    # reports both lists and writes nothing. Runs AFTER base-drift adoption so a freshly-adopted
+    # root's own deps are pulled this run. An unresolvable import is a hard error.
+    unresolved_imports = closure_unresolved(manifest, catalog)
+    closure_errors = [{"name": imp, "reason": f"unresolvable import in closure: {imp}"}
+                      for imp in unresolved_imports]
+
+    orphaned_closure = closure_orphans(manifest, catalog)
+    if orphaned_closure:
+        rm = {}
+        for o in orphaned_closure:
+            lk = list_key_for[o["kind"]]
+            manifest[lk] = [c for c in (manifest.get(lk) or []) if c["name"] != o["name"]]
+            rm.setdefault(lk, []).append(o["name"])
+        if apply and harness_yaml.exists():
+            harness_yaml.write_text(remove_plugin_entries(harness_yaml.read_text(), rm))
+
+    available_closure = closure_drift(manifest, catalog)
+    if available_closure:
+        adds = {}
+        for d in available_closure:
+            lk = list_key_for[d["kind"]]
+            manifest.setdefault(lk, []).append(
+                {"name": d["name"], "source": "plugin", "derived_from": d["derived_from"]})
+            adds.setdefault(lk, []).append({"name": d["name"], "derived_from": d["derived_from"]})
+        if apply and harness_yaml.exists():
+            harness_yaml.write_text(append_plugin_entries(harness_yaml.read_text(), adds))
+
     # 2. Plugin components + engine plan.
     desired, errors = build_plugin_desired(manifest, catalog, anchor)
+    errors = closure_errors + errors
     state = _hs.load_state(state_path)
     installed_all = state.get("components") or {}
     installed_plugin = {n: e for n, e in installed_all.items() if e.get("source") == "plugin"}
@@ -822,6 +854,9 @@ def main():
         "seeded_harness_yaml": seeded,
         "available_base": drift,
         "adopted_base": adopted,
+        "available_closure": available_closure,
+        "orphaned_closure": orphaned_closure,
+        "unresolved_imports": unresolved_imports,
         "engine": {"action": eng_action, "files": len(eng_out)},
         "actions": actions,
         "conflicts": conflicts,
