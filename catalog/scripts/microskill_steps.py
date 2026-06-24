@@ -7,8 +7,8 @@ profile resolution, which may add/patch step text) import this module via
 importlib SourceFileLoader so the numbered-step pattern and the atomicity cap
 cannot drift between the two tools.
 
-Internal control flow is no longer linted — a microskill body is a black box;
-the compiler owns orchestration placement (a microskill exposing AskUserQuestion
+Internal control flow is no longer linted — a microskill body's internals are
+its own concern; the compiler owns orchestration placement (a microskill exposing AskUserQuestion
 runs at an orchestrator checkpoint; the compile dies if mis-placed in a
 background segment). This module therefore carries only the numbered-step
 pattern and the advisory atomicity cap, with no control-flow opinion.

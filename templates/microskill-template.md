@@ -22,7 +22,7 @@ description: <When to trigger + what this does. Keep name + description together
 2. **<verb-led step name>** — <atomic action>. Uses <input_2>.
 3. **<verb-led step name>** — <atomic action>.
 
-<!-- Internals are a black box: branches, loops, tool use, even a human gate (declare
+<!-- Internals are the skill's own concern: branches, loops, tool use, even a human gate (declare
      AskUserQuestion in runtime.allowed_tools) are all fine. A microskill graduates to a
      workflow when it must compose OTHER components — call another microskill/agent/workflow,
      or orchestrate a multi-node graph. -->

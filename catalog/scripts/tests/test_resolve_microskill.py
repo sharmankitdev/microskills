@@ -1759,8 +1759,8 @@ def test_steps_directives_preserve_optional_mandate_skip(tmp_path):
 def test_shared_atomicity_module_vocabulary_matches_validate(tmp_path):
     # The shared module carries only the numbered-step vocabulary + advisory cap
     # used by BOTH validate-microskill and resolve-microskill. Internal control
-    # flow is no longer linted — a microskill body is a black box and the compiler
-    # owns orchestration placement — so the branch vocabulary is gone entirely.
+    # flow is no longer linted — a microskill body's internals are its own concern
+    # and the compiler owns orchestration placement — so the branch vocabulary is gone.
     import importlib.machinery as _m
     import importlib.util as _u
 
@@ -1773,7 +1773,7 @@ def test_shared_atomicity_module_vocabulary_matches_validate(tmp_path):
     assert mod.STEP_RE.search("1. do thing")
     assert mod.count_steps("1. do thing\n2. do other") == 2
     assert isinstance(mod.STEP_CAP, int)
-    # the branch vocabulary no longer exists — internals are a black box
+    # the branch vocabulary no longer exists — internals are the skill's own concern
     assert not hasattr(mod, "BRANCH_RE")
     assert not hasattr(mod, "find_branch_language")
 

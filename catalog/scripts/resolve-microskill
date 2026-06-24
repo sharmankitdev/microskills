@@ -93,8 +93,8 @@ SCHEMA_PATH = _templates_root(SCRIPT) / "references" / "config-schema.json"
 # Shared numbered-step vocabulary + atomicity cap (STEP_RE / STEP_CAP). The SAME
 # module backs validate-microskill's author-time lint, so the advisory step cap
 # applied to a profile's merged Steps cannot drift from the validator's. Internal
-# control flow is not linted — the body is a black box and the compiler owns
-# orchestration placement. Loaded via SourceFileLoader to match the engine's
+# control flow is not linted — the body's internals are the skill's own concern
+# and the compiler owns orchestration placement. Loaded via SourceFileLoader to match the engine's
 # extension-less-script pattern.
 _STEPS_MOD_PATH = SCRIPT.parent / "microskill_steps.py"
 _steps_loader = importlib.machinery.SourceFileLoader(
@@ -958,8 +958,9 @@ def main():
         emit_and_exit({"error": f"step directive error: {e}"}, 1)
 
     # Atomicity re-check on the MERGED Steps (LOCKED decision: inline, shared
-    # module). Internal control flow is no longer linted — a microskill body is a
-    # black box and the compiler owns orchestration placement — so this re-check
+    # module). Internal control flow is no longer linted — a microskill body's
+    # internals are the skill's own concern and the compiler owns orchestration
+    # placement — so this re-check
     # only enforces the advisory step cap. The >STEP_CAP cap stays an advisory
     # WARN (not a block), consistent with validate-microskill's documented cap.
     _, merged_steps_block, _ = parse_steps_section(rendered)
