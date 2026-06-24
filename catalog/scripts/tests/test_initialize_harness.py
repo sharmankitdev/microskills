@@ -667,3 +667,73 @@ def test_schema_rejects_unknown_field(tmp_path):
     import pytest
     with pytest.raises(SystemExit):
         mod.validate_manifest(manifest)
+
+
+# --- dependency closure: walk_closure + import classification (Task 2) -----------------------
+
+def make_closure_catalog(tmp):
+    """A throwaway catalog: root workflow 'wf-root' imports nested workflow 'wf-mid' + leaf
+    microskill 'ms-a'; 'wf-mid' imports 'ms-b'. Only 'wf-root' is base-tagged."""
+    cat = tmp / "catalog"
+
+    def ms(name):
+        d = cat / "microskills" / name
+        (d / "profiles").mkdir(parents=True)
+        (d / "MICROSKILL.md").write_text(
+            f"---\nname: {name}\ndescription: d\n---\n\n# {name}\n")
+        (d / "profiles" / "base.yaml").write_text("version: 1\n")
+
+    def wf(name, imports, base=False):
+        d = cat / "workflow-defs" / name
+        (d / "profiles").mkdir(parents=True)
+        imp = "".join(f"\n  - {i}" for i in imports)
+        base_line = "base: true\n" if base else ""
+        (d / "WORKFLOW.yaml").write_text(
+            f"version: 1\nname: {name}\n{base_line}imports:{imp}\n"
+            "nodes:\n  - id: x\n    delegation: orchestrator\n    prompt: p\noutput:\n  from: x\n")
+        (d / "profiles" / "base.yaml").write_text("version: 1\n")
+
+    ms("ms-a"); ms("ms-b")
+    wf("wf-mid", ["microskills/ms-b"])
+    wf("wf-root", ["wf-mid", "microskills/ms-a"], base=True)
+    return cat
+
+
+def test_walk_closure_transitive(tmp_path):
+    mod = load_init_module()
+    cat = make_closure_catalog(tmp_path)
+    derived, unresolved = mod.walk_closure([("workflow", "wf-root")], cat)
+    assert unresolved == []
+    assert derived == {
+        ("workflow", "wf-mid"): "wf-root",
+        ("microskill", "ms-a"): "wf-root",
+        ("microskill", "ms-b"): "wf-root",  # transitive via wf-mid, stamped with the ROOT
+    }
+
+
+def test_walk_closure_classifies_by_prefix_and_existence(tmp_path):
+    mod = load_init_module()
+    cat = make_closure_catalog(tmp_path)
+    assert mod.classify_import("microskills/ms-a", cat) == ("microskill", "ms-a")
+    assert mod.classify_import("wf-mid", cat) == ("workflow", "wf-mid")
+    assert mod.classify_import("microskills/nope", cat) == (None, "nope")
+    assert mod.classify_import("ghost", cat) == (None, "ghost")
+
+
+def test_walk_closure_reports_unresolved(tmp_path):
+    mod = load_init_module()
+    cat = make_closure_catalog(tmp_path)
+    # break wf-mid's import
+    (cat / "workflow-defs" / "wf-mid" / "WORKFLOW.yaml").write_text(
+        "version: 1\nname: wf-mid\nimports:\n  - microskills/ghost\n"
+        "nodes:\n  - id: x\n    delegation: orchestrator\n    prompt: p\noutput:\n  from: x\n")
+    derived, unresolved = mod.walk_closure([("workflow", "wf-root")], cat)
+    assert unresolved == ["microskills/ghost"]
+    assert ("microskill", "ms-b") not in derived
+
+
+def test_walk_closure_microskill_root_is_leaf(tmp_path):
+    mod = load_init_module()
+    cat = make_closure_catalog(tmp_path)
+    derived, unresolved = mod.walk_closure([("microskill", "ms-a")], cat)
+    assert derived == {} and unresolved == []

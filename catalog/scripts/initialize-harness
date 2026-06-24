@@ -138,6 +138,70 @@ def catalog_names(catalog, kind):
     return sorted(p.name for p in d.iterdir() if p.is_dir() and not p.name.startswith("."))
 
 
+def _list_key_for(kind):
+    """'microskill' -> 'microskills', 'workflow' -> 'workflows'."""
+    return {k: lk for lk, k in _hs.LIST_KIND.items()}[kind]
+
+
+def classify_import(imp, catalog):
+    """Resolve an imports[] entry to (kind, name), or (None, name) if it resolves to nothing.
+    Grammar: 'microskills/<name>' -> microskill (a leaf); 'workflow-defs/<name>' -> workflow;
+    a bare '<name>' -> workflow by convention. The prefix is authoritative when present; a bare
+    name is classified by catalog existence (workflow first), so the convention can be verified."""
+    name = imp.split("/", 1)[1] if "/" in imp else imp
+    if imp.startswith("microskills/"):
+        return ("microskill", name) if (catalog / "microskills" / name).is_dir() else (None, name)
+    if imp.startswith("workflow-defs/"):
+        return ("workflow", name) if (catalog / "workflow-defs" / name).is_dir() else (None, name)
+    if (catalog / "workflow-defs" / name).is_dir():
+        return "workflow", name
+    if (catalog / "microskills" / name).is_dir():
+        return "microskill", name
+    return None, name
+
+
+def workflow_imports(catalog, name):
+    """The raw string imports[] of a workflow's WORKFLOW.yaml ([] if absent/unreadable)."""
+    try:
+        doc = yaml.safe_load((catalog / "workflow-defs" / name / "WORKFLOW.yaml").read_text()) or {}
+    except (OSError, yaml.YAMLError):
+        return []
+    return [i for i in (doc.get("imports") or []) if isinstance(i, str)]
+
+
+def walk_closure(roots, catalog):
+    """Transitive imports-closure of `roots` (list of (kind, name)).
+    Returns (derived, unresolved):
+      derived    -- {(kind, name): root_name} for every DERIVED component reachable from a
+                    root (roots themselves excluded). root_name = the lexicographically-smallest
+                    root that reaches it (roots iterated ascending, first writer wins).
+      unresolved -- sorted unique import strings that resolve to no catalog component.
+    Microskills are leaves (no recursion); workflows recurse. A global `seen` set guards
+    against cycles and redundant re-expansion."""
+    derived, unresolved, seen = {}, [], set()
+    rootset = {(k, n) for k, n in roots}
+    for rkind, rname in sorted(roots):
+        if rkind != "workflow":
+            continue  # microskill roots are leaves
+        stack = [rname]
+        while stack:
+            wf = stack.pop()
+            if wf in seen:
+                continue
+            seen.add(wf)
+            for imp in workflow_imports(catalog, wf):
+                kind, cname = classify_import(imp, catalog)
+                if kind is None:
+                    unresolved.append(imp)
+                    continue
+                key = (kind, cname)
+                if key not in rootset:
+                    derived.setdefault(key, rname)
+                if kind == "workflow":
+                    stack.append(cname)
+    return derived, sorted(set(unresolved))
+
+
 def seed_manifest(catalog):
     """A v2 harness.yaml dict listing every base-tagged catalog component as source:plugin."""
     m = {"version": 2, "microskills": [], "workflows": []}
