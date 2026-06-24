@@ -737,3 +737,39 @@ def test_walk_closure_microskill_root_is_leaf(tmp_path):
     cat = make_closure_catalog(tmp_path)
     derived, unresolved = mod.walk_closure([("microskill", "ms-a")], cat)
     assert derived == {} and unresolved == []
+
+
+# --- dependency closure: seed + render (Task 3) ---------------------------------------------
+
+def test_seed_manifest_is_closure(tmp_path):
+    mod = load_init_module()
+    cat = make_closure_catalog(tmp_path)  # only wf-root is base-tagged
+    m = mod.seed_manifest(cat)
+    wf = {c["name"]: c for c in m["workflows"]}
+    ms = {c["name"]: c for c in m["microskills"]}
+    # root: plain, no derived_from
+    assert wf["wf-root"]["source"] == "plugin"
+    assert "derived_from" not in wf["wf-root"]
+    # deps: present + marked derived_from the root
+    assert wf["wf-mid"]["derived_from"] == "wf-root"
+    assert ms["ms-a"]["derived_from"] == "wf-root"
+    assert ms["ms-b"]["derived_from"] == "wf-root"
+    # lists are sorted by name
+    assert [c["name"] for c in m["microskills"]] == sorted(ms)
+
+
+def test_render_manifest_emits_derived_from(tmp_path):
+    mod = load_init_module()
+    m = {
+        "version": 2,
+        "microskills": [{"name": "ms-a", "source": "plugin", "derived_from": "wf-root"}],
+        "workflows": [{"name": "wf-root", "source": "plugin"}],
+    }
+    text = mod.render_manifest_yaml(m)
+    assert "    derived_from: wf-root" in text
+    # the root line carries no derived_from
+    root_block = text.split("workflows:")[1]
+    assert "derived_from" not in root_block
+    # round-trips through the schema
+    import yaml as _y
+    mod.validate_manifest(_y.safe_load(text))
