@@ -1,3 +1,14 @@
+## [0.40.0](https://github.com/sharmankitdev/microskills/compare/v0.39.0...v0.40.0) (2026-06-24)
+
+### ⚠ BREAKING CHANGES
+
+* **harness:** dynamic dependency closure — base tags only on root pipelines (#45)
+
+### Features
+
+* **harness:** dynamic dependency closure — base tags only on root pipelines ([#45](https://github.com/sharmankitdev/microskills/issues/45)) ([2faab4d](https://github.com/sharmankitdev/microskills/commit/2faab4d4a7726a83c4cf7d14f668cdcd22cae726))
+* **workflow:** workflow-create decompose profile — turn an orchestrator SKILL into a workflow ([#46](https://github.com/sharmankitdev/microskills/issues/46)) ([1027257](https://github.com/sharmankitdev/microskills/commit/10272575c9cf46204543a0c1b881f92f7f38e8b4))
+
 ## [0.39.0](https://github.com/sharmankitdev/microskills/compare/v0.38.0...v0.39.0) (2026-06-23)
 
 ### ⚠ BREAKING CHANGES
