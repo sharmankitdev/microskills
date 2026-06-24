@@ -1,0 +1,21 @@
+version: 1
+# workflow-create / decompose — turn an orchestrator SKILL into a first-class workflow by FAITHFUL
+# transcription. A pure-overlay profile family: it re-points the inlined plan-rvs + implement-rvs
+# children onto their workflow-create-decompose profiles (decompose planner contract + the decompose
+# review lenses); everything else (gate, provision fan-out, finalize) is inherited from base. The
+# input is the SKILL DIRECTORY — normalize-input concatenates SKILL.md + references/*.md into one
+# grounding bundle the planner transcribes and every review lens grounds against. Interactive
+# (human approves the decomposition plan at approve_plan); orthogonal to `autonomous`.
+nodes:
+  patch:
+    - id: plan_rvs
+      customize: { profile: workflow-create-decompose }
+    - id: build
+      customize: { profile: workflow-create-decompose }
+
+inputs:
+  requirement_path:
+    description: >-
+      Path to the orchestrator SKILL to decompose — point it at the skill DIRECTORY (e.g.
+      .claude/skills/project-starter). normalize-input concatenates SKILL.md + references/*.md into
+      one bundle the decompose planner transcribes and every review lens grounds against.

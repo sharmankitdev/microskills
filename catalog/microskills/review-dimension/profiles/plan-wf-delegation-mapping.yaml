@@ -1,0 +1,40 @@
+version: 1
+
+# plan-wf-delegation-mapping lens for review-dimension — used ONLY by the workflow-create
+# decompose profile's plan critique. Reviews whether each delegation in the SOURCE SKILL is
+# mapped to the correct workflow construct per the decompose taxonomy. Skill bundle = the
+# context_path. A plain list REPLACES base's correctness snippet. Sibling of
+# plan-wf-decompose-fidelity (which owns WHETHER every phase is reproduced).
+vars:
+  dimension: plan-wf-delegation-mapping
+  artifact_kind: workflow plan (plan.yaml)
+
+context:
+  snippets:
+    - name: plan-wf-delegation-mapping-rubric
+      text: >-
+        Delegation-mapping rubric — answer "is each delegation the SOURCE SKILL performs
+        (the context_path bundle) mapped to the RIGHT workflow construct per the decompose
+        taxonomy?" The taxonomy: a pure deterministic transformation (an agent/script step,
+        no human, well-defined output) -> a use: microskill (reuse) / agent: node / a
+        missing_microskills entry; an INTERACTIVE step or a delegation to an EXTERNAL SKILL
+        (e.g. /spec:interview, /ux-design, anything that pauses for a human or runs another
+        skill's own pipeline) -> an OPAQUE orchestrator (delegation: orchestrator) checkpoint
+        node that invokes the skill, NEVER a use:/agent: node (a background use:/agent: node
+        cannot pause for a human and will silently fabricate); an agent debate / bounded
+        iteration -> a loop region; a conditional phase -> when; a human approval -> a gate.
+        Flag only mapping defects: an interactive or external-skill delegation modeled as a
+        background use:/agent: node instead of an opaque orchestrator node; a pure
+        deterministic transformation modeled as an orchestrator node (losing determinism /
+        reuse) instead of use:/agent:/missing_microskills; an agent debate not expressed as a
+        loop; the planner RECURSING into an external skill's internals instead of keeping it
+        opaque; a missing_microskills entry named for THIS workflow or step rather than the
+        reusable capability it performs. Severity mapping: an interactive / external-skill
+        delegation forced into a background use:/agent: node (it will fabricate — background
+        segments cannot pause) = blocker; a pure transformation miscls as an orchestrator node,
+        a debate not modeled as a loop, or a capability-coupled missing_microskills name =
+        major; a borderline transform-vs-orchestrator judgment = minor; a cosmetic wording
+        issue on an otherwise-correct mapping = nit. Set finding.file to the plan's path and
+        line to the cited node. Do NOT raise plan-wf-decompose-fidelity (whether every phase
+        is reproduced at all), nor the base plan-wf-* soundness concerns — this lens owns ONLY
+        the per-delegation construct choice.

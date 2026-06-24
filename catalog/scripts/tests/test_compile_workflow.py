@@ -6574,3 +6574,25 @@ def test_real_microskill_create_no_bare_xreview_refs():
     no_result = [e for e in (payload.get("errors") or []) if "no recorded result" in e]
     assert not no_result, payload
     assert rc2 == 0, payload
+
+
+def test_decompose_profile_compiles_and_wires_dims():
+    # The workflow-create `decompose` profile family: plan stage runs task-plan's
+    # workflow-decompose domain (the decompose contract), and the decompose review lenses
+    # splice into the plan + build review fan-outs. Reads the generated .claude runtime, so
+    # the catalog profiles must be materialized (initialize-harness --apply) first.
+    rc, data, out, err = run(REAL_DEFS, "workflow-create", "--profile", "decompose")
+    assert rc == 0, err
+    compiled = REAL_DEFS / "workflow-create" / ".compiled"
+    blob = json.dumps(json.loads((compiled / "manifest.json").read_text()))
+    # the decompose plan-critique dims are spliced into the plan review fan-out
+    assert "review_plan_wf_decompose_fidelity" in blob
+    assert "review_plan_wf_delegation_mapping" in blob
+    # the build review fan-out carries the behavior-fidelity dim
+    assert "review_wf_decompose_behavior_fidelity" in blob
+    # the plan node runs task-plan's workflow-decompose domain — the resolved node carries the
+    # decompose contract (contract_doc is resolved at compile into the segment's resolved/ node,
+    # not the top-level manifest).
+    plan_resolved = json.loads((compiled / "resolved" / "plan_rvs__plan.json").read_text())
+    assert plan_resolved["profile_used"] == "workflow-decompose"
+    assert "decompose-planner.md" in json.dumps(plan_resolved)

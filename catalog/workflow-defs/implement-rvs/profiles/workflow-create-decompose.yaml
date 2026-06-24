@@ -1,0 +1,30 @@
+version: 1
+# implement-rvs / workflow-create-decompose — the workflow-DECOMPOSE draft critique. Identical to
+# the workflow-create build RVS, plus the wf-decompose-behavior-fidelity lens (built WORKFLOW.yaml
+# vs the source skill). The cross-artifact panel (xreview), verify (workflow-draft-xref), and floor
+# (workflow) are inherited from base unchanged.
+nodes:
+  patch:
+    - id: review
+      expand:
+        over:
+          - wf-dag-decomposition-correctness
+          - wf-guard-logic-intent
+          - wf-prompt-task-fidelity
+          - wf-gate-prompt-options-quality
+          - wf-profile-overlay-coherence
+          - wf-spill-materialize-judgment
+          - wf-output-schema-downstream-fit
+          - wf-decompose-behavior-fidelity
+
+# Adding a review dim generates review_wf_decompose_behavior_fidelity — co-patch loop.body so it
+# stays inside the contiguous do/while window (the resolver list-replaces body wholesale). Restates
+# the base wf body with the new node appended after the other review_wf_* siblings (same rank).
+loop:
+  body: [implement, catalog_index, bundle, bundle_xref, floor,
+         review_wf_dag_decomposition_correctness, review_wf_guard_logic_intent,
+         review_wf_prompt_task_fidelity, review_wf_gate_prompt_options_quality,
+         review_wf_profile_overlay_coherence, review_wf_spill_materialize_judgment,
+         review_wf_output_schema_downstream_fit, review_wf_decompose_behavior_fidelity,
+         xreview_duplicate_capability, xreview_naming_collision, xreview_reverse_consumer,
+         verify, synth]

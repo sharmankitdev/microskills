@@ -1,0 +1,21 @@
+version: 1
+# plan-rvs / workflow-create-decompose — the workflow-DECOMPOSE plan critique. Retargets the plan
+# node to task-plan's workflow-decompose domain (the decompose contract) and EXTENDS the wf plan
+# critique with the two decompose lenses. LOOP-LESS (single pass; the host's approve_plan gate is
+# the backstop). verify stays plan-workflow (base, domain-correct). Restating review.over MUST
+# co-patch loop.body — but the base is loop-less, so there is no loop to co-patch.
+nodes:
+  patch:
+    - id: plan
+      customize: { profile: workflow-decompose }
+    - id: review
+      expand:
+        over:
+          - plan-wf-completeness
+          - plan-wf-graph-correctness
+          - plan-wf-control-flow
+          - plan-wf-reuse-survey
+          - plan-wf-scope-fit
+          - plan-wf-name-capability
+          - plan-wf-decompose-fidelity
+          - plan-wf-delegation-mapping
