@@ -32,6 +32,8 @@ WF_DIMS = [
     "plan-wf-reuse-survey",
     "plan-wf-scope-fit",
     "plan-wf-name-capability",
+    "plan-wf-decompose-fidelity",
+    "plan-wf-delegation-mapping",
 ]
 
 

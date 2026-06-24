@@ -77,6 +77,7 @@ WF_DIMS = [
     "wf-profile-overlay-coherence",
     "wf-spill-materialize-judgment",
     "wf-output-schema-downstream-fit",
+    "wf-decompose-behavior-fidelity",
 ]
 
 # The load-bearing artifact_kind strings (plan inventory). Every ms review-dimension
@@ -118,7 +119,7 @@ def _raw(path):
 
 def test_inventory_sizes():
     assert len(MS_DIMS) == 12 and len(set(MS_DIMS)) == 12
-    assert len(WF_DIMS) == 7 and len(set(WF_DIMS)) == 7
+    assert len(WF_DIMS) == 8 and len(set(WF_DIMS)) == 8
 
 
 def test_review_dimension_stamps_dimension_per_finding():

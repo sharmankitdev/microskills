@@ -1,0 +1,36 @@
+version: 1
+
+# plan-wf-decompose-fidelity lens for review-dimension — used ONLY by the workflow-create
+# decompose profile's plan critique. Reviews the workflow PLAN object (plan.yaml) the planner
+# wrote from a SOURCE SKILL, with the concatenated skill bundle as context_path. A plain list
+# REPLACES base's correctness snippet wholesale. output_schema, inputs, runtime, body inherit
+# from base. Sibling of plan-wf-delegation-mapping (which owns HOW each delegation is mapped).
+vars:
+  dimension: plan-wf-decompose-fidelity
+  artifact_kind: workflow plan (plan.yaml)
+
+context:
+  snippets:
+    - name: plan-wf-decompose-fidelity-rubric
+      text: >-
+        Decompose-fidelity rubric — answer "does the plan reproduce EVERY phase, gate, loop,
+        and conditional of the SOURCE SKILL (the context_path bundle: SKILL.md + references,
+        concatenated under === <relpath> === headers), with nothing dropped and no behavior
+        added the skill does not have?" Read the skill bundle's phase structure (numbered
+        phases / sub-phases, its "Human Gate?" markers, any "iterate up to N times" loop, any
+        optional / gaps-found conditional phase, and its state/handoff table) and check the
+        plan_yaml design's nodes/gates/loop/when against it, one phase at a time. Flag only
+        fidelity gaps: a skill phase with no corresponding node; a phase the skill marks as a
+        human gate with no gate in the plan; an iteration / debate loop in the skill with no
+        loop in the plan; an optional / conditional phase with no when guard; a phase-to-phase
+        data handoff named in the skill's state table with no depends_on or ref carrying it; a
+        node introducing behavior or a step the source skill does not contain; the plan's node
+        order contradicting the skill's stated phase order. Severity mapping: a whole skill
+        phase dropped, or a human gate the skill requires absent = blocker; an iteration loop
+        or a conditional phase dropped, or behavior added with no skill counterpart = major; a
+        state-handoff edge or phase-ordering thinness = minor; a cosmetic labeling divergence =
+        nit. Set finding.file to the plan's path and line to the cited node/element. Do NOT
+        raise plan-wf-delegation-mapping (whether each delegation is classified to the right
+        construct — that sibling owns it), nor the base plan-wf-completeness / -graph-correctness
+        / -control-flow / -reuse-survey / -scope-fit / -name-capability concerns (general plan
+        soundness) — this lens owns ONLY phase/gate/loop/conditional coverage vs the source skill.

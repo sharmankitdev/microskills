@@ -1,0 +1,32 @@
+version: 1
+
+# wf-decompose-behavior-fidelity lens for review-dimension — used ONLY by the workflow-create
+# decompose profile's BUILD (draft) critique. Reviews the built WORKFLOW.yaml draft bundle
+# against the SOURCE SKILL (context_path), checking behavior-equivalence. A plain list REPLACES
+# base's correctness snippet. output_schema, inputs, runtime, body inherit from base.
+vars:
+  dimension: wf-decompose-behavior-fidelity
+  artifact_kind: workflow draft bundle (WORKFLOW.yaml + profiles/*.yaml, concatenated)
+
+context:
+  snippets:
+    - name: wf-decompose-behavior-fidelity-rubric
+      text: >-
+        Behavior-fidelity rubric — answer "does the BUILT WORKFLOW.yaml's node graph reproduce
+        the SOURCE SKILL's control flow, phase ordering, human gates, and loops?" Compare the
+        draft bundle's nodes/gates/loop/when/depends_on against the skill bundle (context_path:
+        SKILL.md + references, concatenated). Flag only behavior-equivalence defects: a skill
+        phase / gate / loop present in the skill but absent from the built graph; node ordering
+        (depends_on) that diverges from the skill's phase order; a step the skill runs as a
+        human gate realized as a non-gate node, or vice versa; a loop max_iters that contradicts
+        the skill's stated iteration cap; an interactive / external-skill step realized as a
+        background use:/agent: node rather than an orchestrator node; a node with no counterpart
+        in the skill (added behavior). Severity mapping: a dropped phase / gate / loop, or a
+        background node where the skill requires human interaction = blocker; reordered phases or
+        a loop-cap mismatch or added behavior = major; minor ordering / labeling divergence =
+        minor; cosmetic = nit. Set finding.file to the bundle's path and line to the cited node.
+        Do NOT raise the base draft wf-* dimensions (wf-dag-decomposition-correctness,
+        wf-guard-logic-intent, wf-prompt-task-fidelity, wf-gate-prompt-options-quality,
+        wf-profile-overlay-coherence, wf-spill-materialize-judgment, wf-output-schema-downstream-fit) —
+        those own general workflow soundness; THIS lens owns ONLY behavior-equivalence to the
+        source skill.
