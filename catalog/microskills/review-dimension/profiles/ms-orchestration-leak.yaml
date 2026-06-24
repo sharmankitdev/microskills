@@ -1,7 +1,7 @@
 version: 1
 
 # ms-orchestration-leak lens overlay for review-dimension (create pipeline). A microskill is a
-# single black-box unit: it may branch, loop, use tools, and even pause for a human (declare
+# single, super-specialized unit: it may branch, loop, use tools, and even pause for a human (declare
 # AskUserQuestion in runtime.allowed_tools and the compiler runs it at an orchestrator
 # checkpoint — that is LEGITIMATE, never a leak). The two things a body genuinely cannot express
 # are spawning a sub-agent and calling another registered component — those compose in the
@@ -25,8 +25,8 @@ context:
         only those: a step that hands work to another agent ("dispatch a worker to finish the
         rest", "have a subagent classify each item"); a step that drives another registered
         component ("run the task-plan microskill over the result", "call review-dimension for
-        each file"). Internal branches, loops, and tool calls are NOT leaks — the body is a black
-        box. Severity mapping: a genuine sub-agent spawn or cross-component call a single
+        each file"). Internal branches, loops, and tool calls are NOT leaks — how the skill works inside is its own
+        concern. Severity mapping: a genuine sub-agent spawn or cross-component call a single
         microskill cannot perform = blocker (the unit must become a workflow); an ambiguous
         passage that probably delegates to an agent or another component = major; prose that
         merely mentions another component as context without instructing a call = minor. Set each

@@ -212,10 +212,10 @@ When `mandate_tool` is set and the step cannot be performed with that tool, the 
 |---|---|---|---|---|
 | `steps.remove` | array<int≥1> | no | — | ORIGINAL step numbers to elide; unique; a number naming no step is an **error** |
 | `steps.patch."<n>"` | object | no | — | replace step *n*'s body in place (position kept); key `^[0-9]+$`; closed |
-| `steps.patch."<n>".text` | string | no | — | new step body (everything after the renumbered `N. ` prefix); internal control flow is a black box (not linted) |
+| `steps.patch."<n>".text` | string | no | — | new step body (everything after the renumbered `N. ` prefix); internal control flow not linted |
 | `steps.add[]` | array | no | — | insert new steps; applied after remove+patch, in declared order |
 | `steps.add[].after` | int≥0 | yes | — | ORIGINAL step to insert after; `0` prepends before the first surviving step; a non-`0` value naming no step is an **error** |
-| `steps.add[].text` | string | yes | — | new step body; internal control flow is a black box (not linted) |
+| `steps.add[].text` | string | yes | — | new step body; internal control flow not linted |
 
 ```yaml
 steps:

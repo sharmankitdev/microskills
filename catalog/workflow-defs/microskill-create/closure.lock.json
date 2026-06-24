@@ -1,5 +1,5 @@
 {
-  "manifest_hash": "7e94657135747d70f59ab8beaa63dcdfe9a9479c849b7107b92b4e51e0a9f3a7",
+  "manifest_hash": "9241c3e9ebe2b0ff140493a0307073e348dc3e736499547cef3466cab7498e21",
   "name": "microskill-create",
   "node_fingerprints": {
     "advise": "01820cd75c406b7bcac77fd2cee4a4957d145097c1518277338b7e8747d04640",
@@ -14,7 +14,7 @@
     "impl_rvs__review_ms_description_trigger_quality": "6bd5e954204df44a3826877d374628d902c4482aaa1ba66df3a5d23e2363a327",
     "impl_rvs__review_ms_failure_modes_coverage": "d1faedeb12f8470327f2ff80d959b52a88e8ab3598aa18f80977bca48530acaa",
     "impl_rvs__review_ms_inputs_contract_adequacy": "e86ddab6083602315ccfaee4d35242188fbc936bc42154f9a719a7eda6762c4d",
-    "impl_rvs__review_ms_orchestration_leak": "13b427dbe1cc9f3bcf19d884aed25364e9fecdb3b5e50d5de9923b54d9f3a4d6",
+    "impl_rvs__review_ms_orchestration_leak": "6a0656111c6cc8cef31f6f45e608cee841ae2aa922d2fb26d93372170dc9f711",
     "impl_rvs__review_ms_output_contract_appropriate": "afecdc6cef067521cf1149ffb960f7320256183a6c78cf86801861e1b57e28f1",
     "impl_rvs__review_ms_output_section_vs_schema_fields": "e83f57dd2b2d2f2ea6f0054cc9b662474c84a9d85cb1f125f093deabab3f3812",
     "impl_rvs__review_ms_purpose_contract_fidelity": "974006ea492aae6e5e02494525947a6e66846b62e822aa4562ab6607b57877cf",

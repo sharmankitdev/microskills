@@ -208,7 +208,7 @@ def test_setup_section_rejected(tmp_path):
 
 
 def test_branching_language_passes(tmp_path):
-    # A microskill body may branch/loop internally — internals are a black box.
+    # A microskill body may branch/loop internally — internals are the skill's own concern.
     body = MINIMAL_BODY.format(name="branchy").replace(
         "1. **First** — do thing one.",
         "1. **First** — if the file exists then read it, otherwise for each default value emit it.",
