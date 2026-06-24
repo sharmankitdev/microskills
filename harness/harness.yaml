@@ -1,36 +1,40 @@
-# Harness manifest (v2) — the components this project uses.
-# Two lists, each entry tagged by source:
-#   source: plugin  → materialized from the plugin catalog by `initialize-harness`
-#                     (referenced, never copied into harness/). `harness-sync` never touches these.
-#   source: custom  → authored here under harness/<kind-dir>/<name>/ and reconciled by `harness-sync`.
+# Harness manifest (v2). Roots (no derived_from) are entry points; their imports-closure
+# is pulled in as derived_from deps by initialize-harness. Only hand-edit the roots.
 # Schema: templates/references/harness-schema.json
 version: 2
 microskills:
-  # plan/build cores — the create pipelines run as these (domain via profile).
-  - name: task-plan
-    source: plugin
-  - name: task-implement
-    source: plugin
-  # create-pipeline RVS review/verify/synth + floor + grounding + bundling.
-  - name: review-dimension
-    source: plugin
-  - name: verify-finding
-    source: plugin
-  - name: synthesize-review
-    source: plugin
-  - name: run-validators
-    source: plugin
   - name: build-catalog-index
     source: plugin
+    derived_from: microskill-create
   - name: bundle-draft
     source: plugin
+    derived_from: microskill-create
+  - name: review-dimension
+    source: plugin
+    derived_from: microskill-create
+  - name: run-validators
+    source: plugin
+    derived_from: microskill-create
+  - name: synthesize-review
+    source: plugin
+    derived_from: microskill-create
+  - name: task-implement
+    source: plugin
+    derived_from: microskill-create
+  - name: task-plan
+    source: plugin
+    derived_from: microskill-create
+  - name: verify-finding
+    source: plugin
+    derived_from: microskill-create
 workflows:
   - name: microskill-create
     source: plugin
   - name: workflow-create
     source: plugin
-  # reusable RVS stages the two create pipelines inline.
   - name: implement-rvs
     source: plugin
+    derived_from: microskill-create
   - name: plan-rvs
     source: plugin
+    derived_from: microskill-create

@@ -138,14 +138,189 @@ def catalog_names(catalog, kind):
     return sorted(p.name for p in d.iterdir() if p.is_dir() and not p.name.startswith("."))
 
 
+def _list_key_for(kind):
+    """'microskill' -> 'microskills', 'workflow' -> 'workflows'."""
+    return {k: lk for lk, k in _hs.LIST_KIND.items()}[kind]
+
+
+def classify_import(imp, catalog):
+    """Resolve an imports[] entry to (kind, name), or (None, name) if it resolves to nothing.
+    Grammar: 'microskills/<name>' -> microskill (a leaf); 'workflow-defs/<name>' -> workflow;
+    a bare '<name>' -> workflow by convention. The prefix is authoritative when present; a bare
+    name is classified by catalog existence (workflow first), so the convention can be verified."""
+    name = imp.split("/", 1)[1] if "/" in imp else imp
+    if imp.startswith("microskills/"):
+        return ("microskill", name) if (catalog / "microskills" / name).is_dir() else (None, name)
+    if imp.startswith("workflow-defs/"):
+        return ("workflow", name) if (catalog / "workflow-defs" / name).is_dir() else (None, name)
+    if (catalog / "workflow-defs" / name).is_dir():
+        return "workflow", name
+    if (catalog / "microskills" / name).is_dir():
+        return "microskill", name
+    return None, name
+
+
+def workflow_imports(catalog, name):
+    """The raw string imports[] of a workflow's WORKFLOW.yaml ([] if absent/unreadable)."""
+    try:
+        doc = yaml.safe_load((catalog / "workflow-defs" / name / "WORKFLOW.yaml").read_text()) or {}
+    except (OSError, yaml.YAMLError):
+        return []
+    return [i for i in (doc.get("imports") or []) if isinstance(i, str)]
+
+
+def walk_closure(roots, catalog):
+    """Transitive imports-closure of `roots` (list of (kind, name)).
+    Returns (derived, unresolved):
+      derived    -- {(kind, name): root_name} for every DERIVED component reachable from a
+                    root (roots themselves excluded). root_name = the lexicographically-smallest
+                    root that reaches it (roots iterated ascending, first writer wins).
+      unresolved -- sorted unique import strings that resolve to no catalog component.
+    Microskills are leaves (no recursion); workflows recurse. A global `seen` set guards
+    against cycles and redundant re-expansion."""
+    derived, unresolved, seen = {}, [], set()
+    rootset = {(k, n) for k, n in roots}
+    for rkind, rname in sorted(roots):
+        if rkind != "workflow":
+            continue  # microskill roots are leaves
+        stack = [rname]
+        while stack:
+            wf = stack.pop()
+            if wf in seen:
+                continue
+            seen.add(wf)
+            for imp in workflow_imports(catalog, wf):
+                kind, cname = classify_import(imp, catalog)
+                if kind is None:
+                    unresolved.append(imp)
+                    continue
+                key = (kind, cname)
+                if key not in rootset:
+                    derived.setdefault(key, rname)
+                if kind == "workflow":
+                    stack.append(cname)
+    return derived, sorted(set(unresolved))
+
+
 def seed_manifest(catalog):
-    """A v2 harness.yaml dict listing every base-tagged catalog component as source:plugin."""
-    m = {"version": 2, "microskills": [], "workflows": []}
+    """A v2 harness.yaml dict: every base-tagged component as a root (plain), plus its
+    transitive imports-closure (each dep marked derived_from the root that pulled it).
+    base: true now means 'entry-point root', not 'every seed member' — the seed set is the
+    closure of the roots."""
+    roots = []
     for list_key, kind in _hs.LIST_KIND.items():
         for name in catalog_names(catalog, kind):
             if read_base(catalog / _hs.KIND_DIR[kind] / name, kind):
-                m[list_key].append({"name": name, "source": "plugin"})
+                roots.append((kind, name))
+    derived, _unresolved = walk_closure(roots, catalog)
+    m = {"version": 2, "microskills": [], "workflows": []}
+    for kind, name in roots:
+        m[_list_key_for(kind)].append({"name": name, "source": "plugin"})
+    for (kind, name), root in derived.items():
+        m[_list_key_for(kind)].append({"name": name, "source": "plugin", "derived_from": root})
+    for lk in ("microskills", "workflows"):
+        m[lk].sort(key=lambda c: c["name"])
     return m
+
+
+def manifest_roots(manifest):
+    """[(kind, name)] for manifest entries WITHOUT derived_from (base-seeded or hand-added).
+    These are the roots the closure is computed from; they are never auto-pruned."""
+    out = []
+    for lk, kind in _hs.LIST_KIND.items():
+        for c in (manifest.get(lk) or []):
+            if not c.get("derived_from"):
+                out.append((kind, c["name"]))
+    return out
+
+
+def manifest_names(manifest):
+    return {c["name"] for lk in _hs.LIST_KIND for c in (manifest.get(lk) or [])}
+
+
+def closure_drift(manifest, catalog):
+    """Mandatory transitive deps in closure(manifest roots) MISSING from the manifest →
+    [{name, kind, derived_from}], sorted. Unlike base_drift (new ROOTS, gated by --adopt-base),
+    these are auto-added on --apply: a missing dep breaks compile."""
+    derived, _u = walk_closure(manifest_roots(manifest), catalog)
+    listed = manifest_names(manifest)
+    out = [{"name": n, "kind": k, "derived_from": root}
+           for (k, n), root in derived.items() if n not in listed]
+    return sorted(out, key=lambda d: (d["kind"], d["name"]))
+
+
+def closure_orphans(manifest, catalog):
+    """derived_from entries NO LONGER reachable from any root → [{name, kind}], sorted.
+    Only derived_from entries are ever returned — roots (no derived_from) are sacrosanct."""
+    derived, _u = walk_closure(manifest_roots(manifest), catalog)
+    reachable = {n for (_, n) in derived} | {n for _, n in manifest_roots(manifest)}
+    out = []
+    for lk, kind in _hs.LIST_KIND.items():
+        for c in (manifest.get(lk) or []):
+            if c.get("derived_from") and c["name"] not in reachable:
+                out.append({"name": c["name"], "kind": kind})
+    return sorted(out, key=lambda d: (d["kind"], d["name"]))
+
+
+def closure_unresolved(manifest, catalog):
+    """Import strings reachable from roots that resolve to no catalog component (broken imports)."""
+    _d, unresolved = walk_closure(manifest_roots(manifest), catalog)
+    return unresolved
+
+
+def _list_item_blocks(lines, list_key):
+    """[(start, end)] half-open line ranges of items under top-level list_key. Mirrors
+    flip_entry_source's scanner: interstitial comments are absorbed into the preceding item."""
+    cur_key, item_start, blocks = None, None, []
+    for i, ln in enumerate(lines):
+        stripped = ln.strip()
+        if ln and not ln.startswith(" ") and not stripped.startswith("#"):
+            if cur_key == list_key and item_start is not None:
+                blocks.append((item_start, i)); item_start = None
+            cur_key = ln.split(":", 1)[0].strip(); continue
+        if cur_key != list_key or not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("- "):
+            if item_start is not None:
+                blocks.append((item_start, i))
+            item_start = i
+    if cur_key == list_key and item_start is not None:
+        blocks.append((item_start, len(lines)))
+    return blocks
+
+
+def _block_name(lines, block):
+    """The `name:` value within an item block (dash line included), or None."""
+    for j in range(*block):
+        t = lines[j].strip()
+        if t.startswith("- "):
+            t = t[2:].strip()
+        if t.startswith("name:"):
+            return t[len("name:"):].split("#", 1)[0].strip().strip("'\"")
+    return None
+
+
+def remove_plugin_entries(text, removals):
+    """Delete whole item blocks (removals: list_key -> iterable of names) from harness.yaml
+    text, preserving the header, sibling entries, and comments. Returns the new text. Used to
+    prune orphaned derived_from deps; derived entries are appended plain at EOF so no
+    interstitial comments are lost in practice."""
+    if not any(removals.get(k) for k in ("microskills", "workflows")):
+        return text
+    had_trailing_nl = text.endswith("\n")
+    lines = text.split("\n")
+    if had_trailing_nl and lines and lines[-1] == "":
+        lines.pop()
+    drop = set()
+    for key in ("microskills", "workflows"):
+        names = set(removals.get(key) or [])
+        if not names:
+            continue
+        for block in _list_item_blocks(lines, key):
+            if _block_name(lines, block) in names:
+                drop.update(range(*block))
+    out = "\n".join(ln for i, ln in enumerate(lines) if i not in drop)
+    return out + "\n" if (had_trailing_nl and out) else out
 
 
 def base_drift(manifest, catalog):
@@ -165,8 +340,9 @@ def base_drift(manifest, catalog):
 
 def append_plugin_entries(text, additions):
     """Append source:plugin entries to existing harness.yaml text, preserving the header comment
-    and every existing entry. `additions` maps list_key -> [name, ...]. A `key: []` empty list is
-    converted to block form; a missing list key gets a fresh section appended at EOF."""
+    and every existing entry. `additions` maps list_key -> [entry, ...] where entry is a name str
+    OR a {'name', 'derived_from'} dict (derived_from emits the provenance line). A `key: []` empty
+    list is converted to block form; a missing list key gets a fresh section appended at EOF."""
     had_trailing_nl = text.endswith("\n")
     lines = text.split("\n")
     if had_trailing_nl and lines and lines[-1] == "":
@@ -199,8 +375,11 @@ def append_plugin_entries(text, additions):
         if not names:
             continue
         new = []
-        for n in names:
-            new += [f"  - name: {n}", "    source: plugin"]
+        for it in names:
+            nm = it["name"] if isinstance(it, dict) else it
+            new += [f"  - name: {nm}", "    source: plugin"]
+            if isinstance(it, dict) and it.get("derived_from"):
+                new.append(f"    derived_from: {it['derived_from']}")
         i = header_idx(key)
         if i is None:
             lines += [f"{key}:"] + new
@@ -290,7 +469,8 @@ def validate_manifest(manifest):
 
 def render_manifest_yaml(m):
     lines = [
-        "# Harness manifest (v2) — generated by initialize-harness from the catalog base set.",
+        "# Harness manifest (v2) — generated by initialize-harness. Roots (no derived_from) are",
+        "# entry points; their imports-closure is pulled in as derived_from deps. Hand-edit roots only.",
         "# source: plugin → materialized from the plugin catalog by initialize-harness.",
         "# source: custom → authored under harness/ and reconciled by harness-sync.",
         "# Schema: templates/references/harness-schema.json",
@@ -302,6 +482,8 @@ def render_manifest_yaml(m):
         for c in items:
             lines.append(f"  - name: {c['name']}")
             lines.append(f"    source: {c['source']}")
+            if c.get("derived_from"):
+                lines.append(f"    derived_from: {c['derived_from']}")
             prof = c.get("profiles")
             if prof and prof != "*":
                 lines.append(f"    profiles: [{', '.join(prof)}]")
@@ -573,8 +755,40 @@ def main():
         if apply and harness_yaml.exists():
             harness_yaml.write_text(append_plugin_entries(harness_yaml.read_text(), additions))
 
+    # Closure reconcile: the manifest's ROOTS (entries without derived_from) imply a transitive
+    # imports-closure of mandatory deps. Prune derived entries no longer reachable from any root,
+    # then auto-add missing closure deps (marked derived_from). MANDATORY, so — unlike base_drift,
+    # which OFFERS new roots behind --adopt-base — these flow automatically on --apply. --plan
+    # reports both lists and writes nothing. Runs AFTER base-drift adoption so a freshly-adopted
+    # root's own deps are pulled this run. An unresolvable import is a hard error.
+    unresolved_imports = closure_unresolved(manifest, catalog)
+    closure_errors = [{"name": imp, "reason": f"unresolvable import in closure: {imp}"}
+                      for imp in unresolved_imports]
+
+    orphaned_closure = closure_orphans(manifest, catalog)
+    if orphaned_closure:
+        rm = {}
+        for o in orphaned_closure:
+            lk = list_key_for[o["kind"]]
+            manifest[lk] = [c for c in (manifest.get(lk) or []) if c["name"] != o["name"]]
+            rm.setdefault(lk, []).append(o["name"])
+        if apply and harness_yaml.exists():
+            harness_yaml.write_text(remove_plugin_entries(harness_yaml.read_text(), rm))
+
+    available_closure = closure_drift(manifest, catalog)
+    if available_closure:
+        adds = {}
+        for d in available_closure:
+            lk = list_key_for[d["kind"]]
+            manifest.setdefault(lk, []).append(
+                {"name": d["name"], "source": "plugin", "derived_from": d["derived_from"]})
+            adds.setdefault(lk, []).append({"name": d["name"], "derived_from": d["derived_from"]})
+        if apply and harness_yaml.exists():
+            harness_yaml.write_text(append_plugin_entries(harness_yaml.read_text(), adds))
+
     # 2. Plugin components + engine plan.
     desired, errors = build_plugin_desired(manifest, catalog, anchor)
+    errors = closure_errors + errors
     state = _hs.load_state(state_path)
     installed_all = state.get("components") or {}
     installed_plugin = {n: e for n, e in installed_all.items() if e.get("source") == "plugin"}
@@ -640,6 +854,9 @@ def main():
         "seeded_harness_yaml": seeded,
         "available_base": drift,
         "adopted_base": adopted,
+        "available_closure": available_closure,
+        "orphaned_closure": orphaned_closure,
+        "unresolved_imports": unresolved_imports,
         "engine": {"action": eng_action, "files": len(eng_out)},
         "actions": actions,
         "conflicts": conflicts,

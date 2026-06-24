@@ -52,6 +52,11 @@
           "version": {
             "type": "string",
             "description": "Optional version pin for 'plugin', honored by initialize-harness as a HOLD: while the pin differs from the catalog's plugin version (.claude-plugin/plugin.json), the deployed bytes stay put and the pending change surfaces in every plan (action 'hold') until the pin moves. Ignored for 'custom'."
+          },
+          "derived_from": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]*$",
+            "description": "Set by initialize-harness on a machine-pulled transitive dependency: the name of the root (an entry without derived_from) whose imports-closure pulled this component in. Entries carrying derived_from are owned by the closure reconcile — auto-added when reachable, pruned when no root reaches them. Absent on roots (base-seeded or hand-added), which are never auto-pruned."
           }
         }
       }

@@ -172,9 +172,13 @@ def test_bundle_draft_resolves_base():
     assert data["directives"]["model"] == "haiku"
 
 
-def test_bundle_draft_is_base_tagged():
+def test_bundle_draft_is_pulled_by_closure_not_base_tagged():
+    # base: true now lives ONLY on the create-pipeline roots; bundle-draft is a derived dep,
+    # pulled into a fresh consumer's seed via implement-rvs's imports-closure (not a base tag).
     fm = yaml.safe_load((MS_ROOT / "bundle-draft" / "MICROSKILL.md").read_text().split("---", 2)[1])
-    assert fm.get("base") is True
+    assert "base" not in fm
+    irvs = yaml.safe_load((CATALOG / "workflow-defs" / "implement-rvs" / "WORKFLOW.yaml").read_text())
+    assert "microskills/bundle-draft" in (irvs.get("imports") or [])
 
 
 # ───────────────────────────── the two combined profiles ────────────────────────

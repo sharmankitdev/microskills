@@ -1,6 +1,5 @@
 ---
 name: task-plan
-base: true
 description: >
   Plan a domain artifact from a natural-language requirement, running as the domain
   planner agent against its phase contract, and return a structured plan object — or
