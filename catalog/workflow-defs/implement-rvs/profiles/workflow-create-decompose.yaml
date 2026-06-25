@@ -15,7 +15,9 @@ nodes:
           - wf-profile-overlay-coherence
           - wf-spill-materialize-judgment
           - wf-output-schema-downstream-fit
+          - wf-input-wiring-fidelity
           - wf-decompose-behavior-fidelity
+          - wf-decompose-phase-content-fidelity
 
 # Adding a review dim generates review_wf_decompose_behavior_fidelity — co-patch loop.body so it
 # stays inside the contiguous do/while window (the resolver list-replaces body wholesale). Restates
@@ -25,6 +27,7 @@ loop:
          review_wf_dag_decomposition_correctness, review_wf_guard_logic_intent,
          review_wf_prompt_task_fidelity, review_wf_gate_prompt_options_quality,
          review_wf_profile_overlay_coherence, review_wf_spill_materialize_judgment,
-         review_wf_output_schema_downstream_fit, review_wf_decompose_behavior_fidelity,
+         review_wf_output_schema_downstream_fit, review_wf_input_wiring_fidelity,
+         review_wf_decompose_behavior_fidelity, review_wf_decompose_phase_content_fidelity,
          xreview_duplicate_capability, xreview_naming_collision, xreview_reverse_consumer,
          verify, synth]
