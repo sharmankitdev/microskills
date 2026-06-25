@@ -1,7 +1,7 @@
 version: 1
 # implement-rvs / microskill-create — retarget the workflow-domain RVS (baked in WORKFLOW.yaml)
 # to the MICROSKILL domain: the implementer + floor switch to the ms validators, the review panel
-# swaps the 7 wf dimensions for the 10 ms dimensions, and verify switches to the ms combined
+# swaps the 7 wf dimensions for the 12 ms dimensions, and verify switches to the ms combined
 # adversarial seat (it fans out over both panels via ${[review[].findings, xreview[].findings].flat()}
 # — no collect fan-in node). The xreview cross panel + synth (create-impl-rvs) are domain-neutral and
 # stay. A profile that swaps review.expand.over MUST co-patch loop.body to the new generated
@@ -13,7 +13,11 @@ nodes:
       customize: { profile: microskill }
     - id: floor
       customize: { profile: microskill }
-    # Review panel → the 10 artifact-stage microskill dimensions (expand.over REPLACES wholesale).
+    # Review panel → the 12 artifact-stage microskill dimensions (expand.over REPLACES wholesale).
+    # shape-not-faithfulness-fabrication-passes + additionalprops-and-empty-content-permissive are
+    # the two adversarial guard lenses (hollow-but-valid steps / vacuous-but-present content): both
+    # authored + tested-to-resolve, now WIRED — ms-purpose-contract-fidelity + the shape lens each
+    # disclaim them, so the disclaimers reference live siblings rather than dangling.
     - id: review
       expand:
         over:
@@ -27,6 +31,8 @@ nodes:
           - ms-declared-input-unused
           - ms-purpose-contract-fidelity
           - ms-description-trigger-quality
+          - shape-not-faithfulness-fabrication-passes
+          - additionalprops-and-empty-content-permissive
     # Verify → the ms combined adversarial seat (microskill draft bundle + catalog index).
     - id: verify
       customize: { profile: microskill-draft-xref }
@@ -42,5 +48,7 @@ loop:
          review_ms_output_section_vs_schema_fields, review_ms_step_input_reference_undeclared,
          review_ms_declared_input_unused, review_ms_purpose_contract_fidelity,
          review_ms_description_trigger_quality,
+         review_shape_not_faithfulness_fabrication_passes,
+         review_additionalprops_and_empty_content_permissive,
          xreview_duplicate_capability, xreview_naming_collision, xreview_reverse_consumer,
          verify, synth]
