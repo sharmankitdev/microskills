@@ -13,9 +13,11 @@ nodes:
         over:
           - plan-wf-completeness
           - plan-wf-graph-correctness
+          - plan-wf-input-contract
           - plan-wf-control-flow
           - plan-wf-reuse-survey
           - plan-wf-scope-fit
           - plan-wf-name-capability
+          - plan-wf-failure-path-coverage
           - plan-wf-decompose-fidelity
           - plan-wf-delegation-mapping

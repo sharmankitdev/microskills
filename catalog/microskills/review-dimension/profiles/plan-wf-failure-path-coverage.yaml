@@ -1,0 +1,57 @@
+version: 1
+
+# plan-wf-failure-path-coverage lens for review-dimension (create pipeline, §8 step 7). The wf-plan
+# twin of plan-ms-failure-coverage: reviews the workflow PLAN object (plan.yaml) the workflow-planner
+# wrote — NOT the built WORKFLOW.yaml (that is the draft-stage wf-* lenses) and NOT a plan-stage floor
+# (none runs; the validators run later, on the implemented artifact). A fidelity lens — it grounds the
+# plan's failure-path design against the requirement, threaded as context_path. A plain list REPLACES
+# base's correctness snippet wholesale; output_schema, inputs, runtime, and the body inherit from base.
+vars:
+  dimension: plan-wf-failure-path-coverage
+  artifact_kind: workflow plan (plan.yaml)
+
+context:
+  snippets:
+    - name: plan-wf-failure-path-coverage-rubric
+      text: >-
+        Failure-path-coverage rubric for a workflow plan — answer "are the plan's failure paths
+        handled for the requirement's risk?" against the plan_yaml design's loop (and its
+        on_exhaust), gates, for_each fan-out, when forks, and terminal nodes. Read the requirement
+        from context_path as ground truth for which paths must be handled; an absent context_path =
+        a missing grounding basis: raise exactly one blocker finding naming the missing grounding
+        and review nothing blind. No programmatic floor runs at the plan stage; the validators that
+        run later, once the artifact exists, enforce loop MECHANICS — body contiguity, the mandatory
+        while/until + max_iters, and on_exhaust mechanics (body-own-segment, the reserved
+        loop/loop_exhaust ids) — but NEVER whether on_exhaust SHOULD exist: its absence is the
+        byte-identical default (the historical continue behavior), so a capped, still-unconverged
+        artifact flows downstream silently — that requirement-blind gap is exactly this lens's job.
+        Flag only failure-path defects: a designed bounded / convergence loop whose still-failing
+        exhaust path is unguarded — no on_exhaust: escalate (the synthetic loop_exhaust verdict
+        gate) or fail (honest hard-stop) intent — so a capped, unconverged artifact would flow
+        downstream when the requirement says it must converge before proceeding; a for_each fan-out
+        whose partial-arm failure is unrouted — nothing downstream checks or routes a failed arm
+        (the native engine usually yields null for a dead arm and may also throw — neither is routed
+        by default), so a hole rides forward; a terminal failure with no stop — a present node whose
+        failure / error OUTCOME (a bad or empty result on the unhappy path) reaches no hard gate or
+        orchestrator checkpoint to halt the run, so a broken result proceeds regardless (completeness
+        asks whether a required gate is structurally PRESENT for the requirement; this lens assumes
+        the node exists and flags only that THAT present node's unhappy OUTCOME is unhalted — not a
+        missing structural gate); a known-flaky external / background step the requirement implies
+        needs a bounded retry yet the plan designs none. Do NOT flag a loop whose silent fall-through
+        is intentional per the requirement (the requirement does not demand convergence before
+        proceeding) — that continue default is correct there. Severity mapping: the silent ship of an
+        unconverged artifact when the requirement demands convergence before proceeding (a bounded
+        loop with no on_exhaust: escalate|fail) = blocker; an unrouted fan-out partial-arm failure,
+        or a missing bounded retry on a step the requirement clearly flags as flaky = major; a
+        failure intent that is present but vague or under-specified (an on_exhaust whose action is
+        named but whose verdict routing is left unclear) = minor; a cosmetic wording nit on an
+        otherwise-complete failure path = nit. Set each finding's file to the reviewed plan's path
+        and line to the line number of the cited loop / on_exhaust / gate / fan-out / node entry (or
+        the loop heading when the gap is an entirely-absent on_exhaust). Do not raise
+        plan-wf-control-flow (loop GRAMMAR and termination — a loop with no while/until or no
+        max_iters; gate / loop PLACEMENT and body contiguity; and whether a for_each has a matching
+        fan-in / collection node at all — whereas this lens assumes the loop terminates and the
+        fan-in exists and asks only how a still-failing exhaust or a failed per-arm result is ROUTED)
+        or plan-wf-completeness (the mere PRESENCE of a required gate / loop / fan-out element the
+        requirement needs — whereas this lens assumes the element is present and asks whether its
+        FAILURE path is handled) concerns under this rubric — those sibling lenses own them.

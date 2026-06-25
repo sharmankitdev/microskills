@@ -1,5 +1,5 @@
 {
-  "manifest_hash": "048e573363bf70f99a35e7853124b0633bbcf486d968c431e817c76de4cb3569",
+  "manifest_hash": "1a8ad97af08a5a6ac6d46273b6c011bb77205344526a7caf6d11bc85a0192133",
   "name": "workflow-create",
   "node_fingerprints": {
     "advise": "e1b2198f1227f3bf3ed34822bb17c35ece8196cf38afa75060560f836b07ca60",
@@ -9,15 +9,18 @@
     "build__floor": "feb4f8c1999e73d1ca90aa7660cecc9ab08f12d0d36887a05d748563a970e326",
     "build__implement": "68b4ded9d49b5e6b03731dad80e7fb0cfa3fd992519ad14e18d2831104441a59",
     "build__review_wf_dag_decomposition_correctness": "4340e1414388d72cfe9aa69558a072eef6e8b06e43574aadfcddcb3a68b04a3a",
+    "build__review_wf_failure_path_coverage": "d2d9e5dae03707ccd233ec4839762d82c09f820346ae191671801f66f4822d4c",
     "build__review_wf_gate_prompt_options_quality": "b3d7bab5e1d22af8a9765000fa3006e036ffa3242e6fb3d8b915129ee5c0106b",
     "build__review_wf_guard_logic_intent": "939f65b78dfe3a402e610203253ee2c2779bf87f654ab19f59d87c61091f9159",
     "build__review_wf_input_wiring_fidelity": "c231d6225dd38854d30de6308206dcd545c1727204be2cb2aacaba1aeab406f7",
+    "build__review_wf_inputs_contract_adequacy": "ea0c30f3c3a19ed34aae7620d74a60a79d2ebd281fa6bff2bff6e363f2d6ff4e",
     "build__review_wf_output_schema_downstream_fit": "fc5f387242da5dae956e7fad56a10387f75f161998566f10360d454d14d7b964",
     "build__review_wf_profile_overlay_coherence": "4b3595eaee0fe93ebbe271b0a355f7ec3725b305a7e94c0821a52957b07a58ab",
     "build__review_wf_prompt_task_fidelity": "c6903c2dee9986bd11636a1ffc5807b4fe76ca78587ca93344d7d45640adc437",
+    "build__review_wf_requirement_fidelity": "571fbc8919fd379afc6d632892ba71f0639b9317281b86dd72e7bb10c8df0a8c",
     "build__review_wf_spill_materialize_judgment": "8c1008d8992db278f1833899c4d796b652e94e88aea9345f1c7ec39483f73eaa",
-    "build__synth": "9c7972e5df47a895d43e641c9a0a68575476d6296dbd4dbe9a896ef5a9e6b734",
-    "build__verify": "1820d1639fc4a360785ad1befdd9fa88a54987bf0742903993a978b642886324",
+    "build__synth": "719aac1136959ff6866d1074f372f7ef1d518a0d050cba868d2f19e62c648583",
+    "build__verify": "0f8e6940b810c5b85a6db5a42ef075087210bf1767b74d3bf15701f936639c00",
     "build__xreview_duplicate_capability": "75e74669d64000076a9c4dae8c35a71632ef4d0bf9b4188a714ea809ac315533",
     "build__xreview_naming_collision": "4b91b7abe747f0c4b090860b34e328e4442fba93d47231c9935a39a1cac34e8b",
     "build__xreview_reverse_consumer": "e650891361d6ba8f09bb635bba38a6777600549e106311d612b04d5c7a390e84",
@@ -25,17 +28,19 @@
     "plan_rvs__plan": "c72a28e2f844631d0197c98d21356c49640eba0bc2b42c94c7cc8dd5d5953f77",
     "plan_rvs__review_plan_wf_completeness": "46148114426374ca790595ffb51be1b4cdf4bc0878608fdf669a48e36ef888e8",
     "plan_rvs__review_plan_wf_control_flow": "97ef02f4b988a604098c531a8f3042bf2736d7a703c21b8427dae096d21bdf6b",
-    "plan_rvs__review_plan_wf_graph_correctness": "46e044d52caf1cc2d9a6d6b75870caf9c4a568b4f93505a47b53b09e4b273d2a",
+    "plan_rvs__review_plan_wf_failure_path_coverage": "ee377da69e25e4a15f9edc7dd93231159aabbc390f090ea071b9c24158bea01a",
+    "plan_rvs__review_plan_wf_graph_correctness": "a6197f4cd00111d3a0eccbc2b934b6d2c51fb2cf2a98490771bb6a31e775fe32",
+    "plan_rvs__review_plan_wf_input_contract": "6e5c4a6e3fa7a0bd834873d85a0dddf733886f66df82eb5bf4f5715aa051db36",
     "plan_rvs__review_plan_wf_name_capability": "953ef43afd0b1bafc594fe56b569321789aa3fcdd06521284bdc18f81efed2c0",
     "plan_rvs__review_plan_wf_reuse_survey": "4a3593f9e30b168ffe1a1767a901e3fffd768d9fa3f3fcc447bb3787fd360207",
     "plan_rvs__review_plan_wf_scope_fit": "6e32a7c6138e73ebcf36e1bd89052525f696bbfee74c25ad2bceeb532868f844",
-    "plan_rvs__synth": "9b96438ea3d0f7679048b3da1a0e8bcbe58d5b1e555d4cba26a1af195c42c46b",
-    "plan_rvs__verify": "7527837ef89d732358d6fc521cb7afaab8b36fab1d7bb8309071bec1e23f41c6",
+    "plan_rvs__synth": "28eb98f779f4f39473ea959d550aec2eae2bbbbfb27f6ba5c8ad681784eb0408",
+    "plan_rvs__verify": "018d39d2fcfe8145f6756f5b13706a5432e7ef885ea3ae8256a810efdc04750c",
     "provision": "c22a3dd31650505c1e06d78f228e7d11316746c477493f10e4f81bd35b657b0c"
   },
   "profile_used": "base",
   "segment_digests": {
-    "seg-1.js": "251f37a97f957e0b18bd3766088ad510bc824b2bbff57dffb17f284d27aac146",
-    "seg-2.js": "496605c838adc2214e973e759d2af6556e552e8590dc232ef5e848625ad7fe1e"
+    "seg-1.js": "1b086a9ea19e675e3c3557e0667e1f50023ff2ab56530b180aceaf653c4a883d",
+    "seg-2.js": "5951a6f5967e3af1a8cf5d0a4ec10e7b088f915cea6940adbdbc5408c5d5e150"
   }
 }

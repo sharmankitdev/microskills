@@ -134,6 +134,9 @@ nodes:
         - wf-spill-materialize-judgment
         - wf-output-schema-downstream-fit
         - wf-input-wiring-fidelity
+        - wf-failure-path-coverage
+        - wf-requirement-fidelity
+        - wf-inputs-contract-adequacy
     inputs:
       artifact_path: ${bundle.output.bundle_path}
       context_path: ${workflow.inputs.requirement_path}
@@ -199,6 +202,8 @@ loop:
          review_wf_prompt_task_fidelity, review_wf_gate_prompt_options_quality,
          review_wf_profile_overlay_coherence, review_wf_spill_materialize_judgment,
          review_wf_output_schema_downstream_fit, review_wf_input_wiring_fidelity,
+         review_wf_failure_path_coverage, review_wf_requirement_fidelity,
+         review_wf_inputs_contract_adequacy,
          xreview_duplicate_capability, xreview_naming_collision, xreview_reverse_consumer,
          verify, synth]
   carry:

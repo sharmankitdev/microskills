@@ -1,0 +1,69 @@
+version: 1
+
+# plan-ms-reuse-survey lens for review-dimension (create pipeline, §8 step 7). Reviews the
+# microskill PLAN object (plan.yaml) the planner wrote — NOT the built artifact (that is the
+# draft-stage ms-* lenses) and NOT a programmatic floor (none runs at the plan stage; the
+# artifact does not exist until the implement stage). The ms-plan analog of plan-wf-reuse-survey,
+# grounded the same index-less way: no catalog-index node exists at the plan stage, so this is a
+# judgment lens that leans confidence medium/low. Sibling of the step-6 spec-* lenses. A plain
+# list REPLACES base's correctness snippet wholesale; output_schema, inputs, runtime, and the
+# body inherit from base.
+vars:
+  dimension: plan-ms-reuse-survey
+  artifact_kind: microskill plan (plan.yaml)
+
+context:
+  snippets:
+    - name: plan-ms-reuse-survey-rubric
+      text: >-
+        Reuse-survey rubric for a microskill plan (plan.yaml) — answer "does this plan reinvent a
+        capability the registry likely already provides, or one that a profile / parameterization
+        of an existing microskill should own rather than a brand-new microskill?" against the
+        plan's purpose, description, and steps (the single-purpose capability it proposes to mint).
+        This is the cheap PLAN-stage preflight: no deterministic floor and no catalog index run at
+        the plan stage, so this lens cannot PROVE a duplicate. The authoritative, index-backed
+        check is the implement-stage cross-artifact duplicate-capability lens, which fires
+        post-build when build-catalog-index threads the real catalog-index.json and that lens
+        compares the built draft's capability against every existing entry's purpose, citing the
+        colliding entry by name and index line. Here there is no index to compare against, so
+        judge against what the registry plausibly already ships and frame every finding as a
+        question for the human rather than an asserted collision: lean confidence medium/low on
+        each finding and phrase it as "verify against the registry before minting." The host
+        approve_plan gate and the human reader are the backstop. Where the requirement is threaded
+        as context_path, read it to confirm the planned capability's intent; an absent
+        context_path does NOT void this review (unlike the draft-stage fidelity lenses) — the plan
+        object itself names the capability being judged. Flag only reuse-survey concerns: a plan
+        whose single-purpose capability is a well-known generic the catalog plausibly already
+        ships — a bespoke diff-review, validate, index, summarize, or extract step that an
+        existing microskill (often plus a thin profile) would already serve — where
+        reuse-or-profile beats a fresh mint; a capability that a NEW PROFILE / parameterization of
+        an existing microskill should own rather than a brand-new component (the generic body
+        already exists and only the rubric / domain differs, e.g. another review-dimension overlay
+        rather than a new reviewer skill). Severity mapping: a plan clearly reinventing a common
+        registry capability, which the human should confirm against the registry before it is
+        minted = major — and this lens NEVER raises a blocker. The index-less plan stage means it
+        cannot PROVE the duplicate, but that alone does not discriminate it from
+        plan-wf-reuse-survey (equally index-less, yet that lens DOES block); the load-bearing
+        reasons are that — unlike the wf plan, whose explicit missing_microskills[]
+        enumerate-and-reuse contract triggers a wasted nested microskill-create build when
+        violated — the ms plan mints just one low-cost component, and an authoritative downstream
+        index-backed duplicate-capability lens already owns the blocker-capable verdict against
+        the real index. So a question-framed major, not a blocker, is the right ceiling here; a
+        should-be-a-profile-of-an-existing-skill judgment call, where the capability is generic
+        and an overlay would plausibly serve but reasonable people could still mint = minor; a
+        borderline overlap worth flagging for the reader's eye = nit. Set each finding's file to
+        the reviewed plan's path and line to the line number of the cited capability statement
+        (the purpose, description, or step that names the reinvented job). Do not raise
+        plan-ms-scope-fit (whether the plan is one atomic linear task versus needs a
+        scope_advisory split / promote-to-workflow — this lens assumes the unit is correctly
+        scoped and asks only whether that scoped capability already exists in the registry),
+        plan-ms-completeness (section presence / thinness, including whether the purpose states
+        its one-sentence input → action → output), plan-ms-name-capability (whether the NEW name
+        is a reusable generic versus caller / step / domain-coupled — that lens designs THIS
+        component's own name; where a duplicate manifests AS a domain-coupled name, the
+        task-plan-vs-plan-for-microskill-create case the two lenses share, plan-ms-name-capability
+        owns the name-string finding and this lens defers, whereas this lens fires when the
+        capability duplicates a DIFFERENTLY-named existing skill or belongs in a profile of one),
+        plan-ms-input-contract (inputs[] soundness), plan-ms-output-contract (output /
+        output_schema soundness), or plan-ms-failure-coverage (reachable-failure coverage)
+        concerns under this rubric — those sibling lenses own them.

@@ -1,0 +1,71 @@
+version: 1
+
+# wf-inputs-contract-adequacy lens overlay for review-dimension (create pipeline, §8 step
+# 4). Implement-stage adequacy of the built WORKFLOW.yaml top-level inputs[] SET vs the
+# requirement, plus dead-input detection — the wf-impl twin of ms-inputs-contract-adequacy
+# fused with ms-declared-input-unused. A plain list REPLACES base's correctness snippet
+# wholesale (resolver list-replace rule). output_schema, inputs, runtime, and the body
+# inherit from base. The caller threads the approved plan/requirement as context_path
+# (grounding, Read by path). BLOCKER-capable.
+vars:
+  dimension: wf-inputs-contract-adequacy
+  artifact_kind: workflow draft bundle (WORKFLOW.yaml + profiles/*.yaml, concatenated)
+
+context:
+  snippets:
+    - name: wf-inputs-contract-adequacy-rubric
+      text: >-
+        Inputs-contract-adequacy rubric for a workflow draft bundle — answer "is the built
+        WORKFLOW.yaml top-level inputs[] SET right against what the requirement asks — every
+        requirement-implied input present, correctly required and typed, nothing invented —
+        and free of dead inputs?". Read the approved plan/requirement from context_path as
+        ground truth; an absent context_path = a missing grounding basis: raise exactly one
+        blocker finding naming the missing grounding and review nothing blind. The
+        deterministic floor (validate-workflow + compile-workflow --defs-root) already blocks
+        an UNDECLARED ${workflow.inputs.x} ref — every referenced workflow-input name must
+        appear in the top-level inputs[] block, a misspelled or undeclared name would
+        otherwise die at run time as undefined — and proves every required:true input lands in
+        the manifest's required_inputs for the dispatcher to collect; but it is
+        requirement-BLIND: a DECLARED-yet-unreferenced (dead) input never blocks, a wrong
+        required-flag never blocks, and type/description are documentation it never enforces —
+        do not re-raise the undeclared-ref block or any ref-resolution finding. Flag only
+        input-SET adequacy and dead-input defects above that floor: a top-level input the
+        requirement implies that is MISSING from inputs[] (a workflow that writes an artifact
+        with no output_path input, a reviewer workflow with no artifact_path to read); a
+        declared top-level input that no ${workflow.inputs.x} ref consumes anywhere in the
+        graph AND that no `wire: auto` node forwards by name (a dead input — but FIRST rule out
+        a wire-auto forward: DAG-RULES §5d auto-forwards, at desugar time, every
+        target-declared yet unsupplied node input whose name EXACTLY matches a declared
+        workflow input as `inputs.<name>: ${workflow.inputs.<name>}`, with NO explicit
+        ${workflow.inputs.x} literal in the authored YAML you read; so before flagging an input
+        dead you MUST also check whether some `wire: auto` node's target-declared inputs
+        name-match the candidate — a name-matched wire-auto forward counts as CONSUMED, and
+        common plumbing like harness_root / harness_yaml / staging_dir reaches its consumer
+        exactly this way and is NOT dead. An input is dead only when no explicit
+        ${workflow.inputs.x} ref AND no name-matching wire-auto forward reaches it; a genuinely
+        dead input is the wf analog of an unused microskill input, and commonly signals a node
+        referencing a DIFFERENT but also-declared input, a silent mis-wire the floor happily
+        accepts because both names resolve); an INVENTED input the requirement never asked for
+        (unrequested surface a caller is forced to reason about); a wrong required-flag or type
+        — most dangerously a needed input declared required:false with no default, which the
+        floor accepts but which surfaces as a silent undefined at run time when the caller omits
+        it, or a required:true flag on an input the requirement treats as optional, or a type or
+        description that cannot carry the data the requirement needs. Severity mapping: a missing
+        requirement-implied input (the workflow cannot do its job), or a needed input declared
+        optional with no default so an omitted value silently runs as undefined = blocker; a dead
+        input, an invented input, or a wrong type = major; a borderline requiredness or a
+        description imprecision on an otherwise-sound input = minor. Set each finding's file to
+        the real source file the issue lives in per the bundle's provenance markers
+        (WORKFLOW.yaml or profiles/<p>.yaml) and line to that file's real line number — the
+        downstream refute pass and fix step read the real source at the finding's file. Do not
+        raise wf-requirement-fidelity (whole-graph behavior realization — a dropped, neighboring,
+        or invented processing NODE or behavior; that sibling owns whether the graph as a whole
+        does the RIGHT work, this lens owns ONLY the top-level input DECLARATION set: a missing,
+        invented, or dead input — the requirement-grounded boundary is node/behavior there vs.
+        input-declaration here), wf-input-wiring-fidelity (INTERNAL node-to-node
+        ${producer.output.field} and ${panel[].field} data wiring — which producer a node's
+        inputs bind to, a different artifact from the external top-level inputs[] block this lens
+        owns; the dead-input SYMPTOM is this lens's to flag, the wrong-source diagnosis is that
+        lens's) or wf-spill-materialize-judgment (the by-reference / payload-SIZE materialize:file
+        choice on a workflow input, not its required-flag, type, presence, or dead status)
+        concerns under this rubric — those sibling lenses own them.

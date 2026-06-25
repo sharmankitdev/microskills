@@ -1,0 +1,60 @@
+version: 1
+
+# plan-wf-input-contract lens for review-dimension (create pipeline, §8 step 7). Reviews the
+# workflow PLAN object (plan.yaml) the workflow-planner wrote — NOT the built WORKFLOW.yaml
+# (that is the draft-stage wf-* lenses) and NOT a programmatic floor (none runs at the plan
+# stage). The wf-plan twin of plan-ms-input-contract. A plain list REPLACES base's correctness
+# snippet wholesale. output_schema, inputs, runtime, and the body inherit from base.
+vars:
+  dimension: plan-wf-input-contract
+  artifact_kind: workflow plan (plan.yaml)
+
+context:
+  snippets:
+    - name: plan-wf-input-contract-rubric
+      text: >-
+        Input-contract rubric for a workflow plan (plan.yaml) — answer "is the plan's
+        top-level inputs[] the right SET against what the requirement asks, with each entry's
+        required-flag, type, and default coherent?" Read the requirement
+        from context_path as ground truth; an absent context_path = a missing grounding basis:
+        raise exactly one blocker finding naming the missing grounding and review nothing blind.
+        Review the declared-SET-vs-requirement direction of the top-level inputs[] — the
+        presence-given-the-requirement, required-flag, type, and default of
+        each entry — NOT whether a consumed ${workflow.inputs.x} reference resolves to a declared
+        input (the ref-resolution direction), and NOT whether the inputs block merely exists. The
+        implement-stage validators (validate-workflow + compile-workflow) later block only a
+        CONSUMED ${workflow.inputs.x} that no top-level input declares, and are requirement-blind
+        — a declared-yet-unreferenced (dead) input, a wrong required-flag or type, and a missing
+        requirement-implied input all pass them silently — so this requirement-facing direction
+        has no programmatic backstop and is this lens's job. Flag: a workflow input the
+        requirement states or obviously implies that is MISSING from inputs[] — because no node
+        references it yet it trips no dangling-ref check and is otherwise invisible; an INVENTED
+        or DEAD top-level input that no node consumes and the requirement never implies (a
+        declared-but-unreferenced input the validators do NOT block); an incoherent
+        required-flag/type/default — a needed input left required:false with no default so the run
+        cannot proceed (required:true lands in the manifest's required_inputs the dispatcher must
+        collect, a default lands in input_defaults), a defaultable input marked required:true (a
+        required input takes no default), or a type that cannot carry the data the description says
+        the input holds; a concrete value baked into a top-level inputs[].default that the
+        requirement marks as a tunable knob — it should ride a profile overlay (or top-level
+        `vars`), not a hard-coded input default. Severity mapping: a
+        requirement-implied input missing entirely, or a needed input left optional with no
+        default so the run cannot proceed = blocker; an invented or dead top-level input, a wrong
+        type, or a defaultable input wrongly marked required that a builder must guess to resolve =
+        major; a default-placement misroute = minor; a
+        cosmetic naming or wording nit on an otherwise-sound input = nit. Set finding.file to the
+        plan's path and line to the cited input entry's line (or the top-level inputs heading when
+        the defect is a missing entry). The materialize:file *_path-naming convention is NOT this
+        lens's job — the later draft-stage floor (validate-workflow + compile-workflow) warns on a
+        materialize:file input name that does not end _path once the WORKFLOW.yaml exists, so leave
+        it to that floor and do not raise it here. Do not raise plan-wf-graph-correctness (the
+        ${workflow.inputs.x} REF-RESOLUTION direction — that a CONSUMED input is declared and a
+        node ref / output.from / dispatch-form resolves; this lens owns the
+        declared-SET-vs-requirement direction, including inputs nothing references),
+        plan-wf-completeness (the mere presence or absence of the inputs block, not the soundness
+        of its entries), plan-wf-control-flow (gate / loop / when / for_each coherence and
+        termination), plan-wf-reuse-survey (the reuse decision and the
+        missing_microskills/_new_profiles SET), plan-wf-scope-fit (whether this is genuinely one
+        workflow), or plan-wf-name-capability (registry naming — note this lens governs input
+        soundness, name-capability never governs input names) concerns under this rubric — those
+        sibling lenses own them.
