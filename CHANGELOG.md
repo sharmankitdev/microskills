@@ -1,3 +1,9 @@
+## [0.42.0](https://github.com/sharmankitdev/microskills/compare/v0.41.0...v0.42.0) (2026-06-25)
+
+### Features
+
+* **workflow:** wf-input-wiring-fidelity + wf-decompose-phase-content-fidelity + plan-wf-reuse-survey spawn-fidelity ([#52](https://github.com/sharmankitdev/microskills/issues/52)) ([9969ef2](https://github.com/sharmankitdev/microskills/commit/9969ef21f9b933e76529249d867ad5a4fd1677d8))
+
 ## [0.41.0](https://github.com/sharmankitdev/microskills/compare/v0.40.0...v0.41.0) (2026-06-25)
 
 ### Features
