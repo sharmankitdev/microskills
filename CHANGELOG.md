@@ -1,3 +1,9 @@
+## [0.43.0](https://github.com/sharmankitdev/microskills/compare/v0.42.0...v0.43.0) (2026-06-25)
+
+### Features
+
+* **workflow:** add failure-path coverage, holistic wf fidelity, plan-ms reuse, input-contract dims ([#49](https://github.com/sharmankitdev/microskills/issues/49)) ([41e35f5](https://github.com/sharmankitdev/microskills/commit/41e35f58c02dcafcae1058e388716e6bb837316c))
+
 ## [0.42.0](https://github.com/sharmankitdev/microskills/compare/v0.41.0...v0.42.0) (2026-06-25)
 
 ### Features
