@@ -1,3 +1,9 @@
+## [0.43.2](https://github.com/sharmankitdev/microskills/compare/v0.43.1...v0.43.2) (2026-06-25)
+
+### Bug Fixes
+
+* **harness:** validate harness.yaml against the source schema, not the stale deployed copy ([#51](https://github.com/sharmankitdev/microskills/issues/51)) ([f497964](https://github.com/sharmankitdev/microskills/commit/f4979643e468252e0f8bf9cbddeeb68802f19f47)), closes [#45](https://github.com/sharmankitdev/microskills/issues/45)
+
 ## [0.43.1](https://github.com/sharmankitdev/microskills/compare/v0.43.0...v0.43.1) (2026-06-25)
 
 ## [0.43.0](https://github.com/sharmankitdev/microskills/compare/v0.42.0...v0.43.0) (2026-06-25)
