@@ -1,19 +1,21 @@
 {
-  "manifest_hash": "f681bf6f08f25c1627aa4e084bf66888f4efbc9c5e645dba4fc22cfb12458d4a",
+  "manifest_hash": "caca4ea60a7738660f6f4a347d0839abe17d82771be8febde45bb2f563241dce",
   "name": "plan-rvs",
   "node_fingerprints": {
     "plan": "773b480ee6dd23fd9edc54fd5a0e0d0396cf9acccc813ce5ce98add37825e599",
     "review_plan_wf_completeness": "bf99e0e977089a1f22c9d1e161fba9cecb02f0467c254dd81ac6aec8069323fc",
     "review_plan_wf_control_flow": "cd0b32b02467925690613363ae259cceab763dd6777b514759d2b88c6331472f",
-    "review_plan_wf_graph_correctness": "bc20b422a21fa4673fbca717f57411402861329b29a1547f174d53c664647685",
+    "review_plan_wf_failure_path_coverage": "5e78521727899cb16616fc1652c72fc64aaf517eea947676918ed2a07cd273a9",
+    "review_plan_wf_graph_correctness": "cef1fbaddd07435303a4df9b9caec62199d506d1a7874c6c196f115199beade4",
+    "review_plan_wf_input_contract": "c6acf33fa6f0508ed270f42a926518370a1ec386412eaa09c82ed3e57a9fc6f4",
     "review_plan_wf_name_capability": "0d1a4dc8f0d916f9fd6f6cc4660d95f886bd28ea7cf2f49c98e3ca5960e6a9d7",
     "review_plan_wf_reuse_survey": "13c58fd0364539ff2382194a0cde996985df9e53903bd0d2589d51f4ea8104f1",
     "review_plan_wf_scope_fit": "830e9c65c7e7cbe01ffde54d5d0165020d8c2fa79891d9da7e376e9b378c7899",
-    "synth": "497f0e87e05bcb3e9a0f40f101d7baf28ead9ce46b01440a95fa3a66c3e82bbe",
-    "verify": "bc7e3e1bb69f6887cb8a70566d8cb99d6387cb63b0b0b82faf224328834ecbfd"
+    "synth": "1652f16f70c86a337ef1b8538d878c1ce47ab3a4501ed90e6fc33874bf6d0489",
+    "verify": "0f1b5e363625d2585d3ab1681c70d59f4294c910463ecdb309760cd9813275b0"
   },
   "profile_used": "base",
   "segment_digests": {
-    "seg-1.js": "b39d984d9a7979bc4a8e562d400705bad5d42870c97f96bcfee092cd6301da71"
+    "seg-1.js": "d3f896fa5b3bf62b939454c28738f67c3fa0ebb0577ccd02af74268e9cf60537"
   }
 }

@@ -34,7 +34,12 @@ context:
         depends_on = major; a borderline depends_on-vs-ref edge judgment = minor; a
         ${ref}-restated-in-depends_on redundancy (harmless duplication the planner contract
         warns against) or a cosmetic graph wording issue = nit. Set finding.file to the
-        plan's path and line to the cited node's line. Do not raise plan-wf-completeness
+        plan's path and line to the cited node's line. This lens owns only the
+        ${workflow.inputs.x} REF-RESOLUTION direction — that a CONSUMED input is declared and
+        that a node ref / output.from / dispatch form resolves; do not raise
+        plan-wf-input-contract (the declared-SET-vs-requirement direction — the
+        presence-given-the-requirement, required-flag/type/default soundness of each input, and
+        inputs nothing references), plan-wf-completeness
         (whether a declared element is present/buildable), plan-wf-control-flow (gate /
         loop / when / for_each coherence and termination), plan-wf-reuse-survey (whether the
         reuse decision and missing_microskills/_new_profiles set are right), plan-wf-scope-fit

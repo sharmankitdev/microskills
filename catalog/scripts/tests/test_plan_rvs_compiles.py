@@ -40,9 +40,11 @@ def test_plan_rvs_workflow_create_is_loopless():
     # No collect node — verify fans out directly over the review panel via
     # ${review[].findings} (the panel-aggregate ref).
     assert s["sequence"] == ["segment[plan,review_plan_wf_completeness,"
-                             "review_plan_wf_graph_correctness,review_plan_wf_control_flow,"
+                             "review_plan_wf_graph_correctness,review_plan_wf_input_contract,"
+                             "review_plan_wf_control_flow,"
                              "review_plan_wf_reuse_survey,review_plan_wf_scope_fit,"
-                             "review_plan_wf_name_capability,verify,synth]"], s["sequence"]
+                             "review_plan_wf_name_capability,review_plan_wf_failure_path_coverage,"
+                             "verify,synth]"], s["sequence"]
 
 
 def test_plan_rvs_microskill_create_is_loopless():

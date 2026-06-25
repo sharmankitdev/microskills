@@ -1,5 +1,5 @@
 {
-  "manifest_hash": "a718fe10cc62e4346f38ce5b2fa5487338946ecde81049dadb6df5ac51c8be7a",
+  "manifest_hash": "4c4e432c0b895db7223abe67ff8bc063a62635a70e85e303488b6b87d619cd9a",
   "name": "microskill-create",
   "node_fingerprints": {
     "advise": "01820cd75c406b7bcac77fd2cee4a4957d145097c1518277338b7e8747d04640",
@@ -32,13 +32,14 @@
     "plan_rvs__review_plan_ms_input_contract": "968823f2868a364912f4d6d6e964fcc1193189091b5df37b0ec366e679703260",
     "plan_rvs__review_plan_ms_name_capability": "b0014ea6e66f1c0f32794e93811d7b34272d6f5e1e2c58edbb6540488d7e8ac7",
     "plan_rvs__review_plan_ms_output_contract": "cac43a19dd23b645217ccde0f233dcc82ec5e424e171ac2987185a7153671344",
+    "plan_rvs__review_plan_ms_reuse_survey": "244a814cfb452f010e5fbd549afb79b4cf9a33d85d3cdc636c713819d30cc722",
     "plan_rvs__review_plan_ms_scope_fit": "af6d934ab7fb238d781516218e6e222040aca1cc928b661b864ff49fbb4e1aa6",
-    "plan_rvs__synth": "6e11abbd497c9518aac23cf1f67daf6fda91ebf7ae7e912b6d62b6a5f98715da",
-    "plan_rvs__verify": "b5da1007bc50b974bf2ff53dd594c20a4cd0167f2ff528fc37da19a3b4f097f3"
+    "plan_rvs__synth": "7effa7af81d1b8c119254a109717f8cecfcb9bda50f63c9490e09d0cf6cb5857",
+    "plan_rvs__verify": "3e935d3a31c9ca90200953b2a4ba5a1f0a8365ca2a0d2d13921c83419b846228"
   },
   "profile_used": "base",
   "segment_digests": {
-    "seg-1.js": "a16716725be13e2eca783af3d074c8afe1b4fcd9e8d2e805f6c171b39b99a3a7",
+    "seg-1.js": "abc1e6d834837b18ca49f7dddddfd863eef372fe47576b098a53f4bf7c0ed770",
     "seg-2.js": "45994abcb1caced0f70e42a17741a367e209870f4a84eb388d71f0f6bf34d91d"
   }
 }

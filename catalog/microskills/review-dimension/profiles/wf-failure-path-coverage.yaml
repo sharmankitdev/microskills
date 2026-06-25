@@ -1,0 +1,57 @@
+version: 1
+
+# wf-failure-path-coverage lens overlay for review-dimension (create pipeline, §8 step 4).
+# The wf-impl twin of ms-failure-modes-coverage — reviews the BUILT workflow's failure paths.
+# Overrides the active dimension, the artifact kind, and the rubric snippet — a plain list
+# REPLACES base's correctness snippet wholesale (resolver list-replace rule). output_schema,
+# inputs, runtime, and the body inherit from base. The caller threads the approved
+# plan/requirement as context_path (grounding, Read by path).
+vars:
+  dimension: wf-failure-path-coverage
+  artifact_kind: workflow draft bundle (WORKFLOW.yaml + profiles/*.yaml, concatenated)
+
+context:
+  snippets:
+    - name: wf-failure-path-coverage-rubric
+      text: >-
+        Failure-path-coverage rubric for a workflow draft bundle — answer "are the built
+        workflow's failure paths handled for the requirement's risk?". Read the approved
+        plan/requirement from context_path as ground truth; an absent context_path = a
+        missing grounding basis: raise exactly one blocker finding naming the missing
+        grounding and review nothing blind. The deterministic floor (validate-workflow +
+        compile-workflow --defs-root) already enforces loop contiguity, the mandatory
+        while|until condition and max_iters bound, and the on_exhaust MECHANICS — the
+        body-own-segment partition rule and the reserved loop/loop_exhaust ids — but it
+        NEVER judges whether on_exhaust SHOULD exist: its absence is the byte-identical
+        historical default, so a loop that hits its cap with its continue-condition still
+        true just ends and the capped, still-unconverged artifact flows downstream silently
+        (inv 29). Do not re-raise those mechanics. Flag only failure-path defects above that
+        floor: a bounded/convergence loop that omits on_exhaust: escalate|fail so an
+        exhausted still-failing artifact flows into a side-effecting or terminal node (a
+        finalize that vendors the draft, a node that writes the workspace) when the
+        requirement demands the artifact converge before it ships; a for_each fan-out whose
+        partial-arm failure is unrouted — a failing arm reaches the fan-in with no when/gate
+        that catches it, so a partial result proceeds as if whole; a terminal failure path
+        with no gate or stop, where the requirement's unhappy outcome should halt the run or
+        hand off to a human but the graph runs straight on; a flaky background use:/agent:
+        node — an external call, a network fetch — with no retry: { max_attempts: N } so a
+        single transient throw or null return aborts the whole segment. Ground every claim
+        against the requirement at context_path: do NOT flag an intentional silent
+        fall-through the requirement permits (a best-effort artifact that is fine to ship
+        uncapped). Severity mapping: a silent flow into a side-effecting/terminal node of
+        EITHER an exhausted still-unconverged artifact where the requirement demands
+        convergence OR an unhappy outcome the requirement says must halt the run = blocker;
+        an unrouted fan-out partial-arm failure, or a missing retry on a node the
+        requirement marks flaky/external = major; a failure path that is handled but
+        vaguely, or merely under-specified and needing a decision = minor. Set each
+        finding's file to the real source file the issue lives in per the bundle's
+        provenance markers (WORKFLOW.yaml or profiles/<p>.yaml) and line to that file's real
+        line number — the downstream refute pass and fix step read the real source at the
+        finding's file. Do not raise wf-guard-logic-intent (the loop's while/until
+        predicate, the convergence signal it terminates on, or the magnitude of max_iters —
+        NOT the exhaustion policy), wf-gate-prompt-options-quality (a human gate's prompt
+        clarity or option-set completeness/distinctness), or wf-dag-decomposition-correctness
+        (a missing ORDINARY processing node, node granularity, or dispatch form) concerns
+        under this rubric — those sibling lenses own them; THIS lens owns only the missing
+        FAILURE-path halt (an exhausted-loop or unhappy-outcome path that should gate/stop
+        but runs straight on), never an ordinary node the graph simply lacks.

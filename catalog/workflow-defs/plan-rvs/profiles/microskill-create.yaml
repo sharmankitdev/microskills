@@ -18,5 +18,6 @@ nodes:
           - plan-ms-output-contract
           - plan-ms-name-capability
           - plan-ms-failure-coverage
+          - plan-ms-reuse-survey
     - id: verify
       customize: { profile: plan-microskill }

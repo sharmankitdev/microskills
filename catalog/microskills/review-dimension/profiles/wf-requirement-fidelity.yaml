@@ -1,0 +1,64 @@
+version: 1
+
+# wf-requirement-fidelity lens overlay for review-dimension (create pipeline, §8 step 4) —
+# the wf-impl twin of ms-purpose-contract-fidelity. Every other wf-impl lens is construct-
+# local (one node's dispatch/prompt/guard/schema/wiring); THIS one asks the whole-graph
+# question "does the built workflow as a whole realize the requirement — did it build the
+# RIGHT thing?". A plain list REPLACES base's correctness snippet wholesale (resolver
+# list-replace rule); output_schema, inputs, runtime, and the body inherit from base. The
+# caller threads the approved plan/requirement as context_path (grounding, Read by path).
+vars:
+  dimension: wf-requirement-fidelity
+  artifact_kind: workflow draft bundle (WORKFLOW.yaml + profiles/*.yaml, concatenated)
+
+context:
+  snippets:
+    - name: wf-requirement-fidelity-rubric
+      text: >-
+        Requirement-fidelity rubric for a workflow draft bundle — answer the whole-graph
+        question "does the built workflow as a whole realize the requirement — did it build
+        the RIGHT thing?". Read the approved plan/requirement from context_path as ground
+        truth; an absent context_path = a missing grounding basis: raise exactly one blocker
+        finding naming the missing grounding and review nothing blind. The deterministic
+        floor (validate-workflow + compile-workflow --defs-root) already proves ref
+        RESOLUTION (every ${id.output.field} names a real producer and a declared field),
+        required-input-supplied, loop contiguity plus the mandatory while/until and
+        max_iters, on_exhaust MECHANICS (the body-owns-its-segment rule and the reserved
+        loop/loop_exhaust gate ids), gate default-in-options membership, that every
+        depends_on resolves, and that an UNDECLARED ${workflow.inputs.x} ref blocks — but it
+        is requirement-BLIND: it never reads whether the graph as a whole performs what the
+        requirement asks; do not re-raise resolution, structural, or floor findings. Flag
+        only whole-graph fidelity defects: a behavior or processing step the requirement
+        demands that NO node in the graph performs (a dropped ordinary processing node — not
+        a missing gate, loop, or orchestrator-native checkpoint step, which the structural
+        lenses catch); a node whose designed work computes a materially different or adjacent
+        thing than the requirement asks (the graph solves a neighboring problem); invented
+        scope — nodes or behaviors with no basis in the requirement; a reused workflow's
+        behavior the requirement relies on that the implementer hand-rebuilt inline — re-
+        implementing it node-by-node instead of referencing workflow: X (compile-time
+        inlining of a real workflow: node is faithful by construction and cannot silently
+        drop a child node) — while dropping a source node, gate, or loop in that hand-rebuild,
+        so the realized graph no longer reproduces the behavior the requirement relies on.
+        Severity mapping: a dropped requirement-mandated behavior, or a graph that as a whole
+        solves a different problem than asked = blocker; a partial divergence on one
+        behavior, or a span of invented scope = major; a borderline interpretation where the
+        requirement's intent is plausibly preserved = minor. Set each finding's file to the
+        real source file the issue lives in per the bundle's provenance markers
+        (WORKFLOW.yaml or profiles/<p>.yaml) and line to that file's real line number — the
+        downstream refute pass and fix step read the real source at the finding's file. Do
+        not raise wf-dag-decomposition-correctness (node GRANULARITY, dispatch FORM, and
+        segmentation — the decomposition SHAPE, not whether the right computation is present
+        at all; its "missing node" case is the structural/checkpoint-shape one — an
+        orchestrator-native step that never gets its own checkpoint — whereas THIS lens owns
+        the absence of a requirement-implied ordinary processing computation, and the
+        reuse-vs-reimplement dispatch-FORM choice is its, while whether a hand-rebuilt graph
+        still does what the requirement needs is this lens's), wf-inputs-contract-adequacy
+        (the top-level inputs[] SET adequacy — a dead declared-yet-unreferenced workflow
+        input, a wrong required-flag or type, or a requirement-implied input the graph never
+        declares), wf-failure-path-coverage (whether on_exhaust SHOULD exist on a
+        bounded/convergence loop, plus other failure-path and loop cap-exhaustion coverage),
+        wf-prompt-task-fidelity (one node's prompt PROSE versus its OWN role and
+        output_schema), wf-input-wiring-fidelity (which producer and field a node's input ref
+        binds), or wf-output-schema-downstream-fit (a producer's declared output field SET)
+        concerns under this rubric — those sibling lenses own them; THIS lens owns ONLY
+        whole-graph requirement realization.

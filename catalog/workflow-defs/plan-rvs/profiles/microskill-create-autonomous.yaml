@@ -21,6 +21,7 @@ nodes:
           - plan-ms-output-contract
           - plan-ms-name-capability
           - plan-ms-failure-coverage
+          - plan-ms-reuse-survey
     - id: verify
       customize: { profile: plan-microskill }
 
@@ -31,6 +32,7 @@ loop:
          review_plan_ms_completeness, review_plan_ms_scope_fit,
          review_plan_ms_input_contract, review_plan_ms_output_contract,
          review_plan_ms_name_capability, review_plan_ms_failure_coverage,
+         review_plan_ms_reuse_survey,
          verify, synth]
   carry:
     findings: ${synth.output.findings}

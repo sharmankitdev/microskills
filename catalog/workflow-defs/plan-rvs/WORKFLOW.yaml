@@ -62,10 +62,12 @@ nodes:
       over:
         - plan-wf-completeness
         - plan-wf-graph-correctness
+        - plan-wf-input-contract
         - plan-wf-control-flow
         - plan-wf-reuse-survey
         - plan-wf-scope-fit
         - plan-wf-name-capability
+        - plan-wf-failure-path-coverage
     inputs:
       artifact_path: ${plan.output.plan_path}
       context_path: ${workflow.inputs.requirement_path}

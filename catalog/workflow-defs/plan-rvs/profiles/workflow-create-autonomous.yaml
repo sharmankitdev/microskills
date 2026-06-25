@@ -17,8 +17,10 @@ loop:
   max_iters: 2
   body: [plan,
          review_plan_wf_completeness, review_plan_wf_graph_correctness,
+         review_plan_wf_input_contract,
          review_plan_wf_control_flow, review_plan_wf_reuse_survey,
          review_plan_wf_scope_fit, review_plan_wf_name_capability,
+         review_plan_wf_failure_path_coverage,
          verify, synth]
   carry:
     findings: ${synth.output.findings}
