@@ -1341,8 +1341,9 @@ def desugar_nested_workflows(wf, defs_root, _stack=None):
     errors are a HARD block. Compile/validate call desugar_subgraphs with
     check_reserved=False afterward (this pass already guarded the author '__' ids).
 
-    NOTE (sub-PR 1 scope): a loop-bearing child is not yet unioned as a loop region
-    — that is a fail-loud error here until the multiple-loop-region engine lands."""
+    NOTE: a loop-bearing static child IS unioned as its own namespaced loop region
+    (the multiple-loop-region engine) — its do/while body, guard, and exhaust gate are
+    spliced in and returned for the partitioner to emit as a per-origin segment."""
     errors = []
     if not isinstance(wf, dict) or not isinstance(wf.get("nodes"), list):
         return wf, errors, False, []
@@ -2436,8 +2437,8 @@ def nested_workflow_depth_cycle_errors(defs_root, merged):
         # RETARGET (compile-time inlining): a STATIC nested workflow flattens at
         # compile, so the depth cap no longer governs it — it governs only the
         # surviving RUNTIME (for_each) nesting. Inline the child's OWN static nests
-        # first; a workflow: node surviving in the FLAT child (a for_each grandchild,
-        # or — until the multiple-loop engine lands — a loop-bearing static one) is a
+        # first (this also unions a loop-bearing static grandchild as a loop region);
+        # a workflow: node surviving in the FLAT child (a for_each grandchild) is a
         # true depth-2 the dispatcher cannot re-enter. (A for_each child that merely
         # statically nests a leaf grandchild is depth-1 and legal.)
         flat_doc, _ie, _di, _ir = desugar_nested_workflows(
