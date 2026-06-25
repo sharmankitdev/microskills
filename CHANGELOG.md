@@ -1,3 +1,9 @@
+## [0.41.0](https://github.com/sharmankitdev/microskills/compare/v0.40.0...v0.41.0) (2026-06-25)
+
+### Features
+
+* **workflow:** wire shape-not-faithfulness + additionalprops into ms-impl review panel ([#47](https://github.com/sharmankitdev/microskills/issues/47)) ([0d2db8c](https://github.com/sharmankitdev/microskills/commit/0d2db8cef8e7205fe55c4ec57dd3edf310403ce2))
+
 ## [0.40.0](https://github.com/sharmankitdev/microskills/compare/v0.39.0...v0.40.0) (2026-06-24)
 
 ### ⚠ BREAKING CHANGES
