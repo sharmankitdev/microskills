@@ -26,15 +26,19 @@ context:
         Flag only mapping defects: an interactive or external-skill delegation modeled as a
         background use:/agent: node instead of an opaque orchestrator node; a pure
         deterministic transformation modeled as an orchestrator node (losing determinism /
-        reuse) instead of use:/agent:/missing_microskills; an agent debate not expressed as a
-        loop; the planner RECURSING into an external skill's internals instead of keeping it
-        opaque; a missing_microskills entry named for THIS workflow or step rather than the
-        reusable capability it performs. Severity mapping: an interactive / external-skill
-        delegation forced into a background use:/agent: node (it will fabricate — background
-        segments cannot pause) = blocker; a pure transformation miscls as an orchestrator node,
-        a debate not modeled as a loop, or a capability-coupled missing_microskills name =
-        major; a borderline transform-vs-orchestrator judgment = minor; a cosmetic wording
-        issue on an otherwise-correct mapping = nit. Set finding.file to the plan's path and
-        line to the cited node. Do NOT raise plan-wf-decompose-fidelity (whether every phase
-        is reproduced at all), nor the base plan-wf-* soundness concerns — this lens owns ONLY
-        the per-delegation construct choice.
+        reuse) instead of use:/agent:/missing_microskills; an agent debate where a loop IS
+        present but the iteration is modeled with the wrong delegation construct; the planner
+        RECURSING into an external skill's internals instead of keeping it opaque. Severity
+        mapping: an interactive / external-skill delegation forced into a background
+        use:/agent: node (it will fabricate — background segments cannot pause) = blocker; a
+        pure transformation miscls as an orchestrator node, or a debate whose iteration uses
+        the wrong delegation construct though a loop IS present = major; a borderline
+        transform-vs-orchestrator judgment = minor; a cosmetic wording issue on an
+        otherwise-correct mapping = nit. Set finding.file to the plan's path and line to the
+        cited node. Do NOT raise plan-wf-decompose-fidelity (whether every phase is reproduced
+        at all — including a debate/iteration with NO loop at all, i.e. loop-PRESENCE; that
+        sibling owns it, this lens judges the construct ONLY once a loop IS present, so neither
+        lens suppresses the defect believing the other owns it), nor plan-wf-name-capability
+        (whether the workflow name or any missing_microskills[].name says what the artifact
+        does — defer missing_microskills naming to it), nor the base plan-wf-* soundness
+        concerns — this lens owns ONLY the per-delegation construct choice.

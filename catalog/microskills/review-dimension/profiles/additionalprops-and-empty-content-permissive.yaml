@@ -39,5 +39,5 @@ context:
         real source at the finding's file. Do not raise
         shape-not-faithfulness-fabrication-passes (steps that name but do not perform the
         task), ms-inputs-contract-adequacy (whether the input SET is complete for the
-        requirement), or ms-step-input-reference-undeclared (a step needing an undeclared
+        requirement), or ms-input-step-wiring-coherence (a step needing an undeclared
         input) concerns under this rubric — sibling lenses own them.

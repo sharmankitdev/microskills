@@ -3,7 +3,7 @@ version: 1
 # wf-inputs-contract-adequacy lens overlay for review-dimension (create pipeline, §8 step
 # 4). Implement-stage adequacy of the built WORKFLOW.yaml top-level inputs[] SET vs the
 # requirement, plus dead-input detection — the wf-impl twin of ms-inputs-contract-adequacy
-# fused with ms-declared-input-unused. A plain list REPLACES base's correctness snippet
+# fused with ms-input-step-wiring-coherence. A plain list REPLACES base's correctness snippet
 # wholesale (resolver list-replace rule). output_schema, inputs, runtime, and the body
 # inherit from base. The caller threads the approved plan/requirement as context_path
 # (grounding, Read by path). BLOCKER-capable.
