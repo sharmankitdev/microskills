@@ -1,0 +1,62 @@
+version: 1
+
+# wf-input-wiring-fidelity lens overlay for review-dimension (create pipeline, §8 step 4).
+# Consumer-side data-wiring fidelity: is each node input / panel-aggregate ref wired to the
+# semantically RIGHT producer + field for the node's task? Overrides the active dimension,
+# the artifact kind, and the rubric snippet — a plain list REPLACES base's correctness
+# snippet wholesale (resolver list-replace rule). output_schema, inputs, runtime, and the
+# body inherit from base. The caller threads the approved plan/requirement as context_path
+# (grounding, Read by path). BLOCKER-capable.
+vars:
+  dimension: wf-input-wiring-fidelity
+  artifact_kind: workflow draft bundle (WORKFLOW.yaml + profiles/*.yaml, concatenated)
+
+context:
+  snippets:
+    - name: wf-input-wiring-fidelity-rubric
+      text: >-
+        Input-wiring-fidelity rubric for a workflow draft bundle — answer "is each node
+        input ref and each ${panel[].field} panel-aggregate ref wired to the semantically
+        RIGHT producer and field for that node's task?". Read the approved plan/requirement
+        from context_path as ground truth; an absent context_path = a missing grounding
+        basis: raise exactly one blocker finding naming the missing grounding and review
+        nothing blind. The deterministic floor (validate-workflow + compile-workflow
+        --defs-root) already proves that every ${id.output.field} names a real producer and
+        a field in that producer's effective schema (S-FIELD), that a ${panel[].field}
+        names a real expand: template and a tail field and implies the dependency edge on
+        each panel sibling (S-INFER), that every required input is supplied, and that every
+        depends_on entry resolves — but it is requirement-BLIND: it only proves a ref
+        RESOLVES and TYPE-CHECKS, never that the wired source is the CORRECT one for the
+        node's job; do not re-raise resolution, field-existence, required-input, or
+        depends_on-resolves findings. Flag only wrong-source defects above that floor: a
+        node inputs ref that resolves and type-checks but binds the WRONG producer or WRONG
+        field for the task the plan gives the node (e.g. a synthesize node reading the
+        reviewer's findings when its job needs the verifier's verdicts; a node fed
+        ${a.output.report} where the plan's data flow means ${b.output.report}); a
+        ${panel[].field} aggregate ref in a node's inputs: that binds the wrong tail field
+        for the consumer (a ${review[].explanation} handed to a node whose task consumes
+        ${review[].findings}; a for_each-position panel source belongs to
+        wf-guard-logic-intent); a ${workflow.inputs.x} bound where another declared
+        workflow input was the intended source; a missing pure-ordering depends_on edge
+        between a node with a filesystem side effect and a later node that reads that result
+        OUT OF BAND — not through a ${ref} — so the compiler, seeing no ref-implied edge,
+        co-ranks the two into one racy await parallel([...]) batch (recall ${workflow.inputs.x}
+        and ${gate-id.output.choice} refs imply NO edge, so a consumer that depends on them
+        for ordering also needs the explicit depends_on). Severity mapping: a misrouting
+        that feeds the terminal output.from node or a loop's while/until convergence signal
+        (the wrong source reaches the workflow's returned result or decides loop
+        termination) = blocker; corruption of an intermediate node's input, or a
+        side-effect/out-of-band ordering race from a missing depends_on = major; a
+        cosmetically-odd but harmless source (a ref reaching an equivalent value by a
+        roundabout path) = minor. Set each finding's file to the real source file the issue
+        lives in per the bundle's provenance markers (WORKFLOW.yaml or profiles/<p>.yaml)
+        and line to that file's real line number — the downstream refute pass and fix step
+        read the real source at the finding's file. Do not raise wf-guard-logic-intent (a
+        while/until/when/for_each guard with right grammar but the wrong convergence or
+        branch SIGNAL — that lens owns the predicate; this lens owns only which producer
+        a node's data INPUTS bind to), wf-output-schema-downstream-fit (a PRODUCER's
+        declared output field SET — whether the upstream schema carries the right fields,
+        vs. this lens's which-field-a-consumer-READS), wf-prompt-task-fidelity (a node's
+        prompt PROSE vs. its role and input NAMES), or wf-dag-decomposition-correctness
+        (node granularity, dispatch form, and segmentation) concerns under this rubric —
+        those sibling lenses own them.

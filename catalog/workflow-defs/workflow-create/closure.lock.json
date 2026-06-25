@@ -1,5 +1,5 @@
 {
-  "manifest_hash": "5930234b5ce19ce73c27d8de72af11b447a053532bc5fc6a88e84e3cd4a8f195",
+  "manifest_hash": "048e573363bf70f99a35e7853124b0633bbcf486d968c431e817c76de4cb3569",
   "name": "workflow-create",
   "node_fingerprints": {
     "advise": "e1b2198f1227f3bf3ed34822bb17c35ece8196cf38afa75060560f836b07ca60",
@@ -11,12 +11,13 @@
     "build__review_wf_dag_decomposition_correctness": "4340e1414388d72cfe9aa69558a072eef6e8b06e43574aadfcddcb3a68b04a3a",
     "build__review_wf_gate_prompt_options_quality": "b3d7bab5e1d22af8a9765000fa3006e036ffa3242e6fb3d8b915129ee5c0106b",
     "build__review_wf_guard_logic_intent": "939f65b78dfe3a402e610203253ee2c2779bf87f654ab19f59d87c61091f9159",
+    "build__review_wf_input_wiring_fidelity": "c231d6225dd38854d30de6308206dcd545c1727204be2cb2aacaba1aeab406f7",
     "build__review_wf_output_schema_downstream_fit": "fc5f387242da5dae956e7fad56a10387f75f161998566f10360d454d14d7b964",
     "build__review_wf_profile_overlay_coherence": "4b3595eaee0fe93ebbe271b0a355f7ec3725b305a7e94c0821a52957b07a58ab",
     "build__review_wf_prompt_task_fidelity": "c6903c2dee9986bd11636a1ffc5807b4fe76ca78587ca93344d7d45640adc437",
     "build__review_wf_spill_materialize_judgment": "8c1008d8992db278f1833899c4d796b652e94e88aea9345f1c7ec39483f73eaa",
-    "build__synth": "a6b1eedbcaf6e1cd11849377462b8e170007a754da9174eadf75826ce639970d",
-    "build__verify": "192f5813fd81d06c16635aae469bff82b5d9f43614d61d41069345ce1bc49ba9",
+    "build__synth": "9c7972e5df47a895d43e641c9a0a68575476d6296dbd4dbe9a896ef5a9e6b734",
+    "build__verify": "1820d1639fc4a360785ad1befdd9fa88a54987bf0742903993a978b642886324",
     "build__xreview_duplicate_capability": "75e74669d64000076a9c4dae8c35a71632ef4d0bf9b4188a714ea809ac315533",
     "build__xreview_naming_collision": "4b91b7abe747f0c4b090860b34e328e4442fba93d47231c9935a39a1cac34e8b",
     "build__xreview_reverse_consumer": "e650891361d6ba8f09bb635bba38a6777600549e106311d612b04d5c7a390e84",
@@ -26,7 +27,7 @@
     "plan_rvs__review_plan_wf_control_flow": "97ef02f4b988a604098c531a8f3042bf2736d7a703c21b8427dae096d21bdf6b",
     "plan_rvs__review_plan_wf_graph_correctness": "46e044d52caf1cc2d9a6d6b75870caf9c4a568b4f93505a47b53b09e4b273d2a",
     "plan_rvs__review_plan_wf_name_capability": "953ef43afd0b1bafc594fe56b569321789aa3fcdd06521284bdc18f81efed2c0",
-    "plan_rvs__review_plan_wf_reuse_survey": "6f09769c3225d3b0b1cbf7db1bbfcbde0fa0032f9898dfb8a3eee27401284160",
+    "plan_rvs__review_plan_wf_reuse_survey": "4a3593f9e30b168ffe1a1767a901e3fffd768d9fa3f3fcc447bb3787fd360207",
     "plan_rvs__review_plan_wf_scope_fit": "6e32a7c6138e73ebcf36e1bd89052525f696bbfee74c25ad2bceeb532868f844",
     "plan_rvs__synth": "9b96438ea3d0f7679048b3da1a0e8bcbe58d5b1e555d4cba26a1af195c42c46b",
     "plan_rvs__verify": "7527837ef89d732358d6fc521cb7afaab8b36fab1d7bb8309071bec1e23f41c6",
@@ -35,6 +36,6 @@
   "profile_used": "base",
   "segment_digests": {
     "seg-1.js": "251f37a97f957e0b18bd3766088ad510bc824b2bbff57dffb17f284d27aac146",
-    "seg-2.js": "de50add2d8b535ef28fa0e87c53499fbc69e5821e05ac9e481776728b11ee1d5"
+    "seg-2.js": "496605c838adc2214e973e759d2af6556e552e8590dc232ef5e848625ad7fe1e"
   }
 }

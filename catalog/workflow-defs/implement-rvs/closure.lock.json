@@ -1,5 +1,5 @@
 {
-  "manifest_hash": "4c24577a8cc09ed7f5c31d85e75861435794cf535fc12cd59514387b0e665b01",
+  "manifest_hash": "eae77aff59673705810fd75379194e34887bd08425d06be444c77ada81a64be2",
   "name": "implement-rvs",
   "node_fingerprints": {
     "bundle": "53d0b6604573ab4dcb26ca05d347c69fc25439a7198e4d545282b7446e7335cb",
@@ -10,18 +10,19 @@
     "review_wf_dag_decomposition_correctness": "bc0cefa1b30bfc33d6f88293c31b48e742458c39e03af9d9572c34c3d5c5d0c5",
     "review_wf_gate_prompt_options_quality": "cfe0366cbc7b428af84ba055eaf7b7ccf90170a959e5f49878f461c30ae18761",
     "review_wf_guard_logic_intent": "92c2b446f6b6d60b123500c3e7cc675a94ef8261ca81836c6e0957733a1e2d77",
+    "review_wf_input_wiring_fidelity": "46103772332433d5e205d2c283791758818fe863299b07224305d43fcf81ce07",
     "review_wf_output_schema_downstream_fit": "1d30ab5c6a9aa674e32f1dc31ec438bd4c59f480c7645267f2aeb5d120956662",
     "review_wf_profile_overlay_coherence": "89bdf6b09322ebfbcf53c35dafff8440433e3204f3e29c70509f1dfafa3da6dc",
     "review_wf_prompt_task_fidelity": "c79a4b8af574848490c6b7eef0c7969f2536f67be422f4220ff4b0a27979b482",
     "review_wf_spill_materialize_judgment": "13627edf56c4ff55df76cd17f89b9df58c013f411458bcd18e7833610c98ea2b",
-    "synth": "5860c8fa6914e2b9799525737ad0149d0bb8c8d690e714138fb27608327dd716",
-    "verify": "7a2ce07851a9c5fe39c6d2b8da11efe9a94c76712f43cdc882d4a4de10a0680b",
+    "synth": "605326e5a29fdad17c8f2de730d45729f93d45d677395fe8726e40ef817e9796",
+    "verify": "5421478f894df9c0ff4b22763481e47d1f69d3f66275a6d77f001c80e6632a13",
     "xreview_duplicate_capability": "01ebfa3b2e0d8104a805f31a70765338c3f85ea26bbca4db27d9ad78b3ee905f",
     "xreview_naming_collision": "ad3098f8c3057cdc021611a1a84cdebf081406dc77c4653debcd9559b0035ac7",
     "xreview_reverse_consumer": "84f480229c41019d11e06d704c38331cbc3b66480dd450612896b0983e489c55"
   },
   "profile_used": "base",
   "segment_digests": {
-    "seg-1.js": "6337416a8154394150d4f81e79cad93a6a7541e0de9379020f98f08d80842526"
+    "seg-1.js": "e42225d92bd8d2e746752cbafd2737416c869bb7bd7d71bb9fc2d7b56fb8f60b"
   }
 }

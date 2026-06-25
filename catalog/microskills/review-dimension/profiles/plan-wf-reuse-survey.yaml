@@ -14,8 +14,9 @@ context:
     - name: plan-wf-reuse-survey-rubric
       text: >-
         Reuse-survey rubric for a workflow plan — answer "did the plan enumerate the existing
-        registry and reuse it, declaring the right set of genuinely-missing components?"
-        against the plan_yaml design's nodes, missing_microskills[], _new_profiles[], and
+        registry and reuse it, declaring the right set of genuinely-missing components — and is
+        each genuinely-missing requirement a faithful spawn spec for the node that will consume
+        it?" against the plan_yaml design's nodes, missing_microskills[], _new_profiles[], and
         _reuse[]. The planner contract is binding: it must reuse existing microskills /
         agents / workflows where they fit (choosing base, an existing overlay, or a new
         profile per use: node), and it must NEVER invent a workflow: node type — a whole
@@ -27,16 +28,44 @@ context:
         needs but does not reuse; a node modeled as a brand-new microskill when an existing
         one plus a _new_profiles overlay would serve; an invented workflow: node type; a
         _new_profiles entry that duplicates an overlay the registry already ships; a _reuse
-        annotation that misattributes or omits the origin of an inline-expanded node.
-        Severity mapping: an invented workflow: node, or a missing_microskills entry that
-        reinvents a capability the registry already provides = blocker; an obvious reuse
-        missed (a new microskill proposed where an existing one fits) = major; a new-profile
-        vs reuse-existing-overlay judgment call = minor; a cosmetic _reuse annotation gap =
-        nit. Set finding.file to the plan's path and line to the cited node /
-        missing_microskills / _new_profiles entry's line. Do not raise plan-wf-completeness
-        (whether a missing_microskills/_new_profiles entry is merely present and fleshed out),
-        plan-wf-graph-correctness (edge/ref resolution and dispatch-form choice),
-        plan-wf-control-flow (gate/loop/when/for_each coherence), plan-wf-scope-fit (whether
-        a whole existing workflow covering this should instead be a scope_advisory.kind
-        adapt), or plan-wf-name-capability (whether a missing_microskills[].name is
-        capability-coupled) concerns — those sibling lenses own them.
+        annotation that misattributes or omits the origin of an inline-expanded node. Then —
+        for each genuinely-missing entry the plan keeps (one it will hand to microskill-create
+        to mint) — also check the spawn-spec fidelity of its missing_microskills[].requirement
+        against the plan's own node graph: read the node(s) that consume the to-be-minted
+        microskill and verify the requirement IMPLIES every input those node(s) pass into it,
+        IMPLIES every output field that a downstream ${<node>.output.<field>} ref dereferences
+        off it, and describes the capability that node's role actually needs. Flag a
+        requirement that is present and well-named yet contract-mismatched: I/O-incompatible —
+        it omits or contradicts an input the consuming node supplies, or an output field a
+        downstream ref reads — or semantically off — it describes a capability narrower than,
+        or beside, the role the node plays in the graph; the stakes are why this clause rides
+        here rather than waiting for the draft stage — microskill-create would otherwise mint
+        the microskill from this requirement through a full nested build, and the contract
+        mismatch surfaces only afterward, the most expensive possible failure. Severity
+        mapping: an invented workflow: node, a missing_microskills entry that reinvents a
+        capability the registry already provides, or a missing_microskills[].requirement that
+        is I/O-incompatible with its consuming node (the minted microskill could not wire — a
+        full nested build wasted) = blocker; an obvious reuse missed (a new microskill proposed
+        where an existing one fits), or a requirement that would wire but is semantically off
+        from the consuming node's role (a usable-but-wrong capability minted) = major; a
+        new-profile vs reuse-existing-overlay judgment call, or a requirement merely
+        under-specified yet still inferable from the node's wiring = minor; a cosmetic _reuse
+        annotation gap = nit. Set finding.file to the plan's path and line to the cited node /
+        missing_microskills entry (or its requirement line) / _new_profiles entry's line. Do
+        not raise plan-wf-completeness (whether a missing_microskills/_new_profiles entry is
+        merely present and fleshed out — a wholly ABSENT requirement line is its defect,
+        whereas this clause fires only on a requirement that IS present but unfit),
+        plan-wf-graph-correctness (edge/ref resolution and dispatch-form choice — whether the
+        plan's declared refs resolve among its declared nodes, whereas this clause asks whether
+        the to-be-minted microskill's requirement promises the contract those existing wirings
+        will need), plan-wf-control-flow (gate/loop/when/for_each coherence), plan-wf-scope-fit
+        (whether a whole existing workflow covering this should instead be a
+        scope_advisory.kind adapt), or plan-wf-name-capability (whether a
+        missing_microskills[].name is capability-coupled — this clause assumes the name is fine
+        and tests only the requirement's I/O and semantic fit) concerns — those sibling lenses
+        own them. And in the workflow-create decompose plan panel — where this lens co-runs
+        with two decompose-family lenses that each cede '-reuse-survey' back to it —
+        plan-wf-delegation-mapping (per-delegation construct choice: which workflow construct
+        each source-skill delegation maps to) and plan-wf-decompose-fidelity (phase / gate /
+        loop / conditional coverage versus the source skill) own their respective scope
+        likewise.

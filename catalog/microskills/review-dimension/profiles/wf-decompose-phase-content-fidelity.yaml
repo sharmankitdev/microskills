@@ -1,0 +1,64 @@
+version: 1
+
+# wf-decompose-phase-content-fidelity lens for review-dimension — used ONLY by the
+# workflow-create DECOMPOSE profile's BUILD (draft) critique. Reviews the built workflow
+# bundle's per-phase CONTENT (each node prompt, gate prompt, and minted profile body)
+# against the SOURCE SKILL phase it transcribes (context_path: SKILL.md + references). A
+# plain list REPLACES base's correctness snippet wholesale (resolver list-replace rule);
+# output_schema, inputs, runtime, and the body inherit from base. The "transcribed from a
+# source skill" nuance lives in this comment and the rubric snippet, NOT in artifact_kind —
+# that var is held identical to the build-panel family so it substitutes cleanly into the
+# inherited body. Fidelity/meta lens: it reasons about ABSENCE/divergence, so it leans
+# confidence medium/low and frames findings as uncertainty for a human rather than asserted
+# defects.
+vars:
+  dimension: wf-decompose-phase-content-fidelity
+  artifact_kind: workflow draft bundle (WORKFLOW.yaml + profiles/*.yaml, concatenated)
+
+context:
+  snippets:
+    - name: wf-decompose-phase-content-fidelity-rubric
+      text: >-
+        Phase-content-fidelity rubric for a workflow draft bundle transcribed from a source
+        skill — answer "does each BUILT node prompt, human-gate prompt, and minted profile
+        body REPRODUCE the corresponding skill phase's actual procedure, including the
+        load-bearing detail in that phase's references/*.md?". Ground each built prompt /
+        gate prompt / profile body against its counterpart phase in the source-skill bundle
+        threaded via context_path (SKILL.md + references, concatenated under === <relpath> ===
+        headers); an absent context_path = a missing grounding basis: raise exactly one
+        blocker finding naming the missing grounding and review nothing blind. The
+        deterministic floor (validate-workflow + compile-workflow --defs-root) confirms only
+        ref RESOLUTION (every ${id.output.field} names a real producer + declared field),
+        required-input-supplied, loop contiguity + mandatory while/until + max_iters,
+        on_exhaust mechanics, gate default-in-options membership, and that depends_on
+        resolves — it is requirement-blind and skill-blind, never reading prompt prose nor
+        judging whether built CONTENT matches a source phase, so its silence on a prompt is
+        not approval — do not re-raise any of those. This lens reasons about ABSENCE /
+        divergence, which is rarely certain, so lean confidence medium or low across it and
+        raise each finding as a question for a human to confirm, not a confident verdict.
+        Flag only per-phase content-fidelity gaps: a phase whose procedure is materially
+        lost, weakened, or altered in the built prompt (a 5-step method in the skill
+        paraphrased into a weaker 2-step one); load-bearing per-phase detail carried in that
+        phase's references/*.md dropped from the node prompt or the minted profile body; a
+        transcribed human-gate prompt that asks a DIFFERENT question than the skill's gate
+        (the skill asks "approve the threat model?" but the draft asks "approve the plan?");
+        a prompt that would let the executor FABRICATE the step's result rather than perform
+        the phase's procedure. Severity mapping: a phase whose core procedure is
+        substantively gutted or made fabricatable = candidate blocker for human confirmation
+        (the strongest severity, but raised as a question to confirm rather than a confident
+        verdict — confidence medium or low); a partial weakening of a phase, or one dropped
+        load-bearing reference detail = major; a minor wording loss with the phase intent
+        still intact = minor. Set each finding's file to the real source file the issue lives
+        in per the bundle's provenance markers (WORKFLOW.yaml or profiles/<p>.yaml) and line
+        to that file's real line number — the downstream refute pass and fix step read the
+        real source at the finding's file. Do NOT raise wf-decompose-behavior-fidelity
+        (structural phase / gate / loop PRESENCE, ordering, control flow, gate-presence, and
+        loop-cap vs the skill — together with its plan sibling plan-wf-decompose-fidelity),
+        wf-prompt-task-fidelity (a prompt's consistency with its OWN output_schema and
+        plan-role, never grounded against the source skill), wf-gate-prompt-options-quality
+        (generic human-gate option-set completeness and prompt clarity), or
+        wf-profile-overlay-coherence (generic profile-overlay merge coherence and
+        contract-minimality — NOT whether the minted profile body's prose reproduces the
+        source phase, which IS this lens) concerns under this rubric — those sibling lenses
+        own them; THIS lens owns ONLY whether built per-phase CONTENT faithfully reproduces
+        the source skill phase's procedure.
