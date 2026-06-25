@@ -84,7 +84,14 @@ def _templates_root(script):
     return next((c for c in cands if c.is_dir()), cands[0])
 
 
-SCHEMA_PATH = _templates_root(SCRIPT) / "references" / "harness-schema.json"
+# Validate harness.yaml against the SOURCE schema being applied (PLUGIN_ROOT/templates), not the
+# previously-deployed .claude copy. initialize-harness re-materializes the templates tree itself,
+# so reading the deployed copy lets a schema evolution DEADLOCK: init would validate the new
+# manifest against the STALE deployed schema and die(1) before it could refresh it (the
+# chicken-and-egg that left a dogfood .claude permanently rejecting a derived_from manifest). The
+# runtime-preferring _templates_root stays a last-resort fallback for an odd layout with no source.
+_SOURCE_SCHEMA = PLUGIN_ROOT / "templates" / "references" / "harness-schema.json"
+SCHEMA_PATH = _SOURCE_SCHEMA if _SOURCE_SCHEMA.exists() else _templates_root(SCRIPT) / "references" / "harness-schema.json"
 HARNESS_SYNC = SCRIPT.parent / "harness-sync"
 
 # Reuse the harness-sync engine (extension-less file → SourceFileLoader). harness-sync

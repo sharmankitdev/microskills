@@ -76,6 +76,28 @@ def test_compile_workflow_hard_blocks_on_missing_schema(tmp_path):
     assert "not found" in (out + err).lower()
 
 
+def test_apply_revalidates_against_source_schema_not_stale_deployed(tmp_path):
+    """A shipped schema evolution must self-heal. init re-materializes the templates tree, so it
+    must validate harness.yaml against the SOURCE schema it is about to deploy — never the
+    previously-deployed .claude copy. Otherwise a stale deployed schema (one predating, say, the
+    derived_from change) rejects the closure-seeded manifest and init die(1)s before it can refresh
+    the copy: a permanent deadlock. Guards that a stale deployed schema neither blocks --apply nor
+    survives it."""
+    init_project(tmp_path)  # CLAUDE_PLUGIN_ROOT=REPO → source schema is REPO/templates
+    deployed = tmp_path / ".claude" / "templates" / "references" / "harness-schema.json"
+    props = json.loads(deployed.read_text())["$defs"]["componentList"]["items"]["properties"]
+    assert "derived_from" in props, "precondition: current schema accepts derived_from"
+    # Simulate a deployed copy that PREDATES the derived_from schema change (the dogfood symptom).
+    stale = json.loads(deployed.read_text())
+    stale["$defs"]["componentList"]["items"]["properties"].pop("derived_from", None)
+    deployed.write_text(json.dumps(stale))
+    # Re-apply must NOT die on the stale deployed schema (validates against source) ...
+    init_project(tmp_path)  # asserts returncode == 0 internally
+    # ... and must refresh the deployed copy back to current.
+    healed = json.loads(deployed.read_text())["$defs"]["componentList"]["items"]["properties"]
+    assert "derived_from" in healed, "init must re-materialize the stale deployed schema"
+
+
 def test_init_is_idempotent(tmp_path):
     init_project(tmp_path)
     second = init_project(tmp_path)
