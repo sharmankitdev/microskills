@@ -29,4 +29,9 @@ context:
         wf-guard-logic-intent, wf-prompt-task-fidelity, wf-gate-prompt-options-quality,
         wf-profile-overlay-coherence, wf-spill-materialize-judgment, wf-output-schema-downstream-fit) —
         those own general workflow soundness; THIS lens owns ONLY behavior-equivalence to the
-        source skill.
+        source skill. The one seam those two lenses share — an interactive / external-skill
+        step realized as a background use:/agent: node rather than an orchestrator node (a
+        background segment cannot pause for a human; a subagent that tries silently
+        fabricates) — is owned HERE: within the decompose build panel
+        wf-dag-decomposition-correctness DEFERS that specific orchestrator-vs-background case
+        to this lens, so flag it here and only here (no double-flag).

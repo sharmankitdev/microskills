@@ -1,0 +1,50 @@
+version: 1
+
+# ms-input-step-wiring-coherence lens overlay for review-dimension (create pipeline, §8
+# step 4). A MERGED dimension that replaces two former seats —
+# ms-step-input-reference-undeclared and ms-declared-input-unused — with one bidirectional
+# input<->step wiring lens. Overrides the active dimension, the artifact kind, and the
+# rubric snippet — a plain list REPLACES base's correctness snippet wholesale (resolver
+# list-replace rule). output_schema, inputs, runtime, and the body inherit from base.
+vars:
+  dimension: ms-input-step-wiring-coherence
+  artifact_kind: microskill draft bundle (MICROSKILL.md + profiles/base.yaml, concatenated)
+
+context:
+  snippets:
+    - name: ms-input-step-wiring-coherence-rubric
+      text: >-
+        Input-step-wiring-coherence rubric for a microskill draft bundle — answer "does
+        every value a step consumes trace back to a declared input or an earlier step's
+        output, AND is every declared input consumed by at least one step?". This single
+        lens owns the full bidirectional input<->step closure, merging the two former
+        seats — a step naming undeclared data, and a declared input no step uses — into
+        one wiring-coherence dimension. The deterministic floor (validate-microskill) only
+        WARNs on a zero-row Inputs table and checks the table's five-column shape and the
+        required-input fidelity match; it never reads Step prose, so neither half of
+        step<->input semantic wiring is floored — do not re-raise the table-coverage,
+        table-shape, or required-input fidelity warnings. Flag both halves of the closure.
+        Undeclared-reference half (every value a step consumes must trace to a declared
+        input or an earlier step's output): a step that names or consumes a value with no
+        matching declared input and no earlier step that produces it; a step whose core
+        action needs data the skill never receives as an input; a step referencing a field
+        of an input that the input's declared type does not contain; a step that assumes a
+        default or ambient value the bundle never declares. Dead-input half (every declared
+        input must be consumed by some step): a declared input that no step references,
+        reads, or otherwise consumes; an input kept from an earlier draft that the current
+        Steps no longer touch; an input the Output mentions but no Step actually uses to
+        produce it; a Required=yes input that, despite being mandatory to gather, drives no
+        step. Severity mapping for the undeclared-reference half: a step's core action that
+        needs data with no input (and no earlier step) to supply it (the step cannot run) =
+        blocker; a step referencing an undeclared value on a non-critical path = major; a
+        loosely-worded step that probably means a declared input but names it imprecisely =
+        minor. Severity mapping for the dead-input half: a Required=yes input that no step
+        uses (the caller is forced to supply data the skill ignores) = major, rising to
+        blocker only if that ignored input means a required capability silently never runs;
+        an optional input no step uses = minor (dead surface needing a decision to keep or
+        drop); a vestigial input mentioned only in passing = nit. Set each finding's file
+        to the real source file the issue lives in per the bundle's provenance markers
+        (MICROSKILL.md or profiles/base.yaml) and line to that file's real line number —
+        the downstream refute pass and fix step read the real source at the finding's file.
+        Do not raise ms-inputs-contract-adequacy (whether the input SET is complete against
+        the requirement) concerns under this rubric — that sibling lens owns them.

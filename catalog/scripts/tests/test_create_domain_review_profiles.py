@@ -62,8 +62,7 @@ MS_DIMS = [
     "ms-output-contract-appropriate",
     "ms-failure-modes-coverage",
     "ms-output-section-vs-schema-fields",
-    "ms-step-input-reference-undeclared",
-    "ms-declared-input-unused",
+    "ms-input-step-wiring-coherence",
     "ms-purpose-contract-fidelity",
     "ms-description-trigger-quality",
     "shape-not-faithfulness-fabrication-passes",
@@ -118,7 +117,7 @@ def _raw(path):
 
 
 def test_inventory_sizes():
-    assert len(MS_DIMS) == 12 and len(set(MS_DIMS)) == 12
+    assert len(MS_DIMS) == 11 and len(set(MS_DIMS)) == 11
     assert len(WF_DIMS) == 8 and len(set(WF_DIMS)) == 8
 
 

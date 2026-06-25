@@ -35,6 +35,6 @@ context:
         the real source file the issue lives in per the bundle's provenance markers
         (MICROSKILL.md or profiles/base.yaml) and line to that file's real line number —
         the downstream refute pass and fix step read the real source at the finding's
-        file. Do not raise ms-step-input-reference-undeclared (a step naming data no
-        input declares) or ms-declared-input-unused (an input no step uses) concerns
-        under this rubric — sibling lenses own them.
+        file. Do not raise ms-input-step-wiring-coherence (the bidirectional
+        input<->step wiring closure — a step referencing an undeclared value, or a
+        declared input no step consumes) — that sibling owns them.

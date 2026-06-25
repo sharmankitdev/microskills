@@ -41,3 +41,10 @@ context:
         read the real source at the finding's file. Do not raise wf-guard-logic-intent
         (the semantics of when/for_each/loop guards) or wf-output-schema-downstream-fit
         (node output field shape) concerns under this rubric — sibling lenses own them.
+        In the workflow-create decompose build panel — where wf-decompose-behavior-fidelity
+        co-runs and grounds the built graph against the source skill — do not raise the
+        specific orchestrator-native case of an interactive / external-skill step realized
+        as a background use:/agent: node rather than an orchestrator node: defer it to
+        wf-decompose-behavior-fidelity, which owns source-skill behavior-equivalence there.
+        Outside the decompose family this lens still owns that
+        orchestrator-native-concern-as-agent-node defect.
