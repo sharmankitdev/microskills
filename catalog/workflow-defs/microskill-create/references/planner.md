@@ -27,6 +27,12 @@ The `microskill-planner` agent turns a natural-language requirement into a struc
 4. **Draft the plan.** Fill the YAML schema below. The frontmatter description must end with what the microskill *produces*, so callers know when to invoke it.
 5. **Identify config axes.** Every microskill ships a `profiles/base.yaml` baseline. List in `config.axes` only the sections the requirement motivates (beyond `version: 1` and any input defaults already declared in `inputs[]`). An empty list means the base is the bare minimum (`version: 1` plus any input defaults).
 6. **Declare the output contract when composable.** If the microskill returns structured data a caller or a workflow `use:` node would consume (a list, a verdict, extracted fields), emit `output_schema` — a JSON Schema fragment for the result. For a file-producing skill, emit a minimal `{ <path-field>: { type: string } }` so callers can chain on the artifact's path. Omit `output_schema` for purely human-facing prose with no composable handle. The resolver injects a directive so the skill returns exactly this JSON shape (standalone or composed), and the implementer copies the schema verbatim into `base.yaml`.
+7. **Decide the model tier.** Choose `model_tier` by the **nature** of the microskill, per the model-tier policy (`.claude/templates/references/model-tier-policy.md`):
+   - `opus` — deep reasoning under ambiguity: planning, system/design authoring, adversarial review or critique, multi-constraint synthesis. Opus is *earned*, only for plan/design/review/critique-natured work — never a blanket "best model" default.
+   - `sonnet` — general-purpose implementation: structured generation, transformation/extraction with moderate judgement, interactive elicitation. **Default to `sonnet` when unsure.**
+   - `haiku` — provably mechanical work only: formatting, validation, fixed-schema I/O, CRUD or publish to an external target, pure data transforms, bookkeeping.
+
+   Pick the *dominant* nature. The tier is **policy-driven (always decided), not requirement-driven**: emit `model_tier` for every plan even when the requirement never mentions models.
 
 ## Output contract
 
@@ -45,6 +51,7 @@ inputs:
 steps:
   - <verb-led atomic action>             # at least 1 entry; no upper cap — if you need more than ~8, reconsider scope
 output: <artifact + destination, one short paragraph>
+model_tier: <opus|sonnet|haiku>          # tier by the microskill's dominant nature (policy-driven, always emitted); default sonnet
 output_schema:                           # OMIT when output is human-facing prose with no composable handle
   # JSON Schema fragment for the structured result the skill returns; the implementer writes it
   # verbatim into base.yaml. Emit it when the output is structured/consumable data (a list, a

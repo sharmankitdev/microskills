@@ -12,10 +12,14 @@ version: 1
 # passthrough. Separate profile so the implement-rvs review fuse stays untouched.
 vars:
   verdict_mapping: >-
-    a surviving blocker-severity finding (whether a deterministic-floor blocker or a review
-    blocker) or a review major-severity finding gives request_changes; only review
-    minor/nit survivors or deterministic-floor warn survivors give comment; no survivors
-    gives approve.
+    a surviving deterministic-floor blocker, or a CONFIRMED review finding of blocker or
+    major severity, gives request_changes; a surviving review finding whose verification
+    verdict is needs_human is treated as comment-tier regardless of its severity — it is an
+    unresolved question deferred to the human approver and to the downstream index-backed
+    checks, never a confirmed defect, so it never drives request_changes (this needs_human
+    override takes precedence over the blocker/major rule for any needs_human survivor); only
+    review minor/nit survivors, needs_human survivors, or deterministic-floor warn survivors
+    give comment; no survivors gives approve.
   report_target: >-
     write the severity-grouped markdown report to the exact file named by the report_path
     input (creating parent directories), AND write a .json sidecar next to it (same path +

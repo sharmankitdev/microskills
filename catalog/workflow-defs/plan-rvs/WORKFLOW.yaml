@@ -68,6 +68,7 @@ nodes:
         - plan-wf-scope-fit
         - plan-wf-name-capability
         - plan-wf-failure-path-coverage
+        - plan-wf-model-tiering
     inputs:
       artifact_path: ${plan.output.plan_path}
       context_path: ${workflow.inputs.requirement_path}

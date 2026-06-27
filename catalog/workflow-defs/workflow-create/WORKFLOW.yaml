@@ -180,6 +180,11 @@ gates:
     severity: hard
     prompt: Review the plan (node graph, reuse/profile decisions, microskills to be created — check each name is a reusable capability, not coupled to this workflow/step). Approve to build, revise to re-plan, or abandon.
     options: [approve, revise, abandon]
+    present:
+      - plan_rvs.output.verdict
+      - plan_rvs.output.summary
+      - {read_file: plan_rvs.output.report_path}
+      - {read_file: plan_rvs.output.plan_path}
 
 # No top-level loop: the convergence loops now live INSIDE the inlined plan-rvs
 # (autonomous) and implement-rvs children, each spliced in as its own loop region.

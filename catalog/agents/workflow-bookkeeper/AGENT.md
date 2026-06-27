@@ -1,7 +1,7 @@
 ---
 name: workflow-bookkeeper
 description: Deterministic plumbing worker for the workflow conductor. Runs the pinned orchestration CLI (compile-workflow, run-journal, run-step, check-step-io, normalize-input) and the run-state Write off the main loop, returning a single fenced-JSON digest. Never speaks to the user, never launches a segment — its locked toolset (Bash/Read/Write) cannot. Dispatched once per step boundary by the workflow skill.
-model: sonnet
+model: haiku
 tools: Bash, Read, Write
 ---
 

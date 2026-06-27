@@ -2,7 +2,8 @@ version: 1
 # plan-rvs / microskill-create-autonomous — the MICROSKILL-domain plan critique WITH the
 # convergence loop. Composes the microskill-create domain swap (planner + critique panel + verify
 # fanned directly over the panel) with the autonomous loop (re-plan on carried findings; exit on
-# approve OR a scope_advisory; cap escalates, parks headless). loop.body carries the ms
+# a non-request_changes verdict — approve OR a clean comment — OR a scope_advisory; cap escalates,
+# parks headless). loop.body carries the ms
 # review_plan_ms_* ids (no collect node — verify reads the panel via ${review[].findings}).
 gate_mode: auto
 
@@ -22,17 +23,18 @@ nodes:
           - plan-ms-name-capability
           - plan-ms-failure-coverage
           - plan-ms-reuse-survey
+          - plan-ms-model-tiering
     - id: verify
       customize: { profile: plan-microskill }
 
 loop:
-  until: ${synth.output.verdict == 'approve' || synth.output.scope_advisory != null}
+  until: ${synth.output.verdict != 'request_changes' || synth.output.scope_advisory != null}
   max_iters: 2
   body: [plan,
          review_plan_ms_completeness, review_plan_ms_scope_fit,
          review_plan_ms_input_contract, review_plan_ms_output_contract,
          review_plan_ms_name_capability, review_plan_ms_failure_coverage,
-         review_plan_ms_reuse_survey,
+         review_plan_ms_reuse_survey, review_plan_ms_model_tiering,
          verify, synth]
   carry:
     findings: ${synth.output.findings}

@@ -23,6 +23,7 @@ MS_DIMS = [
     "plan-ms-output-contract",
     "plan-ms-name-capability",
     "plan-ms-failure-coverage",
+    "plan-ms-model-tiering",
 ]
 
 WF_DIMS = [
@@ -34,6 +35,7 @@ WF_DIMS = [
     "plan-wf-name-capability",
     "plan-wf-decompose-fidelity",
     "plan-wf-delegation-mapping",
+    "plan-wf-model-tiering",
 ]
 
 

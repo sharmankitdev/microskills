@@ -15,8 +15,11 @@ inputs:
     required: true
     materialize: file
 # The body Reads the artifact file at artifact_path, so Read must be allowlisted.
+# verify-finding is adversarial verification (case-for/against + judgment) ->
+# Opus per the model-tier policy (templates/references/model-tier-policy.md).
 runtime:
   allowed_tools: [Read]
+  model: opus
 output_schema:
   type: object
   required: [finding_id, verdict, rationale, adjusted_severity, false_positive]

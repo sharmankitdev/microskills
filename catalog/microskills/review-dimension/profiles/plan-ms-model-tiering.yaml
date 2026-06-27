@@ -1,0 +1,37 @@
+version: 1
+
+# plan-ms-model-tiering lens for review-dimension (model-tiering architecture). Reviews the
+# microskill PLAN object (plan.yaml) the planner wrote — NOT the built artifact (that is the
+# draft-stage ms-* lenses) and NOT a programmatic floor (none runs at the plan stage; the
+# artifact does not exist until the implement stage). Sibling of the plan-ms-* lenses.
+# A plain list REPLACES base's correctness snippet wholesale (resolver list-replace rule).
+vars:
+  dimension: plan-ms-model-tiering
+  artifact_kind: microskill plan (plan.yaml)
+
+context:
+  snippets:
+    - name: plan-ms-model-tiering-rubric
+      text: >-
+        Model-tiering rubric (microskill plan). The plan must declare a model_tier field — one
+        of opus, sonnet, haiku — chosen by the NATURE of the microskill's work, per the
+        model-tier policy: Opus for deep-reasoning / planning / design-authoring /
+        adversarial-review / critique work; Sonnet for general-purpose implementation,
+        structured generation, transformation or extraction with moderate judgement, and
+        interactive elicitation (the default when unsure between Sonnet and Opus); Haiku for
+        deterministic / mechanical work — formatting, validation, fixed-schema I/O, CRUD or
+        publish to an external target, pure data transforms, bookkeeping. Flag as a finding: a
+        plan that declares NO model_tier (absent) — major, since the built microskill would be
+        left unpinned; a model_tier that MISMATCHES the microskill's dominant nature judged
+        from its purpose and steps — Opus on a purely mechanical unit is over-provisioned
+        (minor unless egregious), while Haiku or Sonnet on a core deep-reasoning or critique
+        unit is under-provisioned (major); a model_tier outside {opus, sonnet, haiku} — major.
+        Judge the tier against what the microskill actually DOES, not what the requirement text
+        says. A defensible borderline Sonnet-vs-Opus call the plan justifies is not a finding.
+        Severity mapping: an absent model_tier, a tier outside {opus, sonnet, haiku}, or a
+        Haiku/Sonnet tier under-provisioning a core deep-reasoning or critique unit = major; an
+        egregious under-provision a builder could not work around = blocker; an over-provisioned
+        Opus-on-mechanical tier = minor; a cosmetic awkwardness in an otherwise-correct tier's
+        justification = nit. Do not raise input-contract, output-contract, scope-fit,
+        completeness, name-capability, failure-coverage, or reuse concerns — those sibling
+        lenses own them.

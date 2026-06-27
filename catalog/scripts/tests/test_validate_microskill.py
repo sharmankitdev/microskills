@@ -84,7 +84,7 @@ def test_output_schema_accepted(tmp_path):
     skill = write_skill(tmp_path, "os")
     cfg = write_cfg(
         tmp_path, "base.yaml",
-        "version: 1\noutput_schema:\n  type: object\n  properties:\n    x: { type: string }\n")
+        "version: 1\nruntime:\n  model: opus\noutput_schema:\n  type: object\n  properties:\n    x: { type: string }\n")
     rc, data, out, err = run(str(skill), str(cfg))
     assert data["pass"] is True, data
 
@@ -171,7 +171,7 @@ def test_required_table_without_base_required_blocks(tmp_path):
 
 def test_required_table_with_base_required_passes(tmp_path):
     skill = write_skill(tmp_path, "needs-input", REQUIRED_BODY)
-    cfg = write_cfg(tmp_path, "base.yaml", "version: 1\ninputs:\n  src:\n    required: true\n")
+    cfg = write_cfg(tmp_path, "base.yaml", "version: 1\nruntime:\n  model: opus\ninputs:\n  src:\n    required: true\n")
     code, data, _, err = run(str(skill), str(cfg))
     assert code == 0, err
     assert _blocks(data) == []
@@ -180,7 +180,7 @@ def test_required_table_with_base_required_passes(tmp_path):
 def test_required_table_with_inject_from_exempt(tmp_path):
     skill = write_skill(tmp_path, "needs-input", REQUIRED_BODY)
     cfg = write_cfg(tmp_path, "base.yaml",
-                    "version: 1\ninputs:\n  src:\n    inject_from:\n      env: SRC\n")
+                    "version: 1\nruntime:\n  model: opus\ninputs:\n  src:\n    inject_from:\n      env: SRC\n")
     code, data, _, err = run(str(skill), str(cfg))
     assert code == 0, err
     assert _blocks(data) == []
@@ -308,7 +308,7 @@ def test_word_count_cap_blocks(tmp_path):
 
 def test_base_yaml_valid_passes(tmp_path):
     skill = write_skill(tmp_path, "cfg-ok")
-    cfg = write_cfg(tmp_path, "base.yaml", "version: 1\n")
+    cfg = write_cfg(tmp_path, "base.yaml", "version: 1\nruntime:\n  model: opus\n")
     code, data, _, err = run(str(skill), str(cfg))
     assert code == 0, err
     assert data["pass"] is True
@@ -464,7 +464,7 @@ def test_profile_step_add_branching_passes(tmp_path):
     skill = write_skill(tmp_path, "padd", MINIMAL_BODY.format(name="padd"))
     cfg = tmp_path / "base.yaml"
     cfg.write_text(
-        "version: 1\nsteps:\n  add:\n    - after: 1\n      text: for each commit, process it\n")
+        "version: 1\nruntime:\n  model: opus\nsteps:\n  add:\n    - after: 1\n      text: for each commit, process it\n")
     code, data, _, err = run(str(skill), str(cfg))
     assert code == 0, data
     assert not any("branch" in i["message"].lower() for i in data["issues"]), data
@@ -540,7 +540,38 @@ def test_undeclared_hyphenated_var_token_warns(tmp_path):
     body = MINIMAL_BODY.format(name="hyvar").replace(
         "Test fixture.", "Test fixture using {{my-var}}.")
     skill = write_skill(tmp_path, "hyvar", body)
-    cfg = write_cfg(tmp_path, "base.yaml", "version: 1\n")
+    cfg = write_cfg(tmp_path, "base.yaml", "version: 1\nruntime:\n  model: opus\n")
     code, data, _, err = run(str(skill), str(cfg))
     assert any(i["severity"] == "warn" and "my-var" in i["message"]
                and "resolves from no config" in i["message"] for i in data["issues"]), data
+
+
+# ---------------------------------------------------------------------------
+# model-tier invariant — base.yaml must declare runtime.model in {opus,sonnet,haiku}
+# ---------------------------------------------------------------------------
+
+
+def test_base_yaml_without_model_blocks(tmp_path):
+    skill = write_skill(tmp_path, "no-model")
+    cfg = write_cfg(tmp_path, "base.yaml", "version: 1\n")
+    code, data, _, err = run(str(skill), str(cfg))
+    assert code == 1, err
+    assert any(i["severity"] == "block" and "must declare runtime.model" in i["message"]
+               for i in data["issues"]), data
+
+
+def test_base_yaml_unknown_model_blocks(tmp_path):
+    skill = write_skill(tmp_path, "bad-model")
+    cfg = write_cfg(tmp_path, "base.yaml", "version: 1\nruntime:\n  model: gpt4\n")
+    code, data, _, err = run(str(skill), str(cfg))
+    assert code == 1, err
+    assert any(i["severity"] == "block" and "not a known tier" in i["message"]
+               for i in data["issues"]), data
+
+
+def test_base_yaml_known_model_passes(tmp_path):
+    skill = write_skill(tmp_path, "good-model")
+    cfg = write_cfg(tmp_path, "base.yaml", "version: 1\nruntime:\n  model: opus\n")
+    code, data, _, err = run(str(skill), str(cfg))
+    assert code == 0, err
+    assert _blocks(data) == []

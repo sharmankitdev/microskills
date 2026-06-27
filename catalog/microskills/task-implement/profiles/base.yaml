@@ -13,7 +13,7 @@ inputs:
 
 runtime:
   agent: microskill-implementer
-  model: opus
+  model: sonnet
 
 output_schema:
   type: object

@@ -267,7 +267,7 @@
         "model": {
           "type": "string",
           "minLength": 1,
-          "description": "Model alias the executor runs on in a workflow `use:` node (e.g. 'opus', 'sonnet', 'haiku'). The compiler passes it to the agent() call. Absent -> the segment default (today Sonnet). Set this to pin the agent's intended model, since background segments do not auto-honor the agent's AGENT.md model frontmatter."
+          "description": "Model alias the executor runs on in a workflow `use:` node (e.g. 'opus', 'sonnet', 'haiku'). The compiler passes it to the agent() call. Absent -> the segment default (today Sonnet). Set this to pin the agent's intended model, since background segments do not auto-honor the agent's AGENT.md model frontmatter. The grammar accepts any alias; this plugin's create-pipeline tier policy (opus|sonnet|haiku) is enforced separately by validate-microskill (the deterministic floor)."
         }
       }
     },

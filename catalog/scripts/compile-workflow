@@ -1570,6 +1570,19 @@ def desugar_nested_workflows(wf, defs_root, _stack=None):
         body_inner_ids = set((child.get("loop") or {}).get("body") or [])
         for _go, _gl, _gg in child_regions:
             body_inner_ids |= set((_gl or {}).get("body") or [])
+        # This inline pass runs BEFORE expand_static_fanout, so an expand TEMPLATE node
+        # (e.g. id `review`) is still ONE node here while loop.body lists its POST-expand
+        # generated sibling ids (`review_<item>`). Without mapping the template to its
+        # projected siblings, the template reads as a NON-loop node, the region guard gets
+        # ANDed onto its `when`, and every generated sibling then INHERITS that guard at
+        # expand time — a redundant per-sibling guard (the region if-wrap already gates the
+        # whole loop) that trips has_guarded_body and needlessly SERIALIZES the loop body.
+        # Treat a template whose projected siblings land in the body as a body node itself,
+        # so it (and its siblings) stay unguarded under the single region if-wrap.
+        for cn in inner_nodes:
+            if (isinstance(cn, dict) and isinstance(cn.get("expand"), dict)
+                    and _projected_expand_sibling_ids([cn]) & body_inner_ids):
+                body_inner_ids.add(cn["id"])
 
         # Namespace + rewrite each child node.
         gen = []
@@ -1730,6 +1743,19 @@ def desugar_nested_workflows(wf, defs_root, _stack=None):
     # nodes + gates (a cross-splice ${B.output} binding inside A's spliced nodes also
     # re-points). _subgraph_rewrite_exit matches the EXACT splice id, so a namespaced
     # sibling ${<splice>__<inner>.output} is left alone.
+    def _splice_present_repoint(path, sid, exit_id):
+        # A gate `present` path is a bare `<id>.output[.field...]` (or the inner value of
+        # a {read_file: ...} entry), NOT a ${...} ref — so the SCOPED_REF_FIELDS rewrite
+        # below skips it. Re-point a leading id == <splice> to the child exit id, mirroring
+        # the after / depends_on re-point (else a host gate's evidence for an inlined
+        # producer renders blank — the leading id names a node that no longer exists).
+        if not isinstance(path, str):
+            return path
+        head, sep, rest = path.partition(".")
+        if head == sid:
+            return exit_id + sep + rest if sep else exit_id
+        return path
+
     def _rewrite_exits(items):
         for n in items:
             if not isinstance(n, dict):
@@ -1746,6 +1772,14 @@ def desugar_nested_workflows(wf, defs_root, _stack=None):
                     n["depends_on"] = [exit_id if d == sid else d for d in n["depends_on"]]
                 if isinstance(n.get("after"), str) and n["after"] == sid:
                     n["after"] = exit_id
+                # A host gate's `present` paths (bare `<id>.output...` or {read_file: <path>})
+                # are not ${...} refs, so re-point a leading splice id here too.
+                if isinstance(n.get("present"), list):
+                    n["present"] = [
+                        {"read_file": _splice_present_repoint(p["read_file"], sid, exit_id)}
+                        if isinstance(p, dict) and isinstance(p.get("read_file"), str)
+                        else _splice_present_repoint(p, sid, exit_id)
+                        for p in n["present"]]
     _rewrite_exits(new_nodes)
     _rewrite_exits(all_gates)
 
@@ -1779,11 +1813,22 @@ def desugar_nested_workflows(wf, defs_root, _stack=None):
             isinstance(item.get("depends_on"), list) and sid in item["depends_on"]
             for item in new_nodes if isinstance(item, dict))
         out_hit = isinstance(out, dict) and out.get("from") == sid
-        if ref_hit or dep_hit or out_hit:
+        # A gate `present` path (bare `<id>.output...` or {read_file: <path>}) is not a
+        # ${...} ref, so the ref_hit scan above misses it — check leading ids here too,
+        # else a present to a no-output inlined child would dangle silently.
+        present_hit = any(
+            isinstance(g.get("present"), list)
+            and any(
+                ((p.get("read_file") if isinstance(p, dict) else p) or "").split(".", 1)[0] == sid
+                for p in g["present"]
+                if isinstance(p, str)
+                or (isinstance(p, dict) and isinstance(p.get("read_file"), str)))
+            for g in all_gates if isinstance(g, dict))
+        if ref_hit or dep_hit or out_hit or present_hit:
             errors.append(
                 f"inlined workflow '{sid}' declares no output: but is consumed "
-                f"downstream (${{{sid}.output}} / depends_on / output.from) — the "
-                f"child must declare an output: block")
+                f"downstream (${{{sid}.output}} / depends_on / output.from / gate present) "
+                f"— the child must declare an output: block")
 
     # Merge each inlined child's imports into the host allowlist (M2): a surviving
     # for_each grandchild target must be allowlisted for validate + the depth walk.

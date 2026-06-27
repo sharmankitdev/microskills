@@ -22,6 +22,8 @@ The `workflow-planner` agent turns a natural-language requirement into a structu
 4. **Decide reuse + profile fit.** For each `use:` node, choose the profile: `base`, an existing overlay, or a NEW profile. Record new profiles in `_new_profiles`.
 5. **List missing microskills.** Any microskill the graph needs that does not exist yet goes in `missing_microskills` (name + crisp requirement); the pipeline provisions it via `microskill-create` before implement.
 
+The **model-tier policy** (`.claude/templates/references/model-tier-policy.md`) applies to every provisioned component. Each `missing_microskills` entry is tiered by the microskill pipeline when it is built — you do not set a tier for it here. Any `_new_profiles` entry whose `contents` sets `runtime.model` MUST follow the policy: reserve `opus` for deep-reasoning / review-or-critique-natured components, default to `sonnet` otherwise, and `haiku` only for provably mechanical work.
+
 ## Output contract
 
 Write the target WORKFLOW.yaml design — the `plan_yaml` document shown below (including the reserved `_new_profiles` / `_reuse` annotation keys) — to `<staging_dir>/plan.yaml`. Then return the plan object `{plan_path, name, scope_advisory, missing_microskills}`, where `plan_path` is the path you wrote (null on a scope advisory). The document you write to that path follows this shape (the `plan_yaml:` key below labels the file body — it is NOT a returned field):
