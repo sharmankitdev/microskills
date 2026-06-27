@@ -435,18 +435,37 @@ def test_real_flow_segments_and_advisory_branch():
     assert "refine__approve_requirements" not in gate_ids
 
 
-def test_real_flow_guarded_loop_breaks_when_skipped():
-    # The guarded impl_rvs loop body must emit the __ran flag + break so the advisory
-    # path doesn't read a skipped (null) node in the while condition. (The impl_rvs region
-    # trails plan_rvs — locate it by its guard rather than a hardcoded segment number.)
+def test_real_flow_guarded_loop_body_parallelizes_under_region_guard():
+    # The inlined impl_rvs loop is gated by ONE region if-wrap on scope_advisory == null,
+    # NOT per-body-node guards. Regression: the host build node's `when` was being pushed
+    # onto the review/xreview EXPAND TEMPLATES (loop.body lists their POST-expand sibling
+    # ids, so the pre-expand templates read as non-loop nodes and got the guard ANDed onto
+    # their `when`); every generated review sibling then inherited that guard, which tripped
+    # has_guarded_body and SERIALIZED the whole review panel. The body must stay UNGUARDED
+    # so its independent review siblings fan out into ONE parallel([...]) batch — matching
+    # the plan-rvs review panel. (The impl_rvs region trails plan_rvs — locate it by guard.)
     run(REAL_DEFS, "microskill-create")
     compiled = REAL_DEFS / "microskill-create" / ".compiled"
     guarded = [p for p in compiled.glob("seg-*.js")
                if "scope_advisory == null" in p.read_text()]
     assert len(guarded) == 1, [p.name for p in guarded]
     seg = guarded[0].read_text()
-    assert "let __ran = false" in seg
-    assert "if (!__ran) break" in seg
+    # The region guard if-wraps the WHOLE do/while — the single gate.
+    assert "scope_advisory == null) {" in seg
+    assert "do {" in seg
+    # Exactly ONE guard occurrence (the region wrap) — no per-body-node guard survives.
+    assert seg.count("scope_advisory == null") == 1, seg.count("scope_advisory == null")
+    # Body is unguarded: no per-node __ran bookkeeping...
+    assert "__ran" not in seg
+    # ...and the review panel (11 review_ + 3 xreview_ siblings) fans out as ONE parallel batch.
+    assert re.search(
+        r"\[[^\]]*review_ms_atomicity_single_purpose[^\]]*"
+        r"xreview_reverse_consumer[^\]]*\] = await parallel\(\[", seg), \
+        "review panel did not fan out into one parallel batch"
+    # Skip safety no longer needs __ran/break: a skipped loop leaves __iter == 0, and the
+    # exhaust check derefs the while-condition ONLY after `__iter >= __max` (false → the &&
+    # short-circuits, so the null synth.verdict is never read).
+    assert "(__iter >= __max) && (" in seg
 
 
 def test_autonomous_profile_softens_gate():

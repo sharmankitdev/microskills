@@ -1570,6 +1570,19 @@ def desugar_nested_workflows(wf, defs_root, _stack=None):
         body_inner_ids = set((child.get("loop") or {}).get("body") or [])
         for _go, _gl, _gg in child_regions:
             body_inner_ids |= set((_gl or {}).get("body") or [])
+        # This inline pass runs BEFORE expand_static_fanout, so an expand TEMPLATE node
+        # (e.g. id `review`) is still ONE node here while loop.body lists its POST-expand
+        # generated sibling ids (`review_<item>`). Without mapping the template to its
+        # projected siblings, the template reads as a NON-loop node, the region guard gets
+        # ANDed onto its `when`, and every generated sibling then INHERITS that guard at
+        # expand time — a redundant per-sibling guard (the region if-wrap already gates the
+        # whole loop) that trips has_guarded_body and needlessly SERIALIZES the loop body.
+        # Treat a template whose projected siblings land in the body as a body node itself,
+        # so it (and its siblings) stay unguarded under the single region if-wrap.
+        for cn in inner_nodes:
+            if (isinstance(cn, dict) and isinstance(cn.get("expand"), dict)
+                    and _projected_expand_sibling_ids([cn]) & body_inner_ids):
+                body_inner_ids.add(cn["id"])
 
         # Namespace + rewrite each child node.
         gen = []

@@ -5,6 +5,7 @@ Build throwaway parent + child WORKFLOW.yaml worlds under tmp_path, compile with
 touches the real catalog. Segment files are named seg-<N>.js (1-indexed).
 """
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -146,6 +147,72 @@ output: { from: done }
     assert not any(s.get("checkpoint_type") == "nested_workflow"
                    for s in manifest["steps"])
     _node_check_all(tmp_path, "rh")
+
+
+def test_guarded_inlined_region_expand_template_body_stays_unguarded(tmp_path):
+    # Regression: a guarded loop-bearing child whose body is an EXPAND TEMPLATE. loop.body
+    # lists the template's POST-expand sibling ids (review_alpha/beta/gamma), but this inline
+    # pass runs PRE-expand over the template node `review` — whose id is NOT in loop.body.
+    # The fix maps the template to its projected siblings so it counts as a body node; without
+    # it the region guard was ANDed onto the template `when`, every generated sibling inherited
+    # it, and the review panel serialized (has_guarded_body) instead of fanning out parallel.
+    _write(tmp_path / "rke" / "WORKFLOW.yaml", """
+version: 1
+name: rke
+inputs: { thing: { required: true } }
+nodes:
+  - id: make
+    agent: scratch
+    prompt: "make ${workflow.inputs.thing}"
+  - id: review
+    agent: scratch
+    depends_on: [make]
+    expand:
+      over: [alpha, beta, gamma]
+    prompt: "review ${make.output} as {{each.item}}"
+loop:
+  body: [make, review_alpha, review_beta, review_gamma]
+  until: ${make.output.done == true}
+  max_iters: 2
+output: { from: make }
+""")
+    _write(tmp_path / "rhe" / "WORKFLOW.yaml", """
+version: 1
+name: rhe
+imports: [rke]
+inputs: { req: { required: true } }
+nodes:
+  - id: plan
+    agent: scratch
+    prompt: "plan ${workflow.inputs.req}"
+  - id: impl
+    workflow: rke
+    when: ${plan.output.scope_advisory == null}
+    inputs:
+      thing: ${plan.output}
+  - id: done
+    agent: scratch
+    when: ${plan.output.scope_advisory == null}
+    prompt: "done ${impl.output}"
+output: { from: done }
+""")
+    r = _compile(tmp_path, "rhe")
+    assert r.returncode == 0, r.stderr
+    blob = _all_segment_js(tmp_path, "rhe")
+    # The region guard wraps the do/while as ONE if-block (the single gate).
+    assert "scope_advisory == null) {" in blob
+    assert "do {" in blob
+    # The loop body is UNGUARDED — no per-node __ran bookkeeping rides the body...
+    assert "__ran" not in blob
+    # ...so the three expand siblings fan out as ONE parallel([...]) batch (the fix). Before
+    # the fix each carried an inherited guard → a serial `if (...) { ... }` per sibling.
+    assert re.search(
+        r"\[[^\]]*review_alpha[^\]]*review_beta[^\]]*review_gamma[^\]]*\]"
+        r" = await parallel\(\[", blob), blob
+    # Only the post-loop `done` node (a genuine NON-loop guarded node) keeps a guard ternary;
+    # none of the review siblings do.
+    assert "review_alpha) ?" not in blob and "review_alpha = (" not in blob
+    _node_check_all(tmp_path, "rhe")
 
 
 def test_guarded_region_with_on_exhaust_ands_guard_into_gate(tmp_path):
