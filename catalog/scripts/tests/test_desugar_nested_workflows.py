@@ -126,6 +126,118 @@ output: { from: tail }
     _node_check(tmp_path, "host")
 
 
+def test_host_gate_present_repoints_to_inlined_child_exit(tmp_path):
+    # A host gate's `present` paths (a bare `<id>.output...` AND a {read_file: <path>}
+    # entry) that name a static `workflow:` node must re-point to the inlined child's
+    # exit id, exactly like `after` / `depends_on` — else the gate evidence for an
+    # inlined producer resolves blank (the leading id names a node that no longer
+    # exists after the splice).
+    _write(tmp_path / "kid" / "WORKFLOW.yaml", """
+version: 1
+name: kid
+inputs: { thing: { required: true } }
+nodes:
+  - id: step1
+    agent: scratch
+    prompt: "a ${workflow.inputs.thing}"
+  - id: step2
+    agent: scratch
+    prompt: "b ${step1.output}"
+    output_schema:
+      type: object
+      required: [verdict, report_path]
+      properties:
+        verdict: { type: string }
+        report_path: { type: string }
+output: { from: step2 }
+""")
+    _write(tmp_path / "host" / "WORKFLOW.yaml", """
+version: 1
+name: host
+imports: [kid]
+inputs: { req: { required: true } }
+nodes:
+  - id: seed
+    agent: scratch
+    prompt: "seed ${workflow.inputs.req}"
+  - id: nest
+    workflow: kid
+    inputs:
+      thing: ${seed.output}
+gates:
+  - id: approve
+    after: nest
+    type: human_approval
+    severity: hard
+    prompt: "ok?"
+    options: [approve, abandon]
+    present:
+      - nest.output.verdict
+      - { read_file: nest.output.report_path }
+output: { from: nest }
+""")
+    r = _compile(tmp_path, "host")
+    assert r.returncode == 0, r.stderr
+    m = _manifest(tmp_path, "host")
+    gate = next(s["gate"] for s in m["steps"]
+                if isinstance(s, dict) and isinstance(s.get("gate"), dict)
+                and s["gate"].get("id") == "approve")
+    # `after` re-points to the child exit (step2) — the existing behavior ...
+    assert gate["after"] == "nest__step2", gate
+    # ... and so does EVERY present entry: the bare path and the {read_file} inner path.
+    assert gate["present"] == [
+        "nest__step2.output.verdict",
+        {"read_file": "nest__step2.output.report_path"},
+    ], gate["present"]
+    # The pre-fix bug left `nest.output.*` (a node absent from the inlined DAG).
+    assert "nest.output" not in json.dumps(gate["present"])
+
+
+def test_host_gate_present_to_no_output_child_fails_loud(tmp_path):
+    # A gate `present` that names a NO-output inlined child cannot be re-pointed (the
+    # child has no exit), so it must fail loud — like a dangling depends_on / output ref —
+    # rather than emit a present path naming a node that no longer exists.
+    _write(tmp_path / "kid" / "WORKFLOW.yaml", """
+version: 1
+name: kid
+inputs: { thing: { required: true } }
+nodes:
+  - id: step1
+    agent: scratch
+    prompt: "a ${workflow.inputs.thing}"
+""")  # no output: block
+    _write(tmp_path / "host" / "WORKFLOW.yaml", """
+version: 1
+name: host
+imports: [kid]
+inputs: { req: { required: true } }
+nodes:
+  - id: seed
+    agent: scratch
+    prompt: "seed ${workflow.inputs.req}"
+  - id: nest
+    workflow: kid
+    inputs:
+      thing: ${seed.output}
+  - id: tail
+    agent: scratch
+    prompt: "tail ${seed.output}"
+gates:
+  - id: approve
+    after: tail
+    type: human_approval
+    severity: hard
+    prompt: "ok?"
+    options: [approve, abandon]
+    present:
+      - nest.output.verdict
+output: { from: tail }
+""")
+    r = _compile(tmp_path, "host")
+    assert r.returncode != 0, "a present to a no-output inlined child must fail loud"
+    assert "declares no output" in (r.stderr + r.stdout), (r.stderr, r.stdout)
+
+
 # ---------------------------------------------------------------- Task 1.3
 
 

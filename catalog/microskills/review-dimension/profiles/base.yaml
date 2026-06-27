@@ -28,10 +28,12 @@ inputs:
     materialize: file
 
 # The body Reads the artifact file at artifact_path, so Read must be allowlisted.
-# A per-dimension overlay (security/style) adds runtime.model — it deep-merges
-# with this allowed_tools, so both survive.
+# review-dimension is review-natured work → Opus per the model-tier policy
+# (templates/references/model-tier-policy.md). A per-dimension overlay may override
+# the model; it deep-merges with this allowed_tools, so both survive.
 runtime:
   allowed_tools: [Read]
+  model: opus
 
 # The active dimension's rubric, supplied as reference context so the body has a
 # concrete rubric to scan against. Base ships the correctness rubric to match

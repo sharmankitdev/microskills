@@ -19,5 +19,6 @@ nodes:
           - plan-ms-name-capability
           - plan-ms-failure-coverage
           - plan-ms-reuse-survey
+          - plan-ms-model-tiering
     - id: verify
       customize: { profile: plan-microskill }

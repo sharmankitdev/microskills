@@ -32,6 +32,7 @@ The `microskill-implementer` agent fleshes out the bare template using the appro
    - For `gates.<id>.severity` — `warn` or `hard` only.
    - The optional top-level `profile.default: <name>` field (only valid in base.yaml) names a default overlay profile. Only set it when the plan explicitly calls for one.
    - The optional top-level `output_schema` — if `plan.output_schema` is present, copy it verbatim as a top-level `output_schema` key. The resolver injects a structured-return directive from it so the skill emits this JSON shape (standalone or composed in a workflow `use:` node).
+   - ALWAYS write a `runtime:` block with `model: <plan.model_tier>` into `base.yaml`, copying the plan's `model_tier` value verbatim. Treat `runtime.model` as plan-derivable like `output_schema` — it does NOT need to be listed in `config.axes`, so the `config.axes` derivability guardrail above does not apply to it.
 4. **Remediate findings (any remediation pass — i.e. when `last_findings` is supplied).** For each issue in `last_findings.issues[]`, locate the offending section in the prior draft (`staging_paths`) and fix it. Modify only the sections named in `last_findings.issues[].location`. Do not edit sections that no issue in the current round references — the evaluator did not flag them, so any change to them risks regressing a previously-accepted field.
 
 ## Output

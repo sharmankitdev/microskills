@@ -17,6 +17,10 @@ inputs:
     required: true
   verifications:
     required: true
+# synthesize-review is a structured join + judgement-based dedup of verified findings -> Sonnet
+# per the model-tier policy (templates/references/model-tier-policy.md).
+runtime:
+  model: sonnet
 output_schema:
   type: object
   required:

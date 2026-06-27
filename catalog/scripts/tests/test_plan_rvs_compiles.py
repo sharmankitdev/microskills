@@ -44,6 +44,7 @@ def test_plan_rvs_workflow_create_is_loopless():
                              "review_plan_wf_control_flow,"
                              "review_plan_wf_reuse_survey,review_plan_wf_scope_fit,"
                              "review_plan_wf_name_capability,review_plan_wf_failure_path_coverage,"
+                             "review_plan_wf_model_tiering,"
                              "verify,synth]"], s["sequence"]
 
 

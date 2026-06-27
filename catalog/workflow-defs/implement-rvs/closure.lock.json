@@ -1,31 +1,31 @@
 {
-  "manifest_hash": "f9cf9b8946782bb165a027676ebb2a3e31a017254cbbc83df9796e9ab2aa4337",
+  "manifest_hash": "b4a0596f17a810841a8cb7d651d00bbdba6da6077874511af6c661c3525536e7",
   "name": "implement-rvs",
   "node_fingerprints": {
     "bundle": "53d0b6604573ab4dcb26ca05d347c69fc25439a7198e4d545282b7446e7335cb",
     "bundle_xref": "947103d4264ddceb7aa7dcacdb57703b29c241767e98df3fa860b218d2894cde",
     "catalog_index": "3e234471762e344bc8a423be55034caabd39fb3f54fbfaa28444d21b2acc6a3e",
     "floor": "5c4750caf8b9713c101a0ad7de2fdb19d6995e08b7f2ca2778e0b9a6f1c71f0a",
-    "implement": "346809a67a3092ab7606e86031ef1ac0900868b518ea023da711c4716f2dfe98",
-    "review_wf_dag_decomposition_correctness": "70d20695a295efea562b58876fde3226f02ce5fe9f2ee5894c937e0f86c6e944",
-    "review_wf_failure_path_coverage": "be31771bc3ff250ef77f2737b458486610f822cfeab8ced28a71e5ad30d68530",
-    "review_wf_gate_prompt_options_quality": "cfe0366cbc7b428af84ba055eaf7b7ccf90170a959e5f49878f461c30ae18761",
-    "review_wf_guard_logic_intent": "92c2b446f6b6d60b123500c3e7cc675a94ef8261ca81836c6e0957733a1e2d77",
-    "review_wf_input_wiring_fidelity": "46103772332433d5e205d2c283791758818fe863299b07224305d43fcf81ce07",
-    "review_wf_inputs_contract_adequacy": "500341258d50d9beb902f1a0954105c49e8e0e759ce200f9223b9d99ad2f9b09",
-    "review_wf_output_schema_downstream_fit": "1d30ab5c6a9aa674e32f1dc31ec438bd4c59f480c7645267f2aeb5d120956662",
-    "review_wf_profile_overlay_coherence": "89bdf6b09322ebfbcf53c35dafff8440433e3204f3e29c70509f1dfafa3da6dc",
-    "review_wf_prompt_task_fidelity": "c79a4b8af574848490c6b7eef0c7969f2536f67be422f4220ff4b0a27979b482",
-    "review_wf_requirement_fidelity": "c05a14eb056268c294e492c2d552bf58222308df4b924f212f6470bddb5d637e",
-    "review_wf_spill_materialize_judgment": "13627edf56c4ff55df76cd17f89b9df58c013f411458bcd18e7833610c98ea2b",
-    "synth": "82136d5648844771529623d2641b9b1bea102ac7045a3c8b350caef6ac87ada1",
-    "verify": "e89f14b3a65daf6c01e55d6a13b3194f21458126270cdadb14c2bf87a250aeef",
-    "xreview_duplicate_capability": "01ebfa3b2e0d8104a805f31a70765338c3f85ea26bbca4db27d9ad78b3ee905f",
-    "xreview_naming_collision": "ad3098f8c3057cdc021611a1a84cdebf081406dc77c4653debcd9559b0035ac7",
-    "xreview_reverse_consumer": "84f480229c41019d11e06d704c38331cbc3b66480dd450612896b0983e489c55"
+    "implement": "0a09e3f877ff1eb53aac618277c3a57c5102fbd66f1c05101aca2152dd9da6d3",
+    "review_wf_dag_decomposition_correctness": "ff7a0b0002f5ef1c65f273b611ccf43edd5d13ff8db0c9fa2ead43f0d4e554a9",
+    "review_wf_failure_path_coverage": "971f2692a7ece4509259048824bc17a655398fcbf7d3f63d958e9c793cb4c0d6",
+    "review_wf_gate_prompt_options_quality": "5f24abfb256654e365100e52ca2d9cb674a357fbe7fea8b09cd1ce3df42a8619",
+    "review_wf_guard_logic_intent": "bbd63b9fcef314452edfd637c96fbd63f6192fbd844564fb042307114437e2eb",
+    "review_wf_input_wiring_fidelity": "56f41b1983ac0691500a694cf4a2541ea21343d55dcc56b79107f5bbcaa4ab9b",
+    "review_wf_inputs_contract_adequacy": "7052ef93124b62d224b6b1ff418e5d392341a396ece0e9ddb1723ca4261ca146",
+    "review_wf_output_schema_downstream_fit": "09cd2506a61fa8a72a18c598089aba62da0ca78bfc12ae61a88e609f51c24f91",
+    "review_wf_profile_overlay_coherence": "4e241a11bf690defbccf699297841b34fe0686429c10b6fb44823869cb486f71",
+    "review_wf_prompt_task_fidelity": "8c785b3a84cf8eb9c7b9edc9fdec21d79a50c7ffa2d4adb768c6798404782506",
+    "review_wf_requirement_fidelity": "806d65a2bc2dc1410188b448327f15d0db4a15916c7071fa92315c761d8ba0f1",
+    "review_wf_spill_materialize_judgment": "d41bc3e25ddbbbba18cd02c5f34fd89e735c691c15c4293c86be84f187c027f4",
+    "synth": "3a8b2c34edde25470eb8bd822a66dbc3294023965901c4b4ba4019c228550a12",
+    "verify": "c3253a3b2a75fa95c7e0ab3d51c97c11645bbf62e2fbae1e2693738115587236",
+    "xreview_duplicate_capability": "e1f00788a6929675a40eebeae43e9009f9dc159a3f94846d90b7dc172a095c67",
+    "xreview_naming_collision": "280dd64a13b60a6908a316b81a86af88be7667b8c24bf6bc6cbcb81d07151139",
+    "xreview_reverse_consumer": "9a36ea3efdcf5d9fa638340a2900ca1acee716f09be4135234e8337cc5247676"
   },
   "profile_used": "base",
   "segment_digests": {
-    "seg-1.js": "0d335834abf161f8a7e39c49ac0dd35e77de10cbb54143160f0d9c44fcfdf920"
+    "seg-1.js": "7d45759d0df98c51a18f94fbb0c1e165a6aef0ae6570ff2600252b648a8739f8"
   }
 }

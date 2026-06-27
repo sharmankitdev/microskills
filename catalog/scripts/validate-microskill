@@ -50,6 +50,7 @@ except ImportError:
 REQUIRED_SECTIONS = ["## Purpose", "## Inputs", "## Steps", "## Output", "## Failure modes"]
 NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 PLACEHOLDER_RE = re.compile(r"\{\{([\w-]+)\}\}")
+KNOWN_MODELS = {"opus", "sonnet", "haiku"}
 
 SCRIPT = Path(__file__).resolve()
 
@@ -259,6 +260,16 @@ def check_config(path, issues):
                     add(issues, "warn", "config",
                         f"{p.name}: output_schema.required lists '{req}' which is not in properties — "
                         f"a dead field that dead-ends downstream .output.{req} refs.")
+
+    if p.name == "base.yaml" and isinstance(doc, dict):
+        rt = doc.get("runtime") or {}
+        model = rt.get("model") if isinstance(rt, dict) else None
+        if not model:
+            add(issues, "block", "config",
+                "base.yaml must declare runtime.model (one of opus|sonnet|haiku)")
+        elif model not in KNOWN_MODELS:
+            add(issues, "block", "config",
+                f"runtime.model {model!r} is not a known tier; use one of opus|sonnet|haiku")
 
     if p.name != "base.yaml" and isinstance(doc, dict) and "profile" in doc:
         add(issues, "block", "config",

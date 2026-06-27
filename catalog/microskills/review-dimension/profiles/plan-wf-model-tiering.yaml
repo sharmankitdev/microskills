@@ -1,0 +1,36 @@
+version: 1
+
+# plan-wf-model-tiering lens for review-dimension (model-tiering architecture). Reviews the
+# workflow PLAN object (plan.yaml) the workflow-planner wrote — NOT the built WORKFLOW.yaml
+# (that is the draft-stage wf-* lenses) and NOT a programmatic floor (none runs at the plan
+# stage). Sibling of the plan-wf-* lenses. A plain list REPLACES base's correctness snippet
+# wholesale (resolver list-replace rule).
+vars:
+  dimension: plan-wf-model-tiering
+  artifact_kind: workflow plan (plan.yaml)
+
+context:
+  snippets:
+    - name: plan-wf-model-tiering-rubric
+      text: >-
+        Model-tiering rubric (workflow plan). A workflow composes microskills; each node's
+        execution model comes from its microskill's runtime.model, so a workflow plan adheres
+        to the model-tier policy by (1) any microskill it MINTS (via missing_microskills
+        requirements or _new_profiles) being tiered to match its nature, and (2) not forcing a
+        tier that contradicts a reused component's nature. Per the policy: Opus for
+        deep-reasoning / planning / design-authoring / adversarial-review / critique nature;
+        Sonnet for general-purpose implementation, structured generation, or interactive work;
+        Haiku for deterministic / mechanical / CRUD / publish / bookkeeping. Flag as a finding:
+        a _new_profiles entry whose runtime.model mismatches the component's nature or is
+        outside {opus, sonnet, haiku}; a missing_microskills requirement whose described nature
+        plainly implies a tier the workflow's wiring or description contradicts; a claim that an
+        orchestrator (delegation: orchestrator) node is model-tiered — orchestrator nodes run in
+        the main loop on the session model and are not pinnable, so flag only if the plan
+        asserts otherwise. Judge each component's tier against the nature of its work; do not
+        flag a reused microskill's pre-existing tier. Severity mapping: a minted tier (a
+        _new_profiles runtime.model or a missing_microskills requirement) that mismatches its
+        component's nature or sits outside {opus, sonnet, haiku} = major; a mint that would
+        under-provision a component whose whole job is deep reasoning or critique = blocker; an
+        over-provisioned mint = minor; a cosmetic tier-note awkwardness = nit. Do not raise
+        graph-correctness, input-contract, control-flow, reuse-survey, scope-fit,
+        name-capability, or failure-path-coverage concerns — those sibling lenses own them.
